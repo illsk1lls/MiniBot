@@ -33,6 +33,26 @@ $Protected	  = $false # Set $true to use NPMPlus access control credentials for 
 
 # ================================================
 
+# SAFE COMMAND WHITELIST
+
+$SafePrefixes = @('Get-','Test-','Resolve-','ConvertTo-','ConvertFrom-','Select-','Where-','Sort-','Group-','Measure-','Out-Null','cd','Set-Location')
+$SafeExactCommands = @('dir','type','ls','whoami','hostname','systeminfo','ipconfig','Get-NetIPConfiguration','Test-NetConnection','Test-Connection','Get-Process','Get-Service','Get-ChildItem','Get-Item','Get-Content','Get-Command','Get-Help','Get-Module')
+
+# PROMPT TUNING
+
+$SystemPrompt = @"
+You are $AgentName, a helpful, precise, and careful coding/technical assistant running on a Windows machine.
+
+You have access to tools to read, write, and edit files on the local machine, and to run CMD and PowerShell commands.
+
+Rules:
+- Be extremely careful with destructive actions. Always confirm before writing files or running commands that modify the system.
+- When editing code or configs, show a clear diff or summary of changes.
+- If you need more context, use the Read tool first.
+- Prefer simple, working solutions over clever ones.
+- You are assisting an experienced IT technician. Use PowerShell and Windows-native approaches when appropriate.
+"@
+
 function Get-NpmPlusCreds {
 	param([bool]$ForceRefresh = $false)
 
@@ -91,11 +111,6 @@ if($Protected){
 	$NpmplusPass = $NpmCreds.Pass
 }
 
-# SAFE COMMAND WHITELIST
-
-$SafePrefixes = @('Get-','Test-','Resolve-','ConvertTo-','ConvertFrom-','Select-','Where-','Sort-','Group-','Measure-','Out-Null','cd','Set-Location')
-$SafeExactCommands = @('dir','type','ls','whoami','hostname','systeminfo','ipconfig','Get-NetIPConfiguration','Test-NetConnection','Test-Connection','Get-Process','Get-Service','Get-ChildItem','Get-Item','Get-Content','Get-Command','Get-Help','Get-Module')
-
 function Test-IsSafeCommand {
 	param([string]$Command)
 	$first = ($Command -split '\s+')[0].Trim()
@@ -106,20 +121,7 @@ function Test-IsSafeCommand {
 	return $false
 }
 
-# SYSTEM PROMPT AND TOOLS
-
-$SystemPrompt = @"
-You are $AgentName, a helpful, precise, and careful coding/technical assistant running on a Windows machine.
-
-You have access to tools to read, write, and edit files on the local machine, and to run CMD and PowerShell commands.
-
-Rules:
-- Be extremely careful with destructive actions. Always confirm before writing files or running commands that modify the system.
-- When editing code or configs, show a clear diff or summary of changes.
-- If you need more context, use the Read tool first.
-- Prefer simple, working solutions over clever ones.
-- You are assisting an experienced IT technician. Use PowerShell and Windows-native approaches when appropriate.
-"@
+# TOOL SETUP
 
 $Tools = @(
 	@{ type = "function"; function = @{
@@ -158,7 +160,7 @@ function Invoke-RunCommand {
 	try { if ($shell -eq "cmd") { cmd /c $command 2>&1 } else { Invoke-Expression $command 2>&1 | Out-String } } catch { "ERROR: $_" }
 }
 
-# GET RESPONSE
+# COMMS
 
 function Invoke-ModelStreaming {
 	param([array]$Messages)
