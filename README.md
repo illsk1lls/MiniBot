@@ -19,7 +19,7 @@ $Version	  = "0.0.2" # Displays this script version in the console header at lau
 
 2.) Run the script and interact with your agent ;P
 
-(If you use NPMPlus ACL for your host, the script will automatically prompt for credentials. Make sure to set 'Satisfy Any/Pass Auth to Upstream' in the NPM's settings for this to work properly.)
+(If you use NPMPlus ACL for your host, the script will automatically prompt for credentials. Make sure to set 'Satisfy Any/Pass Auth to Upstream' in NPM's settings for this to work properly.)
 
 <p align="center"><img src="https://github.com/illsk1lls/MiniBot/blob/main/.readme/MiniBot.png?raw=true"></p>
 *NOTE: There is a whitelist(array) of pre-approved commands/command-prefixes near the top of the script. Any commands that arent in the whitelist(s) will require user approval before proceeding.*
