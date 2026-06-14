@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-	MiniBot v0.0.1 - Local Mini Agent
+	MiniBot v0.0.2 - Local Mini Agent
 .DESCRIPTION
 	An OpenAI compatible Powershell console client
 #>
@@ -18,7 +18,7 @@ if ($ForceCredRefresh) {
 
 # ==================== CONFIG ====================
 
-$BaseUrl	  = "http://192.168.1.231:8081/v1" # Point to an OpenAI compatible endpoint e.g. https://domain.com/v1, http://192.168.1.50:8080/v1
+$BaseUrl	  = "http://192.168.1.50:8080/v1" # Point to an OpenAI compatible endpoint e.g. https://domain.com/v1, http://192.168.1.50:8080/v1
 $Model		  = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q8_0" # This needs to match the model name you want to connect with
 $ApiKey		  = "none" # this usually doesnt matter but if you have it set enter it here
 
@@ -28,8 +28,7 @@ $maxTurns	  = 12
 
 $AgentName	  = "MiniBot-Agent" # This is the agents display name
 $DisplayModel = $Model # This displays the remote models name in the console header
-$Version	  = "0.0.1"
-$Protected	  = $false # Set $true to use NPMPlus access control credentials for outside access (Make sure to set 'Satify Any/Pass Auth to Upstream' in the access list for this to work properly.)
+$Version	  = "0.0.2"
 
 # ================================================
 
@@ -77,7 +76,9 @@ function Get-NpmPlusCreds {
 					[Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePass)
 				)
 
-				return @{ User = $user; Pass = $plainPass }
+				if ($user -and $plainPass) {
+					return @{ User = $user; Pass = $plainPass }
+				}
 			}
 		}
 		catch {
@@ -85,30 +86,124 @@ function Get-NpmPlusCreds {
 		}
 	}
 
-	Write-Host "`nCredentials required.`n" -ForegroundColor DarkYellow
-	$user = Read-Host "Username"
-	$passSecure = Read-Host "Password" -AsSecureString
+	while ($true) {
+		Write-Host "`nCredentials required for $($BaseUrl)`n" -ForegroundColor DarkYellow
+		$user = Read-Host "Username"
+		$passSecure = Read-Host "Password" -AsSecureString
 
-	if (-not $user -or -not $passSecure) {
-		return @{ User = $null; Pass = $null }
+		$plainPass = $null
+		if ($passSecure) {
+			try {
+				$plainPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+					[Runtime.InteropServices.Marshal]::SecureStringToBSTR($passSecure)
+				)
+			} catch {}
+		}
+
+		if ($user -and $plainPass) {
+			if (-not (Test-Path $agentDir)) {
+				New-Item -ItemType Directory -Path $agentDir -Force | Out-Null
+			}
+			$encrypted = $passSecure | ConvertFrom-SecureString
+			"$user`n$encrypted" | Out-File $credFile -Encoding UTF8 -Force
+
+			return @{ User = $user; Pass = $plainPass }
+		}
+
+		Write-Host "Username and password cannot be empty. Please try again.`n" -ForegroundColor Red
 	}
-
-	if (-not (Test-Path $agentDir)) {
-		New-Item -ItemType Directory -Path $agentDir -Force | Out-Null
-	}
-
-	$encrypted = $passSecure | ConvertFrom-SecureString
-	"$user`n$encrypted" | Out-File $credFile -Encoding UTF8 -Force
-	$plainPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-		[Runtime.InteropServices.Marshal]::SecureStringToBSTR($passSecure)
-	)
-	return @{ User = $user; Pass = $plainPass }
 }
 
-if($Protected){
-	$NpmCreds = Get-NpmPlusCreds -ForceRefresh $ForceCredRefresh
-	$NpmplusUser = $NpmCreds.User
-	$NpmplusPass = $NpmCreds.Pass
+function Wait-ForKey {
+	Write-Host "`nPress any key to exit..." -ForegroundColor DarkGray
+	$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
+
+# TEST IF AUTH IS REQUIRED
+
+function Test-ModelConnection {
+	[CmdletBinding()]
+	param(
+		[string]$BaseUrl,
+		[string]$Username,
+		[string]$Password,
+		[int]$TimeoutSeconds = 8
+	)
+
+	$testUrl = "$BaseUrl/models"
+
+	try {
+		$headers = @{}
+
+		if ($Username -and $Password) {
+			$credBytes = [System.Text.Encoding]::UTF8.GetBytes("$Username`:$Password")
+			$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
+			$authType = "Basic"
+		} else {
+			$headers['Authorization'] = "Bearer none"
+			$authType = "Bearer"
+		}
+
+		$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+		$ProgressPreference = 'SilentlyContinue'
+		$response = Invoke-WebRequest -Uri $testUrl `
+									  -Method GET `
+									  -Headers $headers `
+									  -TimeoutSec $TimeoutSeconds `
+									  -UseBasicParsing `
+									  -ErrorAction Stop
+		$ProgressPreference = 'Continue'
+		$stopwatch.Stop()
+
+		return [pscustomobject]@{
+			Success	   = ($response.StatusCode -eq 200)
+			StatusCode = $response.StatusCode
+			Message	   = if ($response.StatusCode -eq 200) { "Connection successful" } else { "Server responded with $($response.StatusCode)" }
+			AuthType   = $authType
+			ElapsedMs  = $stopwatch.ElapsedMilliseconds
+		}
+	}
+	catch [System.Net.WebException] {
+		if ($stopwatch) { $stopwatch.Stop() | Out-Null }
+		$statusCode = $_.Exception.Response.StatusCode.value__
+
+		if ($statusCode -eq 401 -or $statusCode -eq 403) {
+			return [pscustomobject]@{
+				Success	   = $false
+				StatusCode = $statusCode
+				Message	   = "Authentication failed (401/403) - bad or missing credentials"
+				AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
+				ElapsedMs  = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
+			}
+		}
+		elseif ($statusCode) {
+			return [pscustomobject]@{
+				Success	   = $false
+				StatusCode = $statusCode
+				Message	   = "Server reachable but returned HTTP $statusCode"
+				AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
+				ElapsedMs  = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
+			}
+		}
+		else {
+			return [pscustomobject]@{
+				Success	   = $false
+				StatusCode = $null
+				Message	   = "Cannot reach server: $($_.Exception.Message)"
+				AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
+				ElapsedMs  = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
+			}
+		}
+	}
+	catch {
+		return [pscustomobject]@{
+			Success	   = $false
+			StatusCode = $null
+			Message	   = "Unexpected error: $($_.Exception.Message)"
+			AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
+			ElapsedMs  = 0
+		}
+	}
 }
 
 function Test-IsSafeCommand {
@@ -131,17 +226,17 @@ $Tools = @(
 	}},
 	@{ type = "function"; function = @{
 		name = "WriteFile"
-		description = "Write or overwrite a file. Requires confirm=true."
+		description = "Write or overwrite a file. Requires user confirmation."
 		parameters = @{ type = "object"; properties = @{
-			path = @{ type = "string" }; content = @{ type = "string" }; confirm = @{ type = "boolean" }
-		}; required = @("path","content","confirm") }
+			path = @{ type = "string" }; content = @{ type = "string" }
+		}; required = @("path","content") }
 	}},
 	@{ type = "function"; function = @{
 		name = "EditFile"
-		description = "Search/replace edit. Requires confirm=true."
+		description = "Search/replace edit. Requires user confirmation."
 		parameters = @{ type = "object"; properties = @{
-			path = @{ type = "string" }; search = @{ type = "string" }; replace = @{ type = "string" }; confirm = @{ type = "boolean" }
-		}; required = @("path","search","replace","confirm") }
+			path = @{ type = "string" }; search = @{ type = "string" }; replace = @{ type = "string" }
+		}; required = @("path","search","replace") }
 	}},
 	@{ type = "function"; function = @{
 		name = "RunCommand"
@@ -153,8 +248,28 @@ $Tools = @(
 )
 
 function Invoke-ReadFile   { param([string]$path) if (Test-Path $path) { Get-Content $path -Raw } else { "ERROR: File not found" } }
-function Invoke-WriteFile  { param([string]$path,[string]$content,[bool]$confirm) if (-not $confirm) { return "SAFETY: confirm=false" }; try { $content | Out-File $path -Encoding UTF8 -Force; "SUCCESS" } catch { "ERROR: $_" } }
-function Invoke-EditFile   { param([string]$path,[string]$search,[string]$replace,[bool]$confirm) if (-not $confirm) { return "SAFETY: confirm=false" }; if (-not (Test-Path $path)) { return "ERROR: Not found" }; try { (Get-Content $path -Raw) -replace [regex]::Escape($search), $replace | Out-File $path -Encoding UTF8 -Force; "SUCCESS" } catch { "ERROR: $_" } }
+
+function Invoke-WriteFile  {
+	param([string]$path,[string]$content)
+	try {
+		$content | Out-File $path -Encoding UTF8 -Force
+		"SUCCESS"
+	} catch {
+		"ERROR: $_"
+	}
+}
+
+function Invoke-EditFile   {
+	param([string]$path,[string]$search,[string]$replace)
+	if (-not (Test-Path $path)) { return "ERROR: Not found" }
+	try {
+		(Get-Content $path -Raw) -replace [regex]::Escape($search), $replace | Out-File $path -Encoding UTF8 -Force
+		"SUCCESS"
+	} catch {
+		"ERROR: $_"
+	}
+}
+
 function Invoke-RunCommand {
 	param([string]$command, [string]$shell="powershell", [bool]$confirm)
 	try { if ($shell -eq "cmd") { cmd /c $command 2>&1 } else { Invoke-Expression $command 2>&1 | Out-String } } catch { "ERROR: $_" }
@@ -185,7 +300,7 @@ function Invoke-ModelStreaming {
 	$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, "$BaseUrl/chat/completions")
 	$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $ApiKey)
 
-	if ($NpmplusUser -and $NpmplusPass -and $Protected) {
+	if ($NpmplusUser -and $NpmplusPass) {
 		$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$NpmplusUser`:$NpmplusPass")
 		$authBase64 = [Convert]::ToBase64String($authBytes)
 		$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $authBase64)
@@ -269,6 +384,57 @@ function Invoke-ModelStreaming {
 
 # MAIN
 function Start-LocalAgent {
+	$NpmplusUser = $null
+	$NpmplusPass = $null
+
+	$testParams = @{
+		BaseUrl		   = $BaseUrl
+		TimeoutSeconds = 8
+	}
+
+	if ($ForceCredRefresh) {
+		$NpmCreds = Get-NpmPlusCreds -ForceRefresh $true
+		$NpmplusUser = $NpmCreds.User
+		$NpmplusPass = $NpmCreds.Pass
+		if ($NpmplusUser -and $NpmplusPass) {
+			$testParams['Username'] = $NpmplusUser
+			$testParams['Password'] = $NpmplusPass
+		}
+		$connTest = Test-ModelConnection @testParams
+	}
+	else {
+		$connTest = Test-ModelConnection @testParams
+		if (-not $connTest.Success -and ($connTest.StatusCode -in 401,403)) {
+			$NpmCreds = Get-NpmPlusCreds -ForceRefresh $false
+			$NpmplusUser = $NpmCreds.User
+			$NpmplusPass = $NpmCreds.Pass
+			if ($NpmplusUser -and $NpmplusPass) {
+				$testParams['Username'] = $NpmplusUser
+				$testParams['Password'] = $NpmplusPass
+				$connTest = Test-ModelConnection @testParams
+			}
+		}
+	}
+
+	if (-not $connTest.Success) {
+		Write-Host ""
+		Write-Host "==============================================================" -ForegroundColor DarkRed
+		Write-Host "  CONNECTION TEST FAILED - Cannot start session" -ForegroundColor Red
+		Write-Host "==============================================================" -ForegroundColor DarkRed
+		Write-Host ""
+		Write-Host "Reason : $($connTest.Message)" -ForegroundColor Yellow
+
+		if ($connTest.StatusCode -in 401,403) {
+			Write-Host "Your credentials appear to be invalid or expired." -ForegroundColor DarkYellow
+			Write-Host "Hold CTRL while launching to force a fresh credential prompt." -ForegroundColor Yellow
+		} else {
+			Write-Host "The model server appears to be unreachable or misconfigured." -ForegroundColor DarkYellow
+		}
+		Write-Host ""
+		Wait-ForKey
+		return
+	}
+
 	Clear-Host
 	Write-Host "==============================================================" -ForegroundColor DarkGray
 	Write-Host "|  $AgentName v$Version" -ForegroundColor DarkRed
@@ -303,26 +469,54 @@ function Start-LocalAgent {
 					$fn = $tc.function.name
 					$args = $tc.function.arguments | ConvertFrom-Json
 
-					if ($fn -eq "RunCommand") {
-						if (Test-IsSafeCommand $args.command) {
-							Write-Host "  -> RunCommand (auto-approved)" -ForegroundColor DarkGreen
-							$result = Invoke-RunCommand $args.command $args.shell $true
-						} else {
-							Write-Host ""
-							Write-Host "[$AgentName] Wants to run:" -ForegroundColor Yellow
-							Write-Host $args.command -ForegroundColor White
-							$ans = Read-Host "Allow? [Y/N]"
-							$result = if ($ans -match '^[Yy]') { Invoke-RunCommand $args.command $args.shell $true } else { "Denied by user. If there are no alternatives explain your reasoning." }
+					switch ($fn) {
+						"RunCommand" {
+							if (Test-IsSafeCommand $args.command) {
+								Write-Host "  -> RunCommand (auto-approved)" -ForegroundColor DarkGreen
+								$result = Invoke-RunCommand $args.command $args.shell $true
+							} else {
+								Write-Host ""
+								Write-Host "[$AgentName] Wants to run:" -ForegroundColor Yellow
+								Write-Host $args.command -ForegroundColor White
+								$ans = Read-Host "Allow? [Y/N]"
+								if ($ans -match '^[Yy]') {
+									$result = Invoke-RunCommand $args.command $args.shell $true
+								} else {
+									$result = "Denied by user. If there are no alternatives explain your reasoning."
+								}
+							}
 						}
-					} else {
-						Write-Host "  -> $fn" -ForegroundColor DarkCyan
-						$result = switch ($fn) {
-							"ReadFile"	{ Invoke-ReadFile $args.path }
-							"WriteFile" { Invoke-WriteFile $args.path $args.content $args.confirm }
-							"EditFile"	{ Invoke-EditFile $args.path $args.search $args.replace $args.confirm }
-							default		{ "Unknown tool" }
+						"ReadFile" {
+							Write-Host "  -> ReadFile" -ForegroundColor DarkCyan
+							$result = Invoke-ReadFile $args.path
+						}
+						"WriteFile" {
+							Write-Host ""
+							Write-Host "[$AgentName] Wants to WRITE to file:" -ForegroundColor Yellow
+							Write-Host $args.path -ForegroundColor White
+							$ans = Read-Host "Allow write? [Y/N]"
+							if ($ans -match '^[Yy]') {
+								$result = Invoke-WriteFile $args.path $args.content
+							} else {
+								$result = "Denied by user. If there are no alternatives explain your reasoning."
+							}
+						}
+						"EditFile" {
+							Write-Host ""
+							Write-Host "[$AgentName] Wants to EDIT file:" -ForegroundColor Yellow
+							Write-Host $args.path -ForegroundColor White
+							$ans = Read-Host "Allow edit? [Y/N]"
+							if ($ans -match '^[Yy]') {
+								$result = Invoke-EditFile $args.path $args.search $args.replace
+							} else {
+								$result = "Denied by user. If there are no alternatives explain your reasoning."
+							}
+						}
+						default {
+							$result = "Unknown tool: $fn"
 						}
 					}
+
 					$messages += @{ role="tool"; tool_call_id=$tc.id; content=($result | Out-String) }
 				}
 				continue
