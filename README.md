@@ -26,3 +26,5 @@ $Protected	  = $false # Set $true to use NPMPlus access control credentials for 
 2.) Run the script and interact with your agent ;P
 
 <p align="center"><img src="https://github.com/illsk1lls/MiniBot/blob/main/.readme/MiniBot.png?raw=true"></p><br><br>
+
+*NOTE: There is a whitelist(array) of pre-approved commands/command-prefixes near the top of the script. Any commands that arent in the whitelist(s) will require user approval before proceeding.*
