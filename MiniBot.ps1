@@ -18,7 +18,7 @@ if ($ForceCredRefresh) {
 
 # ==================== CONFIG ====================
 
-$BaseUrl	  = "http://192.168.1.50:8080/v1" # Point to an OpenAI compatible endpoint e.g. https://domain.com/v1, http://192.168.1.50:8080/v1
+$BaseUrl	  = "http://192.168.1.231:8081/v1" # Point to an OpenAI compatible endpoint e.g. https://domain.com/v1, http://192.168.1.50:8080/v1
 $Model		  = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q8_0" # This needs to match the model name you want to connect with
 $ApiKey		  = "none" # this usually doesnt matter but if you have it set enter it here
 
@@ -272,7 +272,7 @@ function Start-LocalAgent {
 	Clear-Host
 	Write-Host "==============================================================" -ForegroundColor DarkGray
 	Write-Host "|  $AgentName v$Version" -ForegroundColor DarkRed
-	Write-Host "|  Endpoint	 : $BaseUrl" -ForegroundColor DarkRed
+	Write-Host "|  Endpoint  : $BaseUrl" -ForegroundColor DarkRed
 	Write-Host "|  Powered by: $DisplayModel" -ForegroundColor DarkRed
 	Write-Host "==============================================================" -ForegroundColor DarkGray
 	Write-Host "  Type your task. Type 'exit' to quit." -ForegroundColor DarkGray
