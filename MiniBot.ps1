@@ -5,6 +5,22 @@
 	An OpenAI compatible Powershell console client
 #>
 
+param(
+    [string]$BaseUrl = "http://127.0.0.1:8080/v1",
+    [string]$Model = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q8_0",
+    [string]$ApiKey = "none",
+    [int]$MaxTokens = 4096,
+    [double]$Temperature = 0.2,
+    [int]$MaxTurns = 12,
+    [string]$AgentName = "MiniBot-Agent",
+    [string]$DisplayModel = $null,
+    [string]$Version = "0.0.2"
+)
+
+if (-not $DisplayModel) {
+    $DisplayModel = $Model
+}
+
 try {
 	[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 	chcp 65001 | Out-Null
@@ -15,22 +31,6 @@ $ForceCredRefresh = [System.Windows.Forms.Control]::ModifierKeys -band [System.W
 if ($ForceCredRefresh) {
 	Write-Host "CTRL key held during launch - Forcing credential refresh" -ForegroundColor DarkRed
 }
-
-# ==================== CONFIG ====================
-
-$BaseUrl	  = "http://192.168.1.50:8080/v1" # Point to an OpenAI compatible endpoint e.g. https://domain.com/v1, http://192.168.1.50:8080/v1
-$Model		  = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q8_0" # This needs to match the model name you want to connect with
-$ApiKey		  = "none" # this usually doesnt matter but if you have it set enter it here
-
-$MaxTokens	  = 4096
-$Temperature  = 0.2
-$maxTurns	  = 12
-
-$AgentName	  = "MiniBot-Agent" # This is the agents display name
-$DisplayModel = $Model # This displays the remote models name in the console header
-$Version	  = "0.0.2"
-
-# ================================================
 
 # SAFE COMMAND WHITELIST
 
