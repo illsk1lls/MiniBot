@@ -130,6 +130,7 @@ function Test-ModelConnection {
 		[int]$TimeoutSeconds = 8
 	)
 
+	Write-Host "Connecting..."
 	$testUrl = "$BaseUrl/models"
 
 	try {
@@ -146,12 +147,7 @@ function Test-ModelConnection {
 
 		$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 		$ProgressPreference = 'SilentlyContinue'
-		$response = Invoke-WebRequest -Uri $testUrl `
-									  -Method GET `
-									  -Headers $headers `
-									  -TimeoutSec $TimeoutSeconds `
-									  -UseBasicParsing `
-									  -ErrorAction Stop
+		$response = Invoke-WebRequest -Uri $testUrl -Method GET -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
 		$ProgressPreference = 'Continue'
 		$stopwatch.Stop()
 
