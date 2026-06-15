@@ -14,16 +14,12 @@ $maxTurns	  = 12
 
 $AgentName	  = "MiniBot-Agent" # This is the agents display name in the chat
 $DisplayModel = $Model # Displays the model name, or anything you want in the console header at launch e.g. Powered By: 'This value'
-$Version	  = "0.0.1" # Displays this script version in the console header at launch
-```
-
-Support for NPMPlus 'Access' lists is present, for outside access. Set $Protected = $true and you will be prompted for credentials during first run. (Hold CTRL during launch to reset/refresh credentials)
-
-```
-$Protected	  = $false # Set $true to use NPMPlus access control credentials for outside access (Make sure to set 'Satisfy Any/Pass Auth to Upstream' in the access list for this to work properly.)
+$Version	  = "0.0.2" # Displays this script version in the console header at launch
 ```
 
 2.) Run the script and interact with your agent ;P
 
-<p align="center"><img src="https://github.com/illsk1lls/MiniBot/blob/main/.readme/MiniBot.png?raw=true"></p>
+(If you use NPMPlus ACL for your host, the script will automatically prompt for credentials. Make sure to set 'Satisfy Any/Pass Auth to Upstream' in NPM's settings for this to work properly.)
+
+<p align="center"><img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png"></p>
 *NOTE: There is a whitelist(array) of pre-approved commands/command-prefixes near the top of the script. Any commands that arent in the whitelist(s) will require user approval before proceeding.*
