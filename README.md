@@ -4,7 +4,7 @@ An OpenAI compatible Powershell console client.
 1.) Set your configuration values at the top of the script:
 
 ```
-$BaseUrl	  = "http://192.168.1.50:8080/v1" # Point to an OpenAI compatible endpoint
+$BaseUrl	  = "http://127.0.0.2:8080/v1" # Point to an OpenAI compatible endpoint
 $Model		  = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q8_0" # This needs to match the model name you want to connect with
 $ApiKey		  = "none" # this usually doesnt matter but if you have it set enter it here
 
