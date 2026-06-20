@@ -139,6 +139,7 @@ function Get-NPMCreds {
 	}
 
 	while ($true) {
+		Clear-Host
 		Write-Host "`nCredentials required for $($BaseUrl)`n" -ForegroundColor DarkYellow
 		$user = Read-Host "Username"
 		$passSecure = Read-Host "Password" -AsSecureString
