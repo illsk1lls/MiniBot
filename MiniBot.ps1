@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 	MiniBot v0.0.3 - Local Mini Agent
 .DESCRIPTION
