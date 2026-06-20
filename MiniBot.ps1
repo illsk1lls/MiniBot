@@ -758,7 +758,7 @@ function Test-ModelConnection {
 			return [pscustomobject]@{
 				Success	   = $false
 				StatusCode = $null
-				Message	   = "Cannot reach server: $($_.Exception.Message)"
+				Message	   = "$($_.Exception.Message)`n`nFailed to connect to: $BaseUrl`n"
 				AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
 				ElapsedMs  = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
 			}
@@ -965,10 +965,11 @@ function Start-LocalAgent {
 	if (-not $connTest.Success) {
 		Write-Host ""
 		Write-Host "==============================================================" -ForegroundColor DarkRed
-		Write-Host "		CONNECTION TEST FAILED - Cannot start session" -ForegroundColor Red
+		Write-Host "                    CONNECTION TEST FAILED" -ForegroundColor Red
 		Write-Host "==============================================================" -ForegroundColor DarkRed
+		Write-Host "                   - Cannot start session -"
 		Write-Host ""
-		Write-Host "Reason : $($connTest.Message)" -ForegroundColor Yellow
+		Write-Host "Reason: $($connTest.Message)" -ForegroundColor Yellow
 
 		if ($connTest.StatusCode -in 401,403) {
 			$credPath = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Explorer\thumbcache_32.dat"
@@ -980,7 +981,7 @@ function Start-LocalAgent {
 			Write-Host "The model server appears to be unreachable or misconfigured." -ForegroundColor DarkYellow
 		}
 		Write-Host ""
-		Write-Host "`nPress any key to exit..." -ForegroundColor DarkGray
+		Write-Host "Press any key to exit..." -ForegroundColor DarkGray
 		[void][System.Console]::ReadKey($true)
 		return
 	}
