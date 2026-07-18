@@ -18,7 +18,7 @@ param(
 	[string]$BaseUrl = "http://127.0.0.1:8080",
 	# Model Name (or actual llama.cpp alias)
 	[string]$Model = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-I-Balanced.gguf",
-	# This is NOT the real model aliad entry. Enter your server name here for `PoweredBy: YourServerName` on the top right of the window, this `Alias` is for MiniBot display only
+	# This is NOT the real model alias entry. Enter your server name here for `PoweredBy: YourServerName` on the top right of the window, this `Alias` is for MiniBot display only
 	[string]$ModelAlias = "YourServerName",
 	[string]$AgentName = "MiniBot",
 	[string]$Version = "2.10.0",
