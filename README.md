@@ -1,24 +1,82 @@
 # MiniBot
-An OpenAI compatible Powershell console client.
+OpenAI-compatible PowerShell agent client for local models (Windows PowerShell 5.1 + WPF UI).
 
-1.) Set your configuration values at the top of the script:
+## Setup
+1. Edit the defaults at the top of `MiniBot.ps1` (`BaseUrl`, `Model`, `ApiKey`, etc).
+2. Run it.
 
 ```
-[string]$BaseUrl = "http://127.0.0.1:8080/v1",
-[string]$Model = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q8_0",
-[string]$ApiKey = "none",
-[int]$MaxTokens = 8192,
-[double]$Temperature = 0.15,
-[int]$MaxTurns = 25,
-[string]$AgentName = "MiniBot",
-[string]$Version = "0.0.3",
-[bool]$AutoApproveEnabled = $false,
-[bool]$StoreCredentials = $false
+powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1
 ```
 
-2.) Run the script and interact with your agent ;P
+Or rename to `.cmd` and double-click (hybrid launcher at the top of the file).
 
-(If you use NPMPlus ACL for your host, the script will automatically prompt for credentials. Make sure to set 'Satisfy Any/Pass Auth to Upstream' in NPM's settings for this to work properly. You may also want to add the following to your custom settings -> proxy_buffering off; proxy_request_buffering off; so that model streaming looks correct)
+```
+irm https://YOUR_HOST/MiniBot.ps1 | iex
+```
 
-<p align="center"><img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png"></p>
-*NOTE: There is a whitelist(array) of pre-approved commands/command-prefixes near the top of the script. Any commands that arent in the whitelist(s) will require user approval before proceeding.*
+## Useful params
+Set them in the `param` block or pass on the command line:
+
+| Param | Default | Notes |
+| --- | --- | --- |
+| `BaseUrl` | your host | OpenAI-compatible base (chat/completions) |
+| `Model` | model id | API model name |
+| `ModelAlias` | same as model | Sticky "PoweredBy" label (empty = hide) |
+| `ApiKey` | `none` | Or store with `-StoreCredentials` / login checkbox |
+| `AgentName` | agent name | Branding in UI |
+| `HideConsole` | `$true` | `$false` keeps the PS/Terminal window open |
+| `AutoApproveEnabled` | `$false` | Skip Y/N prompts for mutating tools |
+| `ToolProfile` | `core` | `full` enables all tool groups at start |
+| `SpeechEnabled` | `$false` | Right-Ctrl push-to-talk + optional TTS |
+| `DebugLog` | `$false` | Writes `MiniBot-debug.log` on Desktop |
+
+Examples:
+
+```
+.\MiniBot.ps1 -HideConsole:$false
+.\MiniBot.ps1 -BaseUrl "http://127.0.0.1:8081" -Model "my-model"
+.\MiniBot.ps1 -ToolProfile full -AutoApproveEnabled:$true
+```
+
+## Commands
+Type a task in the prompt, or use:
+
+```
+/help
+/status
+/tools              # list groups
+/tools vision       # enable a group
+/auto on|off        # auto-approve mutating actions
+/cd <path>
+/save  /load  /export
+/speech on|off
+exit
+```
+
+Esc interrupts a running turn.
+
+## Tools
+Starts on **core** (files, edits, shell, cwd). Other groups load on demand (`EnableToolGroup` or `/tools <group>`):
+
+`vision` `system` `repair` `setup` `installers` `sandbox` `files` `packages` `registry` `clipboard` `web` `speech`
+
+Mutating actions prompt for approval unless auto-approve is on. Safe read-only shell commands can auto-run; everything else asks.
+
+Installer catalog is near the top of the script (`$script:MBInstallerCatalog`). Edit URLs/flags there.
+
+## Auth
+If the host needs credentials, MiniBot prompts. Use **Save credentials** or `-StoreCredentials` to write Windows Credential Manager. Caps Lock held at launch clears stored MiniBot creds.
+
+If you use NPMPlus ACL: set Satisfy Any / Pass Auth to Upstream. For streaming, `proxy_buffering off; proxy_request_buffering off;` in custom proxy settings helps.
+
+## Notes
+- Needs Windows PowerShell 5.1+ and WPF (normal desktop Windows).
+- Optional: `PSWindowsUpdate` for update status, `System.Speech` for voice.
+- Runs elevated (UAC) when needed for machine setup / installs.
+- Temp folders under `%TEMP%` are cleaned as it goes and again on launch if a previous run died dirty.
+
+Have your favorite AI review the script before trying it and see what it thinks?
+
+## License
+Do whatever you want with it. ;)

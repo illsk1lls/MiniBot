@@ -1,356 +1,6056 @@
-﻿<#
+﻿<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
+@START /MIN "" POWERSHELL -nop -w hidden -c "iex ([io.file]::ReadAllText('%~f0'))">nul&EXIT
+#>
+
+<#
 .SYNOPSIS
-	MiniBot v0.0.3 - Local Mini Agent
+	MiniBot v2.10.0 - Mini Repair-Bot (Or whatever you want it to be!)
 .DESCRIPTION
-	An OpenAI compatible Powershell console client
+	OpenAI-compatible PowerShell 5.1 agent client for local models.
+	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
+.NOTES
+	Requires Windows PowerShell 5.1+. Optional: PSWindowsUpdate for GetWindowsUpdateStatus.
+	Optional: System.Speech for /speech (Right-Ctrl PTT + TTS).
 #>
 
 param(
-	[string]$BaseUrl = "http://127.0.0.1:8080/v1",
-	[string]$Model = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q8_0",
-	[string]$ApiKey = "none",
-	[int]$MaxTokens = 8192,
-	[double]$Temperature = 0.15,
-	[int]$MaxTurns = 25,
+	# Endpoint + Port
+	[string]$BaseUrl = "http://127.0.0.1:8080",
+	# Model Name (or actual llama.cpp alias)
+	[string]$Model = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-I-Balanced.gguf",
+	# This is NOT the real model aliad entry. Enter your server name here for `PoweredBy: YourServerName` on the top right of the window, this `Alias` is for MiniBot display only
+	[string]$ModelAlias = "YourServerName",
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "0.0.3",
+	[string]$Version = "2.10.0",
+	[string]$ApiKey = "none",
+	# Max completion tokens per model request (also reserved out of n_ctx for the prompt budget)
+	[int]$MaxTokens = 32768,
+	[double]$Temperature = 0.15,
+	[int]$MaxToolResultChars = 10000,
+	[int]$MaxHistoryMessages = 48,
+	[int]$CommandTimeoutSec = 360,
+	[int]$ContextWindowTokens = 262144,
+	[double]$ContextSoftPct = 0.72,
+	[double]$ContextHardPct = 0.88,
+	[bool]$AutoCompactEnabled = $true,
+	# Optional model summary on compact (else extractive)
+	[bool]$ModelCompactEnabled = $true,
+	[int]$MaxTurns = 30,
+	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
+	[int]$MaxReplyContinues = 8,
 	[bool]$AutoApproveEnabled = $false,
-	[bool]$StoreCredentials = $false
+	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
+	[bool]$SpeechEnabled = $false,
+	# Speak final assistant text via SAPI when speech is on
+	[bool]$SpeechAutoReply = $true,
+	# Also set by env store=1 when the param is omitted - HOLD CAPPS-LOCK DURING LAUNCH TO CLEAR STORED CREDS
+	[bool]$StoreCredentials = $false,
+	# Tool surface: core (default, progressive) | full (all groups enabled)
+	[ValidateSet('core','full')]
+	[string]$ToolProfile = "core",
+	[string]$TaskApiBase = "",
+	# File debug log (Desktop\MiniBot-debug.log). Off by default. Env: debug=1
+	[bool]$DebugLog = $false,
+	# Hide attached console / Windows Terminal host window (PS1 and irm|iex). CMD hybrid line is separate (START /MIN -w hidden).
+	[bool]$HideConsole = $true
 )
 
+# Console hide (PS param -HideConsole). CMD users: edit the hybrid @START line at top of file.
+$solo = $true
+$script:MB_HideConsole = [bool]$HideConsole
+$script:MB_HiddenConsoleHwnd = [IntPtr]::Zero
+if ($script:MB_HideConsole) {
+	try {
+		Add-Type -MemberDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Win32 {
+	[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+	[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, int nCmdShow);
+	[DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+	[DllImport("kernel32.dll", SetLastError=true)] static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+	[DllImport("kernel32.dll", SetLastError=true)] static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+	[DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr hObject);
+	const uint TH32CS_SNAPPROCESS = 2;
+	[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Auto)]
+	struct PROCESSENTRY32 {
+		public uint dwSize; public uint cntUsage; public uint th32ProcessID;
+		public IntPtr th32DefaultHeapID; public uint th32ModuleID; public uint cntThreads;
+		public uint th32ParentProcessID; public int pcPriClassBase; public uint dwFlags;
+		[MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string szExeFile;
+	}
+	public static uint GetParentProcessId(uint pid) {
+		IntPtr snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+		if (snap == IntPtr.Zero || snap == (IntPtr)(-1)) return 0;
+		try {
+			PROCESSENTRY32 pe = new PROCESSENTRY32();
+			pe.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+			if (!Process32First(snap, ref pe)) return 0;
+			do { if (pe.th32ProcessID == pid) return pe.th32ParentProcessID; }
+			while (Process32Next(snap, ref pe));
+			return 0;
+		} finally { CloseHandle(snap); }
+	}
+}
+"@ -Name "Win32" -Namespace "Win32Functions" -ErrorAction Stop
+	} catch {}
+
+	try {
+		$hwnd = [Win32Functions.Win32]::GetConsoleWindow()
+		if ($hwnd -ne [IntPtr]::Zero) {
+			$script:MB_HiddenConsoleHwnd = $hwnd
+			[void][Win32Functions.Win32]::ShowWindow($hwnd, 0)  # SW_HIDE
+		} else {
+			# Parent walk without WMI/CIM (Windows Terminal has no console hwnd)
+			$currentProcessId = [uint32]$PID
+			$guard = 0
+			while ($currentProcessId -and $guard -lt 16) {
+				$guard++
+				$currentProcess = Get-Process -Id $currentProcessId -ErrorAction SilentlyContinue
+				if ($currentProcess -and $currentProcess.ProcessName -eq 'WindowsTerminal') {
+					$hwnd = $currentProcess.MainWindowHandle
+					if ($hwnd -ne [IntPtr]::Zero) {
+						$script:MB_HiddenConsoleHwnd = $hwnd
+						[void][Win32Functions.Win32]::ShowWindow($hwnd, 0)  # SW_HIDE
+					}
+					break
+				}
+				try { $currentProcessId = [Win32Functions.Win32]::GetParentProcessId($currentProcessId) } catch { break }
+			}
+		}
+	} catch {}
+}
+
+# Installer catalog — edit url / file / install / zip_entry here.
+# kind: exe | msi | zip_msi | open_url
+# install: raw flags after payload (not split). Empty = none.
+# interactive: show UI (ADWCleaner). NewMachineSetup installs every package in this catalog.
+$script:MBInstallerCatalog = [ordered]@{
+	'7zip' = [ordered]@{
+		id        = '7zip'
+		name      = '7-Zip'
+		url       = 'https://github.com/ip7z/7zip/releases/download/26.02/7z2602-x64.exe'
+		file      = '7z2602-x64.exe'
+		kind      = 'exe'
+		install   = '/S'
+		note      = 'Silent /S'
+	}
+	'chrome' = [ordered]@{
+		id        = 'chrome'
+		name      = 'Google Chrome'
+		url       = 'https://dl.google.com/tag/s/appguid%3D%7B8A69D345-D564-463C-AFF1-A69D9E530F96%7D%26iid%3D%7B01BE02E1-8E3F-B3BD-885C-6A7E4415E17F%7D%26lang%3Den%26browser%3D5%26usagestats%3D0%26appname%3DGoogle%2520Chrome%26needsadmin%3Dtrue%26ap%3Dx64-stable-statsdef_0%26brand%3DGCEB/dl/chrome/install/GoogleChromeEnterpriseBundle64.zip'
+		file      = 'GoogleChromeEnterpriseBundle64.zip'
+		kind      = 'zip_msi'
+		zip_entry = 'GoogleChromeStandaloneEnterprise64.msi'
+		install   = '/qn /norestart'
+		note      = 'Zip → MSI; silent /qn'
+	}
+	'adobe_reader' = [ordered]@{
+		id        = 'adobe_reader'
+		name      = 'Adobe Acrobat Reader DC'
+		url       = 'http://ardownload.adobe.com/pub/adobe/reader/win/AcrobatDC/2000920063/AcroRdrDC2000920063_en_US.exe'
+		file      = 'AcroRdrDC2000920063_en_US.exe'
+		kind      = 'exe'
+		install   = '/sAll /rs /msi EULA_ACCEPT=YES'
+		note      = 'Silent /sAll'
+	}
+	'adwcleaner' = [ordered]@{
+		id          = 'adwcleaner'
+		name        = 'ADWCleaner'
+		url         = 'https://adwcleaner.malwarebytes.com/adwcleaner?channel=release'
+		file        = 'ADWCleaner.exe'
+		kind        = 'exe'
+		install     = '/eula /clean /noreboot /preinstalled'
+		interactive = $true
+		runs_scan   = $true
+		note        = 'Interactive scan/clean UI'
+	}
+	'vlc' = [ordered]@{
+		id        = 'vlc'
+		name      = 'VLC media player'
+		url       = 'https://mirror.clarkson.edu/videolan/vlc/3.0.20/win64/vlc-3.0.20-win64.exe'
+		file      = 'vlc-3.0.20-win64.exe'
+		kind      = 'exe'
+		install   = '/S'
+		note      = 'Silent /S'
+	}
+}
+
+# Capture launch context at script scope (not function-scoped MyInvocation)
+$script:MB_LaunchBoundParams = @{}
+try { if ($PSBoundParameters) { $script:MB_LaunchBoundParams = $PSBoundParameters } } catch {}
+$script:MB_LaunchScriptPath = $null
 try {
-	[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-	chcp 65001 | Out-Null
+	if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
+		$script:MB_LaunchScriptPath = $PSCommandPath
+	} elseif ($MyInvocation.MyCommand.Path -and (Test-Path -LiteralPath $MyInvocation.MyCommand.Path)) {
+		$script:MB_LaunchScriptPath = $MyInvocation.MyCommand.Path
+	}
+} catch {}
+$script:MB_LaunchDefinition = $null
+try { $script:MB_LaunchDefinition = [string]$MyInvocation.MyCommand.Definition } catch {}
+
+function Test-MBIsElevated {
+	try {
+		$wi = [Security.Principal.WindowsIdentity]::GetCurrent()
+		$wp = New-Object Security.Principal.WindowsPrincipal($wi)
+		return [bool]$wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+	} catch {
+		return $false
+	}
+}
+
+function Get-MBElevationLaunchArgs {
+	# Build elevated re-launch args for this script.
+	$psArgs = '-NoProfile -ExecutionPolicy Bypass'
+	$hide = $true
+	try { $hide = [bool]$script:MB_HideConsole } catch { $hide = $true }
+	if ($hide) {
+		# Match -HideConsole:$true — avoid console flash while the elevated process parses.
+		$psArgs = "$psArgs -WindowStyle Hidden"
+	}
+	$path = $script:MB_LaunchScriptPath
+	$bound = @{}
+	try { $bound = $script:MB_LaunchBoundParams } catch { $bound = @{} }
+
+	$appendBound = {
+		param([string]$base)
+		$parts = New-Object System.Collections.ArrayList
+		[void]$parts.Add($base)
+		foreach ($key in @($bound.Keys)) {
+			$val = $bound[$key]
+			if ($val -is [bool] -or $val -is [System.Management.Automation.SwitchParameter]) {
+				$bv = [bool]$val
+				[void]$parts.Add((' -{0}:${1}' -f $key, $(if ($bv) { 'true' } else { 'false' })))
+			} elseif ($null -eq $val) {
+				continue
+			} elseif ($val -is [string]) {
+				$esc = ([string]$val) -replace '"', '`"'
+				[void]$parts.Add((' -{0} "{1}"' -f $key, $esc))
+			} else {
+				[void]$parts.Add((' -{0} {1}' -f $key, $val))
+			}
+		}
+		return (($parts | ForEach-Object { $_ }) -join '')
+	}
+
+	if ($path) {
+		$ext = [System.IO.Path]::GetExtension($path)
+		if ($ext -match '^\.(?i)cmd|bat$') {
+			$pathEsc = $path.Replace("'", "''")
+			$cmd = "iex ([io.file]::ReadAllText('$pathEsc'))"
+			return (& $appendBound ("$psArgs -Command `"$cmd`""))
+		}
+		$pathEsc = $path.Replace('"', '\"')
+		return (& $appendBound ("$psArgs -File `"$pathEsc`""))
+	}
+
+	$def = [string]$script:MB_LaunchDefinition
+	if ([string]::IsNullOrWhiteSpace($def)) { return $null }
+	$bytes = [System.Text.Encoding]::Unicode.GetBytes($def)
+	$enc = [Convert]::ToBase64String($bytes)
+	return "$psArgs -EncodedCommand $enc"
+}
+
+function Get-MBAgentDisplayTitle {
+	$n = if (-not [string]::IsNullOrWhiteSpace([string]$AgentName)) { [string]$AgentName.Trim() } else { 'MiniBot' }
+	return ('[{0}-Agent]' -f $n)
+}
+
+function Request-MBElevationOrExit {
+	if (Test-MBIsElevated) { return }
+
+	$title = Get-MBAgentDisplayTitle
+	$argLine = Get-MBElevationLaunchArgs
+	if ([string]::IsNullOrWhiteSpace($argLine)) {
+		try {
+			$shell = New-Object -ComObject Wscript.Shell
+			$shell.Popup(
+				("Administrator privileges are required, but {0} could not re-launch elevated. Right-click PowerShell / the script and choose Run as administrator." -f $title),
+				0, $title, 0x10
+			) | Out-Null
+		} catch {}
+		exit 1
+	}
+
+	$psExe = Join-Path $PSHOME 'powershell.exe'
+	if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+
+	try {
+		$psi = New-Object System.Diagnostics.ProcessStartInfo
+		$psi.FileName = $psExe
+		$psi.Arguments = $argLine
+		$psi.Verb = 'runas'
+		$psi.UseShellExecute = $true
+		$hideElev = $true
+		try { $hideElev = [bool]$script:MB_HideConsole } catch { $hideElev = $true }
+		if ($hideElev) {
+			$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+		}
+		[void][System.Diagnostics.Process]::Start($psi)
+		exit 0
+	} catch {
+		# UAC declined or elevation blocked
+		try {
+			$shell = New-Object -ComObject Wscript.Shell
+			$shell.Popup(("Administrator privileges are required. {0} will now close." -f $title), 0, $title, 0x10) | Out-Null
+		} catch {}
+		exit 1
+	}
+}
+
+try { Request-MBElevationOrExit } catch {
+	try {
+		$title = Get-MBAgentDisplayTitle
+		$shell = New-Object -ComObject Wscript.Shell
+		$shell.Popup(("Administrator privileges are required. {0} will now close." -f $title), 0, $title, 0x10) | Out-Null
+	} catch {}
+	exit 1
+}
+
+if ($solo) {
+	$AppId = 'MiniBot-Agent'
+	$singleInstance = $false
+	$script:SingleInstanceEvent = New-Object Threading.EventWaitHandle $true, ([Threading.EventResetMode]::ManualReset), "Global\$AppId", ([ref]$singleInstance)
+	if (-not $singleInstance) {
+		$shell = New-Object -ComObject Wscript.Shell
+		$shell.Popup("$AppId is already running!", 0, 'ERROR:', 0x0) | Out-Null
+		Exit
+	}
+}
+
+try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch {}
+try { Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue } catch {}
+try { Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue } catch {}
+
+function Test-MBEnvFlag {
+	param(
+		[Parameter(Mandatory = $true)][string]$Name
+	)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+	$raw = [Environment]::GetEnvironmentVariable($Name, 'Process')
+	if ([string]::IsNullOrWhiteSpace($raw)) {
+		$raw = [Environment]::GetEnvironmentVariable($Name, 'User')
+	}
+	if ([string]::IsNullOrWhiteSpace($raw)) {
+		$raw = [Environment]::GetEnvironmentVariable($Name, 'Machine')
+	}
+	if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+	return [bool]($raw.Trim() -match '^(?i)1|true|yes|on|y$')
+}
+
+function Set-MBEnvFlag {
+	param(
+		[Parameter(Mandatory = $true)][string]$Name,
+		[string]$Value = '0'
+	)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return }
+	if ($null -eq $Value) { $Value = '0' }
+	try { Set-Item -Path "Env:$Name" -Value $Value -ErrorAction SilentlyContinue } catch {}
+	try { [Environment]::SetEnvironmentVariable($Name, $Value, 'Process') } catch {}
+}
+
+# Env launch flags (store/clear). -StoreCredentials overrides store=1.
+$script:MB_StoreCredsFromEnv = $false
+$script:MB_ClearCredsFromEnv = $false
+$storeCredParamBound = $false
+try {
+	if ($null -ne $PSBoundParameters -and $PSBoundParameters.ContainsKey('StoreCredentials')) {
+		$storeCredParamBound = $true
+	}
+} catch {
+	$storeCredParamBound = $false
+}
+if (-not $storeCredParamBound) {
+	if (Test-MBEnvFlag -Name 'store') {
+		$StoreCredentials = $true
+		$script:MB_StoreCredsFromEnv = $true
+		Set-MBEnvFlag -Name 'store'
+	}
+}
+if (Test-MBEnvFlag -Name 'clear') {
+	$script:MB_ClearCredsFromEnv = $true
+	Set-MBEnvFlag -Name 'clear'
+}
+# Caps Lock held at launch clears stored creds (key down, not toggle)
+try {
+	if (-not ('MB.Launch.Keys' -as [type])) {
+		Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace MB.Launch {
+  public static class Keys {
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    // VK_CAPITAL=0x14: high bit = held; ignore toggle bit
+    public static bool IsCapsLockHeld() {
+      try { return (GetAsyncKeyState(0x14) & 0x8000) != 0; } catch { return false; }
+    }
+  }
+}
+"@ -ErrorAction Stop
+	}
+	if ([MB.Launch.Keys]::IsCapsLockHeld()) {
+		$script:MB_ClearCredsFromEnv = $true
+		$StoreCredentials = $false
+		$script:MB_StoreCredsFromEnv = $false
+		try { Set-MBEnvFlag -Name 'store' } catch {}
+	}
 } catch {}
 
-# INTERRUPT HANDLING
-$script:interruptRequested = $false
+$script:MB = @{
+	AutoApprove        = [bool]$AutoApproveEnabled
+	Interrupt          = $false
+	IsThinking         = $false
+	ModeSwitch         = $false
+	WorkingDir         = (Get-Location).Path
+	SessionStart       = Get-Date
+	UserTurns          = 0
+	AgentTurns         = 0
+	ToolCalls          = 0
+	ApprovalsGranted   = 0
+	ApprovalsDenied    = 0
+	LastToolMs         = 0
+	NpmUser            = $null
+	NpmPass            = $null
+	HttpClient         = $null
+	HttpClientOwned    = $false
+	AnimRunspace       = $null
+	AnimPs             = $null
+	StreamCancel       = $false
+	ActiveHttpClient   = $null
+	ActiveCts          = $null
+	ActiveStream       = $null
+	ActiveReader       = $null
+	TaskApiBase        = $(if ($TaskApiBase) { [string]$TaskApiBase } else { '' })
+	LastAbortMs        = 0
+	ContextWindow      = [int]$ContextWindowTokens
+	ContextSoftPct     = [double]$ContextSoftPct
+	ContextHardPct     = [double]$ContextHardPct
+	AutoCompact        = [bool]$AutoCompactEnabled
+	ModelCompact       = [bool]$ModelCompactEnabled
+	ActiveToolGroups   = New-Object System.Collections.ArrayList
+	ToolProfile        = [string]$ToolProfile
+	ToolsOverheadChars = 0
+	ToolsOverheadTok   = 0
+	LastCtxChars       = 0
+	LastCtxTokens      = 0
+	LastCtxPct         = 0
+	LastCtxLevel       = 'ok'   # ok | soft | hard
+	TokenCountSource   = 'estimate'  # server | usage | estimate
+	ServerTokenize     = $null       # $true/$false once probed; $null = not yet
+	TokenizeProbeTok   = -1
+	TokCacheKey        = ''
+	TokCacheTokens     = 0
+	TokCacheAt         = [datetime]::MinValue
+	LastServerPromptTokens     = 0
+	LastServerCompletionTokens = 0
+	LastRequestMaxTokens = 0
+	LastFinishReason   = ''
+	CompactionCount    = 0
+	LastCompactReason  = ''
+	IsCompacting       = $false
+	CompactingDepth    = 0
+	LastBodyChars      = 0
+	PendingVision      = $null
+	LastVisionMeta     = $null
+	StickyNotes        = New-Object System.Collections.ArrayList
+	StickyFindings     = New-Object System.Collections.ArrayList
+	StickyExtra        = ''
+	LastToolFp         = $null
+	LastToolAction     = $null   # 'ran' | 'warned' | 'confirmed_ran'
+	LastToolPreview    = ''
+	LoopConfirmedFps   = New-Object System.Collections.ArrayList
+	LoopGuardsFired    = 0
+	ApiFailures        = 0
+	InputHistory       = New-Object System.Collections.ArrayList
+	IsWorking          = $false
+	WorkStartTick      = 0
+	CallStartTick      = 0
+	ThinkStartTick     = 0
+	FirstTokenTick     = 0
+	ThoughtStampEmitted = $false
+	WorkedStampEmitted  = $false
+	SandboxRoot        = $null
+	SandboxId          = $null
+	SandboxLast        = $null
+	# Session temp paths (install/pdf/setup/sandbox); cleared as we go and on exit
+	TempTracked        = New-Object System.Collections.ArrayList
+	SpeechEnabled      = $false
+	SpeechAutoReply    = $true
+	SpeechReady        = $false
+	SpeechInitError    = ''
+	SpeechSynth        = $null
+	SpeechEngine       = $null
+	SpeechListening    = $false
+	SpeechLastHeard    = ''
+	HostUi             = 'wpf'
+	Wpf                = $null
+	ResolvedApiBase    = $null
+	SessionEnding      = $false
+	DebugLogPath       = $null
+	DebugLogEnabled    = $false
+	DebugSeq           = 0
+	LoginSession       = $null
+}
 
-function stepInterrupt {
+# Debug log: -DebugLog or env debug=1 (off by default)
+try {
+	if ($null -ne $PSBoundParameters -and $PSBoundParameters.ContainsKey('DebugLog')) {
+		$script:MB.DebugLogEnabled = [bool]$DebugLog
+	} elseif (Test-MBEnvFlag -Name 'debug') {
+		$script:MB.DebugLogEnabled = $true
+		$DebugLog = $true
+	} else {
+		$script:MB.DebugLogEnabled = [bool]$DebugLog
+	}
+} catch {
+	$script:MB.DebugLogEnabled = $false
+}
+
+try {
+	if ($null -ne $PSBoundParameters -and $PSBoundParameters.ContainsKey('SpeechEnabled')) {
+		$script:MB.SpeechEnabled = [bool]$SpeechEnabled
+	} elseif (Test-MBEnvFlag -Name 'speech') {
+		$script:MB.SpeechEnabled = $true
+	} else {
+		$script:MB.SpeechEnabled = [bool]$SpeechEnabled
+	}
+	if ($null -ne $PSBoundParameters -and $PSBoundParameters.ContainsKey('SpeechAutoReply')) {
+		$script:MB.SpeechAutoReply = [bool]$SpeechAutoReply
+	} else {
+		$script:MB.SpeechAutoReply = [bool]$SpeechAutoReply
+	}
+} catch {
+	$script:MB.SpeechEnabled = $false
+	$script:MB.SpeechAutoReply = $true
+}
+
+$script:MB_STATE_MARKER = '[SESSION STATE'
+
+# --- Temp lifecycle: track session temps, clean as we go, sweep orphans on launch/exit ---
+function Get-MBOsTempPath {
+	$t = $env:TEMP
+	if ([string]::IsNullOrWhiteSpace($t)) {
+		try { $t = [System.IO.Path]::GetTempPath() } catch { $t = $null }
+	}
+	if ([string]::IsNullOrWhiteSpace($t)) { $t = $env:TMP }
+	return [string]$t
+}
+
+function Register-MBTempPath {
+	param([string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return }
+	try {
+		if (-not $script:MB.TempTracked) {
+			$script:MB.TempTracked = New-Object System.Collections.ArrayList
+		}
+		$full = [string]$Path
+		try { $full = [System.IO.Path]::GetFullPath($Path) } catch {}
+		$exists = $false
+		foreach ($x in @($script:MB.TempTracked)) {
+			if ([string]::Equals([string]$x, $full, [StringComparison]::OrdinalIgnoreCase)) {
+				$exists = $true
+				break
+			}
+		}
+		if (-not $exists) { [void]$script:MB.TempTracked.Add($full) }
+	} catch {}
+}
+
+function Unregister-MBTempPath {
+	param([string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return }
+	try {
+		if (-not $script:MB.TempTracked) { return }
+		$full = [string]$Path
+		try { $full = [System.IO.Path]::GetFullPath($Path) } catch {}
+		for ($i = $script:MB.TempTracked.Count - 1; $i -ge 0; $i--) {
+			if ([string]::Equals([string]$script:MB.TempTracked[$i], $full, [StringComparison]::OrdinalIgnoreCase)) {
+				$script:MB.TempTracked.RemoveAt($i)
+			}
+		}
+	} catch {}
+}
+
+function Remove-MBTempPath {
+	param(
+		[string]$Path,
+		[switch]$KeepIfMissing
+	)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+	$ok = $true
+	try {
+		if (Test-Path -LiteralPath $Path) {
+			Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+		} elseif (-not $KeepIfMissing) {
+			# already gone
+		}
+	} catch {
+		$ok = $false
+		try {
+			# Retry: clear read-only then remove
+			Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+				ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+			Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+			$ok = -not (Test-Path -LiteralPath $Path)
+		} catch { $ok = $false }
+	}
+	try { Unregister-MBTempPath -Path $Path } catch {}
+	return $ok
+}
+
+function New-MBTempDir {
+	param(
+		[string]$Prefix = 'MiniBot',
+		[switch]$NoRegister
+	)
+	$base = Get-MBOsTempPath
+	if ([string]::IsNullOrWhiteSpace($base)) { throw 'TEMP path unavailable' }
+	$p = $Prefix
+	if ([string]::IsNullOrWhiteSpace($p)) { $p = 'MiniBot' }
+	# Prefer MiniBot- prefix so remnant sweep can find us
+	if ($p -notmatch '(?i)^MiniBot|^minibot|^mb-') { $p = 'MiniBot-' + $p }
+	$dir = Join-Path $base ($p.TrimEnd('-_') + '-' + [guid]::NewGuid().ToString('n'))
+	New-Item -ItemType Directory -Path $dir -Force | Out-Null
+	if (-not $NoRegister) { Register-MBTempPath -Path $dir }
+	return $dir
+}
+
+function New-MBTempFile {
+	param(
+		[string]$Prefix = 'MiniBot',
+		[string]$Extension = '.tmp',
+		[switch]$NoRegister
+	)
+	$base = Get-MBOsTempPath
+	if ([string]::IsNullOrWhiteSpace($base)) { throw 'TEMP path unavailable' }
+	$p = $Prefix
+	if ([string]::IsNullOrWhiteSpace($p)) { $p = 'MiniBot' }
+	if ($p -notmatch '(?i)^MiniBot|^minibot|^mb-') { $p = 'MiniBot-' + $p }
+	$ext = $Extension
+	if ([string]::IsNullOrWhiteSpace($ext)) { $ext = '.tmp' }
+	if ($ext[0] -ne '.') { $ext = '.' + $ext }
+	$path = Join-Path $base ($p.TrimEnd('-_') + '-' + [guid]::NewGuid().ToString('n') + $ext)
+	# Touch empty file so path is reserved
+	try { [System.IO.File]::WriteAllBytes($path, [byte[]]@()) } catch {
+		New-Item -ItemType File -Path $path -Force | Out-Null
+	}
+	if (-not $NoRegister) { Register-MBTempPath -Path $path }
+	return $path
+}
+
+function Clear-MBTrackedTemps {
+	# Remove everything registered for this session (order: deepest paths first)
+	$list = @()
+	try { $list = @($script:MB.TempTracked) } catch { $list = @() }
+	if ($list.Count -eq 0) { return 0 }
+	$sorted = @($list | Sort-Object { ([string]$_).Length } -Descending)
+	$n = 0
+	foreach ($p in $sorted) {
+		if (Remove-MBTempPath -Path ([string]$p)) { $n++ }
+	}
+	try { $script:MB.TempTracked.Clear() } catch {
+		try { $script:MB.TempTracked = New-Object System.Collections.ArrayList } catch {}
+	}
+	return $n
+}
+
+function Clear-MBTempRemnants {
+	param(
+		[switch]$IncludeActiveSandbox,
+		[switch]$Quiet
+	)
+	# Sweep known MiniBot temp names left by crash / kill / improper close.
+	# Does not touch MiniBot-debug.log or unrelated %TEMP% content.
+	$base = Get-MBOsTempPath
+	if ([string]::IsNullOrWhiteSpace($base) -or -not (Test-Path -LiteralPath $base)) {
+		return @{ ok = $true; removed = 0; failed = 0 }
+	}
+
+	$keep = @{}
+	if (-not $IncludeActiveSandbox) {
+		try {
+			$sr = [string]$script:MB.SandboxRoot
+			if ($sr) {
+				$kf = $sr
+				try { $kf = [System.IO.Path]::GetFullPath($sr) } catch {}
+				$keep[$kf.ToLowerInvariant()] = $true
+			}
+		} catch {}
+		try {
+			foreach ($t in @($script:MB.TempTracked)) {
+				$kf = [string]$t
+				try { $kf = [System.IO.Path]::GetFullPath($t) } catch {}
+				if ($kf) { $keep[$kf.ToLowerInvariant()] = $true }
+			}
+		} catch {}
+	}
+
+	$candidates = New-Object System.Collections.ArrayList
+	$dirNames = @(
+		'MiniBotSandbox'
+	)
+	$dirPrefixes = @(
+		'MiniBotInstall-',
+		'MiniBotSetup-',
+		'MiniBot7z-',
+		'MiniBot-',
+		'minibot-pdf-',
+		'mb-battery-'
+	)
+	$filePrefixes = @(
+		'minibot-pdf-winrt-',
+		'minibot-pdf-',
+		'mb-battery-',
+		'MiniBot-'
+	)
+
+	try {
+		foreach ($name in $dirNames) {
+			$p = Join-Path $base $name
+			if (Test-Path -LiteralPath $p) { [void]$candidates.Add((Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue)) }
+		}
+		Get-ChildItem -LiteralPath $base -Force -ErrorAction SilentlyContinue | ForEach-Object {
+			$leaf = [string]$_.Name
+			if ($_.PSIsContainer) {
+				foreach ($pre in $dirPrefixes) {
+					if ($leaf.StartsWith($pre, [StringComparison]::OrdinalIgnoreCase)) {
+						[void]$candidates.Add($_)
+						break
+					}
+				}
+			} else {
+				# Never delete the optional debug log if someone put it in TEMP
+				if ($leaf -match '(?i)^MiniBot-debug\.log$') { return }
+				foreach ($pre in $filePrefixes) {
+					if ($leaf.StartsWith($pre, [StringComparison]::OrdinalIgnoreCase)) {
+						[void]$candidates.Add($_)
+						break
+					}
+				}
+			}
+		}
+	} catch {}
+
+	$removed = 0
+	$failed = 0
+	# Longest paths first so children go before parents when both listed
+	$items = @($candidates | Where-Object { $_ } | Sort-Object { ([string]$_.FullName).Length } -Descending)
+	$seen = @{}
+	foreach ($item in $items) {
+		try {
+			$fp = [string]$item.FullName
+			if ([string]::IsNullOrWhiteSpace($fp)) { continue }
+			$key = $fp.ToLowerInvariant()
+			if ($seen.ContainsKey($key)) { continue }
+			$seen[$key] = $true
+			if ($keep.ContainsKey($key)) { continue }
+			# Skip if path is under a keep root (active sandbox)
+			$skip = $false
+			foreach ($k in @($keep.Keys)) {
+				if ($key.StartsWith($k.TrimEnd('\') + '\') -or $key -eq $k) { $skip = $true; break }
+			}
+			if ($skip) { continue }
+			try {
+				if ($item.PSIsContainer) {
+					Remove-Item -LiteralPath $fp -Recurse -Force -ErrorAction Stop
+				} else {
+					Remove-Item -LiteralPath $fp -Force -ErrorAction Stop
+				}
+				$removed++
+			} catch {
+				try {
+					Get-ChildItem -LiteralPath $fp -Recurse -Force -ErrorAction SilentlyContinue |
+						ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+					Remove-Item -LiteralPath $fp -Recurse -Force -ErrorAction SilentlyContinue
+					if (Test-Path -LiteralPath $fp) { $failed++ } else { $removed++ }
+				} catch { $failed++ }
+			}
+		} catch { $failed++ }
+	}
+
+	if (-not $Quiet -and ($removed -gt 0 -or $failed -gt 0)) {
+		try {
+			Write-MBDebugLog -Step 'TEMP_REMNANT_SWEEP' -Detail ("removed={0} failed={1}" -f $removed, $failed)
+		} catch {}
+	}
+	return @{ ok = ($failed -eq 0); removed = $removed; failed = $failed }
+}
+
+function Invoke-MBTempCleanup {
+	param(
+		[switch]$Remnants,
+		[switch]$Tracked,
+		[switch]$Sandbox,
+		[switch]$All
+	)
+	if ($All) {
+		$Tracked = $true
+		$Sandbox = $true
+		$Remnants = $true
+	}
+	$n = 0
+	if ($Sandbox) {
+		try {
+			$root = [string]$script:MB.SandboxRoot
+			if ($root) {
+				if (Remove-MBTempPath -Path $root) { $n++ }
+			}
+			$script:MB.SandboxRoot = $null
+			$script:MB.SandboxId = $null
+			$script:MB.SandboxLast = $null
+		} catch {}
+	}
+	if ($Tracked) {
+		try { $n += [int](Clear-MBTrackedTemps) } catch {}
+	}
+	if ($Remnants) {
+		try {
+			$r = Clear-MBTempRemnants -IncludeActiveSandbox:$Sandbox -Quiet
+			if ($r -and $r.removed) { $n += [int]$r.removed }
+		} catch {}
+	}
+	return $n
+}
+
+# Orphans from prior improper close (before any work this session)
+try { $null = Clear-MBTempRemnants -Quiet } catch {}
+
+function Get-MBDebugLogPath {
+	try {
+		if ($script:MB.DebugLogPath) { return [string]$script:MB.DebugLogPath }
+		$desk = [Environment]::GetFolderPath('Desktop')
+		if ([string]::IsNullOrWhiteSpace($desk)) { $desk = $env:USERPROFILE }
+		if ([string]::IsNullOrWhiteSpace($desk)) { $desk = $env:TEMP }
+		$script:MB.DebugLogPath = Join-Path $desk 'MiniBot-debug.log'
+		return [string]$script:MB.DebugLogPath
+	} catch {
+		return (Join-Path $env:TEMP 'MiniBot-debug.log')
+	}
+}
+
+function Write-MBDebugLog {
+	param(
+		[Parameter(Mandatory = $true)][string]$Step,
+		[string]$Detail = ''
+	)
+	$on = $false
+	try { $on = [bool]$script:MB.DebugLogEnabled } catch { $on = $false }
+	if (-not $on) { return }
+	try {
+		$path = Get-MBDebugLogPath
+		$n = 0
+		try {
+			$script:MB.DebugSeq = [int]$script:MB.DebugSeq + 1
+			$n = [int]$script:MB.DebugSeq
+		} catch { $n = 0 }
+		$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+		$tid = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+		$hostUi = ''
+		try { $hostUi = [string]$script:MB.HostUi } catch {}
+		$line = '[{0}] #{1} tid={2} host={3} | {4}' -f $ts, $n, $tid, $hostUi, $Step
+		if (-not [string]::IsNullOrWhiteSpace($Detail)) {
+			$d = ($Detail -replace '[\r\n]+', ' | ')
+			if ($d.Length -gt 800) { $d = $d.Substring(0, 797) + '...' }
+			$line += ' :: ' + $d
+		}
+		$line += [Environment]::NewLine
+		[System.IO.File]::AppendAllText($path, $line)
+	} catch {
+		try {
+			$fallback = Join-Path $env:TEMP 'MiniBot-debug.log'
+			[System.IO.File]::AppendAllText($fallback, ("{0} FALLBACK {1}`r`n" -f (Get-Date -Format o), $Step))
+		} catch {}
+	}
+}
+
+
+function Get-MBApiBaseUrl {
+	try {
+		if ($script:MB -and $script:MB.ResolvedApiBase) {
+			$rb = [string]$script:MB.ResolvedApiBase
+			if (-not [string]::IsNullOrWhiteSpace($rb)) { return $rb.TrimEnd('/') }
+		}
+	} catch {}
+	$u = [string]$BaseUrl
+	if ([string]::IsNullOrWhiteSpace($u)) { return 'http://127.0.0.1:8080' }
+	$u = $u.Trim()
+	while ($u.EndsWith('/')) { $u = $u.Substring(0, $u.Length - 1) }
+	$u = $u -replace '/chat/completions\s*$', '' -replace '/models\s*$', ''
+	$u = $u -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
+	while ($u.EndsWith('/')) { $u = $u.Substring(0, $u.Length - 1) }
+	return $u
+}
+
+function Get-MBDeepErrorMessage {
+	param($ErrorRecord)
+	if ($null -eq $ErrorRecord) { return 'Unknown error' }
+	$ex = $null
+	if ($ErrorRecord -is [System.Exception]) { $ex = $ErrorRecord }
+	elseif ($ErrorRecord.Exception) { $ex = $ErrorRecord.Exception }
+	else { return [string]$ErrorRecord }
+
+	$msgs = New-Object System.Collections.ArrayList
+	$seen = 0
+	while ($null -ne $ex -and $seen -lt 8) {
+		$seen++
+		if ($ex -is [System.AggregateException] -and $ex.InnerExceptions -and $ex.InnerExceptions.Count -gt 0) {
+			$ex = $ex.InnerExceptions[0]
+			continue
+		}
+		if ($ex.Message) { [void]$msgs.Add($ex.Message) }
+		if ($ex.InnerException) { $ex = $ex.InnerException } else { break }
+	}
+	if ($msgs.Count -eq 0) { return [string]$ErrorRecord }
+	return ($msgs -join ' | ')
+}
+
+if (-not ("MiniBot.Core.Native" -as [type])) {
+	$miniBotCs = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+
+namespace MiniBot.Core {
+	public static class Native {
+		static readonly Regex ScriptTag = new Regex("<script[^>]*>.*?</script>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+		static readonly Regex StyleTag  = new Regex("<style[^>]*>.*?</style>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+		static readonly Regex Comment   = new Regex("<!--.*?-->", RegexOptions.Singleline | RegexOptions.Compiled);
+		static readonly Regex Noscript  = new Regex("<noscript[^>]*>.*?</noscript>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+		static readonly Regex BlockTags = new Regex("</?(nav|footer|header|aside|form|iframe|object|embed|svg|noscript)[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+		static readonly Regex StripTags = new Regex("<[^>]+>", RegexOptions.Compiled);
+		static readonly Regex Ws        = new Regex(@"[ \t\f\v]+", RegexOptions.Compiled);
+		static readonly Regex MultiNl   = new Regex(@"\n{3,}", RegexOptions.Compiled);
+		static readonly Regex TitleRx   = new Regex(@"<title[^>]*>(.*?)</title>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+		static readonly Regex MainRx    = new Regex(@"<main[^>]*>(.*?)</main>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+		static readonly Regex ArtRx     = new Regex(@"<article[^>]*>(.*?)</article>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+		static readonly Regex BodyRx    = new Regex(@"<body[^>]*>(.*?)</body>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+
+		public static string HtmlToText(string html, int maxLength) {
+			if (string.IsNullOrEmpty(html)) return "";
+			string title = "No title";
+			var tm = TitleRx.Match(html);
+			if (tm.Success) title = Ws.Replace(tm.Groups[1].Value, " ").Trim();
+
+			html = ScriptTag.Replace(html, " ");
+			html = StyleTag.Replace(html, " ");
+			html = Comment.Replace(html, " ");
+			html = Noscript.Replace(html, " ");
+
+			string main = html;
+			var m = MainRx.Match(html);
+			if (m.Success) main = m.Groups[1].Value;
+			else {
+				m = ArtRx.Match(html);
+				if (m.Success) main = m.Groups[1].Value;
+				else {
+					m = BodyRx.Match(html);
+					if (m.Success) main = m.Groups[1].Value;
+				}
+			}
+
+			main = Regex.Replace(main, @"</(p|div|li|tr|h[1-6]|br|hr)[^>]*>", "\n", RegexOptions.IgnoreCase);
+			main = Regex.Replace(main, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
+			main = BlockTags.Replace(main, " ");
+			string text = StripTags.Replace(main, " ");
+			text = System.Net.WebUtility.HtmlDecode(text);
+			text = Ws.Replace(text, " ");
+			text = MultiNl.Replace(text.Replace("\r\n", "\n").Replace('\r', '\n'), "\n\n").Trim();
+
+			if (maxLength > 0 && text.Length > maxLength)
+				text = text.Substring(0, maxLength) + "\n\n[content truncated]";
+
+			return "**Title:** " + title + "\n\n**Content:**\n" + text;
+		}
+
+		public static volatile bool CancelRequested = false;
+
+		public class RunResult {
+			public int ExitCode;
+			public string StdOut;
+			public string StdErr;
+			public long ElapsedMs;
+			public bool TimedOut;
+			public bool Cancelled;
+		}
+
+		public static RunResult RunProcess(string fileName, string arguments, string workingDir, int timeoutMs) {
+			var sw = Stopwatch.StartNew();
+			var result = new RunResult { ExitCode = -1 };
+			var psi = new ProcessStartInfo {
+				FileName = fileName,
+				Arguments = arguments ?? "",
+				WorkingDirectory = string.IsNullOrEmpty(workingDir) ? Environment.CurrentDirectory : workingDir,
+				UseShellExecute = false,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				CreateNoWindow = true,
+				// UTF-8 with replacement: invalid sequences become U+FFFD.
+				// PowerShell children are forced to UTF-8 by the PS wrapper in Invoke-RunCommand.
+				StandardOutputEncoding = new UTF8Encoding(false, false),
+				StandardErrorEncoding = new UTF8Encoding(false, false)
+			};
+
+			var sbOut = new StringBuilder();
+			var sbErr = new StringBuilder();
+
+			using (var proc = new Process()) {
+				proc.StartInfo = psi;
+				proc.EnableRaisingEvents = false;
+				proc.OutputDataReceived += (s, e) => { if (e.Data != null) lock (sbOut) sbOut.AppendLine(e.Data); };
+				proc.ErrorDataReceived  += (s, e) => { if (e.Data != null) lock (sbErr) sbErr.AppendLine(e.Data); };
+
+				try {
+					CancelRequested = false;
+					proc.Start();
+					proc.BeginOutputReadLine();
+					proc.BeginErrorReadLine();
+
+					while (!proc.HasExited) {
+						try {
+							if (Console.KeyAvailable) {
+								var key = Console.ReadKey(true);
+								if (key.Key == ConsoleKey.Escape) CancelRequested = true;
+							}
+						} catch {}
+
+						if (CancelRequested) {
+							try { proc.Kill(); } catch {}
+							result.Cancelled = true;
+							break;
+						}
+						if (timeoutMs > 0 && sw.ElapsedMilliseconds > timeoutMs) {
+							try { proc.Kill(); } catch {}
+							result.TimedOut = true;
+							break;
+						}
+						Thread.Sleep(40);
+					}
+
+					if (!result.Cancelled && !result.TimedOut) {
+						proc.WaitForExit(2000);
+						try { result.ExitCode = proc.ExitCode; } catch { result.ExitCode = -1; }
+					}
+				} catch (Exception ex) {
+					sbErr.AppendLine(ex.Message);
+				}
+			}
+
+			sw.Stop();
+			result.ElapsedMs = sw.ElapsedMilliseconds;
+			result.StdOut = sbOut.ToString();
+			result.StdErr = sbErr.ToString();
+			return result;
+		}
+
+		public static string TruncateMiddle(string text, int maxChars) {
+			if (string.IsNullOrEmpty(text) || maxChars <= 0 || text.Length <= maxChars) return text ?? "";
+			int keep = maxChars / 2 - 40;
+			if (keep < 200) keep = 200;
+			int head = keep;
+			int tail = maxChars - keep - 80;
+			if (tail < 100) tail = 100;
+			return text.Substring(0, head)
+				+ "\n\n... [" + (text.Length - head - tail) + " chars omitted] ...\n\n"
+				+ text.Substring(text.Length - tail);
+		}
+
+		// Speech PTT (user32). VK_RCONTROL=0xA3 only.
+		[DllImport("user32.dll")]
+		static extern short GetAsyncKeyState(int vKey);
+
+		public static bool IsKeyDown(int vKey) {
+			try { return (GetAsyncKeyState(vKey) & 0x8000) != 0; }
+			catch { return false; }
+		}
+
+		public static bool IsSpeechPttDown() {
+			return IsKeyDown(0xA3); // Right-Ctrl only
+		}
+	}
+
+}
+'@
+
+	try {
+		Add-Type -TypeDefinition $miniBotCs -Language CSharp -ErrorAction Stop
+	} catch {
+		if (-not ("MiniBot.Core.Native" -as [type])) {
+			Write-Warning "MiniBot C# helpers failed to load: $($_.Exception.Message). Falling back to pure PowerShell."
+		}
+	}
+}
+
+$script:HasNative = [bool]("MiniBot.Core.Native" -as [type])
+
+# Credential Manager helper (-StoreCredentials).
+if (-not ("MiniBot.Core.CredMan" -as [type])) {
+	$credManCs = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace MiniBot.Core {
+	public static class CredMan {
+		public const int CRED_TYPE_GENERIC = 1;
+		public const int CRED_PERSIST_LOCAL_MACHINE = 2;
+
+		[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+		public struct CREDENTIAL {
+			public int Flags;
+			public int Type;
+			public string TargetName;
+			public string Comment;
+			public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+			public int CredentialBlobSize;
+			public IntPtr CredentialBlob;
+			public int Persist;
+			public int AttributeCount;
+			public IntPtr Attributes;
+			public string TargetAlias;
+			public string UserName;
+		}
+
+		[DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+		static extern bool CredWrite([In] ref CREDENTIAL userCredential, uint flags);
+
+		[DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
+		static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr);
+
+		[DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
+		static extern bool CredDelete(string target, int type, int flags);
+
+		[DllImport("advapi32.dll", SetLastError = true)]
+		static extern bool CredFree(IntPtr buffer);
+
+		public static bool Write(string target, string username, string password) {
+			if (string.IsNullOrEmpty(target) || string.IsNullOrEmpty(username) || password == null)
+				return false;
+			byte[] blob = Encoding.Unicode.GetBytes(password);
+			IntPtr blobPtr = Marshal.AllocHGlobal(blob.Length);
+			try {
+				Marshal.Copy(blob, 0, blobPtr, blob.Length);
+				CREDENTIAL cred = new CREDENTIAL();
+				cred.Type = CRED_TYPE_GENERIC;
+				cred.TargetName = target;
+				cred.UserName = username;
+				cred.CredentialBlobSize = blob.Length;
+				cred.CredentialBlob = blobPtr;
+				cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
+				cred.AttributeCount = 0;
+				cred.Attributes = IntPtr.Zero;
+				cred.Comment = "MiniBot";
+				return CredWrite(ref cred, 0);
+			} finally {
+				Marshal.FreeHGlobal(blobPtr);
+			}
+		}
+
+		public class ReadResult {
+			public bool Ok;
+			public string UserName;
+			public string Password;
+		}
+
+		public static ReadResult Read(string target) {
+			var result = new ReadResult();
+			IntPtr ptr = IntPtr.Zero;
+			try {
+				if (string.IsNullOrEmpty(target)) return result;
+				if (!CredRead(target, CRED_TYPE_GENERIC, 0, out ptr) || ptr == IntPtr.Zero)
+					return result;
+				CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(ptr, typeof(CREDENTIAL));
+				result.UserName = cred.UserName;
+				if (cred.CredentialBlob != IntPtr.Zero && cred.CredentialBlobSize > 0) {
+					byte[] bytes = new byte[cred.CredentialBlobSize];
+					Marshal.Copy(cred.CredentialBlob, bytes, 0, cred.CredentialBlobSize);
+					result.Password = Encoding.Unicode.GetString(bytes);
+				}
+				result.Ok = !string.IsNullOrEmpty(result.UserName) && result.Password != null;
+				return result;
+			} catch {
+				return new ReadResult();
+			} finally {
+				if (ptr != IntPtr.Zero) CredFree(ptr);
+			}
+		}
+
+		public static bool Delete(string target) {
+			if (string.IsNullOrEmpty(target)) return false;
+			return CredDelete(target, CRED_TYPE_GENERIC, 0);
+		}
+	}
+}
+'@
+	try {
+		Add-Type -TypeDefinition $credManCs -Language CSharp -ErrorAction Stop
+	} catch {
+		if (-not ("MiniBot.Core.CredMan" -as [type])) {
+			Write-Warning "MiniBot Credential Manager helper failed to load: $($_.Exception.Message). Falling back to DPAPI file if needed."
+		}
+	}
+}
+$script:HasCredMan = [bool]("MiniBot.Core.CredMan" -as [type])
+
+# Fast folder-size walk (FindFirstFileEx + LARGE_FETCH); separate Add-Type
+if (-not ("MiniBot.Core.DiskWalk" -as [type])) {
+	$diskWalkCs = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace MiniBot.Core {
+	public sealed class FolderSizeInfo {
+		public string Path;
+		public long Bytes;
+		public int Files;
+		public bool TimedOut;
+		public bool Cancelled;
+		public long ElapsedMs;
+	}
+
+	/// <summary>
+	/// Directory size via FindFirstFileExW + FIND_FIRST_EX_LARGE_FETCH,
+	/// FindExInfoBasic (no short names), skip reparse points, parallel top-level walks.
+	/// </summary>
+	public static class DiskWalk {
+		public static volatile bool CancelRequested = false;
+
+		const int FIND_FIRST_EX_LARGE_FETCH = 2;
+		const int FindExInfoBasic = 1;
+		const int FindExSearchNameMatch = 0;
+		const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
+		const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+		static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+		[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+		struct WIN32_FIND_DATAW {
+			public uint dwFileAttributes;
+			public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+			public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+			public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+			public uint nFileSizeHigh;
+			public uint nFileSizeLow;
+			public uint dwReserved0;
+			public uint dwReserved1;
+			[MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+			public string cFileName;
+			[MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+			public string cAlternateFileName;
+		}
+
+		[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+		static extern IntPtr FindFirstFileExW(
+			string lpFileName,
+			int fInfoLevelId,
+			out WIN32_FIND_DATAW lpFindFileData,
+			int fSearchOp,
+			IntPtr lpSearchFilter,
+			int dwAdditionalFlags);
+
+		[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+		static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATAW lpFindFileData);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		static extern bool FindClose(IntPtr hFindFile);
+
+		[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+		static extern bool GetDiskFreeSpaceExW(
+			string lpDirectoryName,
+			out ulong lpFreeBytesAvailable,
+			out ulong lpTotalNumberOfBytes,
+			out ulong lpTotalNumberOfFreeBytes);
+
+		static long FileSize(ref WIN32_FIND_DATAW d) {
+			return ((long)d.nFileSizeHigh << 32) | (long)(d.nFileSizeLow & 0xFFFFFFFF);
+		}
+
+		static bool IsStop(int deadlineTick) {
+			if (CancelRequested) return true;
+			if (deadlineTick != 0) {
+				// TickCount wrap-safe compare
+				int now = Environment.TickCount;
+				if ((now - deadlineTick) > 0) return true;
+			}
+			return false;
+		}
+
+		/// <summary>Sum file bytes under path. deep=false: immediate children files only.</summary>
+		public static FolderSizeInfo Measure(string path, bool deep, int timeoutMs) {
+			CancelRequested = false;
+			var sw = Stopwatch.StartNew();
+			var info = new FolderSizeInfo { Path = path };
+			if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) {
+				sw.Stop();
+				info.ElapsedMs = sw.ElapsedMilliseconds;
+				return info;
+			}
+			int deadline = timeoutMs > 0 ? Environment.TickCount + timeoutMs : 0;
+			int files = 0;
+			bool timedOut = false, cancelled = false;
+			long bytes = 0;
+			try {
+				if (deep) {
+					bytes = WalkDir(path, ref files, deadline, ref timedOut, ref cancelled);
+				} else {
+					bytes = WalkOneLevel(path, ref files, deadline, ref timedOut, ref cancelled);
+				}
+			} catch { }
+			sw.Stop();
+			info.Bytes = bytes;
+			info.Files = files;
+			info.TimedOut = timedOut;
+			info.Cancelled = cancelled || CancelRequested;
+			info.ElapsedMs = sw.ElapsedMilliseconds;
+			return info;
+		}
+
+		/// <summary>
+		/// Size each top-level subdirectory under root (parallel), return largest first.
+		/// </summary>
+		public static FolderSizeInfo[] TopFolders(string root, int maxResults, bool deep, int timeoutMs, int maxChildren) {
+			CancelRequested = false;
+			var sw = Stopwatch.StartNew();
+			if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) {
+				return new FolderSizeInfo[0];
+			}
+			if (maxResults <= 0) maxResults = 10;
+			if (maxChildren <= 0) maxChildren = 64;
+
+			var children = new List<string>(64);
+			EnumerateTopDirs(root, children, maxChildren);
+
+			int deadline = timeoutMs > 0 ? Environment.TickCount + timeoutMs : 0;
+			var bag = new FolderSizeInfo[children.Count];
+			int dop = Math.Max(1, Math.Min(Environment.ProcessorCount, 8));
+			var opts = new ParallelOptions { MaxDegreeOfParallelism = dop };
+
+			Parallel.For(0, children.Count, opts, i => {
+				if (IsStop(deadline)) {
+					bag[i] = new FolderSizeInfo {
+						Path = children[i],
+						Cancelled = CancelRequested,
+						TimedOut = !CancelRequested && deadline != 0
+					};
+					return;
+				}
+				int files = 0;
+				bool timedOut = false, cancelled = false;
+				long bytes = 0;
+				try {
+					if (deep) {
+						bytes = WalkDir(children[i], ref files, deadline, ref timedOut, ref cancelled);
+					} else {
+						bytes = WalkOneLevel(children[i], ref files, deadline, ref timedOut, ref cancelled);
+					}
+				} catch { }
+				bag[i] = new FolderSizeInfo {
+					Path = children[i],
+					Bytes = bytes,
+					Files = files,
+					TimedOut = timedOut,
+					Cancelled = cancelled
+				};
+			});
+
+			var list = new List<FolderSizeInfo>(bag.Length);
+			foreach (var e in bag) {
+				if (e != null) list.Add(e);
+			}
+			list.Sort((a, b) => b.Bytes.CompareTo(a.Bytes));
+			if (list.Count > maxResults) {
+				list = list.GetRange(0, maxResults);
+			}
+			sw.Stop();
+			// stamp total wall time on first entry for diagnostics
+			if (list.Count > 0) list[0].ElapsedMs = sw.ElapsedMilliseconds;
+			return list.ToArray();
+		}
+
+		public static bool TryGetVolumeSpace(string path, out long freeBytes, out long totalBytes) {
+			freeBytes = 0; totalBytes = 0;
+			try {
+				ulong freeAvail, total, freeTotal;
+				if (!GetDiskFreeSpaceExW(path, out freeAvail, out total, out freeTotal)) return false;
+				freeBytes = (long)freeTotal;
+				totalBytes = (long)total;
+				return true;
+			} catch {
+				return false;
+			}
+		}
+
+		static void EnumerateTopDirs(string root, List<string> into, int maxChildren) {
+			string pattern = root.TrimEnd('\\', '/') + "\\*";
+			WIN32_FIND_DATAW data;
+			IntPtr h = FindFirstFileExW(pattern, FindExInfoBasic, out data, FindExSearchNameMatch, IntPtr.Zero, FIND_FIRST_EX_LARGE_FETCH);
+			if (h == INVALID_HANDLE_VALUE) {
+				// fallback for odd roots
+				try {
+					foreach (var d in Directory.EnumerateDirectories(root)) {
+						into.Add(d);
+						if (into.Count >= maxChildren) break;
+					}
+				} catch { }
+				return;
+			}
+			try {
+				do {
+					if (IsStop(0) && CancelRequested) break;
+					string name = data.cFileName;
+					if (name == "." || name == "..") continue;
+					if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+					if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
+					into.Add(Path.Combine(root, name));
+					if (into.Count >= maxChildren) break;
+				} while (FindNextFileW(h, out data));
+			} finally {
+				FindClose(h);
+			}
+		}
+
+		static long WalkOneLevel(string dir, ref int files, int deadline, ref bool timedOut, ref bool cancelled) {
+			long sum = 0;
+			string pattern = dir.TrimEnd('\\', '/') + "\\*";
+			WIN32_FIND_DATAW data;
+			IntPtr h = FindFirstFileExW(pattern, FindExInfoBasic, out data, FindExSearchNameMatch, IntPtr.Zero, FIND_FIRST_EX_LARGE_FETCH);
+			if (h == INVALID_HANDLE_VALUE) return 0;
+			try {
+				do {
+					if (IsStop(deadline)) {
+						if (CancelRequested) cancelled = true; else timedOut = true;
+						break;
+					}
+					string name = data.cFileName;
+					if (name == "." || name == "..") continue;
+					if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+					if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
+					sum += FileSize(ref data);
+					files++;
+				} while (FindNextFileW(h, out data));
+			} finally {
+				FindClose(h);
+			}
+			return sum;
+		}
+
+		static long WalkDir(string dir, ref int files, int deadline, ref bool timedOut, ref bool cancelled) {
+			long sum = 0;
+			string pattern = dir.TrimEnd('\\', '/') + "\\*";
+			WIN32_FIND_DATAW data;
+			IntPtr h = FindFirstFileExW(pattern, FindExInfoBasic, out data, FindExSearchNameMatch, IntPtr.Zero, FIND_FIRST_EX_LARGE_FETCH);
+			if (h == INVALID_HANDLE_VALUE) return 0;
+			try {
+				do {
+					if (IsStop(deadline)) {
+						if (CancelRequested) cancelled = true; else timedOut = true;
+						break;
+					}
+					string name = data.cFileName;
+					if (name == "." || name == "..") continue;
+					// Skip junctions/symlinks (cycles + mount points)
+					if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
+					if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+						sum += WalkDir(Path.Combine(dir, name), ref files, deadline, ref timedOut, ref cancelled);
+						if (timedOut || cancelled) break;
+					} else {
+						sum += FileSize(ref data);
+						files++;
+					}
+				} while (FindNextFileW(h, out data));
+			} finally {
+				FindClose(h);
+			}
+			return sum;
+		}
+	}
+}
+'@
+	try {
+		Add-Type -TypeDefinition $diskWalkCs -Language CSharp -ErrorAction Stop
+	} catch {
+		if (-not ("MiniBot.Core.DiskWalk" -as [type])) {
+			Write-Warning "MiniBot DiskWalk helper failed to load: $($_.Exception.Message). GetDiskSpace will use PowerShell fallback."
+		}
+	}
+}
+$script:HasDiskWalk = [bool]("MiniBot.Core.DiskWalk" -as [type])
+
+# DPI-aware screen metrics
+if (-not ("MiniBot.Core.DpiScreen" -as [type])) {
+	$dpiScreenCs = @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+
+namespace MiniBot.Core {
+	public static class DpiScreen {
+		const int SM_CXSCREEN = 0;
+		const int SM_CYSCREEN = 1;
+		const int SM_XVIRTUALSCREEN = 76;
+		const int SM_YVIRTUALSCREEN = 77;
+		const int SM_CXVIRTUALSCREEN = 78;
+		const int SM_CYVIRTUALSCREEN = 79;
+
+		// PROCESS_DPI_AWARENESS
+		const int PROCESS_DPI_UNAWARE = 0;
+		const int PROCESS_SYSTEM_DPI_AWARE = 1;
+		const int PROCESS_PER_MONITOR_DPI_AWARE = 2;
+
+		[DllImport("user32.dll")]
+		static extern int GetSystemMetrics(int nIndex);
+
+		[DllImport("user32.dll")]
+		static extern bool SetProcessDPIAware();
+
+		[DllImport("shcore.dll")]
+		static extern int SetProcessDpiAwareness(int value);
+
+		[DllImport("user32.dll")]
+		static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+
+		[DllImport("user32.dll", CharSet = CharSet.Auto)]
+		static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+
+		delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+		[StructLayout(LayoutKind.Sequential)]
+		struct RECT {
+			public int Left, Top, Right, Bottom;
+		}
+
+		[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+		struct MONITORINFOEX {
+			public int cbSize;
+			public RECT rcMonitor;
+			public RECT rcWork;
+			public uint dwFlags;
+			[MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+			public string szDevice;
+		}
+
+		static bool _aware;
+		static readonly object _gate = new object();
+
+		public static void EnsureAware() {
+			lock (_gate) {
+				if (_aware) return;
+				try {
+					// Per-monitor DPI so Bounds / GetSystemMetrics match physical pixels
+					int hr = SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+					if (hr != 0 && hr != -2147024891 /* E_ACCESSDENIED already set */) {
+						SetProcessDpiAwareness(PROCESS_SYSTEM_DPI_AWARE);
+					}
+				} catch {
+					try { SetProcessDPIAware(); } catch {}
+				}
+				_aware = true;
+			}
+		}
+
+		public static Rectangle GetPrimaryBounds() {
+			EnsureAware();
+			int w = GetSystemMetrics(SM_CXSCREEN);
+			int h = GetSystemMetrics(SM_CYSCREEN);
+			if (w < 1) w = 1;
+			if (h < 1) h = 1;
+			// Primary origin is always 0,0 in virtual desktop coords for SM_CXSCREEN
+			return new Rectangle(0, 0, w, h);
+		}
+
+		public static Rectangle GetVirtualBounds() {
+			EnsureAware();
+			int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+			int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+			int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+			int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+			if (w < 1) w = 1;
+			if (h < 1) h = 1;
+			return new Rectangle(x, y, w, h);
+		}
+
+		public static Rectangle GetMonitorBounds(int index) {
+			EnsureAware();
+			if (index < 0) return GetPrimaryBounds();
+			int count = 0;
+			Rectangle found = Rectangle.Empty;
+			bool ok = false;
+			MonitorEnumProc proc = (IntPtr hMon, IntPtr hdc, ref RECT rc, IntPtr data) => {
+				if (count == index) {
+					var mi = new MONITORINFOEX();
+					mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+					if (GetMonitorInfo(hMon, ref mi)) {
+						found = Rectangle.FromLTRB(mi.rcMonitor.Left, mi.rcMonitor.Top, mi.rcMonitor.Right, mi.rcMonitor.Bottom);
+						ok = true;
+					} else {
+						found = Rectangle.FromLTRB(rc.Left, rc.Top, rc.Right, rc.Bottom);
+						ok = true;
+					}
+					return false; // stop
+				}
+				count++;
+				return true;
+			};
+			EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, proc, IntPtr.Zero);
+			if (!ok) throw new ArgumentOutOfRangeException("index", "Monitor index out of range");
+			return found;
+		}
+
+		public static int GetMonitorCount() {
+			EnsureAware();
+			int count = 0;
+			MonitorEnumProc proc = (IntPtr hMon, IntPtr hdc, ref RECT rc, IntPtr data) => {
+				count++;
+				return true;
+			};
+			EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, proc, IntPtr.Zero);
+			return count < 1 ? 1 : count;
+		}
+	}
+}
+'@
+	try {
+		Add-Type -TypeDefinition $dpiScreenCs -Language CSharp -ReferencedAssemblies System.Drawing -ErrorAction Stop
+	} catch {
+		if (-not ("MiniBot.Core.DpiScreen" -as [type])) {
+			try {
+				Add-Type -TypeDefinition $dpiScreenCs -Language CSharp -ErrorAction Stop
+			} catch {
+				Write-Warning "MiniBot DPI screen helper failed: $($_.Exception.Message). Screenshots may clip on scaled displays."
+			}
+		}
+	}
+}
+$script:HasDpiScreen = [bool]("MiniBot.Core.DpiScreen" -as [type])
+
+function Get-MBGlyph {
+	param([string]$Name)
+	switch ($Name) {
+		'tl'     { return [char]0x256D }
+		'tr'     { return [char]0x256E }
+		'bl'     { return [char]0x2570 }
+		'br'     { return [char]0x256F }
+		'h'      { return [char]0x2500 }
+		'v'      { return [char]0x2502 }
+		'dot'    { return [char]0x00B7 }
+		'prompt' { return [char]0x276F }
+		'fill'   { return [char]0x2588 }
+		'empty'  { return [char]0x2591 }
+		default  { return '?' }
+	}
+}
+
+function Get-MBUserDisplayName {
+	if (-not [string]::IsNullOrWhiteSpace([string]$script:MB.NpmUser)) {
+		return [string]$script:MB.NpmUser
+	}
+	if (-not [string]::IsNullOrWhiteSpace($env:USERNAME)) { return $env:USERNAME }
+	if (-not [string]::IsNullOrWhiteSpace($env:USER)) { return $env:USER }
+	return 'You'
+}
+
+function Write-MBChatTurn {
+	param(
+		[Parameter(Mandatory = $true)]
+		[ValidateSet('user', 'agent')]
+		[string]$Role,
+		[AllowNull()][string]$Body = ''
+	)
+	$ts = (Get-Date).ToString('h:mm tt')
+	$name = if ($Role -eq 'user') { Get-MBUserDisplayName } else { [string]$AgentName }
+	if ($null -eq $Body) { $Body = '' }
+
+	if (Test-MBWpfActive) {
+		try { $Body = ConvertTo-MBWpfSafeText -Text $Body } catch {}
+		if (-not $script:MB.Wpf.WriteQueue) {
+			$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+		}
+		$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+			Kind      = 'chat-turn'
+			Role      = $Role
+			Name      = $name
+			Body      = $Body
+			Time      = $ts
+			Highlight = $(if ($Role -eq 'user') { 1 } else { 0 })
+			NoNewline = $true
+			Color     = 'Gray'
+			MdNoLinks = 1
+			Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+		})
+		return
+	}
+
+	if ($Role -eq 'user') {
+		Write-Host "[" -NoNewline -ForegroundColor DarkGray
+		Write-Host $name -NoNewline -ForegroundColor Cyan
+		Write-Host "]" -NoNewline -ForegroundColor DarkGray
+		Write-Host ("  {0}" -f $ts) -ForegroundColor DarkGray
+		$norm = ([string]$Body) -replace "`r`n", "`n" -replace "`r", "`n"
+		$lines = @($norm -split "`n", -1)
+		if ($lines.Count -eq 0) { Write-Host ""; return }
+		Write-Host $lines[0] -ForegroundColor Gray
+		for ($i = 1; $i -lt $lines.Count; $i++) {
+			Write-Host ("  " + $lines[$i]) -ForegroundColor DarkGray
+		}
+		return
+	}
+	Write-Host "[" -NoNewline -ForegroundColor Gray
+	Write-Host $name -NoNewline -ForegroundColor DarkRed
+	Write-Host "-" -NoNewline -ForegroundColor Gray
+	Write-Host "Agent" -NoNewline -ForegroundColor DarkRed
+	Write-Host "]" -NoNewline -ForegroundColor Gray
+	Write-Host ("  {0}" -f $ts) -ForegroundColor DarkGray
+}
+
+function Write-MBBrand {
+	param([switch]$NoNewline)
+	if (Test-MBWpfActive) {
+		Write-MBChatTurn -Role agent
+		return
+	}
+	Write-Host "[" -NoNewline -ForegroundColor Gray
+	Write-Host $AgentName -NoNewline -ForegroundColor DarkRed
+	Write-Host "-" -NoNewline -ForegroundColor Gray
+	Write-Host "Agent" -NoNewline -ForegroundColor DarkRed
+	Write-Host "]" -NoNewline -ForegroundColor Gray
+	if (-not $NoNewline) { Write-Host "" }
+}
+
+function Write-MBUserBrand {
+	param([switch]$NoNewline)
+	$name = Get-MBUserDisplayName
+	if (Test-MBWpfActive) {
+		Write-MBChatTurn -Role user -Body ''
+		return
+	}
+	Write-Host "[" -NoNewline -ForegroundColor DarkGray
+	Write-Host $name -NoNewline -ForegroundColor Cyan
+	Write-Host "]" -NoNewline -ForegroundColor DarkGray
+	if (-not $NoNewline) { Write-Host "" }
+}
+
+function Write-MBUserMessage {
+	param([AllowNull()][string]$Text)
+	if ($null -eq $Text) { $Text = '' }
+	if (Test-MBWpfActive) {
+		Write-MBChatTurn -Role user -Body $Text
+		return
+	}
+	Write-MBUserBrand -NoNewline
+	Write-Host " " -NoNewline
+	$norm = ([string]$Text) -replace "`r`n", "`n" -replace "`r", "`n"
+	$lines = @($norm -split "`n", -1)
+	if ($lines.Count -eq 0) { Write-Host ""; return }
+	Write-Host $lines[0] -ForegroundColor Gray
+	for ($i = 1; $i -lt $lines.Count; $i++) {
+		Write-Host ("  " + $lines[$i]) -ForegroundColor DarkGray
+	}
+}
+
+function Write-MBStreamChunk {
+	param(
+		[AllowNull()][string]$Text,
+		[ConsoleColor]$Color = [ConsoleColor]::Gray
+	)
+	if ($null -eq $Text -or $Text.Length -eq 0) { return }
+	if (Test-MBWpfActive) {
+		Write-MBMdStreamAppend -Text $Text
+		return
+	}
+	Write-Host $Text -NoNewline -ForegroundColor $Color
+}
+
+function Write-MBInfo {
+	param([string]$Message, [ConsoleColor]$Color = [ConsoleColor]::DarkGray)
+	if (Test-MBWpfActive) {
+		$dot = [string](Get-MBGlyph 'dot')
+		Write-Host ("  {0} {1}" -f $dot, $Message) -ForegroundColor $Color
+		return
+	}
+	Write-Host $Message -ForegroundColor $Color
+}
+
+function Write-MBWarn {
+	param([string]$Message)
+	$mark = if (Test-MBWpfActive) { [string][char]0x25B2 } else { '!' }  # triangle in WPF (mono-safe)
+	Write-Host ("{0} {1}" -f $mark, $Message) -ForegroundColor Yellow
+}
+
+function Write-MBReplyStatus {
+	param(
+		[Parameter(Mandatory = $true, Position = 0)]
+		[string]$Title,
+		[string[]]$Meta,
+		[string]$Hint,
+		[switch]$Muted,
+		[switch]$Error,
+		[switch]$DebugOnly
+	)
+	$title = ([string]$Title).Trim()
+	if ($title.Length -eq 0) { return }
+
+	$metaBits = @(
+		@($Meta) |
+			ForEach-Object { if ($null -ne $_) { ([string]$_).Trim() } } |
+			Where-Object { $_.Length -gt 0 }
+	)
+	$hint = if ($null -ne $Hint) { ([string]$Hint).Trim() } else { '' }
+	$logDetail = $title
+	if ($metaBits.Count -gt 0) { $logDetail += ' | ' + ($metaBits -join ' · ') }
+	if ($hint.Length -gt 0) { $logDetail += ' | ' + $hint }
+	try { Write-MBDebugLog -Step 'REPLY_STATUS' -Detail $logDetail } catch {}
+
+	# Continue notices: model sees [CONTINUE]; operator only with debug log
+	if ($DebugOnly) {
+		$dbgOn = $false
+		try { $dbgOn = [bool]$script:MB.DebugLogEnabled } catch { $dbgOn = $false }
+		if (-not $dbgOn) { return }
+	}
+
+	$dot = [string](Get-MBGlyph 'dot')
+	$h = [string](Get-MBGlyph 'h')
+
+	$bar = ($h + $h)
+	# WPF rules: ASCII only (some fonts misrender box-drawing)
+	$banner = if (Test-MBWpfActive) {
+		('-- {0} --' -f $title.ToLowerInvariant())
+	} else {
+		'{0} {1} {0}' -f $bar, $title.ToLowerInvariant()
+	}
+
+	if (Test-MBWpfActive) {
+		$cTitle = 'DarkYellow'
+		$cMeta  = 'Gray'
+		$cHint  = 'DarkGray'
+		if ($Muted) {
+			$cTitle = 'DarkGray'
+			$cMeta  = 'DarkGray'
+			$cHint  = 'DarkGray'
+		} elseif ($Error) {
+			$cTitle = 'Red'
+			$cMeta  = 'DarkRed'
+			$cHint  = 'DarkGray'
+		}
+		Write-MBWpfRaw -Text '' -Color DarkGray
+		Write-MBWpfRaw -Text $banner -Color $cTitle
+		if ($metaBits.Count -gt 0) {
+			$sep = '  ' + $dot + '  '
+			Write-MBWpfRaw -Text ('  ' + ($metaBits -join $sep)) -Color $cMeta
+		}
+		if ($hint.Length -gt 0) {
+			Write-MBWpfRaw -Text ('  ' + $hint) -Color $cHint
+		}
+		return
+	}
+
+	$fc = [ConsoleColor]::DarkYellow
+	if ($Muted) { $fc = [ConsoleColor]::DarkGray }
+	elseif ($Error) { $fc = [ConsoleColor]::Red }
+	Write-Host $banner -ForegroundColor $fc
+	if ($metaBits.Count -gt 0) {
+		$sep = '  ' + $dot + '  '
+		Write-Host ('  ' + ($metaBits -join $sep)) -ForegroundColor Gray
+	}
+	if ($hint.Length -gt 0) {
+		Write-Host ('  ' + $hint) -ForegroundColor DarkGray
+	}
+}
+
+function Write-MBErr {
+	param([string]$Message)
+	$mark = if (Test-MBWpfActive) { [string][char]0x2717 } else { 'x' }  # ballot X in WPF
+	Write-Host ("{0} {1}" -f $mark, $Message) -ForegroundColor Red
+}
+
+function Write-MBOk {
+	param([string]$Message)
+	$mark = if (Test-MBWpfActive) { [string][char]0x2713 } else { '+' }  # checkmark in WPF
+	Write-Host ("{0} {1}" -f $mark, $Message) -ForegroundColor Green
+}
+
+function Get-MBConsoleWidth {
+	try {
+		if (Test-MBWpfActive -and $script:MB.Wpf -and $script:MB.Wpf.Window) {
+			$winW = [double]$script:MB.Wpf.Window.ActualWidth
+			if ($winW -gt 80) {
+				$chars = [int](($winW - 40) / 7.2)
+				if ($chars -ge 40) { return $chars }
+			}
+		}
+	} catch {}
+	return 80
+}
+
+function Get-MBShortPath {
+	param([string]$Path, [int]$MaxLen = 42)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return '.' }
+	$p = $Path
+	try {
+		$home = $env:USERPROFILE
+		if ($home -and $p.StartsWith($home, [System.StringComparison]::OrdinalIgnoreCase)) {
+			$p = '~' + $p.Substring($home.Length)
+		}
+	} catch {}
+	if ($MaxLen -lt 4) { $MaxLen = 4 }
+	if ($p.Length -le $MaxLen) { return $p }
+	$keep = [math]::Max(4, $MaxLen - 3)
+	if ($keep -ge $p.Length) { return $p }
+	return '...' + $p.Substring($p.Length - $keep)
+}
+
+function Get-MBDisplayModel {
+	if (-not [string]::IsNullOrWhiteSpace([string]$ModelAlias)) {
+		return [string]$ModelAlias
+	}
+	return [string]$Model
+}
+
+function Get-MBShortModel {
+	param([int]$MaxLen = 36)
+	$m = Get-MBDisplayModel
+	if ($m.Length -le $MaxLen) { return $m }
+	$m2 = $m -replace '\.gguf$',''
+	if ($m2.Length -le $MaxLen) { return $m2 }
+	return $m2.Substring(0, $MaxLen - 3) + '...'
+}
+
+function Get-MBContextBar {
+	param(
+		[double]$Pct,
+		[int]$Width = 10
+	)
+	if ($Width -lt 4) { $Width = 4 }
+	$filled = [math]::Min($Width, [math]::Max(0, [int][math]::Round($Pct * $Width)))
+	$fill = [string](Get-MBGlyph 'fill')
+	$empty = [string](Get-MBGlyph 'empty')
+	return (($fill * $filled) + ($empty * ($Width - $filled)))
+}
+
+function Get-MBCtxColor {
+	param([string]$Level)
+	switch ($Level) {
+		'hard' { return [ConsoleColor]::Red }
+		'soft' { return [ConsoleColor]::Yellow }
+		default { return [ConsoleColor]::Green }
+	}
+}
+
+function Get-MBBarWidth {
+	$w = Get-MBConsoleWidth
+	$outer = [math]::Min($w, 96)
+	if ($outer -lt 24) { $outer = 24 }
+	return $outer
+}
+
+function Write-MBRule {
+	param([ConsoleColor]$Color = [ConsoleColor]::DarkGray, [string]$Label = "")
+	if (Test-MBWpfActive) {
+		Write-Host ""
+		if ([string]::IsNullOrWhiteSpace($Label)) {
+			try { Write-MBMdEmitRule } catch {
+				Write-Host ('-' * 28) -ForegroundColor $Color
+			}
+			return
+		}
+		# Full-width section rule (sticky accent color)
+		Write-MBWpfSectionBanner -Label $Label -Color Magenta
+		return
+	}
+	$w = Get-MBBarWidth
+	$h = [string](Get-MBGlyph 'h')
+	if ($Label) {
+		$core = " $Label "
+		$pad = $w - $core.Length
+		if ($pad -lt 4) {
+			$pad = 4
+			$w = $core.Length + $pad
+		}
+		$left = [math]::Floor($pad / 2)
+		$right = $pad - $left
+		Write-Host (($h * $left) + $core + ($h * $right)) -ForegroundColor $Color
+	} else {
+		Write-Host ($h * $w) -ForegroundColor $Color
+	}
+}
+
+function Write-MBKV {
+	param(
+		[string]$Key,
+		[AllowNull()][string]$Value,
+		[ConsoleColor]$ValueColor = [ConsoleColor]::Gray,
+		[int]$KeyWidth = 14,
+		[double]$FontSize = 13.5
+	)
+	if ($null -eq $Value) { $Value = '' }
+	$kw = [math]::Max(8, [int]$KeyWidth)
+	$k = ([string]$Key).PadRight($kw)
+	if (Test-MBWpfActive) {
+		Write-MBWpfRaw -Text ('  {0}' -f $k) -Color DarkGray -NoNewline -FontSize $FontSize
+		Write-MBWpfRaw -Text $Value -Color $ValueColor -FontSize $FontSize
+		return
+	}
+	Write-Host ('  {0}: {1}' -f $Key, $Value) -ForegroundColor $ValueColor
+}
+
+function Show-MBWorkingHint {
+	$script:MB.IsWorking = $true
+	$script:MB.WorkStartTick = 0
+	$script:MB.CallStartTick = 0
+	$script:MB.ThinkStartTick = 0
+	$script:MB.FirstTokenTick = 0
+	$script:MB.ThoughtStampEmitted = $false
+	$script:MB.WorkedStampEmitted = $false
+	try {
+		try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = [Environment]::TickCount } } catch {}
+		Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  model working..." -f ([char]0x00B7))
+		Update-MBWpfSticky -Status 'working'
+	} catch {}
+}
+
+function Get-MBElapsedSec {
+	param([int]$StartTick)
+	if ($StartTick -eq 0) { return 0.0 }
+	$ms = ([Environment]::TickCount - $StartTick) -band 0x7fffffff
+	if ($ms -lt 0) { $ms = 0 }
+	return [double]($ms / 1000.0)
+}
+
+function Format-MBDurationSec {
+	param([double]$Seconds)
+	if ($Seconds -lt 0) { $Seconds = 0 }
+	$totalSecs = [int][math]::Floor($Seconds)
+	if ($totalSecs -lt 10) { return ('{0:0.0}s' -f $Seconds) }
+	if ($totalSecs -lt 60) { return ('{0}s' -f $totalSecs) }
+	$mins = [int][math]::Floor($totalSecs / 60)
+	$secs = $totalSecs % 60
+	if ($mins -lt 60) { return ('{0}m{1}s' -f $mins, $secs) }
+	$hours = [int][math]::Floor($mins / 60)
+	$remMins = $mins % 60
+	return ('{0}h{1}m' -f $hours, $remMins)
+}
+
+function Format-MBThoughtDurationSec {
+	param([double]$Seconds)
+	if ($Seconds -lt 0) { $Seconds = 0 }
+	if ($Seconds -lt 60.0) { return ('{0:0.0}s' -f $Seconds) }
+	$mins = [int][math]::Floor($Seconds / 60.0)
+	$rem = $Seconds - ($mins * 60.0)
+	return ('{0}m{1:0}s' -f $mins, $rem)
+}
+
+function Write-MBTimingStamp {
+	param(
+		[Parameter(Mandatory = $true)]
+		[ValidateSet('thought', 'worked')]
+		[string]$Kind,
+		[double]$Seconds = 0
+	)
+	if ($Seconds -lt 0) { $Seconds = 0 }
+	if ($Kind -eq 'thought') {
+		$line = ('Thought for {0}' -f (Format-MBThoughtDurationSec -Seconds $Seconds))
+	} else {
+		$line = ('Worked for {0}' -f (Format-MBDurationSec -Seconds $Seconds))
+	}
+	if (Test-MBWpfActive) {
+		if (-not $script:MB.Wpf.WriteQueue) {
+			$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+		}
+		$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+			Kind      = 'chat-timing'
+			Text      = $line
+			Color     = 'DarkGray'
+			NoNewline = $false
+			MdNoLinks = 1
+			Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+		})
+		return
+	}
+	Write-Host ""
+	Write-Host ("  {0}" -f $line) -ForegroundColor DarkGray
+}
+
+function Write-MBThoughtStamp {
+	if ($script:MB.Interrupt) { return }
+	if ([bool]$script:MB.ThoughtStampEmitted) { return }
+	$think0 = [int]$script:MB.ThinkStartTick
+	if ($think0 -eq 0) { return }
+	$tok0 = [int]$script:MB.FirstTokenTick
+	if ($tok0 -ne 0) {
+		$ms = ($tok0 - $think0) -band 0x7fffffff
+		if ($ms -lt 0) { $ms = 0 }
+		Write-MBTimingStamp -Kind thought -Seconds ([double]($ms / 1000.0))
+	} else {
+		Write-MBTimingStamp -Kind thought -Seconds (Get-MBElapsedSec -StartTick $think0)
+	}
+	$script:MB.ThoughtStampEmitted = $true
+	$script:MB.ThinkStartTick = 0
+	$script:MB.FirstTokenTick = 0
+}
+
+function Write-MBWorkedStamp {
+	param([double]$Seconds = -1)
+	if ($script:MB.Interrupt) { return }
+	if ($Seconds -ge 0) {
+		Write-MBTimingStamp -Kind worked -Seconds $Seconds
+		return
+	}
+	$work0 = [int]$script:MB.WorkStartTick
+	if ($work0 -eq 0) { return }
+	Write-MBTimingStamp -Kind worked -Seconds (Get-MBElapsedSec -StartTick $work0)
+	$script:MB.WorkStartTick = 0
+}
+
+function Hide-MBPromptForWork {
+	Set-MBWpfPromptEnabled -Enabled $false
+	Show-MBWorkingHint
+}
+
+function Clear-MBWorkingState {
+	try {
+		if (-not $script:MB.Interrupt -and [int]$script:MB.WorkStartTick -ne 0) {
+			Write-MBWorkedStamp
+		}
+	} catch {}
+	$script:MB.IsWorking = $false
+	$script:MB.WorkStartTick = 0
+	try {
+		Refresh-MBWpfStickyFromSession
+		Update-MBWpfSticky -Status 'ready'
+	} catch {}
+}
+
+function Show-MBBanner {
+	$dot = [string](Get-MBGlyph 'dot')
+	$effBudget = Get-MBEffectivePromptBudget
+	$ac = if ($script:MB.AutoCompact) { 'ON' } else { 'OFF' }
+	$autoVal = if ($script:MB.AutoApprove) {
+		'ON  (modifying actions auto-run)'
+	} else {
+		'OFF  (modifying actions need Y/N/A)'
+	}
+	# ON (caution) = orange/dark-yellow; OFF (safe) = green — matches sticky prompt
+	$autoColor = if ($script:MB.AutoApprove) { [ConsoleColor]::DarkYellow } else { [ConsoleColor]::Green }
+
+	Write-Host ''
+	Write-MBKV 'Model' (Get-MBShortModel -MaxLen 64) -ValueColor Magenta
+	Write-MBKV 'Host'  ([string]$BaseUrl) -ValueColor Gray
+	Write-MBKV 'Path'  ([string]$script:MB.WorkingDir) -ValueColor Cyan
+	Write-MBKV 'Budget' ("n_ctx ~{0:N0}  {1}  usable ~{2:N0} tok  {1}  soft {3:P0}/{4:P0}  {1}  autocompact {5}" -f `
+		$script:MB.ContextWindow, $dot, $effBudget, $script:MB.ContextSoftPct, $script:MB.ContextHardPct, $ac) -ValueColor Gray
+	Write-MBKV 'auto-approve' $autoVal -ValueColor $autoColor
+	Write-Host ''
+	Write-Host ("  Type a task below  {0}  /help for commands  {0}  exit to quit" -f $dot) -ForegroundColor DarkGray
+	Write-Host ''
+}
+
+function Show-MBHelp {
+	Write-Host ""
+	Write-MBRule -Label "commands"
+	$cmds = @(
+		@{ c = "/help";            d = "Show this help" },
+		@{ c = "/status";          d = "Session stats + context budget" },
+		@{ c = "/context";         d = "Detailed context breakdown" },
+		@{ c = "/clear";           d = "Clear chat history (keeps sticky notes)" },
+		@{ c = "/compact";         d = "Aggressively trim history to free context" },
+		@{ c = "/note <text>";     d = "Pin a sticky note into session state" },
+		@{ c = "/find <text>";     d = "Pin a finding into session state" },
+		@{ c = "/forget";          d = "Clear sticky notes + findings" },
+		@{ c = "/auto [on|off]";   d = "Toggle auto-approve for modifying actions" },
+		@{ c = "/autocompact";     d = "Toggle automatic context compaction" },
+		@{ c = "/cd <path>";       d = "Change agent working directory" },
+		@{ c = "/wd";              d = "Print working directory" },
+		@{ c = "/tools [group]";   d = "List tools by group; enable a group or full|core" },
+		@{ c = "/sandbox [clear|clear all]"; d = "Show SandBox root; clear this session or all machine sessions" },
+		@{ c = "/save [path]";     d = "Save conversation JSON (default: Desktop)" },
+		@{ c = "/load <path>";     d = "Load conversation JSON" },
+		@{ c = "/export [path]";   d = "Export readable transcript markdown" },
+		@{ c = "/model";           d = "Show current model id" },
+		@{ c = "/retry";           d = "Re-send the last user message" },
+		@{ c = "exit | quit";      d = "End session" },
+		@{ c = "ESC";              d = "Hard-stop stream now (anytime between user entry)" }
+	)
+	$withSpeech = New-Object System.Collections.ArrayList
+	foreach ($x in $cmds) {
+		if ($x.c -eq '/save [path]') {
+			[void]$withSpeech.Add(@{ c = "/speech [on|off]"; d = "Voice: hold Right-Ctrl to talk; TTS replies + SpeakText" })
+		}
+		[void]$withSpeech.Add($x)
+	}
+	$cmds = @($withSpeech)
+	foreach ($x in $cmds) {
+		Write-Host ("  {0}" -f $x.c) -NoNewline -ForegroundColor Cyan
+		Write-Host (" - {0}" -f $x.d) -ForegroundColor Gray
+	}
+	Write-Host ""
+	Write-MBRule -Label "tool groups"
+	Write-Host "  Progressive surface: only active tool schemas + matching prompt playbooks are sent." -ForegroundColor DarkGray
+	Write-Host "  Cold start = core only. EnableToolGroup (or /tools <group>) expands tools + system prompt." -ForegroundColor DarkGray
+	Write-Host ("  Profile: {0}  |  Active: {1}" -f $script:MB.ToolProfile, ((@($script:MB.ActiveToolGroups) -join ', '))) -ForegroundColor DarkGray
+	Write-Host ""
+	if ($script:MBToolGroupMeta) {
+		foreach ($key in @($script:MBToolGroupMeta.Keys)) {
+			$meta = $script:MBToolGroupMeta[$key]
+			$isOn = @($script:MB.ActiveToolGroups) -contains $key
+			$flag = if ($isOn) { 'ON' } else { 'off' }
+			$flagColor = if ($isOn) { 'Green' } else { 'DarkGray' }
+			$tools = @($script:MBToolCatalog[$key])
+			$toolPreview = ($tools | Select-Object -First 6) -join ', '
+			if ($tools.Count -gt 6) { $toolPreview += ', ...' }
+			Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+			Write-Host $flag -NoNewline -ForegroundColor $flagColor
+			Write-Host "] " -NoNewline -ForegroundColor DarkGray
+			Write-Host $key -NoNewline -ForegroundColor Cyan
+			Write-Host (" - {0}" -f $meta.Label) -ForegroundColor White
+			Write-Host ("    {0}" -f $meta.Description) -ForegroundColor Gray
+			Write-Host ("    tools: {0}" -f $toolPreview) -ForegroundColor DarkGray
+		}
+	}
+	Write-Host ""
+	Write-Host "  /tools - list tools; /tools <group|full|core|list>" -ForegroundColor Gray
+	Write-Host "  /sandbox - show root; /sandbox clear | clear all" -ForegroundColor Gray
+	Write-Host "  /speech on|off - voice mode (-SpeechEnabled or speech=1)" -ForegroundColor Gray
+	Write-Host "  Agent can also call ListToolGroups / EnableToolGroup" -ForegroundColor DarkGray
+	Write-Host ""
+	Write-MBRule -Label "prompt keys"
+	Write-Host "  Enter - submit" -ForegroundColor Gray
+	Write-Host "  Shift+Enter / Ctrl+Enter - new line" -ForegroundColor Gray
+	Write-Host "  line ending with \ - continue on next line" -ForegroundColor Gray
+	Write-Host "  Right-Ctrl hold - speech PTT (/speech on)" -ForegroundColor Gray
+	Write-Host "  Up / Down - input history" -ForegroundColor Gray
+	Write-Host "  Esc - clear draft; Esc while working - interrupt" -ForegroundColor Gray
+	Write-Host ""
+	Write-MBRule -Label "launch / host"
+	Write-Host "  exit | quit - close shell and end session" -ForegroundColor Gray
+	Write-Host "  -StoreCredentials - save auth to Windows Credential Manager (MiniBot)" -ForegroundColor Gray
+	Write-Host "  `$env:store=1 - one-shot store (resets after launch)" -ForegroundColor Gray
+	Write-Host "  `$env:clear=1 - one-shot wipe MiniBot creds" -ForegroundColor Gray
+	Write-Host "  -DebugLog / `$env:debug=1 - write MiniBot-debug.log (Desktop; off by default)" -ForegroundColor Gray
+	Write-Host "  -HideConsole:`$false - keep PowerShell / Terminal window visible (PS1 / irm|iex)" -ForegroundColor Gray
+	Write-Host "  Hold Caps Lock at launch - wipe stored creds and open login" -ForegroundColor Gray
+	Write-Host "  (no flags) - use stored MiniBot creds if present; else prompt" -ForegroundColor Gray
+	Write-Host ""
+}
+
+function Show-MBStatus {
+	$elapsed = (Get-Date) - $script:MB.SessionStart
+	$est = Get-MBContextEstimate -Messages $script:Messages
+	Write-Host ""
+	Write-MBRule -Label "status"
+	Write-Host "  Agent: $AgentName v$Version" -ForegroundColor Gray
+	Write-Host "  Model: $(Get-MBDisplayModel)" -ForegroundColor Gray
+	if (-not [string]::IsNullOrWhiteSpace([string]$ModelAlias) -and [string]$ModelAlias -ne [string]$Model) {
+		Write-Host "  Model id: $Model" -ForegroundColor DarkGray
+	}
+	Write-Host "  Endpoint: $BaseUrl" -ForegroundColor Gray
+	Write-Host "  CWD: $($script:MB.WorkingDir)" -ForegroundColor Cyan
+	Write-Host "  Host UI: wpf" -ForegroundColor Gray
+	Write-Host "  Auto-App: $($script:MB.AutoApprove)" -ForegroundColor Gray
+	$sp = if ($script:MB.SpeechEnabled) {
+		$a = if ($script:MB.SpeechAutoReply) { 'autoTTS' } else { 'no-auto' }
+		"ON ($a)"
+	} else { 'off' }
+	Write-Host "  Speech: $sp (Right-Ctrl PTT, /speech)" -ForegroundColor Gray
+	Write-Host "  User msgs: $($script:MB.UserTurns)" -ForegroundColor Gray
+	Write-Host "  Agent turns: $($script:MB.AgentTurns) | tools: $($script:MB.ToolCalls)" -ForegroundColor Gray
+	Write-Host "  Approvals: $($script:MB.ApprovalsGranted) granted / $($script:MB.ApprovalsDenied) denied" -ForegroundColor Gray
+	Write-Host "  Session: $([math]::Floor($elapsed.TotalMinutes))m $($elapsed.Seconds)s" -ForegroundColor Gray
+	Write-Host "  History: $($script:Messages.Count) messages" -ForegroundColor Gray
+	Write-Host "  API fails: $($script:MB.ApiFailures) | loop guards: $($script:MB.LoopGuardsFired)" -ForegroundColor Gray
+	Write-Host "  Completions: $(Get-MBApiBaseUrl)/chat/completions" -ForegroundColor DarkGray
+	Write-Host "  Temp/Max: $Temperature / $MaxTokens tok (completion) | continues x$MaxReplyContinues | $MaxTurns tool-loop max" -ForegroundColor Gray
+	Write-Host ""
+	Write-Host "  Context: " -NoNewline -ForegroundColor Gray
+	$pctColor = Get-MBCtxColor -Level $est.Level
+	$bar = Get-MBContextBar -Pct $est.Pct -Width 14
+	Write-Host ("{0}  {1:P0} of usable budget" -f $bar, $est.Pct) -ForegroundColor $pctColor
+	$srcShort = switch ([string]$est.TokenSource) { 'server' { 'server' } 'usage' { 'usage' } default { 'est' } }
+	Write-Host ("    ~{0:N0} / {1:N0} prompt tok ({2}) | {3:N0} chars | tools ~{4:N0} tok" -f `
+		$est.PromptTokens, $est.UsableTokens, $srcShort, $est.TotalChars, $est.ToolsTokens) -ForegroundColor DarkGray
+	Write-Host ("    window {0:N0} | reserve completion {1:N0} | autocompact {2} | model-digest {3} | compactions {4}" -f `
+		$script:MB.ContextWindow, $MaxTokens, $(if ($script:MB.AutoCompact) { 'ON' } else { 'OFF' }), $(if ($script:MB.ModelCompact) { 'ON' } else { 'OFF' }), $script:MB.CompactionCount) -ForegroundColor DarkGray
+	if ($script:MB.LastCompactReason) {
+		Write-Host "    last compact: $($script:MB.LastCompactReason)" -ForegroundColor DarkGray
+	}
+	$nNotes = @($script:MB.StickyNotes).Count
+	$nFind  = @($script:MB.StickyFindings).Count
+	Write-Host ("  Sticky: {0} notes, {1} findings" -f $nNotes, $nFind) -ForegroundColor Gray
+	$groups = @($script:MB.ActiveToolGroups) -join ', '
+	$nTools = @(Get-MBActiveTools).Count
+	Write-Host ("  Tools: {0} active | groups: {1} | profile: {2}" -f $nTools, $groups, $script:MB.ToolProfile) -ForegroundColor Gray
+	Write-Host ""
+}
+
+function Get-MBTaskApiOrigins {
+	$origins = New-Object System.Collections.ArrayList
+	if ($script:MB.TaskApiBase) {
+		$u = [string]$script:MB.TaskApiBase
+		while ($u.EndsWith('/')) { $u = $u.Substring(0, $u.Length - 1) }
+		[void]$origins.Add($u)
+	}
+	try {
+		$api = Get-MBApiBaseUrl
+		while ($api.EndsWith('/')) { $api = $api.Substring(0, $api.Length - 1) }
+		[void]$origins.Add($api)
+		$stripped = $api -replace '/v1$','' -replace '/openai$','' -replace '/api$',''
+		if ($stripped -and $stripped -ne $api) { [void]$origins.Add($stripped) }
+		try {
+			$uri = [Uri]$api
+			[void]$origins.Add(("{0}://{1}" -f $uri.Scheme, $uri.Authority))
+		} catch {}
+	} catch {}
+	$seen = @{}
+	$out = @()
+	foreach ($o in $origins) {
+		if ([string]::IsNullOrWhiteSpace($o)) { continue }
+		$k = $o.ToLowerInvariant()
+		if ($seen.ContainsKey($k)) { continue }
+		$seen[$k] = $true
+		$out += $o
+	}
+	return $out
+}
+
+function Test-MBShouldSendAuthHeader {
+	param([string]$Username, [string]$Password)
+	if ($Username -and $Password) { return $true }
+	if ($script:MB.NpmUser -and $script:MB.NpmPass) { return $true }
+	$k = [string]$ApiKey
+	if ([string]::IsNullOrWhiteSpace($k)) { return $false }
+	if ($k -eq 'none' -or $k -eq 'null' -or $k -eq '-') { return $false }
+	return $true
+}
+
+function Get-MBAuthHeaderValue {
+	if ($script:MB.NpmUser -and $script:MB.NpmPass) {
+		$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$($script:MB.NpmUser):$($script:MB.NpmPass)")
+		return ("Basic {0}" -f [Convert]::ToBase64String($authBytes))
+	}
+	if (-not (Test-MBShouldSendAuthHeader)) { return $null }
+	return ("Bearer {0}" -f [string]$ApiKey)
+}
+
+function Stop-MBBackendTasks {
+	$stopped = 0
+	$origins = @(Get-MBTaskApiOrigins)
+	if ($origins.Count -eq 0) { return 0 }
+
+	$auth = Get-MBAuthHeaderValue
+	foreach ($origin in $origins) {
+		$tasksUrl = "$origin/api/tasks"
+		try {
+			$handler = New-Object System.Net.Http.HttpClientHandler
+			$handler.AllowAutoRedirect = $true
+			$client = New-Object System.Net.Http.HttpClient ($handler)
+			$client.Timeout = [TimeSpan]::FromSeconds(3)
+			try {
+				$req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $tasksUrl)
+				if ($auth) {
+					try { $req.Headers.TryAddWithoutValidation('Authorization', $auth) | Out-Null } catch {}
+				}
+				$resp = $client.SendAsync($req).Result
+				if (-not $resp.IsSuccessStatusCode) { continue }
+				$body = $resp.Content.ReadAsStringAsync().Result
+				if ([string]::IsNullOrWhiteSpace($body)) { continue }
+				$data = $null
+				try { $data = $body | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+				$tasks = @()
+				if ($data.tasks) { $tasks = @($data.tasks) }
+				elseif ($data -is [System.Array]) { $tasks = @($data) }
+				elseif ($data.id -or $data.task_id) { $tasks = @($data) }
+
+				foreach ($t in $tasks) {
+					$taskId = $null
+					if ($t -is [string]) { $taskId = $t }
+					else {
+						try { $taskId = $t.id } catch {}
+						if (-not $taskId) { try { $taskId = $t.task_id } catch {} }
+					}
+					if ([string]::IsNullOrWhiteSpace([string]$taskId)) { continue }
+					try {
+						$stopUrl = "$origin/api/tasks/stop/$taskId"
+						$sreq = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $stopUrl)
+						try { $sreq.Headers.TryAddWithoutValidation('Authorization', $auth) | Out-Null } catch {}
+						$sreq.Content = New-Object System.Net.Http.StringContent('{}', [System.Text.Encoding]::UTF8, 'application/json')
+						$sresp = $client.SendAsync($sreq).Result
+						if ($sresp.IsSuccessStatusCode) { $stopped++ }
+					} catch {}
+				}
+				if ($stopped -gt 0) { break }
+			} finally {
+				try { $client.Dispose() } catch {}
+			}
+		} catch {}
+	}
+	return $stopped
+}
+
+function Request-MBAbort {
+	param([switch]$Silent)
+
+	$script:MB.Interrupt = $true
+	$script:MB.StreamCancel = $true
+	if ($script:HasNative) {
+		try { [MiniBot.Core.Native]::CancelRequested = $true } catch {}
+	}
+	if ($script:HasDiskWalk) {
+		try { [MiniBot.Core.DiskWalk]::CancelRequested = $true } catch {}
+	}
+
+	try {
+		if ($script:MB.ActiveCts) { $script:MB.ActiveCts.Cancel() }
+	} catch {}
+
+	try {
+		if ($script:MB.ActiveReader) { $script:MB.ActiveReader.Dispose() }
+	} catch {}
+	try {
+		if ($script:MB.ActiveStream) { $script:MB.ActiveStream.Dispose() }
+	} catch {}
+
+	try {
+		if ($script:MB.ActiveHttpClient) {
+			$script:MB.ActiveHttpClient.CancelPendingRequests()
+		}
+	} catch {}
+
+	$n = 0
+	try { $n = Stop-MBBackendTasks } catch { $n = 0 }
+
+	if (-not $Silent) {
+		if ($script:MB.IsThinking) { try { Write-Host "" } catch {} }
+		Write-Host ""
+		if ($n -gt 0) {
+			Write-Host ("  [interrupt] esc - aborting stream + stopped {0} backend task(s)..." -f $n) -ForegroundColor Red
+			Write-Host ""
+		} else {
+			Write-Host "  [interrupt] esc - aborting stream / tools..." -ForegroundColor Red
+			Write-Host ""
+		}
+	}
+	$script:MB.LastAbortMs = [Environment]::TickCount
+}
+
+function Test-MBInterrupt {
 	[CmdletBinding()]
 	param()
-	if ([Console]::KeyAvailable) {
-		$keyInfo = [Console]::ReadKey($true)
-		if ($keyInfo.Key -eq [ConsoleKey]::Escape) {
-			$script:interruptRequested = $true
-			if($script:isThinking){
-				Write-Host ""
+	if ($script:MB.Interrupt) { return $true }
+	if ($script:MB.Wpf) {
+		try {
+			if ($script:MB.Wpf.InterruptFlag) {
+				$script:MB.Wpf.InterruptFlag = $false
+				Request-MBAbort -Silent
+				return $true
 			}
-			Write-Host "`n[INTERRUPT] ESC pressed — aborting current turn..." -ForegroundColor Yellow -NoNewLine
-			while ([Console]::KeyAvailable) {
-				[void][Console]::ReadKey($true)
+		} catch {}
+	}
+	return [bool]$script:MB.Interrupt
+}
+
+function Reset-MBInterrupt {
+	$script:MB.Interrupt = $false
+	$script:MB.StreamCancel = $false
+	if ($script:HasNative) {
+		try { [MiniBot.Core.Native]::CancelRequested = $false } catch {}
+	}
+	if ($script:HasDiskWalk) {
+		try { [MiniBot.Core.DiskWalk]::CancelRequested = $false } catch {}
+	}
+}
+
+function Clear-MBActiveHttp {
+	$script:MB.ActiveHttpClient = $null
+	$script:MB.ActiveCts = $null
+	$script:MB.ActiveStream = $null
+	$script:MB.ActiveReader = $null
+}
+
+function Get-MBSharedHttpClient {
+	if ($script:MB.HttpClient) {
+		return $script:MB.HttpClient
+	}
+	try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
+	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+
+	$handler = New-Object System.Net.Http.HttpClientHandler
+	$handler.AllowAutoRedirect = $true
+	$handler.UseCookies = $false
+
+	$client = New-Object System.Net.Http.HttpClient ($handler)
+	$client.Timeout = [TimeSpan]::FromMinutes(12)
+	$client.DefaultRequestHeaders.ExpectContinue = $false
+	try { $client.DefaultRequestHeaders.ConnectionClose = $false } catch {}
+
+	$script:MB.HttpClient = $client
+	$script:MB.HttpClientOwned = $true
+	return $client
+}
+
+function Dispose-MBSharedHttpClient {
+	if ($script:MB.HttpClient -and $script:MB.HttpClientOwned) {
+		try { $script:MB.HttpClient.CancelPendingRequests() } catch {}
+		try { $script:MB.HttpClient.Dispose() } catch {}
+	}
+	$script:MB.HttpClient = $null
+	$script:MB.HttpClientOwned = $false
+	$script:MB.ActiveHttpClient = $null
+}
+
+function Stop-MBAnimation {
+	try {
+		Write-MBDebugLog -Step 'THINK_STOP'
+		if ($script:MB.AnimSync) {
+			try { $script:MB.AnimSync['Stop'] = $true } catch {}
+		}
+		if ($script:MB.AnimPs) {
+			try {
+				if ($script:MB.AnimPs.InvocationStateInfo.State -notin @('Completed','Failed','Stopped')) {
+					$script:MB.AnimPs.Stop() | Out-Null
+				}
+			} catch {}
+			try { $script:MB.AnimPs.Dispose() } catch {}
+			try { if ($script:MB.AnimRunspace) { $script:MB.AnimRunspace.Close() } } catch {}
+			try { if ($script:MB.AnimRunspace) { $script:MB.AnimRunspace.Dispose() } } catch {}
+			$script:MB.AnimPs = $null
+			$script:MB.AnimRunspace = $null
+		}
+		$script:MB.AnimSync = $null
+		$script:MB.IsThinking = $false
+		try {
+			if ($script:MB.IsWorking) {
+				try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = [Environment]::TickCount } } catch {}
+				Update-MBWpfSticky -Status 'working' -Hint ("esc interrupt  {0}  model working..." -f ([char]0x00B7))
+			} else {
+				Update-MBWpfSticky -Status 'ready'
 			}
+		} catch {}
+	} catch {
+		try { $script:MB.IsThinking = $false } catch {}
+	}
+}
+
+function Start-MBThinkingAnimation {
+	param([string]$Name = $AgentName)
+	try {
+		Write-MBDebugLog -Step 'THINK_START' -Detail $Name
+		Stop-MBAnimation
+		$script:MB.IsThinking = $true
+		$now = [Environment]::TickCount
+		$script:MB.CallStartTick = $now
+		$script:MB.ThinkStartTick = $now
+		$script:MB.FirstTokenTick = 0
+		$script:MB.ThoughtStampEmitted = $false
+		$script:MB.WorkStartTick = 0
+		try {
+			Update-MBWpfSticky -Status 'thinking...' -Hint ("esc interrupt  {0}  model thinking..." -f ([char]0x00B7))
+			Write-MBDebugLog -Step 'THINK_WPF_STATIC'
+		} catch {
+			Write-MBDebugLog -Step 'THINK_WPF_ERR' -Detail $_.Exception.Message
+		}
+	} catch {
+		$script:MB.IsThinking = $true
+		$now = [Environment]::TickCount
+		$script:MB.CallStartTick = $now
+		$script:MB.ThinkStartTick = $now
+		$script:MB.FirstTokenTick = 0
+		$script:MB.ThoughtStampEmitted = $false
+		$script:MB.WorkStartTick = 0
+		try { Update-MBWpfSticky -Status 'thinking...' } catch {}
+	}
+}
+
+function Get-MBCredTarget {
+	return 'MiniBot'
+}
+
+function Get-MBLegacyCredFile {
+	Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Explorer\thumbcache_32.dat"
+}
+
+function Read-MBLegacyCredFile {
+	param([string]$Path)
+	if (-not (Test-Path -LiteralPath $Path)) { return $null }
+	try {
+		$content = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+		$lines = $content -split "`r?`n" | Where-Object { $_.Trim() -ne "" }
+		if ($lines.Count -lt 2) { return $null }
+		$user = $lines[0].Trim()
+		$securePass = $lines[1].Trim() | ConvertTo-SecureString -ErrorAction Stop
+		$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePass)
+		try {
+			$plainPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+		} finally {
+			[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+		}
+		if ($user -and $plainPass) { return @{ User = $user; Pass = $plainPass } }
+	} catch {}
+	return $null
+}
+
+function Save-MBStoredCredential {
+	param(
+		[string]$User,
+		[string]$Password,
+		[System.Security.SecureString]$SecurePassword = $null
+	)
+	$target = Get-MBCredTarget
+	if ($script:HasCredMan) {
+		try {
+			$ok = [MiniBot.Core.CredMan]::Write($target, $User, $Password)
+			if ($ok) {
+				# Remove legacy file after CredMan write
+				$legacy = Get-MBLegacyCredFile
+				if (Test-Path -LiteralPath $legacy) {
+					Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
+				}
+				return $true
+			}
+		} catch {}
+	}
+	# DPAPI file fallback if CredMan unavailable
+	try {
+		$legacy = Get-MBLegacyCredFile
+		$dir = Split-Path -Parent $legacy
+		if (-not (Test-Path -LiteralPath $dir)) {
+			New-Item -ItemType Directory -Path $dir -Force | Out-Null
+		}
+		$sec = $SecurePassword
+		if (-not $sec) {
+			$sec = ConvertTo-SecureString -String $Password -AsPlainText -Force
+		}
+		$encrypted = $sec | ConvertFrom-SecureString
+		"$User`n$encrypted" | Out-File -LiteralPath $legacy -Encoding UTF8 -Force
+		return $true
+	} catch {
+		return $false
+	}
+}
+
+function Read-MBStoredCredential {
+	$target = Get-MBCredTarget
+	if ($script:HasCredMan) {
+		try {
+			$rr = [MiniBot.Core.CredMan]::Read($target)
+			if ($rr -and $rr.Ok -and $rr.UserName -and $null -ne $rr.Password) {
+				return @{ User = [string]$rr.UserName; Pass = [string]$rr.Password }
+			}
+		} catch {}
+	}
+	# Migrate legacy DPAPI file to Credential Manager
+	$legacy = Get-MBLegacyCredFile
+	$fromFile = Read-MBLegacyCredFile -Path $legacy
+	if ($fromFile) {
+		if ($script:HasCredMan) {
+			try {
+				if ([MiniBot.Core.CredMan]::Write($target, $fromFile.User, $fromFile.Pass)) {
+					Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
+				}
+			} catch {}
+		}
+		return $fromFile
+	}
+	return $null
+}
+
+function Clear-MBStoredCredential {
+	$target = Get-MBCredTarget
+	if ($script:HasCredMan) {
+		try { [void][MiniBot.Core.CredMan]::Delete($target) } catch {}
+	}
+	$legacy = Get-MBLegacyCredFile
+	if (Test-Path -LiteralPath $legacy) {
+		Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
+	}
+}
+
+if ($script:MB_ClearCredsFromEnv) {
+	try {
+		Clear-MBStoredCredential
+		Set-MBEnvFlag -Name 'clear'
+		Set-MBEnvFlag -Name 'store'
+		$StoreCredentials = $false
+		$script:MB_StoreCredsFromEnv = $false
+		$script:MB_ClearCredsFromEnv = $false
+		Write-Host ""
+		Write-Host "  Cleared stored MiniBot credentials (login will prompt if auth is required)." -ForegroundColor DarkYellow
+		Write-Host ""
+	} catch {
+		Write-Warning "clear: could not wipe stored credentials: $($_.Exception.Message)"
+		Set-MBEnvFlag -Name 'clear'
+		Set-MBEnvFlag -Name 'store'
+		$StoreCredentials = $false
+		$script:MB_StoreCredsFromEnv = $false
+		$script:MB_ClearCredsFromEnv = $false
+	}
+}
+
+function Read-MBWpfLine {
+	param(
+		[string]$Label = '',
+		[switch]$Secret
+	)
+	if (-not (Test-MBWpfActive)) { return $null }
+
+	if ($Label) {
+		Write-MBWpfRaw -Text $Label -Color DarkYellow
+	}
+	Update-MBWpfSticky -Hint $(if ($Secret) { ("enter password  {0}  Enter to submit" -f ([char]0x00B7)) } else { ("type response  {0}  Enter to submit" -f ([char]0x00B7)) })
+	Set-MBWpfPromptEnabled -Enabled $true
+
+	if ($Secret) {
+		Invoke-MBWpf -Action {
+			try {
+				$script:MB.Wpf.Prompt.PasswordChar = [char]0x25CF  # ●
+			} catch {
+				try { $script:MB.Wpf.Prompt.PasswordChar = '*' } catch {}
+			}
+		}
+	}
+
+	$script:MB.Wpf.InputResult = $null
+	try {
+		while ($true) {
+			if ($script:MB.Wpf.ExitRequested) { return $null }
+			if ($script:MB.Wpf.NeedPathBudgetRefresh) {
+				$script:MB.Wpf.NeedPathBudgetRefresh = $false
+				try { Refresh-MBWpfStickyFromSession } catch {}
+			}
+			if ($script:MB.Wpf.InputWait.WaitOne(20)) {
+				$r = [string]$script:MB.Wpf.InputResult
+				$script:MB.Wpf.InputResult = $null
+				if (-not $Secret) {
+					if ([string]::IsNullOrWhiteSpace($r)) {
+						Write-MBWpfRaw -Text '  (empty)' -Color DarkGray
+					} else {
+						Write-MBWpfRaw -Text ("  → " + $r) -Color Cyan
+					}
+				} else {
+					Write-MBWpfRaw -Text '  → ********' -Color DarkGray
+				}
+				return $r
+			}
+		}
+	} finally {
+		Invoke-MBWpf -Action {
+			try {
+				$script:MB.Wpf.Prompt.PasswordChar = [char]0
+				$script:MB.Wpf.Prompt.Clear()
+			} catch {}
+		}
+		Set-MBWpfPromptEnabled -Enabled $false
+	}
+}
+
+function Show-MBWpfAuthOverlay {
+	param([string]$ServerHint = '')
+	if (-not (Test-MBWpfActive)) { return $null }
+
+	$W = $script:MB.Wpf
+	$W.CredResult = $null
+	try { [void]$W.CredWait.Reset() } catch {}
+	$W.AuthActive = $true
+
+	$hint = if ($ServerHint) { $ServerHint } else { [string]$BaseUrl }
+	$d = $W.Dispatcher
+	$show = {
+		if ($W.AuthTitle) { $W.AuthTitle.Text = 'Authentication required' }
+		if ($W.AuthSubtitle) {
+			$W.AuthSubtitle.Text = ("Sign in to access:`n{0}" -f $hint)
+		}
+		if ($W.AuthUser) {
+			$W.AuthUser.Text = ''
+			$W.AuthUser.IsEnabled = $true
+			try { $W.AuthUser.IsReadOnly = $false } catch {}
+			$W.AuthUser.Focusable = $true
+		}
+		if ($W.AuthPass) {
+			try { $W.AuthPass.Password = '' } catch {}
+			$W.AuthPass.IsEnabled = $true
+			$W.AuthPass.Focusable = $true
+		}
+		if ($W.AuthSaveCreds) {
+			try { $W.AuthSaveCreds.IsChecked = $false } catch {}
+		}
+		if ($W.AuthError) { $W.AuthError.Text = '' }
+		if ($W.AuthOk) { $W.AuthOk.IsDefault = $true }
+		try {
+			if ($W.Prompt) {
+				$W.Prompt.IsReadOnly = $true
+			}
+		} catch {}
+		if ($W.AuthOverlay) {
+			$W.AuthOverlay.Visibility = [System.Windows.Visibility]::Visible
+		}
+	}.GetNewClosure()
+	try {
+		if ($d.CheckAccess()) {
+			& $show
+		} else {
+			[void]$d.Invoke([Action]$show, [System.Windows.Threading.DispatcherPriority]::Normal)
+		}
+	} catch {
+		Write-Warning "Could not show auth overlay: $($_.Exception.Message)"
+		$W.AuthActive = $false
+		return @{ User = $null; Pass = $null; Cancelled = $true }
+	}
+
+	while ($true) {
+		if ($W.ExitRequested) {
+			Hide-MBWpfAuthOverlay
+			return @{ User = $null; Pass = $null; Cancelled = $true }
+		}
+		if ($W.CredWait.WaitOne(50)) { break }
+	}
+
+	$result = $W.CredResult
+	Hide-MBWpfAuthOverlay
+	if (-not $result) {
+		return @{ User = $null; Pass = $null; Cancelled = $true }
+	}
+	return $result
+}
+
+function Hide-MBWpfAuthOverlay {
+	if (-not $script:MB.Wpf) { return }
+	$W = $script:MB.Wpf
+	$d = $W.Dispatcher
+	if (-not $d) { return }
+	$W.AuthActive = $false
+	$hide = {
+		if ($W.AuthOverlay) {
+			$W.AuthOverlay.Visibility = [System.Windows.Visibility]::Collapsed
+		}
+		if ($W.AuthOk) { $W.AuthOk.IsDefault = $false }
+		if ($W.AuthPass) { try { $W.AuthPass.Password = '' } catch {} }
+		if ($W.AuthError) { $W.AuthError.Text = '' }
+		try {
+			if ($W.Prompt) {
+				$W.Prompt.Focusable = $true
+				$W.Prompt.IsEnabled = $true
+				$W.Prompt.IsReadOnly = -not [bool]$W.PromptArmed
+			}
+		} catch {}
+		try {
+			if ($W.Log) { $W.Log.Focusable = $true }
+		} catch {}
+	}.GetNewClosure()
+	try {
+		if ($d.CheckAccess()) {
+			& $hide
+		} else {
+			[void]$d.Invoke([Action]$hide, [System.Windows.Threading.DispatcherPriority]::Normal)
+		}
+	} catch {}
+}
+
+function Complete-MBSessionExit {
+	param([string]$Message = 'session ended.')
+	$script:MB.SessionEnding = $true
+	try { Close-MBLoginSession } catch {}
+	try {
+		if ($script:MB.Wpf) {
+			$script:MB.Wpf.SoftClose = $false
+			$script:MB.Wpf.CloseKind = 'user_x'
+			$script:MB.Wpf.ForceProcessExit = $true
+			$script:MB.Wpf.ExitRequested = $true
+		}
+	} catch {}
+	try { Stop-MBSpeech } catch {}
+	try {
+		if ($script:MB.Wpf) { Stop-MBWpfHost }
+	} catch {}
+	# Session temps + any leftover MiniBot* under %TEMP%
+	try { $null = Invoke-MBTempCleanup -All } catch {}
+	# Release single-instance mutex before process exit
+	try {
+		if ($script:SingleInstanceEvent) {
+			try { [void]$script:SingleInstanceEvent.Set() } catch {}
+			try { $script:SingleInstanceEvent.Close() } catch {}
+			try { $script:SingleInstanceEvent.Dispose() } catch {}
+			$script:SingleInstanceEvent = $null
+		}
+	} catch {}
+	try { [Environment]::Exit(0) } catch { try { Exit 0 } catch {} }
+}
+
+
+function Start-MBLoginSession {
+	param([string]$ServerHint = '')
+	if (-not (Test-MBWpfAvailable)) { throw 'MiniBot requires WPF for login UI (PresentationFramework not available).' }
+	try {
+		if ($script:MB.LoginSession -and -not [bool]$script:MB.LoginSession.Closed) {
+			return $script:MB.LoginSession
+		}
+	} catch {}
+
+	$hint = if ($ServerHint) { [string]$ServerHint } else { [string]$BaseUrl }
+	$ver = try { [string]$Version } catch { '' }
+	$bag = [hashtable]::Synchronized(@{
+		Failed       = $false
+		FailMsg      = ''
+		Closed       = $false
+		Cmd          = ''           # show_login | show_confirm | close
+		ConfirmPrompt = ''
+		ConfirmTitle  = 'Invalid Entry'
+		CredResult   = $null
+		ConfirmResult = $null
+		CredWait     = New-Object System.Threading.ManualResetEvent $false
+		ConfirmWait  = New-Object System.Threading.ManualResetEvent $false
+		ReadyWait    = New-Object System.Threading.ManualResetEvent $false
+		Done         = New-Object System.Threading.ManualResetEvent $false
+		Ready        = $false
+	})
+
+	$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+	$rs.ApartmentState = [System.Threading.ApartmentState]::STA
+	$rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+	$rs.Open()
+	$ps = [PowerShell]::Create()
+	$ps.Runspace = $rs
+	[void]$ps.AddScript({
+		param($B, $Hint, $Ver)
+		try {
+			Add-Type -AssemblyName PresentationFramework
+			Add-Type -AssemblyName PresentationCore
+			Add-Type -AssemblyName WindowsBase
+			$title = if ($Ver) { "MiniBot v$Ver" } else { 'MiniBot' }
+			$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$title"
+        Width="420" SizeToContent="Height"
+        MinWidth="360" MinHeight="280"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        Background="#1A1A1E"
+        Foreground="#C8C8D0"
+        FontFamily="Consolas, Cascadia Mono, Courier New"
+        FontSize="13"
+        ShowInTaskbar="True"
+        ShowActivated="True"
+        Topmost="True">
+  <Window.Resources>
+    <Style x:Key="MbAuthPrimaryBtn" TargetType="Button">
+      <Setter Property="Background" Value="#4A4A56"/>
+      <Setter Property="Foreground" Value="#E0E0E8"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="3" SnapsToDevicePixels="True">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#5C5C6A"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#3A3A48"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="MbAuthSecondaryBtn" TargetType="Button">
+      <Setter Property="Background" Value="#2A2A30"/>
+      <Setter Property="Foreground" Value="#C8C8D0"/>
+      <Setter Property="BorderBrush" Value="#3A3A42"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    CornerRadius="3" SnapsToDevicePixels="True">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#363640"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#5A5A66"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#222228"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#4A4A56"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Border BorderBrush="#3A3A42" BorderThickness="1" Background="#1E1E24" Padding="22,18,22,14">
+    <Grid>
+      <!-- LOGIN LAYER -->
+      <Grid x:Name="LoginLayer">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="18"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <StackPanel Grid.Row="0">
+          <TextBlock Text="Authentication required" Foreground="#E0E0E8"
+                     FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+          <TextBlock x:Name="AuthSubtitle" Text="" Foreground="#8A8A96" TextWrapping="Wrap"
+                     FontSize="12" Margin="0,0,0,10" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
+          <TextBlock Text="Username" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+          <TextBox x:Name="AuthUser" Height="32" Padding="8,6" Margin="0,0,0,8"
+                   Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                   BorderBrush="#3A3A42" BorderThickness="1"
+                   FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
+          <TextBlock Text="Password" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+          <PasswordBox x:Name="AuthPass" Height="32" Padding="8,6" Margin="0,0,0,6"
+                       Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                       BorderBrush="#3A3A42" BorderThickness="1"
+                       FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
+          <CheckBox x:Name="AuthSaveCreds" Margin="0,0,0,0" Cursor="Hand" Focusable="True"
+                    IsChecked="False" VerticalContentAlignment="Center">
+            <CheckBox.Template>
+              <ControlTemplate TargetType="CheckBox">
+                <StackPanel Orientation="Horizontal" Background="Transparent">
+                  <Border x:Name="Box" Width="13" Height="13" Background="#121216"
+                          BorderBrush="#52525C" BorderThickness="1" CornerRadius="2"
+                          VerticalAlignment="Center" Margin="0,0,8,0">
+                    <Path x:Name="CheckMark" Data="M1.5,6.5 L4.8,10 L11.5,2.5"
+                          Stroke="#9ECE6A" StrokeThickness="1.7" Visibility="Collapsed"
+                          Stretch="None" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                  </Border>
+                  <ContentPresenter VerticalAlignment="Center"/>
+                </StackPanel>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsChecked" Value="True">
+                    <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                    <Setter TargetName="Box" Property="BorderBrush" Value="#6A6A76"/>
+                    <Setter TargetName="Box" Property="Background" Value="#1A1A1E"/>
+                  </Trigger>
+                  <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="Box" Property="BorderBrush" Value="#8A8A96"/>
+                  </Trigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate>
+            </CheckBox.Template>
+            <CheckBox.Content>
+              <TextBlock Text="Save credentials" Foreground="#A0A0AA" FontSize="12"/>
+            </CheckBox.Content>
+          </CheckBox>
+        </StackPanel>
+        <TextBlock x:Name="AuthError" Grid.Row="1" Text="" Foreground="#F7768E" FontSize="11"
+                   TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
+          <Button x:Name="AuthOk" Style="{StaticResource MbAuthPrimaryBtn}"
+                  Content="Sign in" Width="96" Height="30" Margin="0,0,8,0" IsDefault="True"/>
+          <Button x:Name="AuthCancel" Style="{StaticResource MbAuthSecondaryBtn}"
+                  Content="Cancel" Width="88" Height="30" IsCancel="True"/>
+        </StackPanel>
+      </Grid>
+      <!-- CONFIRM LAYER (usually collapsed) -->
+      <Grid x:Name="ConfirmLayer" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock x:Name="ConfirmTitle" Text="Invalid Entry" Foreground="#E0E0E8"
+                   FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+        <Rectangle x:Name="ConfirmAccentBar" Grid.Row="1" Height="3" Margin="0,0,0,14"
+                   RadiusX="1.5" RadiusY="1.5" Opacity="0.55">
+          <Rectangle.Fill>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+              <GradientStop Color="#7DCFFF" Offset="0"/>
+              <GradientStop Color="#FFFFFF" Offset="0.5"/>
+              <GradientStop Color="#7DCFFF" Offset="1"/>
+            </LinearGradientBrush>
+          </Rectangle.Fill>
+        </Rectangle>
+        <TextBlock x:Name="ConfirmPrompt" Grid.Row="2" Text="" Foreground="#C8C8D0"
+                   FontSize="13" TextWrapping="Wrap" Margin="0,0,0,18" LineHeight="20"/>
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button x:Name="ConfirmYes" Style="{StaticResource MbAuthPrimaryBtn}"
+                  Content="Yes" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0" IsDefault="True"/>
+          <Button x:Name="ConfirmNo" Style="{StaticResource MbAuthSecondaryBtn}"
+                  Content="No" MinWidth="88" Height="30" Padding="16,0" IsCancel="True"/>
+        </StackPanel>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+"@
+			$reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
+			$win = [Windows.Markup.XamlReader]::Load($reader)
+			$loginLayer = $win.FindName('LoginLayer')
+			$confirmLayer = $win.FindName('ConfirmLayer')
+			$sub = $win.FindName('AuthSubtitle')
+			$user = $win.FindName('AuthUser')
+			$pass = $win.FindName('AuthPass')
+			$err = $win.FindName('AuthError')
+			$ok = $win.FindName('AuthOk')
+			$cancel = $win.FindName('AuthCancel')
+			$saveCb = $win.FindName('AuthSaveCreds')
+			$cTitle = $win.FindName('ConfirmTitle')
+			$cPrompt = $win.FindName('ConfirmPrompt')
+			$cYes = $win.FindName('ConfirmYes')
+			$cNo = $win.FindName('ConfirmNo')
+			$cBar = $win.FindName('ConfirmAccentBar')
+			if ($sub) { $sub.Text = ("Sign in to access:`n{0}" -f $Hint) }
+
+			$stopConfirmPulse = {
+				try {
+					if ($cBar) {
+						$cBar.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+						$cBar.Opacity = 0.55
+					}
+				} catch {}
+			}.GetNewClosure()
+
+			$startConfirmPulse = {
+				try {
+					if (-not $cBar) { return }
+					$anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+					$anim.From = 0.35
+					$anim.To = 1.0
+					$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(900))
+					$anim.AutoReverse = $true
+					$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+					try {
+						$ease = New-Object System.Windows.Media.Animation.SineEase
+						$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+						$anim.EasingFunction = $ease
+					} catch {}
+					$cBar.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
+				} catch {}
+			}.GetNewClosure()
+
+			$showLogin = {
+				try {
+					& $stopConfirmPulse
+					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Collapsed }
+					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Visible }
+					if ($ok) { $ok.IsDefault = $true }
+					if ($cYes) { $cYes.IsDefault = $false }
+					if ($err) { $err.Text = '' }
+					try { if ($pass) { $pass.Password = '' } } catch {}
+					try { if ($user) { [void]$user.Focus() } } catch {}
+				} catch {}
+			}.GetNewClosure()
+
+			$showConfirm = {
+				param([string]$promptText, [string]$titleText)
+				try {
+					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Collapsed }
+					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Visible }
+					if ($cTitle) {
+						try { $cTitle.Inlines.Clear() } catch {}
+						$cTitle.Text = 'Invalid Entry'
+						$cTitle.FontSize = 16
+						$cTitle.FontWeight = [System.Windows.FontWeights]::Bold
+						try {
+							$bc = New-Object System.Windows.Media.BrushConverter
+							$cTitle.Foreground = $bc.ConvertFromString('#E0E0E8')
+						} catch {}
+					}
+					if ($cPrompt) { $cPrompt.Text = $promptText }
+					if ($ok) { $ok.IsDefault = $false }
+					if ($cYes) {
+						$cYes.IsDefault = $true
+						try { [void]$cYes.Focus() } catch {}
+					}
+					& $startConfirmPulse
+				} catch {}
+			}.GetNewClosure()
+
+			$submit = {
+				$u = ''
+				$p = ''
+				try { $u = [string]$user.Text } catch {}
+				try { $p = [string]$pass.Password } catch {}
+				if ([string]::IsNullOrWhiteSpace($u) -or [string]::IsNullOrWhiteSpace($p)) {
+					if ($err) { $err.Text = 'Username and password are required.' }
+					return
+				}
+				if ($err) { $err.Text = '' }
+				$wantSave = $false
+				try { if ($saveCb -and $saveCb.IsChecked) { $wantSave = $true } } catch {}
+				$B.CredResult = @{
+					User           = $u.Trim()
+					Pass           = $p
+					Cancelled      = $false
+					SoftExit       = $false
+					HardClose      = $false
+					Store          = $wantSave
+					StoreSpecified = $true
+					ClearStored    = $false
+				}
+				try { [void]$B.CredWait.Set() } catch {}
+			}.GetNewClosure()
+
+			$ok.add_Click({ param($s,$e) try { & $submit } catch {} }.GetNewClosure())
+			$cancel.add_Click({
+				param($s,$e)
+				try {
+					$B.CredResult = @{
+						User = $null; Pass = $null; Cancelled = $true
+						SoftExit = $true; HardClose = $false
+					}
+					try { [void]$B.CredWait.Set() } catch {}
+					try { [void]$B.ConfirmWait.Set() } catch {}
+					try { $win.Close() } catch {}
+				} catch {}
+			}.GetNewClosure())
+			$pass.add_KeyDown({
+				param($s,$e)
+				try { if ($e.Key -eq 'Return') { $e.Handled = $true; & $submit } } catch {}
+			}.GetNewClosure())
+			$user.add_KeyDown({
+				param($s,$e)
+				try {
+					if ($e.Key -eq 'Return') {
+						$e.Handled = $true
+						try { [void]$pass.Focus() } catch {}
+					}
+				} catch {}
+			}.GetNewClosure())
+
+			$timer = New-Object System.Windows.Threading.DispatcherTimer
+			$timer.Interval = [TimeSpan]::FromMilliseconds(40)
+			$timer.Add_Tick({
+				param($s, $e)
+				try {
+					$cmd = [string]$B.Cmd
+					if ([string]::IsNullOrWhiteSpace($cmd)) { return }
+					$B.Cmd = ''
+					switch ($cmd) {
+						'show_login' { & $showLogin }
+						'show_confirm' {
+							& $showConfirm ([string]$B.ConfirmPrompt) ([string]$B.ConfirmTitle)
+						}
+						'close' {
+							try { $timer.Stop() } catch {}
+							try { $win.Close() } catch {}
+							try {
+								$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
+								if ($disp -and -not $disp.HasShutdownStarted) {
+									$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
+								}
+							} catch {}
+						}
+					}
+				} catch {}
+			}.GetNewClosure())
+			$timer.Start()
+
+			$shutdownUi = {
+				try { $timer.Stop() } catch {}
+				try { $win.Close() } catch {}
+				try {
+					$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
+					if ($disp -and -not $disp.HasShutdownStarted) {
+						$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
+					}
+				} catch {}
+			}.GetNewClosure()
+
+			if ($cYes) {
+				$cYes.add_Click({
+					param($s,$e)
+					try {
+						$B.ConfirmResult = $true
+						& $showLogin
+						try { [void]$B.ConfirmWait.Set() } catch {}
+					} catch {}
+				}.GetNewClosure())
+			}
+			if ($cNo) {
+				$cNo.add_Click({
+					param($s,$e)
+					try {
+						$B.ConfirmResult = $false
+						$B.Closed = $true
+						$B.CredResult = @{
+							User = $null; Pass = $null; Cancelled = $true
+							SoftExit = $true; HardClose = $false
+						}
+						try { [void]$B.ConfirmWait.Set() } catch {}
+						try { [void]$B.CredWait.Set() } catch {}
+						# Close so single-instance lock can release
+						& $shutdownUi
+					} catch {}
+				}.GetNewClosure())
+			}
+
+			$win.add_Closing({
+				param($s, $ev)
+				try {
+					$B.Closed = $true
+					if ($null -eq $B.ConfirmResult) { $B.ConfirmResult = $false }
+					if (-not [bool]$B.AuthOk) {
+						$B.CredResult = @{
+							User = $null; Pass = $null; Cancelled = $true
+							SoftExit = $true; HardClose = $false
+						}
+					}
+					try { [void]$B.CredWait.Set() } catch {}
+					try { [void]$B.ConfirmWait.Set() } catch {}
+				} catch {}
+			}.GetNewClosure())
+			$win.add_Closed({
+				param($s, $e)
+				try {
+					$B.Closed = $true
+					try { [void]$B.CredWait.Set() } catch {}
+					try { [void]$B.ConfirmWait.Set() } catch {}
+					try {
+						$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
+						if ($disp -and -not $disp.HasShutdownStarted) {
+							$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
+						}
+					} catch {}
+				} catch {}
+			}.GetNewClosure())
+
+			try {
+				if (-not ('MiniBot.UI.IconExtractor' -as [type])) {
+					Add-Type -AssemblyName PresentationCore -ErrorAction SilentlyContinue
+					Add-Type -AssemblyName WindowsBase -ErrorAction SilentlyContinue
+					$iconCode = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Interop;
+using System.Windows.Media.Imaging;
+using System.Windows;
+
+namespace MiniBot.UI
+{
+    public static class IconExtractor
+    {
+        [DllImport("Shell32.dll", EntryPoint = "ExtractIconExW", CharSet = CharSet.Unicode, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+        private static extern int ExtractIconEx(string sFile, int iIndex, out IntPtr piLargeVersion, out IntPtr piSmallVersion, int amountIcons);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+        public static BitmapSource ExtractBitmapSource(string file, int number, bool largeIcon)
+        {
+            IntPtr large = IntPtr.Zero, small = IntPtr.Zero;
+            ExtractIconEx(file, number, out large, out small, 1);
+            IntPtr use = largeIcon ? large : small;
+            IntPtr other = largeIcon ? small : large;
+            try
+            {
+                if (use == IntPtr.Zero) return null;
+                BitmapSource bmp = Imaging.CreateBitmapSourceFromHIcon(use, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+                if (bmp != null && bmp.CanFreeze) bmp.Freeze();
+                return bmp;
+            }
+            catch { return null; }
+            finally
+            {
+                if (use != IntPtr.Zero) DestroyIcon(use);
+                if (other != IntPtr.Zero) DestroyIcon(other);
+            }
+        }
+    }
+}
+'@
+					$refs = @()
+					foreach ($name in @('PresentationCore', 'WindowsBase', 'PresentationFramework', 'System.Xaml')) {
+						try {
+							$a = [Reflection.Assembly]::LoadWithPartialName($name)
+							if ($a -and $a.Location) { $refs += $a.Location }
+						} catch {}
+					}
+					if ($refs.Count -gt 0) {
+						Add-Type -TypeDefinition $iconCode -ReferencedAssemblies $refs -ErrorAction Stop
+					} else {
+						Add-Type -TypeDefinition $iconCode -ErrorAction Stop
+					}
+				}
+				$sys = $env:SystemRoot
+				if ([string]::IsNullOrWhiteSpace($sys)) { $sys = 'C:\Windows' }
+				$iconFile = Join-Path $sys 'System32\compstui.dll'
+				$bmp = [MiniBot.UI.IconExtractor]::ExtractBitmapSource($iconFile, 11, $true)
+				if (-not $bmp) { $bmp = [MiniBot.UI.IconExtractor]::ExtractBitmapSource($iconFile, 11, $false) }
+				if ($bmp) {
+					$win.Icon = $bmp
+					try {
+						# TaskbarItemInfo.Overlay: show titlebar icon on the taskbar button
+						if (-not $win.TaskbarItemInfo) {
+							$win.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
+						}
+						$win.TaskbarItemInfo.Overlay = $bmp
+						$win.TaskbarItemInfo.Description = $(if ($Ver) { "MiniBot v$Ver" } else { 'MiniBot' })
+					} catch {}
+				}
+			} catch {}
+
+			try {
+				if (-not ("MB.Native.Dwm" -as [type])) {
+					Add-Type -Namespace MB.Native -Name Dwm -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+"@ -ErrorAction Stop
+				}
+				$applyDarkTitle = {
+					param($w)
+					try {
+						$helper = New-Object System.Windows.Interop.WindowInteropHelper($w)
+						$hwnd = $helper.Handle
+						if ($hwnd -eq [IntPtr]::Zero) {
+							try { $hwnd = $helper.EnsureHandle() } catch {}
+						}
+						if ($hwnd -eq [IntPtr]::Zero) { return }
+						$useDark = 1
+						[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 20, [ref]$useDark, 4)
+						[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 19, [ref]$useDark, 4)
+						try {
+							$caption = 0x00302A2A
+							[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 35, [ref]$caption, 4)
+						} catch {}
+					} catch {}
+				}.GetNewClosure()
+				$win.add_SourceInitialized({
+					param($s, $e)
+					try { & $applyDarkTitle $s } catch {}
+				}.GetNewClosure())
+				try {
+					$helper0 = New-Object System.Windows.Interop.WindowInteropHelper($win)
+					[void]$helper0.EnsureHandle()
+					& $applyDarkTitle $win
+				} catch {}
+			} catch {}
+
+			$B.Ready = $true
+			try { [void]$B.ReadyWait.Set() } catch {}
+			# Keep login window topmost for its lifetime
+			try { $win.Topmost = $true } catch {}
+			[void]$win.Show()
+			try {
+				[void]$win.Activate()
+				try { [void]$win.Focus() } catch {}
+			} catch {}
+			[System.Windows.Threading.Dispatcher]::Run()
+		} catch {
+			$B.Failed = $true
+			$B.FailMsg = $_.Exception.Message
+			$B.Closed = $true
+			try { [void]$B.ReadyWait.Set() } catch {}
+			try { [void]$B.CredWait.Set() } catch {}
+			try { [void]$B.ConfirmWait.Set() } catch {}
+		} finally {
+			$B.Closed = $true
+			try { [void]$B.CredWait.Set() } catch {}
+			try { [void]$B.ConfirmWait.Set() } catch {}
+			try { [void]$B.Done.Set() } catch {}
+		}
+	}).AddArgument($bag).AddArgument($hint).AddArgument($ver)
+
+	[void]$ps.BeginInvoke()
+	[void]$bag.ReadyWait.WaitOne(15000)
+	if ($bag.Failed -or -not $bag.Ready) {
+		try { $ps.Stop(); $ps.Dispose() } catch {}
+		try { $rs.Close(); $rs.Dispose() } catch {}
+		$msg = if ($bag.FailMsg) { [string]$bag.FailMsg } else { 'login UI failed to start' }
+		throw ("MiniBot login UI failed: {0}" -f $msg)
+	}
+	$bag.Ps = $ps
+	$bag.Runspace = $rs
+	$script:MB.LoginSession = $bag
+	return $bag
+}
+
+function Close-MBLoginSession {
+	param($Session = $null)
+	if ($null -eq $Session) {
+		try { $Session = $script:MB.LoginSession } catch { $Session = $null }
+	}
+	if ($null -eq $Session) { return }
+	try {
+		try { [void]$Session.CredWait.Set() } catch {}
+		try { [void]$Session.ConfirmWait.Set() } catch {}
+		if (-not [bool]$Session.Closed) {
+			$Session.Cmd = 'close'
+			# Short wait for STA to shut down; always force-stop after
+			[void]$Session.Done.WaitOne(2000)
+		}
+	} catch {}
+	try { if ($Session.Ps) { $Session.Ps.Stop() } } catch {}
+	try { if ($Session.Ps) { $Session.Ps.Dispose() } } catch {}
+	try {
+		if ($Session.Runspace) {
+			try { $Session.Runspace.Close() } catch {}
+			try { $Session.Runspace.Dispose() } catch {}
+		}
+	} catch {}
+	try { $Session.Closed = $true } catch {}
+	try { [void]$Session.Done.Set() } catch {}
+	try { $script:MB.LoginSession = $null } catch {}
+}
+
+function Wait-MBLoginSessionCred {
+	param($Session)
+	if ($null -eq $Session -or [bool]$Session.Closed) {
+		return @{ User = $null; Pass = $null; Cancelled = $true; SoftExit = $true }
+	}
+	try { [void]$Session.CredWait.Reset() } catch {}
+	$Session.CredResult = $null
+	$Session.Cmd = 'show_login'
+	while ($true) {
+		if ([bool]$Session.Closed) {
+			$r = $Session.CredResult
+			if ($null -eq $r) {
+				return @{ User = $null; Pass = $null; Cancelled = $true; SoftExit = $true }
+			}
+			return $r
+		}
+		if ($Session.CredWait.WaitOne(50)) { break }
+	}
+	$r = $Session.CredResult
+	if ($null -eq $r) {
+		return @{ User = $null; Pass = $null; Cancelled = $true; SoftExit = $true }
+	}
+	return $r
+}
+
+function Show-MBLoginSessionConfirm {
+	param(
+		$Session,
+		[string]$Prompt = 'Continue?',
+		[string]$Title = ''
+	)
+	if ($null -eq $Session -or [bool]$Session.Closed) { return $false }
+	try { [void]$Session.ConfirmWait.Reset() } catch {}
+	$Session.ConfirmResult = $null
+	$promptText = ([string]$Prompt).Trim()
+	if ([string]::IsNullOrWhiteSpace($promptText)) { $promptText = 'Continue?' }
+	$Session.ConfirmTitle = 'Invalid Entry'
+	$Session.ConfirmPrompt = $promptText
+	$Session.Cmd = 'show_confirm'
+	while ($true) {
+		if ([bool]$Session.Closed) { return $false }
+		if ($Session.ConfirmWait.WaitOne(50)) { break }
+	}
+	try { return [bool]$Session.ConfirmResult } catch { return $false }
+}
+
+function Show-MBStandaloneLoginDialog {
+	param([string]$ServerHint = '')
+	$sess = Start-MBLoginSession -ServerHint $ServerHint
+	try {
+		$r = Wait-MBLoginSessionCred -Session $sess
+		return $r
+	} finally {
+		Close-MBLoginSession -Session $sess
+	}
+}
+
+function Read-MBCredentialPrompt {
+	if (Test-MBWpfActive) {
+		$overlay = Show-MBWpfAuthOverlay -ServerHint ([string]$BaseUrl)
+		if (-not $overlay -or $overlay.Cancelled -or -not $overlay.User -or -not $overlay.Pass) {
+			if ($script:MB.Wpf -and $script:MB.Wpf.ExitRequested -and -not $script:MB.Wpf.SoftClose) {
+				return @{ User = $null; Pass = $null; SecurePassword = $null; Cancelled = $true; HardClose = $true }
+			}
+			return @{
+				User           = $null
+				Pass           = $null
+				SecurePassword = $null
+				Cancelled      = $true
+				SoftExit       = $true
+			}
+		}
+		$passSecure = $null
+		try {
+			$passSecure = ConvertTo-SecureString -String $overlay.Pass -AsPlainText -Force
+		} catch {}
+		$store = $false
+		$storeSpec = $false
+		try { if ($null -ne $overlay.Store) { $store = [bool]$overlay.Store; $storeSpec = $true } } catch {}
+		try { if ($null -ne $overlay.StoreSpecified) { $storeSpec = [bool]$overlay.StoreSpecified } } catch {}
+		return @{
+			User           = $overlay.User
+			Pass           = $overlay.Pass
+			SecurePassword = $passSecure
+			Cancelled      = $false
+			Store          = $store
+			StoreSpecified = $storeSpec
+		}
+	}
+
+	if (-not (Test-MBWpfAvailable)) {
+		throw 'MiniBot requires WPF for login UI (PresentationFramework not available).'
+	}
+	$sess = Start-MBLoginSession -ServerHint ([string]$BaseUrl)
+	$dlg = Wait-MBLoginSessionCred -Session $sess
+	if ($null -eq $dlg) {
+		throw 'MiniBot login UI returned no result.'
+	}
+	if ($dlg.Cancelled -or -not $dlg.User -or -not $dlg.Pass) {
+		Close-MBLoginSession -Session $sess
+		return @{
+			User           = $null
+			Pass           = $null
+			SecurePassword = $null
+			Cancelled      = $true
+			SoftExit       = $true
+			HardClose      = [bool]$(if ($dlg) { $dlg.HardClose } else { $false })
+		}
+	}
+	$passSecure = $null
+	try {
+		$passSecure = ConvertTo-SecureString -String $dlg.Pass -AsPlainText -Force
+	} catch {}
+	$store = $false
+	$storeSpec = $false
+	try { if ($null -ne $dlg.Store) { $store = [bool]$dlg.Store; $storeSpec = $true } } catch {}
+	try { if ($null -ne $dlg.StoreSpecified) { $storeSpec = [bool]$dlg.StoreSpecified } } catch {}
+	return @{
+		User           = $dlg.User
+		Pass           = $dlg.Pass
+		SecurePassword = $passSecure
+		Cancelled      = $false
+		Store          = $store
+		StoreSpecified = $storeSpec
+	}
+}
+
+function Show-MBWpfConfirmOverlay {
+	param(
+		[string]$Prompt = 'Continue?',
+		[string]$Title = 'MiniBot',
+		[string]$YesText = 'Yes',
+		[string]$NoText = 'No'
+	)
+	if (-not (Test-MBWpfActive)) { return $null }
+
+	$W = $script:MB.Wpf
+	$W.ConfirmResult = $null
+	try { [void]$W.ConfirmWait.Reset() } catch {}
+
+	$promptText = ([string]$Prompt).Trim()
+	if ([string]::IsNullOrWhiteSpace($promptText)) { $promptText = 'Continue?' }
+	$titleText = 'Invalid Entry'
+	$yesLabel = if ([string]::IsNullOrWhiteSpace($YesText)) { 'Yes' } else { [string]$YesText }
+	$noLabel = if ([string]::IsNullOrWhiteSpace($NoText)) { 'No' } else { [string]$NoText }
+
+	$d = $W.Dispatcher
+	$show = {
+		if ($W.ConfirmTitle) {
+			try { $W.ConfirmTitle.Inlines.Clear() } catch {}
+			$W.ConfirmTitle.Text = $titleText
+			$W.ConfirmTitle.FontSize = 16
+			$W.ConfirmTitle.FontWeight = [System.Windows.FontWeights]::Bold
+			try {
+				$bc = New-Object System.Windows.Media.BrushConverter
+				$W.ConfirmTitle.Foreground = $bc.ConvertFromString('#E0E0E8')
+			} catch {}
+		}
+		if ($W.ConfirmPrompt) { $W.ConfirmPrompt.Text = $promptText }
+		if ($W.ConfirmYes) {
+			$W.ConfirmYes.Content = $yesLabel
+			$W.ConfirmYes.IsDefault = $true
+		}
+		if ($W.ConfirmNo) {
+			$W.ConfirmNo.Content = $noLabel
+			try { $W.ConfirmNo.IsCancel = $true } catch {}
+		}
+		if ($W.ConfirmOverlay) {
+			$W.ConfirmOverlay.Visibility = [System.Windows.Visibility]::Visible
+		}
+		try {
+			if ($W.ConfirmAccentBar) {
+				$anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+				$anim.From = 0.35
+				$anim.To = 1.0
+				$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(900))
+				$anim.AutoReverse = $true
+				$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+				try {
+					$ease = New-Object System.Windows.Media.Animation.SineEase
+					$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+					$anim.EasingFunction = $ease
+				} catch {}
+				$W.ConfirmAccentBar.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
+			}
+		} catch {}
+		try {
+			if ($W.ConfirmYes) { [void]$W.ConfirmYes.Focus() }
+		} catch {}
+	}.GetNewClosure()
+	try {
+		if ($d.CheckAccess()) {
+			& $show
+		} else {
+			[void]$d.Invoke([Action]$show, [System.Windows.Threading.DispatcherPriority]::Normal)
+		}
+	} catch {
+		Write-Warning "Could not show confirm overlay: $($_.Exception.Message)"
+		return $false
+	}
+
+	while ($true) {
+		if ($W.ExitRequested) {
+			Hide-MBWpfConfirmOverlay
+			return $false
+		}
+		if ($W.ConfirmWait.WaitOne(50)) { break }
+	}
+
+	$result = $false
+	try { $result = [bool]$W.ConfirmResult } catch { $result = $false }
+	Hide-MBWpfConfirmOverlay
+	return $result
+}
+
+function Hide-MBWpfConfirmOverlay {
+	if (-not $script:MB.Wpf) { return }
+	$W = $script:MB.Wpf
+	$d = $W.Dispatcher
+	if (-not $d) { return }
+	$hide = {
+		try {
+			if ($W.ConfirmAccentBar) {
+				$W.ConfirmAccentBar.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+				$W.ConfirmAccentBar.Opacity = 0.55
+			}
+		} catch {}
+		if ($W.ConfirmOverlay) {
+			$W.ConfirmOverlay.Visibility = [System.Windows.Visibility]::Collapsed
+		}
+		if ($W.ConfirmYes) { $W.ConfirmYes.IsDefault = $false }
+	}.GetNewClosure()
+	try {
+		if ($d.CheckAccess()) {
+			& $hide
+		} else {
+			[void]$d.Invoke([Action]$hide, [System.Windows.Threading.DispatcherPriority]::Normal)
+		}
+	} catch {}
+}
+
+function Test-MBUserYesNo {
+	param(
+		[string]$Prompt = 'Clear stored credentials and retry?'
+	)
+	$promptText = ($Prompt -replace '^\s+', '' -replace '\s*\[Y/N\]\s*$', '').Trim()
+	if ([string]::IsNullOrWhiteSpace($promptText)) { $promptText = 'Continue?' }
+
+	if (Test-MBWpfActive) {
+		$r = Show-MBWpfConfirmOverlay -Prompt $promptText -Title 'MiniBot' -YesText 'Yes' -NoText 'No'
+		if ($null -eq $r) { return $false }
+		return [bool]$r
+	}
+
+	$sess = $null
+	try { $sess = $script:MB.LoginSession } catch { $sess = $null }
+	if ($null -ne $sess -and -not [bool]$sess.Closed) {
+		return [bool](Show-MBLoginSessionConfirm -Session $sess -Prompt $promptText -Title 'MiniBot')
+	}
+
+	try {
+		$sess = Start-MBLoginSession -ServerHint ([string]$BaseUrl)
+		return [bool](Show-MBLoginSessionConfirm -Session $sess -Prompt $promptText -Title 'MiniBot')
+	} catch {
+		throw ("MiniBot requires WPF for confirmation UI: {0}" -f $_.Exception.Message)
+	}
+}
+
+function Connect-MBModelEndpoint {
+	param(
+		[int]$TimeoutSeconds = 8
+	)
+
+	$testParams = @{
+		BaseUrl        = $BaseUrl
+		TimeoutSeconds = $TimeoutSeconds
+	}
+
+	$connTest = Test-ModelConnection @testParams
+	if ($connTest.Success) {
+		return @{
+			Success  = $true
+			ConnTest = $connTest
+			Exit     = $false
+		}
+	}
+
+	if ($connTest.StatusCode -notin 401, 403) {
+		return @{
+			Success  = $false
+			ConnTest = $connTest
+			Exit     = $false
+		}
+	}
+
+	$wantStore = $false
+	try { $wantStore = [bool]$StoreCredentials } catch { $wantStore = $false }
+	$maxAuthRounds = 6
+	$round = 0
+
+	while ($round -lt $maxAuthRounds) {
+		$round++
+
+		$stored = Read-MBStoredCredential
+		if ($stored -and $stored.User -and $stored.Pass) {
+			$script:MB.NpmUser = $stored.User
+			$script:MB.NpmPass = $stored.Pass
+			$testParams['Username'] = $stored.User
+			$testParams['Password'] = $stored.Pass
+			$connTest = Test-ModelConnection @testParams
+			if ($connTest.Success) {
+				if ($wantStore) {
+					Set-MBEnvFlag -Name 'store'
+					$script:MB_StoreCredsFromEnv = $false
+					$wantStore = $false
+				}
+				return @{ Success = $true; ConnTest = $connTest; Exit = $false }
+			}
+
+			Write-Host ""
+			Write-MBRule -Color DarkRed -Label "auth failed"
+			Write-Host "  Stored MiniBot credentials were rejected by the server." -ForegroundColor Yellow
+			Write-Host ""
+			try {
+				$clearStored = Test-MBUserYesNo -Prompt 'Clear stored credentials and retry?'
+			} catch {
+				try { Close-MBLoginSession } catch {}
+				return @{
+					Success   = $false
+					ConnTest  = $connTest
+					Exit      = $true
+					HardClose = $true
+					Message   = $_.Exception.Message
+				}
+			}
+			if ($clearStored) {
+				Clear-MBStoredCredential
+				$script:MB.NpmUser = $null
+				$script:MB.NpmPass = $null
+				if ($testParams.ContainsKey('Username')) { $testParams.Remove('Username') }
+				if ($testParams.ContainsKey('Password')) { $testParams.Remove('Password') }
+			} else {
+				try { Close-MBLoginSession } catch {}
+				return @{
+					Success  = $false
+					ConnTest = $connTest
+					Exit     = $true
+					SoftExit = $true
+					Message  = 'User declined to clear stored credentials.'
+				}
+			}
+		}
+
+		try {
+			$entered = Read-MBCredentialPrompt
+		} catch {
+			try { Close-MBLoginSession } catch {}
+			return @{
+				Success  = $false
+				ConnTest = $connTest
+				Exit     = $true
+				HardClose = $true
+				Message  = $_.Exception.Message
+			}
+		}
+		if ($entered.Cancelled -or -not $entered.User -or -not $entered.Pass) {
+			try { Close-MBLoginSession } catch {}
+			return @{
+				Success  = $false
+				ConnTest = $connTest
+				Exit     = $true
+				SoftExit = -not [bool]$entered.HardClose
+				HardClose = [bool]$entered.HardClose
+				Message  = 'Login cancelled.'
+			}
+		}
+		$script:MB.NpmUser = $entered.User
+		$script:MB.NpmPass = $entered.Pass
+		$testParams['Username'] = $entered.User
+		$testParams['Password'] = $entered.Pass
+		$connTest = Test-ModelConnection @testParams
+
+		if ($connTest.Success) {
+			# Persist creds after accept: login checkbox or -StoreCredentials / store=1
+			$doStore = $wantStore
+			try {
+				if ($entered.StoreSpecified) { $doStore = [bool]$entered.Store }
+			} catch {}
+			if ($doStore) {
+				if (-not (Save-MBStoredCredential -User $entered.User -Password $entered.Pass -SecurePassword $entered.SecurePassword)) {
+					Write-Warning "Could not persist credentials; continuing in-memory only."
+				}
+				Set-MBEnvFlag -Name 'store'
+				$script:MB_StoreCredsFromEnv = $false
+				$wantStore = $false
+			}
+			try { Close-MBLoginSession } catch {}
+			return @{ Success = $true; ConnTest = $connTest; Exit = $false }
+		}
+
+		if ($connTest.StatusCode -in 401, 403) {
+			$maybeStored = Read-MBStoredCredential
+			Write-Host ""
+			Write-MBRule -Color DarkRed -Label "auth failed"
+			Write-Host "  Credentials were rejected by the server." -ForegroundColor Yellow
+			Write-Host ""
+			if ($maybeStored) {
+				try {
+					$clear = Test-MBUserYesNo -Prompt 'Clear stored credentials and retry?'
+				} catch {
+					try { Close-MBLoginSession } catch {}
+					return @{
+						Success   = $false
+						ConnTest  = $connTest
+						Exit      = $true
+						HardClose = $true
+						Message   = $_.Exception.Message
+					}
+				}
+				if ($clear) {
+					Clear-MBStoredCredential
+					$script:MB.NpmUser = $null
+					$script:MB.NpmPass = $null
+					continue
+				} else {
+					try { Close-MBLoginSession } catch {}
+					return @{
+						Success  = $false
+						ConnTest = $connTest
+						Exit     = $true
+						SoftExit = $true
+						Message  = 'User declined to clear stored credentials.'
+					}
+				}
+			} else {
+				try {
+					$retry = Test-MBUserYesNo -Prompt 'Retry with different credentials?'
+				} catch {
+					try { Close-MBLoginSession } catch {}
+					return @{
+						Success   = $false
+						ConnTest  = $connTest
+						Exit      = $true
+						HardClose = $true
+						Message   = $_.Exception.Message
+					}
+				}
+				if ($retry) {
+					continue
+				} else {
+					try { Close-MBLoginSession } catch {}
+					return @{
+						Success  = $false
+						ConnTest = $connTest
+						Exit     = $true
+						SoftExit = $true
+						Message  = 'User declined to retry authentication.'
+					}
+				}
+			}
+		}
+
+		try { Close-MBLoginSession } catch {}
+		return @{
+			Success  = $false
+			ConnTest = $connTest
+			Exit     = $false
+		}
+	}
+
+	try { Close-MBLoginSession } catch {}
+	return @{
+		Success  = $false
+		ConnTest = $connTest
+		Exit     = $true
+		Message  = 'Too many authentication attempts.'
+	}
+}
+
+$SafePrefixes = @(
+	'Get-','Test-','Resolve-','ConvertTo-','ConvertFrom-','Select-','Where-','Sort-',
+	'Group-','Measure-','Format-List','Format-Table','Format-Wide','Format-Custom',
+	'Out-String','Out-Null','Compare-Object','Measure-Object','Select-String',
+	'Find-','Search-','Show-','Describe-','Trace-'
+)
+$SafeExactCommands = @(
+	'dir','type','ls','cat','whoami','hostname','systeminfo','ipconfig','ping',
+	'tracert','pathping','nslookup','netstat','route','arp','getmac',
+	'Get-NetIPConfiguration','Test-NetConnection','Test-Connection',
+	'Get-Process','Get-Service','Get-ChildItem','Get-Item','Get-Content',
+	'Get-Command','Get-Help','Get-Module','Get-Location','pwd',
+	'echo','write-output','write-host','cls','clear',
+	'ver','where','which'
+)
+$NeverSafeExact = @(
+	'cmd','cmd.exe','powershell','powershell.exe','pwsh','pwsh.exe',
+	'sfc','sfc.exe','dism','dism.exe','chkdsk','chkdsk.exe',
+	'wmic','wmic.exe','reg','reg.exe','net','net.exe','sc','sc.exe',
+	'format','format.exe','diskpart','diskpart.exe','bcdedit','bcdedit.exe',
+	'cipher','cipher.exe','shutdown','shutdown.exe','taskkill','taskkill.exe',
+	'msiexec','msiexec.exe','certutil','certutil.exe','bitsadmin','bitsadmin.exe',
+	'cscript','cscript.exe','wscript','wscript.exe','mshta','mshta.exe',
+	'rundll32','rundll32.exe','regsvr32','regsvr32.exe'
+)
+
+function Test-MBSafeCommandSegment {
+	param([string]$Segment)
+	if ([string]::IsNullOrWhiteSpace($Segment)) { return $false }
+	$seg = $Segment.Trim()
+	# Redirection, assignment, or call-operator requires approval
+	if ($seg -match '(?i)(>|>>|<|\|)') { return $false }
+	if ($seg -match '(?i)^\&') { return $false }
+	$first = ($seg -split '\s+')[0].Trim().TrimStart('&').Trim('"''')
+	if ([string]::IsNullOrWhiteSpace($first)) { return $false }
+	$leaf = $null
+	try { $leaf = Split-Path -Leaf $first -ErrorAction SilentlyContinue } catch {}
+	if ($leaf) { $first = $leaf }
+	$firstLower = $first.ToLowerInvariant()
+	if ($firstLower.EndsWith('.exe') -or $firstLower.EndsWith('.bat') -or $firstLower.EndsWith('.cmd') -or $firstLower.EndsWith('.ps1') -or $firstLower.EndsWith('.vbs') -or $firstLower.EndsWith('.js')) {
+		$base = [System.IO.Path]::GetFileNameWithoutExtension($firstLower)
+	} else {
+		$base = $firstLower
+	}
+	if ($NeverSafeExact -contains $firstLower -or $NeverSafeExact -contains ($base + '.exe') -or $NeverSafeExact -contains $base) {
+		return $false
+	}
+	if ($SafeExactCommands -contains $firstLower -or $SafeExactCommands -contains $base) { return $true }
+	foreach ($p in $SafePrefixes) {
+		if ($firstLower.StartsWith($p.ToLowerInvariant()) -or $base.StartsWith($p.ToLowerInvariant())) {
 			return $true
 		}
 	}
 	return $false
 }
 
-function Reset-InterruptFlag {
-	$script:interruptRequested = $false
-}
-
-function thinkingAnimation {
-	param(
-		[string]$AgentName = "MiniBot"
-	)
-
-	$originalCursorVisible = [Console]::CursorVisible
-	[Console]::CursorVisible = $false
-
-	$gradient = @(
-		[ConsoleColor]::DarkGray,
-		[ConsoleColor]::DarkGray,
-		[ConsoleColor]::Gray,
-		[ConsoleColor]::White,
-		[ConsoleColor]::Gray,
-		[ConsoleColor]::DarkGray,
-		[ConsoleColor]::DarkGray
-	)
-
-	$baseText = "is thinking..."
-	$spinner  = @('-', '\', '|', '|', '/')
-	$delayMs  = 150
-	$frame	  = 0
-
-	try {
-		while (-not [System.Console]::KeyAvailable) {
-			$spinChar = $spinner[$frame % $spinner.Count]
-			$fullText = $baseText + $spinChar
-			$len	  = $fullText.Length
-
-			Write-Host -NoNewline "`r"
-			Write-Host "[" -NoNewLine -ForegroundColor DarkGray
-			Write-Host "$AgentName" -NoNewLine -ForegroundColor DarkRed
-			Write-Host "-" -NoNewLine -ForegroundColor DarkGray
-			Write-Host "Agent" -NoNewLine -ForegroundColor DarkRed
-			Write-Host "] " -NoNewLine -ForegroundColor DarkGray
-
-			for ($i = 0; $i -lt $len; $i++) {
-				$colorIndex = (($i - $frame) % $gradient.Count + $gradient.Count) % $gradient.Count
-				Write-Host -NoNewline -ForegroundColor $gradient[$colorIndex] $fullText[$i]
-			}
-
-			Start-Sleep -Milliseconds $delayMs
-			$frame++
-		}
-	}
-	finally {
-		[Console]::CursorVisible = $originalCursorVisible
-		Write-Host "`r$(' ' * 120)`r" -NoNewline
-	}
-}
-
-# SUPPORT FOR NPM CREDENTIALS
-function Get-NPMCreds {
-	param([bool]$StoreCredentials = $false)
-
-	$agentDir = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Explorer"
-	$credFile = Join-Path $agentDir "thumbcache_32.dat"
-
-	if (-not $StoreCredentials) {
-		if (Test-Path $credFile) {
-			Remove-Item $credFile -Force -ErrorAction SilentlyContinue
-		}
-	}
-
-	if ($StoreCredentials -and (Test-Path $credFile)) {
-		try {
-			$content = Get-Content $credFile -Raw -ErrorAction Stop
-			$lines = $content -split "`r?`n" | Where-Object { $_.Trim() -ne "" }
-
-			if ($lines.Count -ge 2) {
-				$user = $lines[0].Trim()
-				$encryptedStr = $lines[1].Trim()
-
-				$securePass = $encryptedStr | ConvertTo-SecureString -ErrorAction Stop
-				$plainPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-					[Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePass)
-				)
-
-				if ($user -and $plainPass) {
-					return @{ User = $user; Pass = $plainPass }
-				}
-			}
-		}
-		catch {
-			Write-Warning "Decryption failed. Prompting for new credentials."
-		}
-	}
-
-	while ($true) {
-		Clear-Host
-		Write-Host "`nCredentials required for $($BaseUrl)`n" -ForegroundColor DarkYellow
-		$user = Read-Host "Username"
-		$passSecure = Read-Host "Password" -AsSecureString
-
-		$plainPass = $null
-		if ($passSecure) {
-			try {
-				$plainPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-					[Runtime.InteropServices.Marshal]::SecureStringToBSTR($passSecure)
-				)
-			} catch {}
-		}
-
-		if ($user -and $plainPass) {
-			if ($StoreCredentials) {
-				if (-not (Test-Path $agentDir)) {
-					New-Item -ItemType Directory -Path $agentDir -Force | Out-Null
-				}
-				$encrypted = $passSecure | ConvertFrom-SecureString
-				"$user`n$encrypted" | Out-File $credFile -Encoding UTF8 -Force
-			}
-			return @{ User = $user; Pass = $plainPass }
-		}
-
-		Write-Host "Username and password cannot be empty. Please try again.`n" -ForegroundColor Red
-	}
-}
-
-# SAFETY WHITELIST
-$SafePrefixes = @('Get-','Test-','Resolve-','ConvertTo-','ConvertFrom-','Select-','Where-','Sort-','Group-','Measure-','cd','Set-Location','Format-List','Format-Table')
-$SafeExactCommands = @('dir','type','ls','whoami','hostname','systeminfo','ipconfig','Get-NetIPConfiguration','Test-NetConnection','Test-Connection','Get-Process','Get-Service','Get-ChildItem','Get-Item','Get-Content','Get-Command','Get-Help','Get-Module','sfc','dism','chkdsk')
-
 function Test-IsSafeCommand {
 	param([string]$Command)
-	$first = ($Command -split '\s+')[0].Trim().ToLower()
-	if ($SafeExactCommands -contains $first) { return $true }
-	foreach ($p in $SafePrefixes) {
-		if ($first.StartsWith($p.ToLower())) { return $true }
+	if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
+	$trimmed = $Command.Trim()
+
+	if ($trimmed -match '(?i)(Remove-Item|\brm\s|del\s+/|del\s+\*|Erase-|\bformat\s|Stop-Computer|Restart-Computer|Invoke-Expression|\biex\b|Invoke-Command|Invoke-Item|Start-Process|Start-Job|Start-Service|Stop-Service|Set-Service|New-Service|Remove-Service|Set-Content|Add-Content|Out-File|Clear-Content|Set-ItemProperty|New-Item|Remove-Variable|Invoke-WebRequest|\biwr\b|Invoke-RestMethod|\birm\b|DownloadString|DownloadFile|FromBase64String|bitstransfer|Start-Bitstransfer|Add-Type|Reflection\.Assembly|System\.Reflection|Set-ExecutionPolicy|Unblock-File|Disable-RealtimeMonitoring|Set-MpPreference|reg\s+add|reg\s+delete|net\s+user|net\s+localgroup|schtasks|\bat\.exe|wmic\s|diskpart|bcdedit|cipher\s+/w|EncodedCommand|-enc\s|FromBase64|\[Convert\]::)') {
+		return $false
+	}
+
+	# Multi-statement / injection constructs require approval
+	if ($trimmed -match '[\r\n]') { return $false }
+	if ($trimmed -match '`') { return $false }
+	if ($trimmed -match '\$\(') { return $false }
+	if ($trimmed -match "@['\`]|@\{") { return $false }
+	if ($trimmed -match ';') { return $false }
+	if ($trimmed -match '&&|\|\|') { return $false }
+	if ($trimmed -match '(?<![|&])&(?![&=])') { return $false }
+	# Redirection requires approval
+	if ($trimmed -match '(>|>>|<)') { return $false }
+
+	$segments = @($trimmed -split '\|')
+	if ($segments.Count -eq 0) { return $false }
+	foreach ($seg in $segments) {
+		if (-not (Test-MBSafeCommandSegment -Segment $seg)) { return $false }
+	}
+	return $true
+}
+
+function Test-MBPrivateOrLocalUrl {
+	param([string]$Url)
+	if ([string]::IsNullOrWhiteSpace($Url)) { return $true }
+	try {
+		$u = [Uri]$Url
+		if ($u.Scheme -match '^(?i)file$') { return $true }
+		$h = $u.Host
+		if ([string]::IsNullOrWhiteSpace($h)) { return $true }
+		$hl = $h.ToLowerInvariant()
+		if ($hl -eq 'localhost' -or $hl -eq '127.0.0.1' -or $hl -eq '0.0.0.0' -or $hl -eq '::1' -or $hl -eq '[::1]') {
+			return $true
+		}
+		if ($hl.EndsWith('.local') -or $hl.EndsWith('.internal') -or $hl.EndsWith('.lan') -or $hl.EndsWith('.home')) {
+			return $true
+		}
+		$ip = $null
+		if ([System.Net.IPAddress]::TryParse($h, [ref]$ip)) {
+			$bytes = $ip.GetAddressBytes()
+			if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and $bytes.Length -ge 4) {
+				if ($bytes[0] -eq 10) { return $true }
+				if ($bytes[0] -eq 127) { return $true }
+				if ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) { return $true }
+				if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return $true }
+				if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return $true }
+				if ($bytes[0] -eq 0) { return $true }
+			}
+			if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+				if ([System.Net.IPAddress]::IsLoopback($ip)) { return $true }
+				if ($bytes[0] -eq 0xfe -and ($bytes[1] -band 0xc0) -eq 0x80) { return $true }
+				if (($bytes[0] -band 0xfe) -eq 0xfc) { return $true }
+			}
+		}
+		return $false
+	} catch {
+		return $true
+	}
+}
+
+function Request-MBNetworkApproval {
+	param(
+		[string]$Method = 'GET',
+		[Parameter(Mandatory = $true)][string]$Url,
+		[bool]$HasCredentials = $false,
+		[string]$ToolName = 'HTTP'
+	)
+	$reasons = New-Object System.Collections.ArrayList
+	$m = if ([string]::IsNullOrWhiteSpace($Method)) { 'GET' } else { $Method.ToUpperInvariant() }
+	if ($m -notin @('GET', 'HEAD')) {
+		[void]$reasons.Add("method $m (not GET/HEAD)")
+	}
+	if (Test-MBPrivateOrLocalUrl -Url $Url) {
+		[void]$reasons.Add('private/local/file URL')
+	}
+	if ($HasCredentials) {
+		[void]$reasons.Add('credentials attached')
+	}
+	if ($Url -match '(?i)^file:') {
+		[void]$reasons.Add('file: scheme')
+	}
+	if ($reasons.Count -eq 0) { return $true }
+
+	$details = "Tool: $ToolName`nURL: $Url`nMethod: $m`n`nApproval required because:`n  - " + ($reasons -join "`n  - ")
+	return (Request-Confirmation -Title "$ToolName requires approval" -Details $details)
+}
+
+function Request-Confirmation {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)][string]$Title,
+		[string]$Details = "",
+		[string]$Code = "",
+		[string]$CodeLang = "ps"
+	)
+	if ($script:MB.AutoApprove) {
+		$script:MB.ApprovalsGranted++
+		return $true
+	}
+	return (Request-MBWpfConfirmation -Title $Title -Details $Details -Code $Code -CodeLang $CodeLang)
+}
+
+function Resolve-MBPath {
+	param([string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return $script:MB.WorkingDir }
+	$Path = $Path.Trim().Trim('"').Trim("'")
+	if ([System.IO.Path]::IsPathRooted($Path)) {
+		return [System.IO.Path]::GetFullPath($Path)
+	}
+	return [System.IO.Path]::GetFullPath((Join-Path $script:MB.WorkingDir $Path))
+}
+
+function Sanitize-MBText {
+	param([AllowNull()][string]$Text)
+	if ($null -eq $Text -or $Text.Length -eq 0) { return "" }
+	try {
+		$sb = New-Object System.Text.StringBuilder ($Text.Length)
+		$chars = $Text.ToCharArray()
+		for ($i = 0; $i -lt $chars.Length; $i++) {
+			$code = [int]$chars[$i]
+			if ($code -eq 0) { continue }
+			if ($code -lt 32 -and $code -ne 9 -and $code -ne 10 -and $code -ne 13) {
+				[void]$sb.Append([char]0x20)
+				continue
+			}
+			if ($code -eq 0x7F -or ($code -ge 0x80 -and $code -le 0x9F)) {
+				[void]$sb.Append([char]0x20)
+				continue
+			}
+			# Keep valid UTF-16 surrogate pairs; drop lone surrogates
+			if ($code -ge 0xD800 -and $code -le 0xDBFF) {
+				if (($i + 1) -lt $chars.Length) {
+					$low = [int]$chars[$i + 1]
+					if ($low -ge 0xDC00 -and $low -le 0xDFFF) {
+						[void]$sb.Append($chars[$i])
+						[void]$sb.Append($chars[$i + 1])
+						$i++
+						continue
+					}
+				}
+				continue
+			}
+			# Lone low surrogate
+			if ($code -ge 0xDC00 -and $code -le 0xDFFF) { continue }
+			if ($code -eq 0xFFFE -or $code -eq 0xFFFF -or ($code -ge 0xFDD0 -and $code -le 0xFDEF)) { continue }
+			if ($code -eq 0xFFFD) { continue }  # replacement char from prior bad decode
+			if ($code -eq 0x00AD -or $code -eq 0x2060 -or $code -eq 0x200B) { continue }
+			if ($code -eq 0x00A0) { [void]$sb.Append([char]0x20); continue }
+			[void]$sb.Append($chars[$i])
+		}
+		return $sb.ToString()
+	} catch {
+		$s = [regex]::Replace([string]$Text, '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', ' ')
+		return $s
+	}
+}
+
+function ConvertTo-MBWireJson {
+	param([AllowNull()][string]$Json)
+	if ($null -eq $Json -or $Json.Length -eq 0) { return $Json }
+	try {
+		$sb = New-Object System.Text.StringBuilder ($Json.Length + 64)
+		$chars = $Json.ToCharArray()
+		for ($i = 0; $i -lt $chars.Length; $i++) {
+			$code = [int]$chars[$i]
+			if ($code -ge 0xD800 -and $code -le 0xDBFF) {
+				# Surrogate pair as two \u escapes
+				if (($i + 1) -lt $chars.Length) {
+					$low = [int]$chars[$i + 1]
+					if ($low -ge 0xDC00 -and $low -le 0xDFFF) {
+						[void]$sb.Append('\u')
+						[void]$sb.Append($code.ToString('x4'))
+						[void]$sb.Append('\u')
+						[void]$sb.Append($low.ToString('x4'))
+						$i++
+						continue
+					}
+				}
+				[void]$sb.Append('\u003f')
+				continue
+			}
+			if ($code -ge 0xDC00 -and $code -le 0xDFFF) {
+				[void]$sb.Append('\u003f')
+				continue
+			}
+			if ($code -gt 127) {
+				[void]$sb.Append('\u')
+				[void]$sb.Append($code.ToString('x4'))
+			} else {
+				[void]$sb.Append($chars[$i])
+			}
+		}
+		return $sb.ToString()
+	} catch {
+		return $Json
+	}
+}
+
+function Get-MBUtf8JsonBytes {
+	param([AllowNull()][string]$Json)
+	if ($null -eq $Json) { $Json = '' }
+	$wire = ConvertTo-MBWireJson -Json ([string]$Json)
+	$sb = New-Object System.Text.StringBuilder ($wire.Length)
+	foreach ($ch in $wire.ToCharArray()) {
+		$code = [int]$ch
+		if ($code -gt 127) {
+			[void]$sb.Append([char]0x3F)
+		} elseif ($code -lt 32 -and $code -ne 9 -and $code -ne 10 -and $code -ne 13) {
+			[void]$sb.Append([char]0x20)
+		} else {
+			[void]$sb.Append($ch)
+		}
+	}
+	$ascii = $sb.ToString()
+	$utf8 = New-Object System.Text.UTF8Encoding $false, $false
+	return , $utf8.GetBytes($ascii)
+}
+
+function ConvertTo-MBRequestJson {
+	param($Object, [int]$Depth = 20)
+	if ($null -eq $Object) { return '{}' }
+	$json = if ($Object -is [string]) {
+		[string]$Object
+	} else {
+		try {
+			ConvertTo-Json -InputObject $Object -Depth $Depth -Compress
+		} catch {
+			ConvertTo-Json -InputObject $Object -Depth 6 -Compress
+		}
+	}
+	return (ConvertTo-MBWireJson -Json $json)
+}
+
+function Repair-MBMessagesEncoding {
+	param([array]$Messages)
+	$out = New-Object System.Collections.ArrayList
+	foreach ($m in @($Messages)) {
+		if ($null -eq $m) { continue }
+		$role = [string](Get-MBProp $m 'role')
+		if ([string]::IsNullOrWhiteSpace($role)) { $role = 'user' }
+		$content = Sanitize-MBText -Text ([string](Get-MBProp $m 'content'))
+		$msg = @{
+			role    = $role
+			content = $content
+		}
+		if ($role -eq 'tool') {
+			$tcid = Get-MBProp $m 'tool_call_id'
+			if (-not $tcid) { $tcid = Get-MBProp $m 'id' }
+			if (-not $tcid) { $tcid = 'tool_call' }
+			$msg['tool_call_id'] = Sanitize-MBText -Text ([string]$tcid)
+			$name = Get-MBProp $m 'name'
+			if ($name) { $msg['name'] = Sanitize-MBText -Text ([string]$name) }
+		}
+		if ($role -eq 'assistant') {
+			$toolCalls = Get-MBProp $m 'tool_calls'
+			if ($toolCalls) {
+				$tcOut = New-Object System.Collections.ArrayList
+				foreach ($tc in @($toolCalls)) {
+					$fn = Get-MBProp $tc 'function'
+					$fnName = Sanitize-MBText -Text ([string](Get-MBProp $fn 'name'))
+					$fnArgs = Get-MBProp $fn 'arguments'
+					if ($null -eq $fnArgs) { $fnArgs = '{}' }
+					elseif (-not ($fnArgs -is [string])) {
+						try { $fnArgs = ConvertTo-MBJson $fnArgs -Depth 10 } catch { $fnArgs = '{}' }
+					}
+					$fnArgs = Sanitize-MBText -Text ([string]$fnArgs)
+					$tcId = Get-MBProp $tc 'id'
+					if (-not $tcId) { $tcId = 'call_' + [guid]::NewGuid().ToString('N').Substring(0, 8) }
+					[void]$tcOut.Add(@{
+						id       = Sanitize-MBText -Text ([string]$tcId)
+						type     = 'function'
+						function = @{
+							name      = $fnName
+							arguments = $fnArgs
+						}
+					})
+				}
+				if ($tcOut.Count -gt 0) {
+					$msg['tool_calls'] = @($tcOut.ToArray())
+				}
+			}
+		}
+		[void]$out.Add($msg)
+	}
+	return $out.ToArray()
+}
+
+function Test-MBReplyIncomplete {
+	param(
+		[AllowNull()][string]$Text,
+		[string]$FinishReason = '',
+		[bool]$HasToolCalls = $false,
+		[int]$CompletionTokens = 0,
+		[bool]$HaveUsage = $false
+	)
+	if ($HasToolCalls) { return $false }
+	if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+
+	if ($FinishReason -match '^(?i)length|max_tokens|limit|max_completion_tokens$') { return $true }
+
+	$budget = [int]$MaxTokens
+	try {
+		if ($script:MB.LastRequestMaxTokens -gt 0) { $budget = [int]$script:MB.LastRequestMaxTokens }
+	} catch {}
+	if ($HaveUsage -and $CompletionTokens -gt 0 -and $budget -gt 0) {
+		if ($CompletionTokens -ge [int]([math]::Floor($budget * 0.95))) { return $true }
+	}
+
+	$t = $Text.TrimEnd()
+	if ($t.Length -lt 12) { return $false }
+
+	if ($t -match '[\.\!\?…]$') { return $false }
+	if ($t -match '[\.\!\?…]["''”»)]$') { return $false }
+	if ($t -match '(?i)```\s*$') { return $false }
+	if ($t -match '[\)\]\}]\s*$') { return $false }          # ends with ) ] }
+	if ($t -match '(?i)\*\*\s*$') { return $false }
+	if ($t -match '(?i)(thanks|thank you|you''re welcome|done|complete|all set)\.?["''”]*\s*$') {
+		return $false
+	}
+	if ($t -match '(?i)^(ok|okay|yes|no|sure|yep|nope|got it|understood)\.?$') { return $false }
+
+	if ($t -match '[,;:]\s*$') { return $true }
+	if ($t -match '[-—–]\s*$') { return $true }
+	if ($t -match '\b(the|a|an|and|or|to|of|for|with|that|this|lets|let''s|can|will|would|should|may|might|from|into|about)\s*$') {
+		return $true
+	}
+	if ($t -match '\s[A-Za-z]$') { return $true }
+	if ($t -match '/[a-zA-Z]{1,5}$') { return $true }
+
+	return $false
+}
+
+function Get-MBContinuePrompt {
+	return @(
+		'[CONTINUE] Your previous reply was cut off (token limit or mid-sentence).'
+		'Continue EXACTLY from the next word - do not restart, do not repeat any text already written.'
+		'Finish the incomplete sentence and complete the FULL answer. Prefer finishing over stopping early.'
+	) -join ' '
+}
+
+function Limit-MBResult {
+	param([string]$Text, [int]$Max = 0)
+	if ($Max -le 0) { $Max = $MaxToolResultChars }
+	if ($null -eq $Text) { return "" }
+	$s = if ($Text -is [string]) { $Text } else { ($Text | Out-String) }
+	$s = Sanitize-MBText -Text $s
+	try {
+		if ($script:HasNative) {
+			return [MiniBot.Core.Native]::TruncateMiddle($s, $Max)
+		}
+	} catch {}
+	if ($s.Length -le $Max) { return $s }
+	$head = [math]::Floor($Max * 0.55)
+	$tail = $Max - $head - 60
+	if ($head -lt 1) { $head = 1 }
+	if ($tail -lt 1) { $tail = 1 }
+	if (($head + $tail) -ge $s.Length) { return $s }
+	try {
+		return $s.Substring(0, $head) + "`n`n... [truncated $($s.Length - $head - $tail) chars] ...`n`n" + $s.Substring($s.Length - $tail)
+	} catch {
+		if ($s.Length -gt $Max) { return $s.Substring(0, $Max) + "`n... [truncated]" }
+		return $s
+	}
+}
+
+function Convert-MBJsonReady {
+	param($Object, [int]$Depth = 12)
+	if ($Depth -lt 0) { return $null }
+	if ($null -eq $Object) { return $null }
+
+	if ($Object -is [string]) { return [string]$Object }
+	if ($Object -is [bool]) { return [bool]$Object }
+	if ($Object -is [byte] -or $Object -is [int16] -or $Object -is [int] -or $Object -is [long]) {
+		return [long]$Object
+	}
+	if ($Object -is [double] -or $Object -is [float] -or $Object -is [decimal]) {
+		return [double]$Object
+	}
+	if ($Object -is [datetime]) { return $Object.ToString('o') }
+	if ($Object -is [guid]) { return $Object.ToString() }
+
+	if ($Object -is [System.Collections.IDictionary]) {
+		$h = [ordered]@{}
+		foreach ($k in @($Object.Keys)) {
+			$key = [string]$k
+			if ([string]::IsNullOrEmpty($key)) { continue }
+			$val = $Object[$k]
+			if ($null -eq $val) {
+				$h[$key] = $null
+			} else {
+				$h[$key] = Convert-MBJsonReady -Object $val -Depth ($Depth - 1)
+			}
+		}
+		# Prefer PSCustomObject for JSON on PS 5.1
+		return [pscustomobject]$h
+	}
+
+	if ($Object -is [System.Array] -or
+		($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string]))) {
+		$list = New-Object System.Collections.ArrayList
+		foreach ($item in $Object) {
+			[void]$list.Add((Convert-MBJsonReady -Object $item -Depth ($Depth - 1)))
+		}
+		return @($list.ToArray())
+	}
+
+	try {
+		$props = @($Object.PSObject.Properties | Where-Object {
+			$_.MemberType -eq 'NoteProperty' -or $_.MemberType -eq 'Property'
+		})
+		if ($props.Count -gt 0 -and -not ($Object -is [System.ValueType])) {
+			$h = [ordered]@{}
+			foreach ($p in $props) {
+				if ($p.Name -match '^(Count|Length|Keys|Values|SyncRoot|IsReadOnly|IsFixedSize|IsSynchronized)$' -and
+					$Object -is [System.Collections.IEnumerable]) { continue }
+				try {
+					$h[[string]$p.Name] = Convert-MBJsonReady -Object $p.Value -Depth ($Depth - 1)
+				} catch {
+					$h[[string]$p.Name] = [string]$p.Value
+				}
+			}
+			if ($h.Count -gt 0) { return [pscustomobject]$h }
+		}
+	} catch {}
+
+	try { return [string]$Object } catch { return $null }
+}
+
+function ConvertTo-MBJson {
+	param($Object, $Depth = 6)
+	$d = 6
+	try { $d = [int]$Depth } catch { $d = 6 }
+	if ($d -lt 1) { $d = 1 }
+	$safe = $null
+	try {
+		$safe = Convert-MBJsonReady -Object $Object -Depth ([math]::Max(4, $d + 2))
+	} catch {
+		$safe = $Object
+	}
+	try {
+		return (ConvertTo-Json -InputObject $safe -Depth $d -Compress)
+	} catch {
+		try {
+			return (ConvertTo-Json -InputObject $safe -Depth 3 -Compress)
+		} catch {
+			try {
+				return (ConvertTo-Json -InputObject ([pscustomobject]@{ error = 'json_serialize_failed'; message = $_.Exception.Message }) -Compress -Depth 2)
+			} catch {
+				return '{"error":"json_serialize_failed"}'
+			}
+		}
+	}
+}
+
+function New-MBSandboxCheck {
+	param(
+		$Name = 'check',
+		$Pass = $false,
+		$Detail = '',
+		$Expected = $null,
+		$Actual = $null,
+		$Expr = $null
+	)
+	$row = [ordered]@{}
+	$row['name'] = [string]$Name
+	$row['pass'] = [bool](Convert-MBToBool -Value $Pass -Default $false)
+	if ($null -ne $Detail -and "$Detail" -ne '') { $row['detail'] = [string]$Detail }
+	if ($null -ne $Expected) { $row['expected'] = $(try { if ($Expected -is [string] -or $Expected -is [ValueType]) { $Expected } else { [string]$Expected } } catch { [string]$Expected }) }
+	if ($null -ne $Actual) { $row['actual'] = $(try { if ($Actual -is [string] -or $Actual -is [ValueType]) { $Actual } else { [string]$Actual } } catch { [string]$Actual }) }
+	if ($null -ne $Expr -and "$Expr" -ne '') { $row['expr'] = [string]$Expr }
+	return [pscustomobject]$row
+}
+
+function Get-MBProp {
+	param($Obj, $Name = $null, $Default = $null)
+	if ($null -eq $Name) { return $Default }
+	$Name = [string]$Name
+	if ($null -eq $Obj) { return $Default }
+	if ($Obj -is [hashtable] -or $Obj -is [System.Collections.IDictionary]) {
+		foreach ($k in @($Obj.Keys)) {
+			if ([string]::Equals([string]$k, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+				return $Obj[$k]
+			}
+		}
+		return $Default
+	}
+	$p = $Obj.PSObject.Properties[$Name]
+	if ($p) { return $p.Value }
+	foreach ($prop in $Obj.PSObject.Properties) {
+		if ([string]::Equals($prop.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+			return $prop.Value
+		}
+	}
+	return $Default
+}
+
+function Test-MBHasProp {
+	param($Obj, $Name = $null)
+	if ($null -eq $Obj -or $null -eq $Name) { return $false }
+	$Name = [string]$Name
+	if ($Obj -is [hashtable] -or $Obj -is [System.Collections.IDictionary]) {
+		foreach ($k in @($Obj.Keys)) {
+			if ([string]::Equals([string]$k, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+		}
+		return $false
+	}
+	if ($Obj.PSObject.Properties[$Name]) { return $true }
+	foreach ($prop in $Obj.PSObject.Properties) {
+		if ([string]::Equals($prop.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
 	}
 	return $false
 }
 
-# CONFIRMATION HELPER
-function Request-Confirmation {
-	[CmdletBinding()]
-	param(
-		[Parameter(Mandatory = $true)]
-		[string]$Title,
+function Convert-MBToBool {
+	param($Value, $Default = $false)
+	$def = $false
+	if ($Default -is [bool]) { $def = $Default }
+	elseif ("$Default" -match '^(?i)1|true|yes$') { $def = $true }
+	if ($null -eq $Value) { return $def }
+	if ($Value -is [bool]) { return $Value }
+	if ($Value -is [int] -or $Value -is [long]) { return ($Value -ne 0) }
+	$s = ([string]$Value).Trim().ToLowerInvariant()
+	if ($s -in @('1', 'true', 'yes', 'on', 'y')) { return $true }
+	if ($s -in @('0', 'false', 'no', 'off', 'n', '')) { return $false }
+	return $def
+}
 
-		[string]$Details = ""
+function Convert-MBToInt {
+	param($Value, $Default = 0)
+	$def = 0
+	try { if ($null -ne $Default) { $def = [int]$Default } } catch { $def = 0 }
+	if ($null -eq $Value) { return $def }
+	if ($Value -is [int] -or $Value -is [long]) { return [int]$Value }
+	$n = 0
+	if ([int]::TryParse(([string]$Value).Trim(), [ref]$n)) { return $n }
+	return $def
+}
+
+function Convert-MBForceArray {
+	param($Value)
+	if ($null -eq $Value) { return @() }
+	if ($Value -is [string]) { return @($Value) }
+	if ($Value -is [System.Array]) { return @($Value) }
+	if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+		return @($Value)
+	}
+	return @($Value)
+}
+
+function Convert-MBToCodeString {
+	param($Value)
+	if ($null -eq $Value) { return '' }
+	if ($Value -is [string]) { return [string]$Value }
+	if ($Value -is [System.Array] -or ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string]))) {
+		$parts = New-Object System.Collections.Generic.List[string]
+		foreach ($x in @($Value)) {
+			if ($null -eq $x) { continue }
+			if ($x -is [string]) { [void]$parts.Add($x) }
+			else {
+				$t = Get-MBProp $x 'code'
+				if ($null -eq $t) { $t = Get-MBProp $x 'text' }
+				if ($null -eq $t) { $t = Get-MBProp $x 'content' }
+				if ($null -ne $t) { [void]$parts.Add([string]$t) }
+				else {
+					try { [void]$parts.Add((ConvertTo-MBJson $x -Depth 6)) } catch { [void]$parts.Add([string]$x) }
+				}
+			}
+		}
+		return ($parts -join "`n")
+	}
+	try {
+		$asCode = Get-MBProp $Value 'code'
+		if ($null -ne $asCode) { return (Convert-MBToCodeString $asCode) }
+	} catch {}
+	return [string]$Value
+}
+
+function Convert-MBToolArguments {
+	param($ArgString)
+
+	if ($null -eq $ArgString) { return [pscustomobject]@{} }
+	if (-not ($ArgString -is [string])) {
+		return $ArgString
+	}
+
+	$s = [string]$ArgString
+	$s = $s.Trim()
+	if ($s.Length -eq 0 -or $s -eq 'null') { return [pscustomobject]@{} }
+
+	if ($s -match '(?s)^```(?:json)?\s*(.*?)\s*```$') {
+		$s = $Matches[1].Trim()
+	}
+
+	try {
+		$obj = $s | ConvertFrom-Json -ErrorAction Stop
+		if ($null -eq $obj) { return [pscustomobject]@{} }
+		if ($obj -is [string]) {
+			$inner = ([string]$obj).Trim()
+			if ($inner.StartsWith('{') -or $inner.StartsWith('[')) {
+				try { return ($inner | ConvertFrom-Json -ErrorAction Stop) } catch {}
+			}
+		}
+		return $obj
+	} catch {
+	}
+
+	$ht = [ordered]@{}
+	try {
+		if ($s -match '"code"\s*:\s*"((?:\\.|[^"\\])*)"') {
+			$codeVal = $Matches[1]
+			$codeVal = $codeVal -replace '\\n', "`n" -replace '\\r', "`r" -replace '\\t', "`t" -replace '\\"', '"' -replace '\\\\', '\'
+			$ht['code'] = $codeVal
+		}
+		if ($s -match '"name"\s*:\s*"((?:\\.|[^"\\])*)"') {
+			$ht['name'] = ($Matches[1] -replace '\\"', '"')
+		}
+		if ($s -match '"piece"\s*:\s*"((?:\\.|[^"\\])*)"') {
+			$ht['piece'] = ($Matches[1] -replace '\\"', '"')
+		}
+		if ($s -match '"path"\s*:\s*"((?:\\.|[^"\\])*)"') {
+			$ht['path'] = ($Matches[1] -replace '\\"', '"')
+		}
+		if ($s -match '"save_as"\s*:\s*"((?:\\.|[^"\\])*)"') {
+			$ht['save_as'] = ($Matches[1] -replace '\\"', '"')
+		}
+		if ($s -match '"test_script"\s*:\s*"((?:\\.|[^"\\])*)"') {
+			$ts = $Matches[1]
+			$ts = $ts -replace '\\n', "`n" -replace '\\r', "`r" -replace '\\t', "`t" -replace '\\"', '"' -replace '\\\\', '\'
+			$ht['test_script'] = $ts
+		}
+		if ($s -match '"expect_stdout"\s*:\s*"((?:\\.|[^"\\])*)"') {
+			$ht['expect_stdout'] = ($Matches[1] -replace '\\n', "`n" -replace '\\"', '"')
+		}
+		if ($s -match '"expect_exit"\s*:\s*(-?\d+)') {
+			$ht['expect_exit'] = [int]$Matches[1]
+		}
+		if ($s -match '"compose"\s*:\s*(true|false)') {
+			$ht['compose'] = ($Matches[1] -eq 'true')
+		}
+		if ($s -match '"pieces"\s*:\s*\[(.*?)\]') {
+			$inner = $Matches[1]
+			$plist = New-Object System.Collections.Generic.List[string]
+			[regex]::Matches($inner, '"([^"]+)"') | ForEach-Object { [void]$plist.Add($_.Groups[1].Value) }
+			if ($plist.Count -gt 0) { $ht['pieces'] = @($plist) }
+		}
+		if ($s -match '"assert"\s*:\s*\[(.*?)\]') {
+			$inner = $Matches[1]
+			$alist = New-Object System.Collections.Generic.List[string]
+			[regex]::Matches($inner, '"((?:\\.|[^"\\])*)"') | ForEach-Object {
+				$a = $_.Groups[1].Value -replace '\\"', '"' -replace '\\n', "`n"
+				[void]$alist.Add($a)
+			}
+			if ($alist.Count -gt 0) { $ht['assert'] = @($alist) }
+		} elseif ($s -match '"assert"\s*:\s*"((?:\\.|[^"\\])*)"') {
+			$ht['assert'] = @(($Matches[1] -replace '\\"', '"' -replace '\\n', "`n"))
+		}
+	} catch {}
+
+	if ($ht.Count -gt 0) {
+		return [pscustomobject]$ht
+	}
+
+	return [pscustomobject]@{
+		_parse_error = $true
+		_raw_preview = $(if ($s.Length -gt 300) { $s.Substring(0, 297) + '...' } else { $s })
+	}
+}
+
+function Test-MBMultimodalContent {
+	param($Content)
+	if ($null -eq $Content) { return $false }
+	if ($Content -is [string]) { return $false }
+	if ($Content -is [System.Array]) { return $true }
+	if ($Content -is [System.Collections.IList] -and -not ($Content -is [string])) {
+		try {
+			if (@($Content).Count -gt 0) {
+				$first = @($Content)[0]
+				$t = Get-MBProp $first 'type'
+				if ($t -in @('text','image_url','image')) { return $true }
+			}
+		} catch {}
+	}
+	return $false
+}
+
+function Normalize-MBContentPart {
+	param($Part)
+	if ($null -eq $Part) { return $null }
+	$type = [string](Get-MBProp $Part 'type')
+	if ($type -eq 'image_url') {
+		$img = Get-MBProp $Part 'image_url'
+		$url = $null
+		if ($img -is [string]) { $url = $img }
+		else { $url = [string](Get-MBProp $img 'url') }
+		if ([string]::IsNullOrWhiteSpace($url)) { return $null }
+		return @{
+			type      = 'image_url'
+			image_url = @{ url = $url }
+		}
+	}
+	if ($type -eq 'image') {
+		$data = Get-MBProp $Part 'data'
+		$url = Get-MBProp $Part 'url'
+		if ($data) {
+			return @{
+				type      = 'image_url'
+				image_url = @{ url = ("data:image/png;base64," + ([string]$data).Trim()) }
+			}
+		}
+		if ($url) {
+			return @{
+				type      = 'image_url'
+				image_url = @{ url = [string]$url }
+			}
+		}
+		return $null
+	}
+	$text = Get-MBProp $Part 'text'
+	if ($null -eq $text) { $text = Get-MBProp $Part 'content' }
+	return @{
+		type = 'text'
+		text = (Sanitize-MBText -Text ([string]$text))
+	}
+}
+
+function Normalize-MBMessagesForApi {
+	param([array]$Messages)
+
+	$out = New-Object System.Collections.ArrayList
+	foreach ($m in @($Messages)) {
+		if ($null -eq $m) { continue }
+		$role = [string](Get-MBProp $m 'role')
+		if ([string]::IsNullOrWhiteSpace($role)) { $role = 'user' }
+
+		$rawContent = Get-MBProp $m 'content'
+		$content = $null
+		if (Test-MBMultimodalContent -Content $rawContent) {
+			$parts = New-Object System.Collections.ArrayList
+			foreach ($p in @($rawContent)) {
+				$np = Normalize-MBContentPart -Part $p
+				if ($null -ne $np) { [void]$parts.Add($np) }
+			}
+			if ($parts.Count -eq 0) {
+				$content = ""
+			} elseif ($parts.Count -eq 1 -and $parts[0].type -eq 'text') {
+				$content = [string]$parts[0].text
+			} else {
+				$content = @($parts.ToArray())
+			}
+		} elseif ($null -eq $rawContent) {
+			$content = ""
+		} elseif ($rawContent -is [string]) {
+			$content = Sanitize-MBText -Text $rawContent
+		} else {
+			$content = Sanitize-MBText -Text ([string]$rawContent)
+		}
+
+		$msg = @{
+			role    = $role
+			content = $content
+		}
+
+		if ($role -eq 'tool') {
+			$tcid = Get-MBProp $m 'tool_call_id'
+			if (-not $tcid) { $tcid = Get-MBProp $m 'id' }
+			if (-not $tcid) { $tcid = 'tool_call' }
+			$msg['tool_call_id'] = Sanitize-MBText -Text ([string]$tcid)
+			$name = Get-MBProp $m 'name'
+			if ($name) { $msg['name'] = Sanitize-MBText -Text ([string]$name) }
+		}
+
+		if ($role -eq 'assistant') {
+			$toolCalls = Get-MBProp $m 'tool_calls'
+			if ($toolCalls) {
+				$tcOut = New-Object System.Collections.ArrayList
+				foreach ($tc in @($toolCalls)) {
+					$fn = Get-MBProp $tc 'function'
+					$fnName = Sanitize-MBText -Text ([string](Get-MBProp $fn 'name'))
+					$fnArgs = Get-MBProp $fn 'arguments'
+					if ($null -eq $fnArgs) { $fnArgs = '{}' }
+					elseif (-not ($fnArgs -is [string])) {
+						try { $fnArgs = ConvertTo-MBJson $fnArgs -Depth 10 } catch { $fnArgs = '{}' }
+					}
+					$fnArgs = Sanitize-MBText -Text ([string]$fnArgs)
+					$tcId = Get-MBProp $tc 'id'
+					if (-not $tcId) { $tcId = 'call_' + [guid]::NewGuid().ToString('N').Substring(0, 8) }
+
+					[void]$tcOut.Add(@{
+						id       = Sanitize-MBText -Text ([string]$tcId)
+						type     = 'function'
+						function = @{
+							name      = $fnName
+							arguments = $fnArgs
+						}
+					})
+				}
+				if ($tcOut.Count -gt 0) {
+					$msg['tool_calls'] = @($tcOut.ToArray())
+				}
+			}
+		}
+
+		[void]$out.Add($msg)
+	}
+	return $out.ToArray()
+}
+
+function Get-MBMessagesWithPendingVision {
+	param([array]$Messages)
+	$pv = $script:MB.PendingVision
+	if (-not $pv -or [string]::IsNullOrWhiteSpace([string]$pv.Base64)) {
+		return @($Messages)
+	}
+	$kb = [math]::Round([double]$pv.SizeBytes / 1KB, 1)
+	$label = if ($pv.Label) { [string]$pv.Label } else { 'screen' }
+	$saved = $pv.SavedPath
+	$kind = if ($pv.Kind) { [string]$pv.Kind } else { 'screen' }
+	$src = if ($pv.SourcePath) { [string]$pv.SourcePath } else { '' }
+	if ($saved) {
+		$text = "You can see this image ($label). A full-resolution file was also saved to disk. In your reply: (1) describe what you see if relevant; (2) ALWAYS include the exact save path: $saved"
+	} elseif ($kind -eq 'pdf') {
+		$srcBit = if ($src) { " from PDF: $src" } else { '' }
+		$text = "You can see a rendered PDF page$srcBit ($label, $($pv.Width)x$($pv.Height), ${kb} KB). The text layer was missing or garbled — extract fields VISUALLY (names, policy numbers, dates, limits, insurer). Do not invent values not visible. Do not invent other paths."
+	} elseif ($src) {
+		$text = "You can see this image from disk: $src ($label, $($pv.Width)x$($pv.Height), ${kb} KB). Describe what you see that answers the user. Do not invent other paths."
+	} else {
+		$text = "You can see this $kind image ($label, $($pv.Width)x$($pv.Height), ${kb} KB). Reply by describing what you see that answers their question. Do not invent a file path. Do not mention tools unless asked."
+	}
+	$mime = if ($pv.Mime) { [string]$pv.Mime } else { 'image/png' }
+	if ($mime -notmatch '^image/') { $mime = 'image/png' }
+	$dataUrl = "data:${mime};base64,$($pv.Base64)"
+	$visionMsg = @{
+		role    = 'user'
+		content = @(
+			@{ type = 'text'; text = $text }
+			@{ type = 'image_url'; image_url = @{ url = $dataUrl } }
+		)
+	}
+	return @(@($Messages) + $visionMsg)
+}
+
+function Clear-MBPendingVision {
+	param([switch]$KeepMeta)
+	$pv = $script:MB.PendingVision
+	if ($pv -and -not $KeepMeta) {
+		$script:MB.LastVisionMeta = @{
+			Width     = $pv.Width
+			Height    = $pv.Height
+			SizeBytes = $pv.SizeBytes
+			Label     = $pv.Label
+			Attached  = (Get-Date).ToString('o')
+		}
+	}
+	$script:MB.PendingVision = $null
+}
+
+function New-MBChatRequestBody {
+	param(
+		[array]$Messages,
+		[array]$Tools,
+		[string]$ModelName,
+		[double]$Temp,
+		[int]$MaxTok,
+		[bool]$Stream = $true
 	)
 
-	if ($AutoApproveEnabled) {
-		return $true
+	$Messages = @(Get-MBMessagesWithPendingVision -Messages $Messages)
+
+	$normMessages = @(Normalize-MBMessagesForApi -Messages $Messages)
+
+	for ($i = 0; $i -lt $normMessages.Count; $i++) {
+		if ($normMessages[$i] -is [hashtable] -and $normMessages[$i].ContainsKey('content')) {
+			$c = $normMessages[$i]['content']
+			if ($c -is [string]) {
+				$normMessages[$i]['content'] = Sanitize-MBText -Text $c
+			}
+		}
 	}
 
-	Write-Host ""
-	Write-Host "===================================================" -ForegroundColor DarkRed
-	Write-Host "	   $Title" -ForegroundColor DarkYellow
-	Write-Host "===================================================" -ForegroundColor DarkRed
-	Write-Host ""
+	$req = @{
+		model        = $ModelName
+		messages     = $normMessages
+		tools        = $Tools
+		tool_choice  = 'auto'
+		temperature  = $Temp
+		max_tokens   = $MaxTok
+		stream       = $Stream
+		cache_prompt = $true
+	}
+	if ($Stream) {
+		$req['stream_options'] = @{ include_usage = $true }
+	}
+	try {
+		return (ConvertTo-MBRequestJson -Object $req -Depth 20)
+	} catch {
+		Write-MBWarn "JSON build failed ($($_.Exception.Message)) - truncating tool results and retrying..."
+		for ($i = 0; $i -lt $normMessages.Count; $i++) {
+			if ($normMessages[$i] -is [hashtable] -and $normMessages[$i]['role'] -eq 'tool') {
+				$c = [string]$normMessages[$i]['content']
+				if ($c.Length -gt 4000) {
+					$normMessages[$i]['content'] = (Limit-MBResult $c 4000)
+				}
+			}
+		}
+		$req['messages'] = $normMessages
+		return (ConvertTo-MBRequestJson -Object $req -Depth 20)
+	}
+}
 
-	if ($Details) {
-		Write-Host $Details -ForegroundColor White
-		Write-Host "" -ForegroundColor DarkYellow
+# Capability map kept short for cold-start token cost.
+# Cold-start group map. Model enables groups by these names.
+$script:MBGroupQuickMap = [ordered]@{
+	vision    = 'pdf/image/screenshot: ReadImage, ReadPdf, ViewScreen'
+	system    = 'OS inventory: processes, ports, services, disk, BSOD, events, software'
+	repair    = 'RunQuickDiagnostics; RunRepairTool sfc|dism|chkdsk'
+	setup     = 'tune PC + NewMachineSetup (settings; can install catalog apps)'
+	installers = 'silent download/install catalog: 7zip, chrome, adobe, adwcleaner, vlc'
+	sandbox   = 'multi-step PS lab (SandBoxWrite/SandBox pieces)'
+	files     = 'DownloadFile; zip ExpandArchive/CompressArchive'
+	packages  = 'PS Gallery Find/Install/Update modules'
+	registry  = 'ReadRegistry / SetRegistry'
+	clipboard = 'Clipboard read/write'
+	web       = 'HTTP MakeHttpRequest; BrowsePage; GitHub raw/list'
+	speech    = 'SpeakText TTS'
+}
+
+$script:MBSystemPromptBase = @"
+You are $AgentName v$Version - local Windows agent (local model). Tool-first co-pilot: ship scripts, edit files, diagnose, verify with tools.
+Rules: evidence-only (never invent results/paths/status); concise (findings + next steps); PS 5.1 only; paths relative to CWD unless absolute; large files use head/tail/offset+length - never dump multi-MB/binary/.dmp.
+Mutate only after read when possible; operator may deny - stop that action, never bypass. Identical tool+args in a row is blocked - change args/tool or synthesize.
+TOOL GROUPS: Only tools in active groups appear in your tool list. core is always on. Need something else? Call EnableToolGroup group=<name> once, then call the real tool in the same turn - no ask, no ListToolGroups, no narration. Prefer specialized tools over RunCommand.
+MAP (group = when to enable):
+vision = pdf/image/screenshot (ReadImage, ReadPdf page=1 first, ViewScreen)
+system = processes/ports/services/disk/BSOD/events/software inventory
+repair = RunQuickDiagnostics, sfc/dism/chkdsk
+setup = volume/brightness/explorer/power/F8 boot/UAC/restore/uninstall; NewMachineSetup
+installers = silent app installs: ListInstallers / InstallPackage (7zip, chrome, adobe, adwcleaner, vlc)
+sandbox = multi-step PowerShell lab pieces
+files = DownloadFile, zip expand/compress
+packages = PowerShell Gallery modules
+registry = registry read/write
+clipboard = clipboard read/write
+web = HTTP API, BrowsePage, GitHub files
+speech = SpeakText TTS
+User-facing text = results and next steps only - never announce enabling tools.
+"@
+
+$script:MBGroupPrompt = [ordered]@{
+	core = @"
+CORE (always on): ReadFile/WriteFile/EditFile/ApplyPatch/ListDirectory/SearchFiles/FindFiles/DiffText; RunCommand; CWD+env; EnableToolGroup/ListToolGroups.
+Edit: EditFile unique search (or occurrence/replaceAll); ApplyPatch multi-hunk; WriteFile only new/full rewrite. Preserve encoding/newlines. On miss: re-read, never invent nearby text.
+RunCommand: safe read-only auto; nested shells/writers/downloads/sfc|dism|chkdsk/multi-statement/redirect always prompt. If you need a specialized tool not listed above, EnableToolGroup from MAP first.
+"@
+	vision = @"
+VISION: ReadImage path= (vision next turn). ReadPdf: default page=1 only - multipage render is expensive; do not page through a PDF unless the user asks for later pages, full doc, or a page the first pass cannot answer. Text extract when clean; auto page-render vision if empty/garbled/CID (still page 1 unless page=N). render=true forces vision. ViewScreen no approval - look only, or save=true/path= (report exact path). Trust vision over garbled PDF text. Do not spam captures or multi-page ReadPdf loops.
+"@
+	system = @"
+SYSTEM: inventory via GetSystemInfo, GetProcessList/Tree, GetMemoryInfo, GetNetworkInfo, GetNetConnections, GetDiskSpace/Health, GetServiceStatus, ControlService (prompt), GetPowerInfo, GetStartupItems, GetInstalledSoftware, GetDriverInfo, GetWindowsUpdateStatus, GetScheduledTasks, GetBSODInfo, GetEventLogs, GetSystemUptime. Prefer these over ad-hoc shell.
+"@
+	repair = @"
+REPAIR: RunQuickDiagnostics for a quick bundle. RunRepairTool sfc|dism|chkdsk always prompts. BSOD: GetBSODInfo+GetEventLogs first; list dump names/sizes only - never ReadAllBytes on .dmp.
+"@
+	setup = @"
+SETUP (Windows tune / new-machine settings):
+- AudioVolume / DisplayBrightness / SetWindowsOption / SystemRestore / UninstallSoftware for one-off tweaks (always prompt on mutate).
+- NewMachineSetup: one approval for SETTINGS + SOFTWARE. Settings: restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off. Software from catalog: 7zip, Chrome, Adobe, ADWCleaner, VLC. skip_software=true for settings-only. dry_run=true previews.
+"@
+	installers = @"
+INSTALLERS (silent download+install, temp files cleaned after each package):
+- ListInstallers / InstallPackage: catalog installs anytime (ALWAYS prompt). Silent; redirects OK. adwcleaner downloads and runs a scan/clean. NewMachineSetup (setup group) also installs the full catalog in one approval.
+"@
+	sandbox = @"
+SANDBOX: incremental PS lab (not a security boundary). SandBoxWrite name+code (depends_on optional) -> SandBox piece/pieces + assert -> compose=true to ship. merge_results builds `$Result.by_piece/`$Result.merged; resolve_deps topo-sorts. Claim success only if ok=true / asserts pass. SandBoxList = progress. Prefer over RunCommand thrash for multi-step script design.
+"@
+	files = @"
+FILES: DownloadFile url+path to save to disk (not MakeHttpRequest). ExpandArchive / CompressArchive for zip. Always prompt on mutate.
+"@
+	packages = @"
+PACKAGES: FindPSModule / GetInstalledPSModule (read); InstallPSModule / UpdatePSModule (prompt). Prefer over raw Install-Module in shell.
+"@
+	registry = @"
+REGISTRY: ReadRegistry path=; SetRegistry path/name/value/type (always prompts).
+"@
+	clipboard = @"
+CLIPBOARD: Clipboard action=read|write (always prompts).
+"@
+	web = @"
+WEB: MakeHttpRequest for HTTP API/status/body; BrowsePage for readable page text; GetGitHubRawFile / ListGitHubDirectory for github.com (ConvertGitHubUrl optional). Do not use MakeHttpRequest as a file downloader - enable files + DownloadFile.
+"@
+	speech = @"
+SPEECH: SpeakText short plain sentences (Windows SAPI). Operator hold-to-talk is Right-Ctrl only.
+"@
+}
+
+function Get-MBSystemPrompt {
+	$parts = New-Object System.Collections.ArrayList
+	[void]$parts.Add([string]$script:MBSystemPromptBase)
+
+	$active = @()
+	try { $active = @($script:MB.ActiveToolGroups) } catch { $active = @('core') }
+	if ($active.Count -eq 0) { $active = @('core') }
+	$activeSet = @{}
+	foreach ($g in $active) {
+		if ($g) { $activeSet[[string]$g.ToLowerInvariant()] = $true }
+	}
+	if ($activeSet.ContainsKey('full') -or $activeSet.ContainsKey('all')) {
+		foreach ($k in @($script:MBGroupPrompt.Keys)) { $activeSet[$k] = $true }
+	}
+	if (-not $activeSet.ContainsKey('core')) { $activeSet['core'] = $true }
+
+	$order = @('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')
+	$onList = New-Object System.Collections.ArrayList
+	$offBits = New-Object System.Collections.ArrayList
+	foreach ($g in $order) {
+		if ($activeSet.ContainsKey($g)) {
+			[void]$onList.Add($g)
+			if ($script:MBGroupPrompt.Contains($g)) {
+				$snip = ([string]$script:MBGroupPrompt[$g]).Trim()
+				if ($snip) { [void]$parts.Add($snip) }
+			}
+		} else {
+			$hint = $g
+			if ($script:MBGroupQuickMap -and $script:MBGroupQuickMap.Contains($g)) {
+				$hint = '{0} ({1})' -f $g, $script:MBGroupQuickMap[$g]
+			}
+			[void]$offBits.Add($hint)
+		}
 	}
 
-	while ($true) {
-		$choice = Read-Host "Proceed?  [Y]es / [N]o / [A] Yes to All"
-		switch ($choice.Trim().ToLower()) {
-			{ $_ -in @('y', 'yes') } {
-				Write-Host ""
-				return $true
-			}
-			{ $_ -in @('n', 'no') } {
-				Write-Host ""
-				return $false
-			}
-			{ $_ -in @('a', 'all', 'yes to all', 'yestoall') } {
-				$script:AutoApproveEnabled = $true
-				Write-Host ""
-				Write-Host "Approved by user -> executing..." -ForegroundColor Green
-				Write-Host ""
-				Write-Host "Auto-Approve has been ENABLED for the remainder of this session." -ForegroundColor Green
-				Write-Host "					 ...ESC to interrupt..." -ForegroundColor DarkGray
-				$script:modeSwitch = $true
-				return $true
-			}
-			default {
-				Write-Host "Invalid choice. Please enter Y, N, or A." -ForegroundColor Yellow
+	[void]$parts.Add(("ON: {0}." -f (($onList | ForEach-Object { $_ }) -join ', ')))
+	if ($offBits.Count -gt 0) {
+		[void]$parts.Add(("OFF - EnableToolGroup group=<name> then use the tool (silent): {0}." -f ($offBits -join '; ')))
+	}
+	return (($parts | Where-Object { $_ -and "$_".Trim() }) -join "`n")
+}
+
+$SystemPrompt = Get-MBSystemPrompt
+
+$Tools = @(
+	@{ type = "function"; function = @{ name = "ReadFile"; description = "Read text files. Supports head, tail, or offset+length for large files. Blocks binary types."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; head = @{ type = "integer"; description = "First N lines" }; tail = @{ type = "integer"; description = "Last N lines" }; offset = @{ type = "integer"; description = "1-based start line" }; length = @{ type = "integer"; description = "Lines from offset" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "WriteFile"; description = "Create or overwrite a whole file. Prefer EditFile/ApplyPatch for existing files. Preserves encoding/newlines when overwriting. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" } }; required = @("path","content") } } },
+	@{ type = "function"; function = @{ name = "EditFile"; description = "Precise search/replace edit. Default requires a UNIQUE match (include surrounding context). Use replaceAll=true only when intentional; occurrence=N for the Nth match; edits[] for multiple hunks in one approval. CRLF/LF tolerant. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string"; description = "Exact text to find (include context lines to make unique)" }; replace = @{ type = "string"; description = "Replacement text" }; useRegex = @{ type = "boolean"; description = "Treat search as regex (default false)" }; replaceAll = @{ type = "boolean"; description = "Replace every match (default false — unique match required)" }; occurrence = @{ type = "integer"; description = "1-based match index when multiple matches exist" }; edits = @{ type = "array"; description = "Optional multi-hunk list of {search, replace, useRegex?, replaceAll?, occurrence?}"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply a unified diff or *** Update File patch to existing file(s). Best for multi-hunk structured edits. Include enough context lines so each hunk matches once. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string"; description = "Unified diff or *** Update File patch body" }; path = @{ type = "string"; description = "Optional default file path if patch omits headers" } }; required = @("patch") } } },
+	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell or CMD. Safe read-only commands auto-run; others require approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string" }; shell = @{ type = "string"; enum = @("powershell","cmd") }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default session setting)" } }; required = @("command") } } },
+	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory entries as JSON (up to 500; reports total/truncated)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Search text file contents under a path (skips common binaries; max 50 matches default)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Root path to search" }; pattern = @{ type = "string"; description = "Regex pattern" }; glob = @{ type = "string"; description = "File filter e.g. *.log, *.ps1" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer"; description = "Max matches (default 50, max 200)" } }; required = @("path","pattern") } } },
+	@{ type = "function"; function = @{ name = "DiffText"; description = "Show a simple line diff between two strings or two files."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string"; description = "Left text OR path if leftIsFile=true" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" } }; required = @("left","right") } } },
+	@{ type = "function"; function = @{ name = "GetWorkingDirectory"; description = "Return agent working directory."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "SetWorkingDirectory"; description = "Set agent working directory for relative paths and commands."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "GetEnvironment"; description = "Selected environment variables and PATH summary."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Optional single variable name" } } } } },
+	@{ type = "function"; function = @{ name = "SetEnvironment"; description = "Set an environment variable. Process scope is immediate (no prompt). User/Machine scopes ALWAYS prompt. Use target=Process|User|Machine."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; value = @{ type = "string" }; target = @{ type = "string"; description = "Process (default) | User | Machine" } }; required = @("name","value") } } },
+	@{ type = "function"; function = @{ name = "GetSystemInfo"; description = "Basic system information as JSON."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetProcessList"; description = "Top processes by CPU as JSON."; parameters = @{ type = "object"; properties = @{ limit = @{ type = "integer" } } } } },
+	@{ type = "function"; function = @{ name = "GetProcessTree"; description = "Process parent/child tree (pid, ppid, name, depth). Optional root_pid to start from one process."; parameters = @{ type = "object"; properties = @{ root_pid = @{ type = "integer"; description = "Start from this PID (0 = all roots)" }; max_depth = @{ type = "integer"; description = "Max tree depth (default 6)" }; max_nodes = @{ type = "integer"; description = "Cap nodes returned (default 200)" } } } } },
+	@{ type = "function"; function = @{ name = "GetNetConnections"; description = "TCP connections/listeners (local/remote address:port, state, pid, process). Like netstat."; parameters = @{ type = "object"; properties = @{ state = @{ type = "string"; description = "Filter e.g. Listen, Established" }; port = @{ type = "integer"; description = "Filter by local or remote port" }; max = @{ type = "integer"; description = "Max rows (default 100)" } } } } },
+	@{ type = "function"; function = @{ name = "FindFiles"; description = "Find files by name glob + metadata (modified within N days, size). For content search use SearchFiles."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Root folder (default agent CWD)" }; glob = @{ type = "string"; description = "Name filter e.g. *.ps1 (default *)" }; modified_within_days = @{ type = "integer"; description = "Only files modified in last N days (0 = no filter)" }; min_bytes = @{ type = "integer" }; max_bytes = @{ type = "integer" }; recursive = @{ type = "boolean"; description = "Recurse subfolders (default false)" }; max = @{ type = "integer"; description = "Max results (default 100)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ReadImage"; description = "Load an image file for vision (next model reply can see it). png/jpg/gif/bmp/tif/webp. Optional maxWidth downscale for vision (default 1280). No approval."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxWidth = @{ type = "integer"; description = "Vision max width px (default 1280)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ReadPdf"; description = "Read a PDF (cheap path first). Default page=1 only - multipage vision is expensive; only set page>1 or call again for other pages if the user needs them or page 1 is insufficient. Extracts text when clean; if empty/garbled, auto-renders that one page into vision. render=true forces vision; maxWidth downscales vision."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxChars = @{ type = "integer"; description = "Max text chars (default 50000)" }; page = @{ type = "integer"; description = "1-based page for vision render (default 1). Prefer 1 unless user needs another page." }; render = @{ type = "boolean"; description = "Force page render to vision even if text looks fine" }; autoVision = @{ type = "boolean"; description = "Auto-render when text empty/garbled (default true)" }; maxWidth = @{ type = "integer"; description = "Vision max width px (default 1280)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "Clipboard"; description = "Read or write clipboard text. Always requires approval."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; enum = @("read","write") }; text = @{ type = "string" } }; required = @("action") } } },
+	@{ type = "function"; function = @{ name = "ViewScreen"; description = "Look at the desktop and/or save a PNG. NO approval. Looking: omit save/path, then describe what you see. Screenshot file: save=true (Desktop default) or path=file|folder. After save, your reply MUST include the full path returned. monitor: primary|all|0|1|... Vision model required to describe."; parameters = @{ type = "object"; properties = @{ save = @{ type = "boolean"; description = "true = write PNG (Desktop if no path). false/omit = look only." }; path = @{ type = "string"; description = "Where to save: full file path, or folder (auto filename). Implies save. Empty + save=true → Desktop." }; monitor = @{ type = "string"; description = "primary | all | 0-based monitor index" }; x = @{ type = "integer" }; y = @{ type = "integer" }; width = @{ type = "integer" }; height = @{ type = "integer" }; maxWidth = @{ type = "integer"; description = "Vision downscale max width (default 1280); disk save is always full-res" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "GetBSODInfo"; description = "Recent BSOD/minidump info + related events."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetEventLogs"; description = "Recent errors/warnings + disk I/O events."; parameters = @{ type = "object"; properties = @{ hours = @{ type = "integer" } } } } },
+	@{ type = "function"; function = @{ name = "GetDiskHealth"; description = "Physical disk health + SMART counters."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetDiskSpace"; description = "Drive free/used + top folders under path. Recursive sizes use a fast Win32 FindFirstFileEx walk, not PowerShell Get-ChildItem -Recurse."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Folder whose top-level children are sized (default C:\\)" }; deep = @{ type = "boolean"; description = "true (default) = full recursive under each top-level child; false = immediate files only" }; top = @{ type = "integer"; description = "How many largest folders to return (default 10)" }; timeout_sec = @{ type = "integer"; description = "Scan budget seconds (default 45)" } } } } },
+	@{ type = "function"; function = @{ name = "GetInstalledSoftware"; description = "Installed programs (Uninstall registry). Optional name filter; caps results for context."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Filter by display name or publisher (substring)" }; max = @{ type = "integer"; description = "Max rows (default 200, max 1000)" } } } } },
+	@{ type = "function"; function = @{ name = "GetDriverInfo"; description = "Query PnP drivers with filters."; parameters = @{ type = "object"; properties = @{ filter = @{ type = "string"; description = "unsigned, microsoft, realtek, nvidia, network, audio, storage, or free text" }; limit = @{ type = "integer" }; showAll = @{ type = "boolean" } } } } },
+	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetMemoryInfo"; description = "RAM usage + top consumers."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetNetworkInfo"; description = "Adapters + connectivity test."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetWindowsUpdateStatus"; description = "Pending Windows updates (needs PSWindowsUpdate)."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetSystemUptime"; description = "Uptime and last boot."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle: BSOD, events, disk health/space, memory."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "RunRepairTool"; description = "sfc, dism, or chkdsk. ALWAYS prompts for approval."; parameters = @{ type = "object"; properties = @{ tool = @{ type = "string"; enum = @("sfc","dism","chkdsk") }; driveLetter = @{ type = "string" }; arguments = @{ type = "string" } }; required = @("tool") } } },
+	@{ type = "function"; function = @{ name = "GetServiceStatus"; description = "Service status. Omit name to list services (optional status filter, max cap). With name = one service."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Service name; omit to list many" }; status = @{ type = "string"; description = "When listing: Running|Stopped|..." }; max = @{ type = "integer"; description = "Max when listing (default 250)" } } } } },
+	@{ type = "function"; function = @{ name = "ReadRegistry"; description = "Read registry key values."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "SetRegistry"; description = "Create/set a registry value (creates key if missing). ALWAYS prompts. type: String|ExpandString|MultiString|DWord|QWord|Binary."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "e.g. HKCU:\\Software\\MyApp" }; name = @{ type = "string"; description = "Value name; (default) for default value" }; value = @{ type = "string"; description = "Value (hex for Binary; MultiString newline/semicolon separated)" }; type = @{ type = "string"; description = "String (default) | ExpandString | MultiString | DWord | QWord | Binary" } }; required = @("path","name","value") } } },
+	@{ type = "function"; function = @{ name = "GetPowerInfo"; description = "Battery/power health summary."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetScheduledTasks"; description = "Scheduled tasks for diagnostics/persistence hunting."; parameters = @{ type = "object"; properties = @{ days = @{ type = "integer" }; filter = @{ type = "string" }; includeDisabled = @{ type = "boolean" }; exportPath = @{ type = "string" } } } } },
+	@{ type = "function"; function = @{ name = "MakeHttpRequest"; description = "HTTP client GET/POST/PUT/PATCH/DELETE/HEAD with auth, headers, JSON/form body."; parameters = @{ type = "object"; properties = @{ method = @{ type = "string"; enum = @("GET","POST","PUT","PATCH","DELETE","HEAD") }; url = @{ type = "string" }; headers = @{ type = "object" }; params = @{ type = "object" }; json_body = @{ type = "object" }; form_data = @{ type = "object" }; raw_data = @{ type = "string" }; bearer_token = @{ type = "string" }; basic_auth_username = @{ type = "string" }; basic_auth_password = @{ type = "string" }; cookies = @{ type = "object" }; content_type = @{ type = "string" }; verify_ssl = @{ type = "boolean" }; user_agent = @{ type = "string" }; timeout = @{ type = "integer" } }; required = @("method","url") } } },
+	@{ type = "function"; function = @{ name = "BrowsePage"; description = "Fetch webpage as clean readable text."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string" }; max_length = @{ type = "integer" }; verify_ssl = @{ type = "boolean" }; user_agent = @{ type = "string" }; extract_links = @{ type = "boolean" } }; required = @("url") } } },
+	@{ type = "function"; function = @{ name = "ConvertGitHubUrl"; description = "Convert github.com URLs to raw.githubusercontent.com form."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string" } }; required = @("github_url") } } },
+	@{ type = "function"; function = @{ name = "GetGitHubRawFile"; description = "Fetch raw file content from a GitHub URL."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string" }; max_length = @{ type = "integer" } }; required = @("github_url") } } },
+	@{ type = "function"; function = @{ name = "ListGitHubDirectory"; description = "List files/folders in a GitHub repo (repo URL or tree/blob URL; optional ref)."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string"; description = "github.com owner/repo or tree/blob URL" }; ref = @{ type = "string"; description = "Branch/tag/commit if not in URL (default main)" } }; required = @("github_url") } } },
+	@{ type = "function"; function = @{ name = "SandBoxWrite"; description = "Save a named PowerShell piece (no run). Optional depends_on=[other pieces] for auto load order. Prefer small functions per piece."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Piece name (letters/numbers/_-)" }; code = @{ type = "string"; description = "PowerShell source for this piece" }; description = @{ type = "string"; description = "Optional short note" }; depends_on = @{ type = "array"; description = "Piece names this piece requires (loaded first when resolve_deps=true)"; items = @{ type = "string" } } }; required = @("name","code") } } },
+	@{ type = "function"; function = @{ name = "SandBox"; description = "Run/check lab code. Multi-piece: merge_results=true (default) builds `$Result.by_piece / `$Result.merged; resolve_deps=true expands depends_on and topo-sorts. Assert examples: `$Result.merged.Sum -eq 5, `$Result.by_piece.math_ops.Sum -eq 5. Modes: code= | piece= | pieces=[] | save_as=. Checks: expect_*, assert[]. compose=true writes composed.ps1."; parameters = @{ type = "object"; properties = @{ code = @{ type = "string"; description = "Snippet/glue. Prefer `$Result = @{ Key = value }" }; path = @{ type = "string" }; piece = @{ type = "string"; description = "Run one piece (deps auto-included by default)" }; pieces = @{ type = "array"; description = "Pieces to run (deps expanded + sorted by default)"; items = @{ type = "string" } }; save_as = @{ type = "string" }; compose = @{ type = "boolean" }; resolve_deps = @{ type = "boolean"; description = "Expand depends_on + topo-sort (default true)" }; merge_results = @{ type = "boolean"; description = "Merge each piece `$Result into by_piece/merged (default true)" }; test_script = @{ type = "string" }; timeout_sec = @{ type = "integer" }; expect_exit = @{ type = "integer" }; expect_stdout = @{ type = "string" }; expect_stdout_regex = @{ type = "string" }; expect_stderr_empty = @{ type = "boolean" }; assert = @{ type = "array"; description = "Host asserts. `$Result has by_piece, merged, order, plus promoted merged keys"; items = @{ type = "string" } } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "SandBoxList"; description = "List saved pieces and last PASS/FAIL status for each (incremental progress)."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetSandBoxInfo"; description = "Show SandBox session root, paths (work/pieces/fixtures/out), workflow hints, last run."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "ClearSandBox"; description = "Delete SandBox scratch tree(s). Default: this session only. all=true removes every MiniBotSandbox session under %TEMP% (stale sessions too)."; parameters = @{ type = "object"; properties = @{ all = @{ type = "boolean"; description = "If true, delete ALL MiniBotSandbox folders on this machine (not just the current session)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ControlService"; description = "Start, stop, or restart a Windows service; optionally set startup type. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Service name (not always display name)" }; action = @{ type = "string"; description = "start | stop | restart | set_startup" }; startup_type = @{ type = "string"; description = "For set_startup or with restart: Automatic | Manual | Disabled | AutomaticDelayedStart" } }; required = @("name","action") } } },
+	@{ type = "function"; function = @{ name = "DownloadFile"; description = "Download a URL to a local path (size-capped). ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string" }; path = @{ type = "string"; description = "Destination file path" }; overwrite = @{ type = "boolean"; description = "Overwrite existing file (default false)" }; max_mb = @{ type = "integer"; description = "Max size in MB (default 100, max 512)" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default 120)" } }; required = @("url","path") } } },
+	@{ type = "function"; function = @{ name = "ExpandArchive"; description = "Extract a .zip archive to a folder. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Archive path (.zip)" }; destination = @{ type = "string"; description = "Output folder" }; force = @{ type = "boolean"; description = "Overwrite existing files (default false)" } }; required = @("path","destination") } } },
+	@{ type = "function"; function = @{ name = "CompressArchive"; description = "Create a .zip from a file or folder. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Source file or folder" }; destination = @{ type = "string"; description = "Output .zip path" }; force = @{ type = "boolean"; description = "Overwrite zip if present (default false)" } }; required = @("path","destination") } } },
+	@{ type = "function"; function = @{ name = "FindPSModule"; description = "Search PowerShell Gallery modules (read-only)."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Module name or wildcard" }; max_results = @{ type = "integer"; description = "Max results (default 15)" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "GetInstalledPSModule"; description = "List installed PowerShell modules (optional name filter)."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Optional module name filter" } } } } },
+	@{ type = "function"; function = @{ name = "InstallPSModule"; description = "Install a PowerShell module (default CurrentUser scope). ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; version = @{ type = "string"; description = "Optional exact version" }; scope = @{ type = "string"; description = "CurrentUser (default) or AllUsers" }; allow_prerelease = @{ type = "boolean" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "UpdatePSModule"; description = "Update an installed PowerShell module. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; scope = @{ type = "string"; description = "CurrentUser or AllUsers (optional)" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "SpeakText"; description = "Speak text aloud via Windows built-in speech (System.Speech SAPI). Prefer short plain sentences. No approval."; parameters = @{ type = "object"; properties = @{ text = @{ type = "string"; description = "Text to speak" }; rate = @{ type = "integer"; description = "Speech rate -10..10 (default 1)" }; wait = @{ type = "boolean"; description = "true = block until finished (default false async)" } }; required = @("text") } } },
+	@{ type = "function"; function = @{ name = "AudioVolume"; description = "Get or set default playback volume/mute (Windows Core Audio). action=get|set|mute|unmute. level=0-100 for set. set/mute ALWAYS prompt."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "get (default) | set | mute | unmute" }; level = @{ type = "integer"; description = "0-100 percent when action=set" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "DisplayBrightness"; description = "Get or set internal display brightness when supported (usually laptops via WMI). action=get|set; level=0-100. Desktops often unsupported - tool reports that cleanly. set ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "get (default) | set" }; level = @{ type = "integer"; description = "0-100 percent when action=set" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "SetWindowsOption"; description = "Apply a named Windows setup/tune option (explorer, UAC, power, boot F8, network sharing, timezone, bitlocker-off, etc). option= catalog key; value= on|off|show|hide|... ALWAYS prompts. Call ListWindowsOptions for keys."; parameters = @{ type = "object"; properties = @{ option = @{ type = "string"; description = "e.g. explorer.hidden_files, power.max_performance, boot.f8_legacy" }; value = @{ type = "string"; description = "Target value (on/off/show/hide/timezone id/etc)" }; drive = @{ type = "string"; description = "Drive letter for bitlocker/restore options (default C:)" } }; required = @("option","value") } } },
+	@{ type = "function"; function = @{ name = "ListWindowsOptions"; description = "List SetWindowsOption catalog keys, allowed values, and short descriptions (read-only)."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "SystemRestore"; description = "System Restore: action=status|enable|disable|create|list. enable/create/disable ALWAYS prompt. create optional description=."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "status|enable|disable|create|list" }; description = @{ type = "string"; description = "Restore point description when action=create" }; drive = @{ type = "string"; description = "Drive letter (default C:)" } }; required = @("action") } } },
+	@{ type = "function"; function = @{ name = "UninstallSoftware"; description = "Uninstall an installed program by display name match (Uninstall registry). Prefer exact-ish name from GetInstalledSoftware first. ALWAYS prompts. No silent force beyond QuietUninstall/msiexec when available."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Display name substring to match" }; product_code = @{ type = "string"; description = "Optional MSI product code {GUID}" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "NewMachineSetup"; description = "Full new-machine setup. ALWAYS prompts once listing SETTINGS + SOFTWARE. Settings: restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off. Software from catalog: 7zip, Chrome, Adobe, ADWCleaner, VLC. ADWCleaner will run a scan. skip_software=true for settings only. dry_run=true previews."; parameters = @{ type = "object"; properties = @{ dry_run = @{ type = "boolean" }; timezone = @{ type = "string" }; skip_restore_point = @{ type = "boolean" }; skip_software = @{ type = "boolean" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ListInstallers"; description = "List silent installer catalog (id, name, notes). Read-only."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "InstallPackage"; description = "Silent download+install from the installers catalog. package=id or packages=[ids]. Follows redirects (dynamic URLs). ALWAYS prompts. Temp downloads cleaned after each package. Ids: 7zip, chrome, adobe_reader, adwcleaner (will run a scan), vlc."; parameters = @{ type = "object"; properties = @{ package = @{ type = "string"; description = "Single package id" }; packages = @{ type = "array"; items = @{ type = "string" }; description = "Multiple package ids" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently unlock tools. group= vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full (aliases: tune/newmachine->setup, install/chrome/vlc->installers, http->web, ...). Then call the real tool. Never announce."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string"; description = "Group name or alias from MAP" } }; required = @("group") } } },
+	@{ type = "function"; function = @{ name = "ListToolGroups"; description = "Dump group/tool catalog. Prefer EnableToolGroup using the MAP in the system prompt - usually no need to list first."; parameters = @{ type = "object"; properties = @{} } } }
+)
+
+# Progressive tool catalog (core lean; optional groups on demand)
+$script:MBToolCatalog = [ordered]@{
+	core = @(
+		'ReadFile','WriteFile','EditFile','ApplyPatch','ListDirectory','SearchFiles','FindFiles','DiffText',
+		'RunCommand','GetWorkingDirectory','SetWorkingDirectory','GetEnvironment','SetEnvironment',
+		'EnableToolGroup','ListToolGroups'
+	)
+	vision = @(
+		'ReadImage','ReadPdf','ViewScreen'
+	)
+	system = @(
+		'GetSystemInfo','GetProcessList','GetProcessTree','GetMemoryInfo','GetNetworkInfo','GetNetConnections',
+		'GetDiskSpace','GetDiskHealth','GetBSODInfo','GetEventLogs','GetSystemUptime',
+		'GetServiceStatus','ControlService','GetPowerInfo','GetStartupItems',
+		'GetInstalledSoftware','GetDriverInfo','GetWindowsUpdateStatus','GetScheduledTasks'
+	)
+	repair    = @('RunQuickDiagnostics','RunRepairTool')
+	setup     = @(
+		'AudioVolume','DisplayBrightness','SetWindowsOption','ListWindowsOptions',
+		'SystemRestore','UninstallSoftware','NewMachineSetup'
+	)
+	installers = @(
+		'ListInstallers','InstallPackage'
+	)
+	sandbox   = @('SandBoxWrite','SandBox','SandBoxList','GetSandBoxInfo','ClearSandBox')
+	files     = @('DownloadFile','ExpandArchive','CompressArchive')
+	packages  = @('FindPSModule','GetInstalledPSModule','InstallPSModule','UpdatePSModule')
+	registry  = @('ReadRegistry','SetRegistry')
+	clipboard = @('Clipboard')
+	web       = @('MakeHttpRequest','BrowsePage','ConvertGitHubUrl','GetGitHubRawFile','ListGitHubDirectory')
+	speech    = @('SpeakText')
+}
+
+$script:MBToolGroupMeta = [ordered]@{
+	core = @{
+		Label       = 'Core'
+		Description = 'Files, edits, shell, CWD, env (always on)'
+	}
+	vision = @{
+		Label       = 'Vision'
+		Description = 'ReadImage, ReadPdf, ViewScreen'
+	}
+	system = @{
+		Label       = 'System'
+		Description = 'System info, process tree, ports, services'
+	}
+	repair = @{
+		Label       = 'Repair'
+		Description = 'Quick diagnostics, sfc, DISM, chkdsk'
+	}
+	setup = @{
+		Label       = 'Setup / Tune'
+		Description = 'Volume, brightness, Windows options, restore, uninstall, NewMachineSetup'
+	}
+	installers = @{
+		Label       = 'Installers'
+		Description = 'Silent catalog installs: 7zip, Chrome, Adobe, ADWCleaner, VLC'
+	}
+	sandbox = @{
+		Label       = 'SandBox'
+		Description = 'Incremental PowerShell lab: pieces, compose, PASS/FAIL checks'
+	}
+	files = @{
+		Label       = 'Files'
+		Description = 'Download and zip extract/compress'
+	}
+	packages = @{
+		Label       = 'Packages'
+		Description = 'PowerShell Gallery find/install/update'
+	}
+	registry = @{
+		Label       = 'Registry'
+		Description = 'Read/write registry keys (write prompts)'
+	}
+	clipboard = @{
+		Label       = 'Clipboard'
+		Description = 'Read/write Windows clipboard'
+	}
+	web = @{
+		Label       = 'Web / HTTP'
+		Description = 'HTTP client, page fetch, GitHub helpers'
+	}
+	speech = @{
+		Label       = 'Speech'
+		Description = 'Windows TTS (SpeakText); operator Right-Ctrl PTT via /speech'
+	}
+}
+
+function Initialize-MBToolGroups {
+	if (-not $script:MB.ActiveToolGroups) {
+		$script:MB.ActiveToolGroups = New-Object System.Collections.ArrayList
+	}
+	$script:MB.ActiveToolGroups.Clear()
+	[void]$script:MB.ActiveToolGroups.Add('core')
+	$profile = [string]$script:MB.ToolProfile
+	if ([string]::IsNullOrWhiteSpace($profile)) { $profile = [string]$ToolProfile }
+	if ($profile -match '^(?i)full|all$') {
+		foreach ($g in @('vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')) {
+			if (-not ($script:MB.ActiveToolGroups -contains $g)) {
+				[void]$script:MB.ActiveToolGroups.Add($g)
 			}
 		}
 	}
 }
 
-# SYSTEM PROMPT
-$SystemPrompt = @"
-You are $AgentName v$Version, a precise Windows system repair and diagnostic assistant.
-You help an experienced IT technician quickly perform a diagnostic and create a repair plan based on the current scenario.
+function Sync-MBPromptAfterToolGroups {
+	try { Initialize-MBToolsOverhead } catch {}
+	try {
+		if ($script:Messages) {
+			$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+		}
+	} catch {}
+	try { $script:SystemPrompt = Get-MBSystemPrompt } catch {}
+	try { Update-MBWpfToolGroupBar -Force } catch {}
+}
 
-DO NOT try to bypass tool usage denials! If you have been denied permission to do a required action, stop what you are doing and explain clearly why approval is needed.
+function Get-MBToolGroupOrder {
+	@('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')
+}
 
-Prioritize speed. Look for needle-in-haystack issues (BSODs, disk errors, slow I/O, failing drivers, corrupted components, etc.).
-Always summarize findings clearly and recommend concrete next actions.
-Be concise but thorough.
-"@
+function Update-MBWpfToolGroupBar {
+	# Agent thread pushes tool-group snapshot; STA timer paints chips.
+	param([switch]$Force)
+	if (-not (Test-MBWpfActive)) { return }
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
 
-# TOOLS
-$Tools = @(
-	@{ type = "function"; function = @{ name = "ReadFile"; description = "Read text-based files. Supports chunked reading on large files using head, tail, or offset+length. Blocks binary files (executables, dumps, archives, images, documents, databases)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; head = @{ type = "integer"; description = "Read first N lines" }; tail = @{ type = "integer"; description = "Read last N lines" }; offset = @{ type = "integer"; description = "Start line number (1-based)" }; length = @{ type = "integer"; description = "Number of lines to read from offset" } }; required = @("path") } } },	@{ type = "function"; function = @{ name = "WriteFile"; description = "Write/overwrite file. This ALWAYS prompts the user for approval."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" }; confirm = @{ type = "boolean" } }; required = @("path","content") } }},
-	@{ type = "function"; function = @{ name = "EditFile"; description = "Search/replace edit in a file. UseRegex=false (default) does safe literal string replacement. This ALWAYS prompts the user for approval."; parameters = @{ type = "object"; properties = @{path = @{ type = "string" };search = @{ type = "string" };replace = @{ type = "string" };useRegex = @{ type = "boolean"; description = "Use regex-based replace instead of literal string replace. Default: false" };confirm = @{ type = "boolean" }}; required = @("path","search","replace") } }},
-	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell or CMD command. Safe read-only diagnostic commands run automatically. ALL modifying or non-whitelisted commands ALWAYS prompt the user first. The model cannot bypass approval. Do not try to circumvent denials."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string" }; shell = @{ type = "string"; enum = @("powershell","cmd") } }; required = @("command") } }},
-	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory contents as JSON."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } }},
-	@{ type = "function"; function = @{ name = "GetSystemInfo"; description = "Basic system information as JSON."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "GetProcessList"; description = "Top processes by CPU as JSON."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "Clipboard"; description = "Read or write clipboard."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; enum = @("read","write") }; text = @{ type = "string" } }; required = @("action") } }},
+	$order = @(Get-MBToolGroupOrder)
+	$activeList = New-Object System.Collections.ArrayList
+	try {
+		foreach ($g in @($script:MB.ActiveToolGroups)) {
+			$gl = ([string]$g).Trim().ToLowerInvariant()
+			if ($gl -and -not ($activeList -contains $gl)) { [void]$activeList.Add($gl) }
+		}
+	} catch {}
+	if ($activeList.Count -eq 0) { [void]$activeList.Add('core') }
+	if ($activeList -contains 'full' -or $activeList -contains 'all') {
+		$activeList = New-Object System.Collections.ArrayList
+		foreach ($g in $order) { [void]$activeList.Add($g) }
+	}
+	$fp = (@($activeList) -join ',')
+	if (-not $Force) {
+		try {
+			if ($W.ToolGroupsFp -eq $fp -and $W.ToolGroupsBuilt -and -not $W.ToolGroupsDirty) { return }
+		} catch {}
+	}
 
-	@{ type = "function"; function = @{ name = "GetBSODInfo"; description = "Recent BSOD/minidump info + related events."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "GetEventLogs"; description = "Recent errors/warnings + disk I/O events."; parameters = @{ type = "object"; properties = @{ hours = @{ type = "integer" } } } }},
-	@{ type = "function"; function = @{ name = "GetDiskHealth"; description = "Physical disk health + SMART data."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "GetDiskSpace"; description = "Drive usage + top large folders."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } } } }},
-	@{ type = "function"; function = @{ name = "GetInstalledSoftware"; description = "Installed programs list."; parameters = @{ type = "object"; properties = @{} } }},
+	$toolsByGroup = @{}
+	foreach ($g in $order) {
+		try {
+			if ($script:MBToolCatalog -and $script:MBToolCatalog.Contains($g)) {
+				$toolsByGroup[$g] = @($script:MBToolCatalog[$g] | ForEach-Object { [string]$_ })
+			} else {
+				$toolsByGroup[$g] = @()
+			}
+		} catch { $toolsByGroup[$g] = @() }
+	}
 
-	@{ type = "function"; function = @{ name = "GetDriverInfo"; description = "Query PnP drivers with optional filters. Use this for focused searches instead of dumping everything."; parameters = @{ type = "object"; properties = @{ filter = @{ type = "string"; description = "Optional filter. Examples: 'unsigned', 'microsoft', 'realtek', 'nvidia', 'network', 'audio', 'storage'. Leave empty for summary only." }; limit = @{ type = "integer"; description = "Max number of results to return (default 50). Use higher values only when needed." }; showAll = @{ type = "boolean"; description = "Set to true only if you really need every single driver. Avoid this when possible." } } } } },
+	# Installers chip: tools, then divider, then catalog package names
+	$installerPkgs = New-Object System.Collections.ArrayList
+	try {
+		$cat = Get-MBInstallerCatalog
+		foreach ($k in @($cat.Keys)) {
+			$p = $cat[$k]
+			if (-not $p) { continue }
+			$id = [string]$p.id
+			if ([string]::IsNullOrWhiteSpace($id)) { $id = [string]$k }
+			$nm = [string]$p.name
+			if ([string]::IsNullOrWhiteSpace($nm)) { $nm = $id }
+			[void]$installerPkgs.Add([pscustomobject]@{ id = $id; name = $nm })
+		}
+	} catch {}
 
-	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "GetMemoryInfo"; description = "RAM usage + top consumers."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "GetNetworkInfo"; description = "Network adapters + connectivity test."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "GetWindowsUpdateStatus"; description = "Pending Windows updates."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "GetSystemUptime"; description = "System uptime and last boot time."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle of key diagnostic checks."; parameters = @{ type = "object"; properties = @{} } }},
-	@{ type = "function"; function = @{ name = "RunRepairTool"; description = "Flexible repair tool for sfc, dism, and chkdsk. Supports custom drive letters and arbitrary arguments (especially useful for DISM). This ALWAYS prompts the user for approval.";parameters = @{ type = "object"; properties = @{tool = @{ type = "string"; enum = @("sfc","dism","chkdsk") };driveLetter = @{ type = "string"; description = "Drive letter for chkdsk (e.g. 'D:'). Defaults to C:" };arguments = @{ type = "string"; description = "Extra flags or full command arguments. For DISM, you can pass almost anything here (e.g. '/Online /Cleanup-Image /RestoreHealth /Source:...')" }}; required = @("tool") } }},
-	@{ type = "function"; function = @{ name = "GetServiceStatus"; description = "Get status of one or all services."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" } } } }},
-	@{ type = "function"; function = @{ name = "ReadRegistry"; description = "Read registry key values safely."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } }},
-	@{ type = "function"; function = @{ name = "GetPowerInfo"; description = "Generate battery/power report."; parameters = @{ type = "object"; properties = @{} } }}
-)
+	try {
+		$W.ToolGroupsData = @{
+			order              = $order
+			active             = @($activeList)
+			tools              = $toolsByGroup
+			installerPackages  = @($installerPkgs)
+			fp                 = $fp
+		}
+		$W.ToolGroupsDirty = $true
+	} catch {}
+}
 
-# TOOL IMPLEMENTATIONS
+function Get-MBToolGroupForName {
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+	$target = $Name.Trim()
+	foreach ($key in @($script:MBToolCatalog.Keys)) {
+		foreach ($n in @($script:MBToolCatalog[$key])) {
+			if ($n -eq $target) { return $key }
+			if ($n -and $n.ToLowerInvariant() -eq $target.ToLowerInvariant()) { return $key }
+		}
+	}
+	return $null
+}
+
+function Resolve-MBToolGroupName {
+	param([string]$Group)
+	if ([string]::IsNullOrWhiteSpace($Group)) { return $null }
+	$g = $Group.Trim().ToLowerInvariant() -replace '[\s_]+', ''
+	if ($g -in @('full', 'all', 'everything')) { return 'full' }
+	if ($g -eq 'core') { return 'core' }
+	if ($script:MBToolCatalog -and $script:MBToolCatalog.Contains($g)) { return $g }
+
+	$aliases = @{
+		'image' = 'vision'; 'images' = 'vision'; 'img' = 'vision'
+		'pdf' = 'vision'; 'pdfs' = 'vision'; 'screen' = 'vision'; 'screenshot' = 'vision'
+		'viewscreen' = 'vision'; 'readimage' = 'vision'; 'readpdf' = 'vision'
+		'sys' = 'system'; 'os' = 'system'; 'process' = 'system'; 'processes' = 'system'
+		'service' = 'system'; 'services' = 'system'; 'disk' = 'system'; 'network' = 'system'
+		'port' = 'system'; 'ports' = 'system'; 'bsod' = 'system'; 'event' = 'system'
+		'events' = 'system'; 'software' = 'system'; 'driver' = 'system'; 'uptime' = 'system'
+		'fix' = 'repair'; 'diagnostics' = 'repair'; 'diagnostic' = 'repair'
+		'dism' = 'repair'; 'sfc' = 'repair'; 'chkdsk' = 'repair'
+		'tune' = 'setup'; 'tuning' = 'setup'; 'newmachine' = 'setup'; 'newpc' = 'setup'
+		'desktop' = 'setup'; 'brightness' = 'setup'; 'volume' = 'setup'; 'audio' = 'setup'
+		'power' = 'setup'; 'uac' = 'setup'; 'restore' = 'setup'; 'uninstall' = 'setup'
+		'boot' = 'setup'; 'f8' = 'setup'; 'explorer' = 'setup'
+		'install' = 'installers'; 'installer' = 'installers'; 'apps' = 'installers'
+		'chrome' = 'installers'; 'vlc' = 'installers'; '7zip' = 'installers'; 'adobe' = 'installers'
+		'lab' = 'sandbox'; 'sandboxes' = 'sandbox'
+		'download' = 'files'; 'downloads' = 'files'; 'zip' = 'files'; 'archive' = 'files'
+		'unzip' = 'files'; 'compress' = 'files'; 'expand' = 'files'
+		'module' = 'packages'; 'modules' = 'packages'; 'gallery' = 'packages'
+		'psgallery' = 'packages'; 'psmodule' = 'packages'; 'psmodules' = 'packages'
+		'reg' = 'registry'; 'regs' = 'registry'
+		'clip' = 'clipboard'; 'paste' = 'clipboard'
+		'http' = 'web'; 'https' = 'web'; 'browse' = 'web'; 'browser' = 'web'
+		'github' = 'web'; 'url' = 'web'; 'www' = 'web'; 'fetch' = 'web'
+		'tts' = 'speech'; 'voice' = 'speech'; 'speak' = 'speech'; 'sapi' = 'speech'
+	}
+	if ($aliases.ContainsKey($g)) { return [string]$aliases[$g] }
+
+	foreach ($key in @($script:MBToolCatalog.Keys)) {
+		if ($key -eq 'core') { continue }
+		if ($g.StartsWith($key) -or $key.StartsWith($g)) { return $key }
+	}
+	return $null
+}
+
+function Resolve-MBToolName {
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+	$raw = $Name.Trim()
+	$all = @($Tools | ForEach-Object { $_.function.name } | Where-Object { $_ })
+	foreach ($n in $all) {
+		if ($n -eq $raw) { return $n }
+	}
+	$lower = $raw.ToLowerInvariant()
+	foreach ($n in $all) {
+		if ($n.ToLowerInvariant() -eq $lower) { return $n }
+	}
+	$nick = @{
+		'read_file' = 'ReadFile'; 'write_file' = 'WriteFile'; 'edit_file' = 'EditFile'
+		'run' = 'RunCommand'; 'run_command' = 'RunCommand'; 'shell' = 'RunCommand'
+		'exec' = 'RunCommand'; 'bash' = 'RunCommand'; 'powershell' = 'RunCommand'
+		'list_dir' = 'ListDirectory'; 'ls' = 'ListDirectory'; 'dir' = 'ListDirectory'
+		'search' = 'SearchFiles'; 'grep' = 'SearchFiles'; 'find' = 'FindFiles'
+		'screenshot' = 'ViewScreen'; 'screen' = 'ViewScreen'; 'capture' = 'ViewScreen'
+		'image' = 'ReadImage'; 'pdf' = 'ReadPdf'; 'read_pdf' = 'ReadPdf'; 'read_image' = 'ReadImage'
+		'http' = 'MakeHttpRequest'; 'fetch' = 'BrowsePage'; 'browse' = 'BrowsePage'
+		'download' = 'DownloadFile'; 'wget' = 'DownloadFile'; 'curl' = 'MakeHttpRequest'
+		'clipboard' = 'Clipboard'; 'clip' = 'Clipboard'
+		'registry' = 'ReadRegistry'; 'reg' = 'ReadRegistry'
+		'process' = 'GetProcessList'; 'processes' = 'GetProcessList'; 'ps' = 'GetProcessList'
+		'service' = 'GetServiceStatus'; 'services' = 'GetServiceStatus'
+		'netstat' = 'GetNetConnections'; 'ports' = 'GetNetConnections'
+		'enable_tools' = 'EnableToolGroup'; 'enable_group' = 'EnableToolGroup'
+		'tools' = 'ListToolGroups'; 'list_tools' = 'ListToolGroups'
+		'volume' = 'AudioVolume'; 'mute' = 'AudioVolume'; 'brightness' = 'DisplayBrightness'
+		'uninstall' = 'UninstallSoftware'; 'setup_machine' = 'NewMachineSetup'; 'new_machine' = 'NewMachineSetup'
+		'system_restore' = 'SystemRestore'; 'restore_point' = 'SystemRestore'
+		'list_installers' = 'ListInstallers'; 'install_package' = 'InstallPackage'; 'install_app' = 'InstallPackage'
+	}
+	$key = ($lower -replace '[\s-]+', '_')
+	if ($nick.ContainsKey($key)) { return [string]$nick[$key] }
+	if ($nick.ContainsKey($lower)) { return [string]$nick[$lower] }
+
+	$compact = $lower -replace '[^a-z0-9]', ''
+	if ($compact.Length -lt 4) { return $null }
+	$best = $null
+	$bestScore = 0
+	foreach ($n in $all) {
+		$nc = $n.ToLowerInvariant() -replace '[^a-z0-9]', ''
+		$score = 0
+		if ($nc -eq $compact) { return $n }
+		if ($nc.Contains($compact)) { $score = 50 + $compact.Length }
+		elseif ($compact.Contains($nc) -and $nc.Length -ge 5) { $score = 40 + $nc.Length }
+		elseif ($nc.StartsWith($compact.Substring(0, [math]::Min(5, $compact.Length)))) { $score = 20 }
+		if ($score -gt $bestScore) { $bestScore = $score; $best = $n }
+	}
+	if ($bestScore -ge 25) { return $best }
+	return $null
+}
+
+function Get-MBToolEnableHint {
+	param([string]$ToolName)
+	$resolved = Resolve-MBToolName -Name $ToolName
+	if (-not $resolved) { $resolved = $ToolName }
+	$grp = Get-MBToolGroupForName -Name $resolved
+	if ($grp -and $grp -ne 'core') {
+		return "Call EnableToolGroup with group=$grp then call $resolved (same turn; do not narrate)."
+	}
+	if ($grp -eq 'core') {
+		return "Tool $resolved is in core and should already be available."
+	}
+	return "Call ListToolGroups or EnableToolGroup using the MAP (vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech)."
+}
+
+function Get-MBActiveToolNames {
+	# Case-insensitive set (hashtable; PS 5.1)
+	$map = @{}
+	$groups = @($script:MB.ActiveToolGroups)
+	$toAdd = New-Object System.Collections.ArrayList
+	if ($groups -contains 'full' -or $groups -contains 'all') {
+		foreach ($t in @($Tools)) {
+			if ($t.function.name) { [void]$toAdd.Add([string]$t.function.name) }
+		}
+	} else {
+		foreach ($g in $groups) {
+			if ($script:MBToolCatalog.Contains($g)) {
+				foreach ($n in @($script:MBToolCatalog[$g])) {
+					if ($n) { [void]$toAdd.Add([string]$n) }
+				}
+			}
+		}
+	}
+	[void]$toAdd.Add('EnableToolGroup')
+	[void]$toAdd.Add('ListToolGroups')
+	foreach ($n in @($toAdd)) {
+		if (-not [string]::IsNullOrWhiteSpace($n)) {
+			$map[$n.ToLowerInvariant()] = $n
+		}
+	}
+	return @($map.Values)
+}
+
+function Test-MBToolNameActive {
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+	$target = $Name.ToLowerInvariant()
+	foreach ($n in @(Get-MBActiveToolNames)) {
+		if ($n.ToLowerInvariant() -eq $target) { return $true }
+	}
+	return $false
+}
+
+function Get-MBActiveTools {
+	$active = @($Tools | Where-Object {
+		$n = $_.function.name
+		$n -and (Test-MBToolNameActive -Name $n)
+	})
+	if ($active.Count -eq 0) {
+		Initialize-MBToolGroups
+		$active = @($Tools | Where-Object { Test-MBToolNameActive -Name $_.function.name })
+	}
+	return $active
+}
+
+function Enable-MBToolGroup {
+	param([string]$Group)
+	if ([string]::IsNullOrWhiteSpace($Group)) {
+		$map = ($script:MBGroupQuickMap.Keys | ForEach-Object { "$_=$($script:MBGroupQuickMap[$_])" }) -join '; '
+		return "ERROR: group required. Use: vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full. MAP: $map"
+	}
+	$resolved = Resolve-MBToolGroupName -Group $Group
+	if (-not $resolved) {
+		$asTool = Resolve-MBToolName -Name $Group
+		if ($asTool) {
+			$tg = Get-MBToolGroupForName -Name $asTool
+			if ($tg -and $tg -ne 'core') {
+				$resolved = $tg
+			} elseif ($tg -eq 'core') {
+				return "OK: '$Group' maps to core tool $asTool (already available). Call $asTool directly - do not narrate."
+			}
+		}
+	}
+	if (-not $resolved) {
+		$known = @($script:MBToolCatalog.Keys) -join ', '
+		return "ERROR: Unknown group '$Group'. Known: $known, full. Or pass a tool name (e.g. ReadPdf -> vision)."
+	}
+	$g = $resolved
+	if ($g -in @('all', 'full')) {
+		foreach ($name in @('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')) {
+			if (-not ($script:MB.ActiveToolGroups -contains $name)) {
+				[void]$script:MB.ActiveToolGroups.Add($name)
+			}
+		}
+		Sync-MBPromptAfterToolGroups
+		$nNow = @((Get-MBActiveToolNames)).Count
+		return "OK full ($nNow tools). Continue the task with the needed tools now - do not narrate this enable to the user."
+	}
+	if ($g -eq 'core') {
+		$script:MB.ActiveToolGroups.Clear()
+		[void]$script:MB.ActiveToolGroups.Add('core')
+		Sync-MBPromptAfterToolGroups
+		$nNow = @((Get-MBActiveToolNames)).Count
+		return "OK core only ($nNow tools)."
+	}
+	if (-not $script:MBToolCatalog.Contains($g)) {
+		$known = ($script:MBToolCatalog.Keys -join ', ')
+		return "ERROR: Unknown group '$Group'. Known: $known, full"
+	}
+	if (-not ($script:MB.ActiveToolGroups -contains 'core')) {
+		[void]$script:MB.ActiveToolGroups.Add('core')
+	}
+	$already = $script:MB.ActiveToolGroups -contains $g
+	if (-not $already) {
+		[void]$script:MB.ActiveToolGroups.Add($g)
+	}
+	Sync-MBPromptAfterToolGroups
+	$toolsIn = @($script:MBToolCatalog[$g])
+	$nNow = @((Get-MBActiveToolNames)).Count
+	$what = if ($script:MBGroupQuickMap -and $script:MBGroupQuickMap.Contains($g)) { [string]$script:MBGroupQuickMap[$g] } else { '' }
+	if ($already) {
+		return "OK group=$g already on ($what). tools=$($toolsIn -join ','). totalSchemas=$nNow. Call the tool you need now - do not narrate."
+	}
+	return "OK enabled group=$g ($what). tools=$($toolsIn -join ','). totalSchemas=$nNow. Call the tool you need NOW in this turn - do not narrate to the user."
+}
+
+function Get-MBToolGroupsStatus {
+	$active = @($script:MB.ActiveToolGroups)
+	$groups = @()
+	foreach ($key in @($script:MBToolCatalog.Keys)) {
+		$meta = $null
+		if ($script:MBToolGroupMeta -and $script:MBToolGroupMeta.Contains($key)) {
+			$meta = $script:MBToolGroupMeta[$key]
+		}
+		$groups += [ordered]@{
+			group       = $key
+			label       = $(if ($meta) { $meta.Label } else { $key })
+			description = $(if ($meta) { $meta.Description } else { '' })
+			active      = [bool]($active -contains $key)
+			tools       = @($script:MBToolCatalog[$key])
+		}
+	}
+	$nActive = @((Get-MBActiveToolNames)).Count
+	return ConvertTo-MBJson ([ordered]@{
+		profile       = [string]$script:MB.ToolProfile
+		activeGroups  = $active
+		activeToolCount = $nActive
+		activeTools   = @((Get-MBActiveToolNames | Sort-Object))
+		groups        = $groups
+		hint          = "EnableToolGroup group=vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full - smallest group needed; prompt playbook updates with the group"
+	}) -Depth 6
+}
+
 function Invoke-ReadFile {
 	param(
 		[string]$path,
-		[int]$head,
-		[int]$tail,
-		[int]$offset,
-		[int]$length
+		[int]$head = 0,
+		[int]$tail = 0,
+		[int]$offset = 0,
+		[int]$length = 0
 	)
 
-	if (-not (Test-Path $path)) {
-		return "ERROR: File not found: $path"
-	}
+	$path = Resolve-MBPath $path
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: Empty or invalid path" }
+	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: File not found: $path" }
 
-	$file = Get-Item $path
+	$file = Get-Item -LiteralPath $path
+	if ($file.PSIsContainer) { return "ERROR: Path is a directory. Use ListDirectory: $path" }
+
 	$ext = $file.Extension.ToLower()
-
 	$blockedExtensions = @(
 		'.exe','.dll','.sys','.drv','.ocx','.com','.scr','.msi','.msp','.mst','.cab',
 		'.dmp','.hdmp','.mdmp','.kdmp',
 		'.zip','.rar','.7z','.tar','.gz','.bz2','.xz','.iso','.img','.wim','.esd',
 		'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.odt','.ods','.odp',
 		'.png','.jpg','.jpeg','.gif','.bmp','.ico','.webp','.mp4','.avi','.mkv','.mov','.mp3','.wav','.flac',
-		'.db','.sqlite','.mdb','.accdb','.bin','.dat','.pak','.bundle','.so','.dylib'
+		'.db','.sqlite','.mdb','.accdb','.bin','.pak','.bundle','.so','.dylib'
 	)
-
 	if ($blockedExtensions -contains $ext) {
+		if ($ext -in @('.png','.jpg','.jpeg','.gif','.bmp','.webp','.tif','.tiff')) {
+			return "BLOCKED: '$ext' is an image - EnableToolGroup group=vision then ReadImage path=... (vision). Do not dump binary as text."
+		}
+		if ($ext -eq '.pdf') {
+			return "BLOCKED: PDF - EnableToolGroup group=vision then ReadPdf path=... (default page=1 only; auto vision if garbled; page=N only if needed)."
+		}
 		return "BLOCKED: File type '$ext' cannot be read as text."
 	}
 
 	$isLarge = $file.Length -gt 1MB
-	$hasChunkParams = $head -or $tail -or ($offset -and $length)
-
-	if ($isLarge -and -not $hasChunkParams) {
-		return "FILE IS LARGE ($([math]::Round($file.Length/1MB,1)) MB). Use head, tail, or offset+length to read in smaller pieces (recommended chunk size: 200-400 lines)."
+	$hasChunk = ($head -gt 0) -or ($tail -gt 0) -or (($offset -gt 0) -and ($length -gt 0))
+	if ($isLarge -and -not $hasChunk) {
+		return "FILE IS LARGE ($([math]::Round($file.Length/1MB,1)) MB). Use head, tail, or offset+length (recommended 200-400 lines)."
 	}
 
 	try {
-		if ($tail) {
-			Get-Content $path -Tail $tail -ErrorAction Stop | Out-String
+		# prefer UTF-8 over ANSI when high-bit characters present
+		if ($tail -gt 0) {
+			return Limit-MBResult ((Get-Content -LiteralPath $path -Tail $tail -Encoding UTF8 -ErrorAction Stop | Out-String))
 		}
-		elseif ($head) {
-			Get-Content $path -TotalCount $head -ErrorAction Stop | Out-String
+		elseif ($head -gt 0) {
+			return Limit-MBResult ((Get-Content -LiteralPath $path -TotalCount $head -Encoding UTF8 -ErrorAction Stop | Out-String))
 		}
-		elseif ($offset -and $length) {
-			Get-Content $path -ErrorAction Stop | Select-Object -Skip ($offset - 1) -First $length | Out-String
+		elseif (($offset -gt 0) -and ($length -gt 0)) {
+			return Limit-MBResult ((Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | Select-Object -Skip ($offset - 1) -First $length | Out-String))
 		}
 		else {
-			Get-Content $path -Raw -ErrorAction Stop
+			return Limit-MBResult ((Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop))
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Get-MBNewlineStyle {
+	param([string]$Text)
+	if ($null -eq $Text) { return 'LF' }
+	if ($Text.Contains("`r`n")) { return 'CRLF' }
+	if ($Text.Contains("`r") -and -not $Text.Contains("`n")) { return 'CR' }
+	return 'LF'
+}
+
+function Convert-MBToNewlineStyle {
+	param([string]$Text, [string]$Style = 'LF')
+	if ($null -eq $Text) { return '' }
+	$n = $Text -replace "`r`n", "`n" -replace "`r", "`n"
+	switch ($Style) {
+		'CRLF' { return ($n -replace "`n", "`r`n") }
+		'CR'   { return ($n -replace "`n", "`r") }
+		default { return $n }
+	}
+}
+
+function Read-MBTextFile {
+	param([Parameter(Mandatory)][string]$Path)
+	$bytes = [System.IO.File]::ReadAllBytes($Path)
+	$encName = 'utf8'
+	$hadBom = $false
+	$text = $null
+
+	if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+		$encName = 'utf8bom'
+		$hadBom = $true
+		$text = [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+	}
+	elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+		$encName = 'utf16le'
+		$hadBom = $true
+		$text = [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+	}
+	elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+		$encName = 'utf16be'
+		$hadBom = $true
+		$text = [System.Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
+	}
+	else {
+		# UTF-8 when valid, else system ANSI
+		try {
+			$utf8Strict = New-Object System.Text.UTF8Encoding $false, $true
+			$text = $utf8Strict.GetString($bytes)
+			$encName = 'utf8'
+		} catch {
+			$text = [System.Text.Encoding]::Default.GetString($bytes)
+			$encName = 'default'
 		}
 	}
-	catch {
-		"ERROR: $($_.Exception.Message)"
+
+	return @{
+		Text     = $text
+		Encoding = $encName
+		HadBom   = $hadBom
+		Newline  = (Get-MBNewlineStyle -Text $text)
+		Bytes    = $bytes.Length
 	}
+}
+
+function Write-MBTextFile {
+	param(
+		[Parameter(Mandatory)][string]$Path,
+		[AllowNull()][string]$Text,
+		[string]$Encoding = 'utf8',
+		[string]$Newline = 'LF'
+	)
+	if ($null -eq $Text) { $Text = '' }
+	$payload = Convert-MBToNewlineStyle -Text $Text -Style $Newline
+	$enc = $null
+	switch -Regex ($Encoding) {
+		'^(?i)utf8bom$'  { $enc = New-Object System.Text.UTF8Encoding $true; break }
+		'^(?i)utf16le$'  { $enc = New-Object System.Text.UnicodeEncoding $false, $true; break }
+		'^(?i)utf16be$'  { $enc = New-Object System.Text.UnicodeEncoding $true, $true; break }
+		'^(?i)default$'  { $enc = [System.Text.Encoding]::Default; break }
+		default          { $enc = New-Object System.Text.UTF8Encoding $false; break }
+	}
+	$dir = Split-Path -Parent $Path
+	if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+		New-Item -ItemType Directory -Path $dir -Force | Out-Null
+	}
+	[System.IO.File]::WriteAllText($Path, $payload, $enc)
+}
+
+function Get-MBLineDiffPreview {
+	param(
+		[string]$OldText,
+		[string]$NewText,
+		[int]$MaxLines = 28
+	)
+	$oldLines = @([string]$OldText -split "`r?`n", -1)
+	$newLines = @([string]$NewText -split "`r?`n", -1)
+	$max = [math]::Max($oldLines.Count, $newLines.Count)
+	$out = New-Object System.Collections.Generic.List[string]
+	$diffs = 0
+	for ($i = 0; $i -lt $max; $i++) {
+		$l = if ($i -lt $oldLines.Count) { $oldLines[$i] } else { $null }
+		$r = if ($i -lt $newLines.Count) { $newLines[$i] } else { $null }
+		if ($l -ceq $r) { continue }
+		$diffs++
+		$n = $i + 1
+		if ($null -ne $l) {
+			$ls = [string]$l
+			if ($ls.Length -gt 160) { $ls = $ls.Substring(0, 157) + '...' }
+			[void]$out.Add("- ${n}: $ls")
+		}
+		if ($null -ne $r) {
+			$rs = [string]$r
+			if ($rs.Length -gt 160) { $rs = $rs.Substring(0, 157) + '...' }
+			[void]$out.Add("+ ${n}: $rs")
+		}
+		if ($out.Count -ge $MaxLines) {
+			[void]$out.Add('... preview truncated ...')
+			break
+		}
+	}
+	return @{
+		Preview   = $(if ($out.Count -gt 0) { $out -join "`n" } else { '(no line-level diff; content length changed only)' })
+		LineDiffs = $diffs
+	}
+}
+
+function Find-MBSearchNearMiss {
+	param(
+		[string]$Content,
+		[string]$Search,
+		[int]$MaxHits = 5
+	)
+	if ([string]::IsNullOrWhiteSpace($Search) -or [string]::IsNullOrEmpty($Content)) { return '' }
+	$searchNorm = ($Search -replace "`r`n", "`n" -replace "`r", "`n").Trim()
+	$firstLine = (($searchNorm -split "`n", 2)[0]).Trim()
+	if ([string]::IsNullOrWhiteSpace($firstLine)) { return '' }
+	if ($firstLine.Length -gt 120) { $firstLine = $firstLine.Substring(0, 120) }
+
+	$lines = $Content -split "`r?`n", -1
+	$hits = New-Object System.Collections.Generic.List[string]
+	for ($i = 0; $i -lt $lines.Count; $i++) {
+		$ln = [string]$lines[$i]
+		$trim = $ln.Trim()
+		if ($trim.Length -eq 0) { continue }
+		$matched = $false
+		if ($trim.IndexOf($firstLine, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matched = $true }
+		elseif ($firstLine.IndexOf($trim, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and $trim.Length -ge 8) { $matched = $true }
+		if (-not $matched) { continue }
+		$show = $ln
+		if ($show.Length -gt 140) { $show = $show.Substring(0, 137) + '...' }
+		[void]$hits.Add(('  line {0}: {1}' -f ($i + 1), $show))
+		if ($hits.Count -ge $MaxHits) { break }
+	}
+	if ($hits.Count -eq 0) { return '' }
+	return "Near-miss lines (first search line):`n" + ($hits -join "`n")
+}
+
+function Find-MBLiteralMatches {
+	param(
+		[string]$Content,
+		[string]$Search
+	)
+	$positions = New-Object System.Collections.Generic.List[int]
+	if ([string]::IsNullOrEmpty($Search) -or $null -eq $Content) { return @() }
+	$idx = 0
+	$step = [math]::Max(1, $Search.Length)
+	while ($idx -le ($Content.Length - $Search.Length)) {
+		$found = $Content.IndexOf($Search, $idx, [System.StringComparison]::Ordinal)
+		if ($found -lt 0) { break }
+		[void]$positions.Add($found)
+		$idx = $found + $step
+	}
+	return @($positions)
+}
+
+function Invoke-MBLiteralReplace {
+	param(
+		[string]$Content,
+		[string]$Search,
+		[string]$Replace,
+		[bool]$ReplaceAll = $false,
+		[int]$Occurrence = 0
+	)
+	$result = @{
+		Count      = 0
+		NewContent = $Content
+		Error      = $null
+		Mode       = 'LITERAL'
+	}
+	if ([string]::IsNullOrEmpty($Search)) {
+		$result.Error = 'Empty search string'
+		return $result
+	}
+
+	$positions = @(Find-MBLiteralMatches -Content $Content -Search $Search)
+	$usedSearch = $Search
+	$usedReplace = $Replace
+	$eolFlex = $false
+
+	if ($positions.Count -eq 0) {
+		$cNorm = $Content -replace "`r`n", "`n" -replace "`r", "`n"
+		$sNorm = $Search -replace "`r`n", "`n" -replace "`r", "`n"
+		$rNorm = if ($null -eq $Replace) { '' } else { $Replace -replace "`r`n", "`n" -replace "`r", "`n" }
+		if ($sNorm -ne $Search -or $cNorm -ne $Content) {
+			$positions = @(Find-MBLiteralMatches -Content $cNorm -Search $sNorm)
+			if ($positions.Count -gt 0) {
+				$eolFlex = $true
+				$usedSearch = $sNorm
+				$usedReplace = $rNorm
+				$Content = $cNorm
+			}
+		}
+	}
+
+	$result.Count = $positions.Count
+	$result.EolFlex = $eolFlex
+
+	if ($positions.Count -eq 0) {
+		$hint = Find-MBSearchNearMiss -Content $Content -Search $Search
+		$msg = 'Search string not found (literal). Include more surrounding context from ReadFile, or fix whitespace.'
+		if ($hint) { $msg = "$msg`n$hint" }
+		$result.Error = $msg
+		return $result
+	}
+
+	if ($Occurrence -gt 0) {
+		if ($Occurrence -gt $positions.Count) {
+			$result.Error = "occurrence=$Occurrence but only $($positions.Count) match(es) found"
+			return $result
+		}
+		$pos = $positions[$Occurrence - 1]
+		$result.NewContent = $Content.Remove($pos, $usedSearch.Length).Insert($pos, [string]$usedReplace)
+		$result.Count = 1
+		$result.Mode = "LITERAL#${Occurrence}"
+		return $result
+	}
+
+	if (-not $ReplaceAll -and $positions.Count -gt 1) {
+		$locs = New-Object System.Collections.Generic.List[string]
+		$lines = $Content -split "`n", -1
+		foreach ($p in ($positions | Select-Object -First 5)) {
+			$before = $Content.Substring(0, $p)
+			$lineNo = ([regex]::Matches($before, "`n")).Count + 1
+			$snippet = $usedSearch -replace "`n", '\n'
+			if ($snippet.Length -gt 80) { $snippet = $snippet.Substring(0, 77) + '...' }
+			[void]$locs.Add("  match at line ~$lineNo : $snippet")
+		}
+		$extra = if ($positions.Count -gt 5) { "`n  ... +$($positions.Count - 5) more" } else { '' }
+		$result.Error = @"
+Search matched $($positions.Count) times — refusing ambiguous edit (unique match required by default).
+Make 'search' unique with surrounding lines, OR set replaceAll=true, OR set occurrence=N (1-based).
+Matches:
+$($locs -join "`n")$extra
+"@
+		return $result
+	}
+
+	if ($ReplaceAll -or $positions.Count -eq 1) {
+		$newText = $Content
+		for ($i = $positions.Count - 1; $i -ge 0; $i--) {
+			$p = $positions[$i]
+			$newText = $newText.Remove($p, $usedSearch.Length).Insert($p, [string]$usedReplace)
+		}
+		$result.NewContent = $newText
+		$result.Mode = if ($ReplaceAll -and $positions.Count -gt 1) { 'LITERAL*all' } else { 'LITERAL' }
+		return $result
+	}
+
+	$result.Error = 'Unexpected replace path'
+	return $result
+}
+
+function Invoke-MBRegexReplace {
+	param(
+		[string]$Content,
+		[string]$Search,
+		[string]$Replace,
+		[bool]$ReplaceAll = $false,
+		[int]$Occurrence = 0
+	)
+	$result = @{
+		Count      = 0
+		NewContent = $Content
+		Error      = $null
+		Mode       = 'REGEX'
+	}
+	if ([string]::IsNullOrEmpty($Search)) {
+		$result.Error = 'Empty search string'
+		return $result
+	}
+	try {
+		$rx = New-Object System.Text.RegularExpressions.Regex(
+			$Search,
+			[System.Text.RegularExpressions.RegexOptions]::None,
+			[TimeSpan]::FromSeconds(2)
+		)
+		$mc = $rx.Matches($Content)
+		$result.Count = $mc.Count
+		if ($mc.Count -eq 0) {
+			$result.Error = 'Regex matched 0 times'
+			return $result
+		}
+		if ($Occurrence -gt 0) {
+			if ($Occurrence -gt $mc.Count) {
+				$result.Error = "occurrence=$Occurrence but only $($mc.Count) match(es)"
+				return $result
+			}
+			$m = $mc[$Occurrence - 1]
+			$repl = $m.Result([string]$Replace)
+			$result.NewContent = $Content.Remove($m.Index, $m.Length).Insert($m.Index, $repl)
+			$result.Count = 1
+			$result.Mode = "REGEX#${Occurrence}"
+			return $result
+		}
+		if (-not $ReplaceAll -and $mc.Count -gt 1) {
+			$result.Error = "Regex matched $($mc.Count) times — set replaceAll=true or occurrence=N, or narrow the pattern."
+			return $result
+		}
+		if ($ReplaceAll) {
+			$result.NewContent = $rx.Replace($Content, [string]$Replace)
+			$result.Mode = 'REGEX*all'
+		} else {
+			$result.NewContent = $rx.Replace($Content, [string]$Replace, 1)
+			$result.Count = 1
+			$result.Mode = 'REGEX'
+		}
+		return $result
+	} catch {
+		$result.Error = $_.Exception.Message
+		return $result
+	}
+}
+
+function Get-MBEditPreview {
+	param(
+		[string]$Content,
+		[string]$Search,
+		[string]$Replace,
+		[bool]$UseRegex = $false,
+		[bool]$ReplaceAll = $false,
+		[int]$Occurrence = 0
+	)
+	$result = @{
+		Count      = 0
+		NewContent = $Content
+		Preview    = ''
+		Error      = $null
+		Mode       = 'LITERAL'
+		LineDiffs  = 0
+	}
+	$op = $null
+	if ($UseRegex) {
+		$op = Invoke-MBRegexReplace -Content $Content -Search $Search -Replace $Replace -ReplaceAll $ReplaceAll -Occurrence $Occurrence
+	} else {
+		$op = Invoke-MBLiteralReplace -Content $Content -Search $Search -Replace $Replace -ReplaceAll $ReplaceAll -Occurrence $Occurrence
+	}
+	$result.Count = $op.Count
+	$result.NewContent = $op.NewContent
+	$result.Error = $op.Error
+	$result.Mode = $op.Mode
+	if ($result.Error) { return $result }
+
+	$diff = Get-MBLineDiffPreview -OldText $Content -NewText $result.NewContent
+	$result.Preview = $diff.Preview
+	$result.LineDiffs = $diff.LineDiffs
+	return $result
 }
 
 function Invoke-WriteFile {
 	param([string]$path, [string]$content)
-
-	if (-not (Request-Confirmation -Title "WriteFile ACTION REQUIRES APPROVAL" `
-				-Details "The agent wants to WRITE/OVERWRITE this file:`n`n`t$path")) {
+	$path = Resolve-MBPath $path
+	$bytes = [System.Text.Encoding]::UTF8.GetByteCount([string]$content)
+	$exists = Test-Path -LiteralPath $path
+	$action = if ($exists) { 'OVERWRITE' } else { 'CREATE' }
+	if (-not (Request-Confirmation -Title "WriteFile requires approval" -Details "${action}:`n`n  $path`n`nBytes: $bytes")) {
 		return "BLOCKED BY USER: File write denied by operator."
 	}
-
 	try {
-		$content | Out-File $path -Encoding UTF8 -Force
-		if ($AutoApproveEnabled) {
-			return "SUCCESS (auto-approved): File written to $path"
+		$enc = 'utf8'
+		$nl = 'LF'
+		if ($exists) {
+			try {
+				$prev = Read-MBTextFile -Path $path
+				$enc = $prev.Encoding
+				$nl = $prev.Newline
+			} catch {}
 		} else {
-			return "SUCCESS: File written to $path"
+			# New files: UTF-8 no BOM; Windows newlines for scripts
+			if ($path -match '\.(ps1|bat|cmd|vbs|reg|ini|psd1|psm1)$') { $nl = 'CRLF' }
 		}
-	}
-	catch {
-		return "ERROR: $_"
+		Write-MBTextFile -Path $path -Text ([string]$content) -Encoding $enc -Newline $nl
+		if ($script:MB.AutoApprove) { return "SUCCESS (auto-approved): Written $path ($action, enc=$enc, nl=$nl)" }
+		return "SUCCESS: Written $path ($action, enc=$enc, nl=$nl)"
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
 	}
 }
 
@@ -359,125 +6059,3296 @@ function Invoke-EditFile {
 		[string]$path,
 		[string]$search,
 		[string]$replace,
-		[bool]$useRegex = $false
+		[bool]$useRegex = $false,
+		[bool]$replaceAll = $false,
+		[int]$occurrence = 0,
+		$edits = $null
 	)
-
-	if (-not (Test-Path $path)) { return "ERROR: File not found: $path" }
-
-	$content = Get-Content $path -Raw
-
-	$mode = if ($useRegex) { "REGEX" } else { "LITERAL (recommended)" }
-	$details = @"
-File: $path
-
-Mode: $mode
-
-Search for:
-$search
-
-Replace with:
-$replace
-"@
-
-	if (-not (Request-Confirmation -Title "EditFile ACTION REQUIRES APPROVAL" -Details $details)) {
-		return "BLOCKED BY USER: Edit denied by operator."
-	}
+	$path = Resolve-MBPath $path
+	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: File not found: $path" }
 
 	try {
-		if ($useRegex) {
-			$newContent = $content -replace $search, $replace
-		} else {
-			$newContent = $content.Replace($search, $replace)
-		}
-
-		$newContent | Out-File $path -Encoding UTF8 -Force
-		return "SUCCESS: Edit applied to $path (Mode: $(if ($useRegex) { 'Regex' } else { 'Literal' }))"
+		$file = Read-MBTextFile -Path $path
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
 	}
-	catch {
+
+	$editList = New-Object System.Collections.Generic.List[object]
+	if ($null -ne $edits) {
+		$arr = @($edits)
+		foreach ($e in $arr) {
+			if ($null -eq $e) { continue }
+			$s = $null; $r = $null; $rx = $useRegex; $ra = $replaceAll; $occ = $occurrence
+			if ($e -is [hashtable]) {
+				$s = [string]$e['search']; $r = [string]$e['replace']
+				if ($e.ContainsKey('useRegex')) { $rx = [bool]$e['useRegex'] }
+				if ($e.ContainsKey('replaceAll')) { $ra = [bool]$e['replaceAll'] }
+				if ($e.ContainsKey('occurrence')) { $occ = [int]$e['occurrence'] }
+			} else {
+				$s = [string](Get-MBProp $e 'search')
+				$r = [string](Get-MBProp $e 'replace')
+				if (Test-MBHasProp $e 'useRegex') { $rx = [bool](Get-MBProp $e 'useRegex') }
+				if (Test-MBHasProp $e 'replaceAll') { $ra = [bool](Get-MBProp $e 'replaceAll') }
+				if (Test-MBHasProp $e 'occurrence') { $occ = [int](Get-MBProp $e 'occurrence') }
+			}
+			if ([string]::IsNullOrEmpty($s)) {
+				return "ERROR: edits[] entry missing search"
+			}
+			[void]$editList.Add([pscustomobject]@{ search = $s; replace = $r; useRegex = $rx; replaceAll = $ra; occurrence = $occ })
+		}
+	}
+	if ($editList.Count -eq 0) {
+		if ([string]::IsNullOrEmpty($search)) {
+			return "ERROR: Provide search/replace or edits[] (array of {search, replace})."
+		}
+		[void]$editList.Add([pscustomobject]@{
+			search = $search; replace = $replace; useRegex = $useRegex
+			replaceAll = $replaceAll; occurrence = $occurrence
+		})
+	}
+
+	$content = [string]$file.Text
+	$contentLF = $content -replace "`r`n", "`n" -replace "`r", "`n"
+	$working = $contentLF
+	$previews = New-Object System.Collections.Generic.List[string]
+	$totalMatches = 0
+	$modes = New-Object System.Collections.Generic.List[string]
+	$step = 0
+	foreach ($ed in $editList) {
+		$step++
+		$sLF = ([string]$ed.search) -replace "`r`n", "`n" -replace "`r", "`n"
+		$rLF = if ($null -eq $ed.replace) { '' } else { ([string]$ed.replace) -replace "`r`n", "`n" -replace "`r", "`n" }
+		$preview = Get-MBEditPreview -Content $working -Search $sLF -Replace $rLF `
+			-UseRegex ([bool]$ed.useRegex) -ReplaceAll ([bool]$ed.replaceAll) -Occurrence ([int]$ed.occurrence)
+		if ($preview.Error) {
+			return "ERROR: edit #$step failed: $($preview.Error)"
+		}
+		$totalMatches += [int]$preview.Count
+		[void]$modes.Add([string]$preview.Mode)
+		$sShow = $sLF; if ($sShow.Length -gt 220) { $sShow = $sShow.Substring(0, 217) + '...' }
+		$rShow = $rLF; if ($rShow.Length -gt 220) { $rShow = $rShow.Substring(0, 217) + '...' }
+		[void]$previews.Add(@"
+--- edit #$step ($($preview.Mode), matches=$($preview.Count), line deltas≈$($preview.LineDiffs)) ---
+Search:
+$sShow
+Replace:
+$rShow
+$($preview.Preview)
+"@)
+		$working = [string]$preview.NewContent
+	}
+
+	if ($working -ceq $contentLF) {
+		return "ERROR: Edit produced no content change (search matched but replacement is identical)."
+	}
+
+	$overall = Get-MBLineDiffPreview -OldText $contentLF -NewText $working -MaxLines 36
+	$details = @"
+File: $path
+Encoding: $($file.Encoding)  |  Newlines: $($file.Newline)  |  Hunks: $($editList.Count)
+Total matches applied: $totalMatches  |  Modes: $($modes -join ', ')
+Line deltas (approx): $($overall.LineDiffs)
+
+$($previews -join "`n`n")
+
+Overall diff sample:
+$($overall.Preview)
+"@
+	if (-not (Request-Confirmation -Title "EditFile requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Edit denied by operator."
+	}
+	try {
+		Write-MBTextFile -Path $path -Text $working -Encoding $file.Encoding -Newline $file.Newline
+		$auto = if ($script:MB.AutoApprove) { ' (auto-approved)' } else { '' }
+		return "SUCCESS${auto}: Edit applied to $path (hunks=$($editList.Count), matches=$totalMatches, enc=$($file.Encoding), nl=$($file.Newline))"
+	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
 }
 
+function Invoke-ApplyPatch {
+	param(
+		[Parameter(Mandatory)][string]$patch,
+		[string]$path = ''
+	)
+	if ([string]::IsNullOrWhiteSpace($patch)) {
+		return "ERROR: Empty patch"
+	}
+
+	$patchLF = ([string]$patch) -replace "`r`n", "`n" -replace "`r", "`n"
+	$lines = $patchLF -split "`n", -1
+
+	$files = New-Object System.Collections.Generic.List[object]
+	$curPath = if ($path) { Resolve-MBPath $path } else { $null }
+	$curHunks = New-Object System.Collections.Generic.List[object]
+	$oldBuf = $null
+	$newBuf = $null
+	$inHunk = $false
+
+	$flushHunk = {
+		param($Hunks, $OldBuf, $NewBuf)
+		if ($null -eq $OldBuf -and $null -eq $NewBuf) { return }
+		$o = if ($null -ne $OldBuf) { @($OldBuf) } else { @() }
+		$n = if ($null -ne $NewBuf) { @($NewBuf) } else { @() }
+		[void]$Hunks.Add([pscustomobject]@{ Old = $o; New = $n })
+	}
+	$flushFile = {
+		param($Files, [string]$P, $Hunks)
+		if ([string]::IsNullOrWhiteSpace($P)) { return }
+		if ($Hunks.Count -eq 0) { return }
+		[void]$Files.Add([pscustomobject]@{
+			Path  = $P
+			Hunks = @($Hunks.ToArray())
+		})
+		$Hunks.Clear()
+	}
+
+	foreach ($raw in $lines) {
+		$line = [string]$raw
+
+		if ($line -match '^\*\*\*\s+Update File:\s*(.+)\s*$') {
+			if ($inHunk) {
+				& $flushHunk $curHunks $oldBuf $newBuf
+				$inHunk = $false; $oldBuf = $null; $newBuf = $null
+			}
+			& $flushFile $files $curPath $curHunks
+			$curPath = Resolve-MBPath $matches[1].Trim()
+			continue
+		}
+		if ($line -match '^\*\*\*\s+Begin Patch' -or $line -match '^\*\*\*\s+End Patch') { continue }
+
+		if ($line -match '^---\s+') {
+			if ($inHunk) {
+				& $flushHunk $curHunks $oldBuf $newBuf
+				$inHunk = $false; $oldBuf = $null; $newBuf = $null
+			}
+			$p = ($line.Substring(3)).Trim() -replace '\t.*$',''
+			if ($p.StartsWith('a/') -or $p.StartsWith('b/')) { $p = $p.Substring(2) }
+			if ($p -ne '/dev/null' -and $p -ne 'nul' -and -not [string]::IsNullOrWhiteSpace($p)) {
+				if (-not $curPath) { $curPath = Resolve-MBPath $p }
+			}
+			continue
+		}
+		if ($line -match '^\+\+\+\s+') {
+			$p = ($line.Substring(3)).Trim() -replace '\t.*$',''
+			if ($p.StartsWith('a/') -or $p.StartsWith('b/')) { $p = $p.Substring(2) }
+			if ($p -ne '/dev/null' -and $p -ne 'nul' -and -not [string]::IsNullOrWhiteSpace($p)) {
+				if ($inHunk) {
+					& $flushHunk $curHunks $oldBuf $newBuf
+					$inHunk = $false; $oldBuf = $null; $newBuf = $null
+				}
+				$resolved = Resolve-MBPath $p
+				if ($curPath -and $curHunks.Count -gt 0 -and ($resolved -ne $curPath)) {
+					& $flushFile $files $curPath $curHunks
+				}
+				$curPath = $resolved
+			}
+			continue
+		}
+		if ($line -match '^@@') {
+			if ($inHunk) { & $flushHunk $curHunks $oldBuf $newBuf }
+			$inHunk = $true
+			$oldBuf = New-Object System.Collections.Generic.List[string]
+			$newBuf = New-Object System.Collections.Generic.List[string]
+			continue
+		}
+		if (-not $inHunk) {
+			# Allow hunk start without @@ for *** patch format
+			if ($line.StartsWith('***')) { continue }
+			if ($line.StartsWith(' ') -or $line.StartsWith('-') -or $line.StartsWith('+')) {
+				$inHunk = $true
+				$oldBuf = New-Object System.Collections.Generic.List[string]
+				$newBuf = New-Object System.Collections.Generic.List[string]
+			} else {
+				continue
+			}
+		}
+
+		if ($line.StartsWith('\')) { continue } # "\ No newline at end of file"
+		if ($line.StartsWith('+')) {
+			[void]$newBuf.Add($line.Substring(1))
+		}
+		elseif ($line.StartsWith('-')) {
+			[void]$oldBuf.Add($line.Substring(1))
+		}
+		elseif ($line.StartsWith(' ')) {
+			$ctx = $line.Substring(1)
+			[void]$oldBuf.Add($ctx)
+			[void]$newBuf.Add($ctx)
+		}
+		elseif ($line -eq '') {
+			[void]$oldBuf.Add('')
+			[void]$newBuf.Add('')
+		}
+		else {
+			& $flushHunk $curHunks $oldBuf $newBuf
+			$inHunk = $false
+			$oldBuf = $null
+			$newBuf = $null
+		}
+	}
+	if ($inHunk) { & $flushHunk $curHunks $oldBuf $newBuf }
+	& $flushFile $files $curPath $curHunks
+
+	if ($files.Count -eq 0) {
+		return @"
+ERROR: Could not parse any file hunks from patch.
+Use unified diff:
+  --- a/path
+  +++ b/path
+  @@
+   context
+  -old
+  +new
+Or:
+  *** Update File: path
+  @@
+   context
+  -old
+  +new
+"@
+	}
+
+	$plan = New-Object System.Collections.Generic.List[object]
+	$previewBlocks = New-Object System.Collections.Generic.List[string]
+	foreach ($f in $files) {
+		$fp = [string]$f.Path
+		if (-not (Test-Path -LiteralPath $fp)) {
+			return "ERROR: Patch target not found: $fp (ApplyPatch updates existing files; use WriteFile to create)."
+		}
+		try {
+			$st = Read-MBTextFile -Path $fp
+		} catch {
+			return "ERROR: Cannot read $fp : $($_.Exception.Message)"
+		}
+		$work = ([string]$st.Text) -replace "`r`n", "`n" -replace "`r", "`n"
+		$hNum = 0
+		foreach ($h in @($f.Hunks)) {
+			$hNum++
+			$oldText = (@($h.Old) -join "`n")
+			$newText = (@($h.New) -join "`n")
+			$positions = @(Find-MBLiteralMatches -Content $work -Search $oldText)
+			if ($positions.Count -eq 0 -and $oldText.Length -gt 0) {
+				$oldTrim = $oldText -replace "`n$", ''
+				$positions = @(Find-MBLiteralMatches -Content $work -Search $oldTrim)
+				if ($positions.Count -gt 0) {
+					$oldText = $oldTrim
+					$newText = $newText -replace "`n$", ''
+				}
+			}
+			if ($oldText.Length -eq 0) {
+				return "ERROR: $fp hunk #$hNum has empty old side (include context lines)."
+			}
+			if ($positions.Count -eq 0) {
+				$hint = Find-MBSearchNearMiss -Content $work -Search $oldText
+				$snip = $oldText.Substring(0, [math]::Min(300, $oldText.Length))
+				return "ERROR: $fp hunk #$hNum old text not found.`n$hint`nHunk old (first 300 chars):`n$snip"
+			}
+			if ($positions.Count -gt 1) {
+				return "ERROR: $fp hunk #$hNum matched $($positions.Count) places — add more context lines to make it unique."
+			}
+			$pos = $positions[0]
+			$work = $work.Remove($pos, $oldText.Length).Insert($pos, $newText)
+		}
+		$origLF = ([string]$st.Text) -replace "`r`n", "`n" -replace "`r", "`n"
+		$diff = Get-MBLineDiffPreview -OldText $origLF -NewText $work
+		[void]$plan.Add([pscustomobject]@{
+			Path      = $fp
+			Encoding  = $st.Encoding
+			Newline   = $st.Newline
+			NewText   = $work
+			Hunks     = $hNum
+			Preview   = $diff.Preview
+			LineDiffs = $diff.LineDiffs
+		})
+		[void]$previewBlocks.Add("File: $fp (hunks=$hNum, line deltas≈$($diff.LineDiffs), enc=$($st.Encoding))`n$($diff.Preview)")
+	}
+
+	$details = "ApplyPatch — $($plan.Count) file(s)`n`n" + ($previewBlocks -join "`n`n")
+	if (-not (Request-Confirmation -Title "ApplyPatch requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Patch denied by operator."
+	}
+
+	$ok = New-Object System.Collections.Generic.List[string]
+	foreach ($p in $plan) {
+		try {
+			Write-MBTextFile -Path $p.Path -Text $p.NewText -Encoding $p.Encoding -Newline $p.Newline
+			[void]$ok.Add("$($p.Path) (hunks=$($p.Hunks))")
+		} catch {
+			return "ERROR: Failed writing $($p.Path): $($_.Exception.Message). Already wrote: $($ok -join '; ')"
+		}
+	}
+	$auto = if ($script:MB.AutoApprove) { ' (auto-approved)' } else { '' }
+	return "SUCCESS${auto}: Patch applied:`n - " + ($ok -join "`n - ")
+}
+
+function Invoke-MBProcessCapture {
+	param(
+		[Parameter(Mandatory = $true)][string]$FileName,
+		[string]$Arguments = '',
+		[string]$WorkingDir = '',
+		[int]$TimeoutMs = 0
+	)
+	if ([string]::IsNullOrWhiteSpace($WorkingDir)) {
+		$WorkingDir = if ($script:MB.WorkingDir) { $script:MB.WorkingDir } else { (Get-Location).Path }
+	}
+
+	if ($script:HasNative) {
+		if ($script:MB.Interrupt) {
+			try { [MiniBot.Core.Native]::CancelRequested = $true } catch {}
+		}
+		return [MiniBot.Core.Native]::RunProcess($FileName, $Arguments, $WorkingDir, $TimeoutMs)
+	}
+
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	$result = [pscustomobject]@{
+		ExitCode   = -1
+		StdOut     = ''
+		StdErr     = ''
+		ElapsedMs  = 0
+		TimedOut   = $false
+		Cancelled  = $false
+	}
+	$proc = $null
+	try {
+		$psi = New-Object System.Diagnostics.ProcessStartInfo
+		$psi.FileName = $FileName
+		$psi.Arguments = $Arguments
+		$psi.WorkingDirectory = $WorkingDir
+		$psi.UseShellExecute = $false
+		$psi.RedirectStandardOutput = $true
+		$psi.RedirectStandardError = $true
+		$psi.CreateNoWindow = $true
+		try {
+			$utf8 = New-Object System.Text.UTF8Encoding $false
+			$psi.StandardOutputEncoding = $utf8
+			$psi.StandardErrorEncoding = $utf8
+		} catch {}
+
+		$proc = New-Object System.Diagnostics.Process
+		$proc.StartInfo = $psi
+		[void]$proc.Start()
+		$outTask = $proc.StandardOutput.ReadToEndAsync()
+		$errTask = $proc.StandardError.ReadToEndAsync()
+
+		while (-not $proc.HasExited) {
+			if ((Test-MBInterrupt)) {
+				try { $proc.Kill() } catch {}
+				$result.Cancelled = $true
+				$script:MB.Interrupt = $true
+				break
+			}
+			if ($TimeoutMs -gt 0 -and $sw.ElapsedMilliseconds -gt $TimeoutMs) {
+				try { $proc.Kill() } catch {}
+				$result.TimedOut = $true
+				break
+			}
+			Start-Sleep -Milliseconds 40
+		}
+
+		if (-not $result.Cancelled -and -not $result.TimedOut) {
+			try { [void]$proc.WaitForExit(2000) } catch {}
+			try { $result.ExitCode = $proc.ExitCode } catch { $result.ExitCode = -1 }
+		}
+
+		try {
+			if ($outTask.IsCompleted) { $result.StdOut = [string]$outTask.Result }
+			else {
+				try { [void]$outTask.Wait(500) } catch {}
+				if ($outTask.IsCompleted) { $result.StdOut = [string]$outTask.Result }
+			}
+		} catch {}
+		try {
+			if ($errTask.IsCompleted) { $result.StdErr = [string]$errTask.Result }
+			else {
+				try { [void]$errTask.Wait(500) } catch {}
+				if ($errTask.IsCompleted) { $result.StdErr = [string]$errTask.Result }
+			}
+		} catch {}
+	} catch {
+		$result.StdErr = $_.Exception.Message
+	} finally {
+		if ($proc) { try { $proc.Dispose() } catch {} }
+	}
+	$sw.Stop()
+	$result.ElapsedMs = $sw.ElapsedMilliseconds
+	return $result
+}
+
+# SandBox (same user as MiniBot; not a security boundary)
+# Sandbox layout: %TEMP%\MiniBotSandbox\<id>
+function Initialize-MBSandboxRoot {
+	if ($script:MB.SandboxRoot -and (Test-Path -LiteralPath $script:MB.SandboxRoot)) {
+		foreach ($sub in @('work', 'work\pieces', 'fixtures', 'out')) {
+			$dir = Join-Path $script:MB.SandboxRoot $sub
+			if (-not (Test-Path -LiteralPath $dir)) {
+				New-Item -ItemType Directory -Path $dir -Force | Out-Null
+			}
+		}
+		return [string]$script:MB.SandboxRoot
+	}
+	$id = [guid]::NewGuid().ToString('N').Substring(0, 12)
+	$base = Get-MBSandboxBasePath
+	if (-not (Test-Path -LiteralPath $base)) {
+		New-Item -ItemType Directory -Path $base -Force | Out-Null
+	}
+	$root = Join-Path $base $id
+	foreach ($sub in @('work', 'work\pieces', 'fixtures', 'out')) {
+		$dir = Join-Path $root $sub
+		if (-not (Test-Path -LiteralPath $dir)) {
+			New-Item -ItemType Directory -Path $dir -Force | Out-Null
+		}
+	}
+	$script:MB.SandboxRoot = $root
+	$script:MB.SandboxId = $id
+	$script:MB.SandboxLast = $null
+	try { Register-MBTempPath -Path $root } catch {}
+	Write-MBSandboxState -State (New-MBSandboxState)
+	return $root
+}
+
+function New-MBSandboxState {
+	return [ordered]@{
+		version = 1
+		order   = @()
+		pieces  = [ordered]@{}
+	}
+}
+
+function Get-MBSandboxStatePath {
+	param($Root = $null)
+	if ([string]::IsNullOrWhiteSpace([string]$Root)) { $Root = [string]$script:MB.SandboxRoot }
+	return (Join-Path ([string]$Root) 'state.json')
+}
+
+function Read-MBSandboxState {
+	$root = Initialize-MBSandboxRoot
+	$path = Get-MBSandboxStatePath -Root $root
+	if (-not (Test-Path -LiteralPath $path)) {
+		return (New-MBSandboxState)
+	}
+	try {
+		$raw = [System.IO.File]::ReadAllText($path)
+		$obj = $raw | ConvertFrom-Json
+		$st = New-MBSandboxState
+		if ($obj.order) { $st.order = @($obj.order | ForEach-Object { [string]$_ }) }
+		if ($obj.pieces) {
+			foreach ($p in $obj.pieces.PSObject.Properties) {
+				$st.pieces[$p.Name] = $p.Value
+			}
+		}
+		return $st
+	} catch {
+		return (New-MBSandboxState)
+	}
+}
+
+function Write-MBSandboxState {
+	param($State)
+	$root = Initialize-MBSandboxRoot
+	$path = Get-MBSandboxStatePath -Root $root
+	try {
+		$utf8 = New-Object System.Text.UTF8Encoding $false
+		[System.IO.File]::WriteAllText($path, (ConvertTo-MBJson $State -Depth 10), $utf8)
+	} catch {}
+}
+
+function Get-MBSandboxPieceName {
+	param($Name)
+	if ($null -eq $Name) { return $null }
+	if (-not ($Name -is [string])) {
+		if ($Name -is [System.Array]) { $Name = ($Name | ForEach-Object { "$_" }) -join '_' }
+		else { $Name = [string]$Name }
+	}
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+	$n = $Name.Trim() -replace '\.ps1$', ''
+	$n = $n -replace '[^\w\-]', '_'
+	if ([string]::IsNullOrWhiteSpace($n)) { return $null }
+	if ($n.Length -gt 64) { $n = $n.Substring(0, 64) }
+	return $n
+}
+
+function Get-MBSandboxPiecePath {
+	param($Name)
+	$root = Initialize-MBSandboxRoot
+	$safe = Get-MBSandboxPieceName -Name $Name
+	if (-not $safe) { return $null }
+	return (Join-Path $root ("work\pieces\$safe.ps1"))
+}
+
+function Convert-MBSandboxPiecesList {
+	param($Pieces)
+	$list = New-Object System.Collections.Generic.List[string]
+	if ($null -eq $Pieces) { return @() }
+	if ($Pieces -is [string]) {
+		foreach ($part in ($Pieces -split '[,;]')) {
+			$s = Get-MBSandboxPieceName -Name $part
+			if ($s) { [void]$list.Add($s) }
+		}
+		return @($list)
+	}
+	foreach ($p in @($Pieces)) {
+		$s = Get-MBSandboxPieceName -Name ([string]$p)
+		if ($s) { [void]$list.Add($s) }
+	}
+	return @($list)
+}
+
+function Save-MBSandboxPiece {
+	param(
+		$Name = $null,
+		$Code = $null,
+		$Description = $null,
+		$DependsOn = $null
+	)
+	$Name = Get-MBSandboxPieceName -Name $Name
+	$Code = Convert-MBToCodeString $Code
+	if ($null -eq $Description) { $Description = '' } else { $Description = [string]$Description }
+	$deps = @(Convert-MBSandboxPiecesList -Pieces $DependsOn)
+	$deps = @($deps | Where-Object { $_ -and $_ -ne $Name })
+	$safe = $Name
+	if (-not $safe) { return @{ Ok = $false; Error = 'Invalid piece name (use letters, numbers, _-)' } }
+	if ([string]::IsNullOrWhiteSpace($Code)) { return @{ Ok = $false; Error = 'Empty code' } }
+	$root = Initialize-MBSandboxRoot
+	$path = Get-MBSandboxPiecePath -Name $safe
+	try {
+		$utf8 = New-Object System.Text.UTF8Encoding $false
+		[System.IO.File]::WriteAllText($path, [string]$Code, $utf8)
+	} catch {
+		return @{ Ok = $false; Error = $_.Exception.Message }
+	}
+	$st = Read-MBSandboxState
+	if (-not ($st.order -contains $safe)) {
+		$st.order = @($st.order) + @($safe)
+	}
+	$prev = $null
+	if ($st.pieces[$safe]) { $prev = $st.pieces[$safe] }
+	$st.pieces[$safe] = [ordered]@{
+		name         = $safe
+		file         = "work\pieces\$safe.ps1"
+		description  = $Description
+		depends_on   = $deps
+		bytes        = [System.Text.Encoding]::UTF8.GetByteCount([string]$Code)
+		updated_at   = (Get-Date).ToString('o')
+		last_ok      = $(if ($prev -and $null -ne $prev.last_ok) { $prev.last_ok } else { $null })
+		last_summary = $(if ($prev) { $prev.last_summary } else { $null })
+		last_at      = $(if ($prev) { $prev.last_at } else { $null })
+	}
+	Write-MBSandboxState -State $st
+	return @{
+		Ok         = $true
+		Name       = $safe
+		Path       = $path
+		Root       = $root
+		DependsOn  = $deps
+	}
+}
+
+function Get-MBSandboxPieceDeps {
+	param($Name, $State = $null)
+	$safe = Get-MBSandboxPieceName -Name $Name
+	if (-not $safe) { return @() }
+	if ($null -eq $State) { $State = Read-MBSandboxState }
+	$meta = $State.pieces[$safe]
+	if (-not $meta) { return @() }
+	$raw = $null
+	try { $raw = $meta.depends_on } catch { $raw = $null }
+	if ($null -eq $raw) {
+		try { $raw = $meta.DependsOn } catch { $raw = $null }
+	}
+	return @(Convert-MBSandboxPiecesList -Pieces $raw)
+}
+
+function Resolve-MBSandboxRunOrder {
+	param(
+		$RequestedNames = $null,
+		$IncludeDependencies = $true
+	)
+	$st = Read-MBSandboxState
+	$req = @(Convert-MBSandboxPiecesList -Pieces $RequestedNames)
+	if ($req.Count -eq 0) {
+		return @{ Ok = $false; Order = @(); Error = 'No piece names given'; Expanded = $false }
+	}
+
+	$includeDeps = Convert-MBToBool -Value $IncludeDependencies -Default $true
+
+	$needed = New-Object System.Collections.ArrayList
+	foreach ($r in $req) { if ($r -and -not ($needed -contains $r)) { [void]$needed.Add($r) } }
+	if ($includeDeps) {
+		$queue = New-Object System.Collections.ArrayList
+		foreach ($r in $req) { [void]$queue.Add($r) }
+		$guard = 0
+		while ($queue.Count -gt 0 -and $guard -lt 200) {
+			$guard++
+			$cur = [string]$queue[0]
+			$queue.RemoveAt(0)
+			$pp = Get-MBSandboxPiecePath -Name $cur
+			if (-not (Test-Path -LiteralPath $pp)) {
+				return @{ Ok = $false; Order = @(); Error = "Missing piece: $cur"; Expanded = $true }
+			}
+			foreach ($d in @(Get-MBSandboxPieceDeps -Name $cur -State $st)) {
+				if (-not $d) { continue }
+				if (-not ($needed -contains $d)) {
+					[void]$needed.Add($d)
+					[void]$queue.Add($d)
+				}
+			}
+		}
+	}
+
+	$nodes = @($needed | ForEach-Object { [string]$_ })
+	$inDegree = @{}
+	$edges = @{}  # name to list of deps
+	foreach ($n in $nodes) {
+		$inDegree[$n] = 0
+		$edges[$n] = New-Object System.Collections.ArrayList
+	}
+	foreach ($n in $nodes) {
+		foreach ($d in @(Get-MBSandboxPieceDeps -Name $n -State $st)) {
+			if (-not $d) { continue }
+			if (-not ($nodes -contains $d)) {
+				if ($includeDeps) {
+					return @{ Ok = $false; Order = @(); Error = "Dependency '$d' of '$n' not in graph"; Expanded = $true }
+				}
+				continue
+			}
+			if (-not ($edges[$d] -contains $n)) {
+				[void]$edges[$d].Add($n)
+				$inDegree[$n] = [int]$inDegree[$n] + 1
+			}
+		}
+	}
+
+	$reqIndex = @{}
+	for ($i = 0; $i -lt $req.Count; $i++) { $reqIndex[[string]$req[$i]] = $i }
+	$stateIndex = @{}
+	$si = 0
+	foreach ($o in @($st.order)) { $stateIndex[[string]$o] = $si; $si++ }
+
+	$ready = New-Object System.Collections.ArrayList
+	foreach ($n in $nodes) {
+		if ([int]$inDegree[$n] -eq 0) { [void]$ready.Add($n) }
+	}
+	$order = New-Object System.Collections.ArrayList
+	while ($ready.Count -gt 0) {
+		$sortedReady = @($ready | Sort-Object {
+			$n = [string]$_
+			$a = 10000; $b = 10000
+			if ($reqIndex.ContainsKey($n)) { $a = [int]$reqIndex[$n] }
+			if ($stateIndex.ContainsKey($n)) { $b = [int]$stateIndex[$n] }
+			'{0:D5}-{1:D5}-{2}' -f $a, $b, $n
+		})
+		$next = [string]$sortedReady[0]
+		$ready.Clear()
+		foreach ($x in $sortedReady) {
+			if ([string]$x -ne $next) { [void]$ready.Add([string]$x) }
+		}
+		[void]$order.Add($next)
+		foreach ($dep in @($edges[$next])) {
+			$dn = [string]$dep
+			$inDegree[$dn] = [int]$inDegree[$dn] - 1
+			if ([int]$inDegree[$dn] -eq 0) { [void]$ready.Add($dn) }
+		}
+	}
+
+	if ($order.Count -ne $nodes.Count) {
+		return @{
+			Ok = $false
+			Order = @()
+			Error = 'Circular depends_on among pieces: ' + (($nodes | Where-Object { -not ($order -contains $_) }) -join ', ')
+			Expanded = $includeDeps
+		}
+	}
+
+	return @{
+		Ok        = $true
+		Order     = @($order | ForEach-Object { [string]$_ })
+		Error     = ''
+		Expanded  = [bool]$includeDeps
+		Requested = $req
+	}
+}
+
+function Update-MBSandboxPieceStatus {
+	param(
+		$Names = $null,
+		$Ok = $false,
+		$Summary = ''
+	)
+	$nameArr = @()
+	if ($null -ne $Names) { $nameArr = @($Names | ForEach-Object { "$_" }) }
+	if ($nameArr.Count -eq 0) { return }
+	$okB = Convert-MBToBool -Value $Ok -Default $false
+	$sum = if ($null -eq $Summary) { '' } else { [string]$Summary }
+	$st = Read-MBSandboxState
+	$at = (Get-Date).ToString('o')
+	foreach ($n in $nameArr) {
+		$safe = Get-MBSandboxPieceName -Name $n
+		if (-not $safe) { continue }
+		if (-not $st.pieces[$safe]) {
+			$st.pieces[$safe] = [ordered]@{ name = $safe; file = "work\pieces\$safe.ps1" }
+			if (-not ($st.order -contains $safe)) { $st.order = @($st.order) + @($safe) }
+		}
+		$old = $st.pieces[$safe]
+		$desc = ''; $bytes = 0; $file = "work\pieces\$safe.ps1"; $upd = $at
+		try { if ($old.description) { $desc = [string]$old.description } } catch {}
+		try { if ($old.bytes) { $bytes = [int]$old.bytes } } catch {}
+		try { if ($old.file) { $file = [string]$old.file } } catch {}
+		try { if ($old.updated_at) { $upd = [string]$old.updated_at } } catch {}
+		$depsKeep = @()
+		try { $depsKeep = @(Convert-MBSandboxPiecesList -Pieces $old.depends_on) } catch { $depsKeep = @() }
+		$st.pieces[$safe] = [ordered]@{
+			name         = $safe
+			file         = $file
+			description  = $desc
+			depends_on   = $depsKeep
+			bytes        = $bytes
+			updated_at   = $upd
+			last_ok      = $okB
+			last_summary = $sum
+			last_at      = $at
+		}
+	}
+	Write-MBSandboxState -State $st
+}
+
+function Build-MBSandboxComposeScript {
+	param(
+		$PieceNames = $null,
+		$GlueCode = '',
+		$TestScript = '',
+		$AsTestHarness = $false,
+		$MergeResults = $true
+	)
+	$root = Initialize-MBSandboxRoot
+	$glue = Convert-MBToCodeString $GlueCode
+	$tScript = Convert-MBToCodeString $TestScript
+	$asTest = Convert-MBToBool -Value $AsTestHarness -Default $false
+	$doMerge = Convert-MBToBool -Value $MergeResults -Default $true
+	$names = @()
+	foreach ($n in @($PieceNames)) {
+		$safe = Get-MBSandboxPieceName -Name $n
+		if ($safe) { $names += $safe }
+	}
+	$sb = New-Object System.Text.StringBuilder
+	[void]$sb.AppendLine('# Auto-composed by MiniBot SandBox')
+	[void]$sb.AppendLine('# Pieces load in dependency order; $Result can be merged across pieces.')
+	[void]$sb.AppendLine("`$ErrorActionPreference = 'Stop'")
+	if ($doMerge -and $names.Count -gt 0) {
+		[void]$sb.AppendLine('# --- result merge bookkeeping ---')
+		[void]$sb.AppendLine('$script:MB_SB_ByPiece = [ordered]@{}')
+		[void]$sb.AppendLine('$script:MB_SB_Merged = [ordered]@{}')
+		[void]$sb.AppendLine('$script:MB_SB_Order = New-Object System.Collections.ArrayList')
+		[void]$sb.AppendLine(@'
+function script:__MB_SB_MergeInto([object]$dst, [object]$src) {
+	if ($null -eq $src) { return }
+	if ($src -is [System.Collections.IDictionary]) {
+		foreach ($k in @($src.Keys)) { $dst[[string]$k] = $src[$k] }
+		return
+	}
+	try {
+		foreach ($p in @($src.PSObject.Properties)) {
+			if ($p.MemberType -match 'NoteProperty|Property') {
+				$dst[[string]$p.Name] = $p.Value
+			}
+		}
+	} catch {
+		$dst['_value'] = $src
+	}
+}
+function script:__MB_SB_Capture([string]$__name) {
+	if ([string]::IsNullOrWhiteSpace($__name)) { return }
+	[void]$script:MB_SB_Order.Add($__name)
+	$r = $null
+	if (Get-Variable -Name Result -ErrorAction SilentlyContinue) {
+		$r = Get-Variable -Name Result -ValueOnly -ErrorAction SilentlyContinue
+	}
+	if ($null -ne $r) {
+		try {
+			if ($r.PSObject.Properties['by_piece'] -and $r.PSObject.Properties['merged'] -and $r.PSObject.Properties['order']) {
+				return
+			}
+		} catch {}
+		$script:MB_SB_ByPiece[$__name] = $r
+		__MB_SB_MergeInto -dst $script:MB_SB_Merged -src $r
+	}
+}
+'@)
+	}
+	foreach ($safe in $names) {
+		$pp = Get-MBSandboxPiecePath -Name $safe
+		if (-not (Test-Path -LiteralPath $pp)) {
+			return @{ Ok = $false; Error = "Missing piece: $safe (SandBoxWrite it first)" }
+		}
+		[void]$sb.AppendLine('')
+		[void]$sb.AppendLine("# --- piece: $safe ---")
+		if ($doMerge) {
+			[void]$sb.AppendLine('Remove-Variable -Name Result -ErrorAction SilentlyContinue')
+		}
+		[void]$sb.AppendLine(". (Join-Path `$PSScriptRoot 'pieces\$safe.ps1')")
+		if ($doMerge) {
+			[void]$sb.AppendLine("__MB_SB_Capture -__name '$safe'")
+		}
+	}
+	if (-not [string]::IsNullOrWhiteSpace($glue)) {
+		[void]$sb.AppendLine('')
+		[void]$sb.AppendLine('# --- glue / entry ---')
+		[void]$sb.AppendLine($glue)
+		if ($doMerge -and $names.Count -gt 0) {
+			[void]$sb.AppendLine(@'
+if (Get-Variable -Name Result -ErrorAction SilentlyContinue) {
+	$__g = Get-Variable -Name Result -ValueOnly
+	$__isMerged = $false
+	try {
+		if ($__g -and $__g.PSObject.Properties['by_piece'] -and $__g.PSObject.Properties['merged']) { $__isMerged = $true }
+	} catch {}
+	if (-not $__isMerged -and $null -ne $__g) {
+		__MB_SB_Capture -__name 'glue'
+	}
+}
+'@)
+		}
+	}
+	if ($doMerge -and $names.Count -gt 0) {
+		[void]$sb.AppendLine('')
+		[void]$sb.AppendLine('# --- finalize merged $Result for host asserts ---')
+		[void]$sb.AppendLine(@'
+$Result = [pscustomobject]@{
+	by_piece = [pscustomobject]$script:MB_SB_ByPiece
+	merged   = [pscustomobject]$script:MB_SB_Merged
+	order    = @($script:MB_SB_Order)
+}
+try {
+	foreach ($p in @($Result.merged.PSObject.Properties)) {
+		Add-Member -InputObject $Result -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force
+	}
+} catch {}
+'@)
+	}
+	if ($asTest -and -not [string]::IsNullOrWhiteSpace($tScript)) {
+		[void]$sb.AppendLine('')
+		[void]$sb.AppendLine('# --- checks ---')
+		[void]$sb.AppendLine($tScript)
+	}
+	return @{
+		Ok    = $true
+		Text  = $sb.ToString()
+		Root  = $root
+		Order = $names
+	}
+}
+
+function Get-MBSandboxBasePath {
+	$temp = $env:TEMP
+	if ([string]::IsNullOrWhiteSpace($temp)) { $temp = [IO.Path]::GetTempPath() }
+	return (Join-Path $temp 'MiniBotSandbox')
+}
+
+function Clear-MBSandboxRoot {
+	$root = [string]$script:MB.SandboxRoot
+	$removed = $false
+	if ($root -and (Test-Path -LiteralPath $root)) {
+		try {
+			$null = Remove-MBTempPath -Path $root
+			if (Test-Path -LiteralPath $root) {
+				return "ERROR: Could not clear sandbox: still present after remove"
+			}
+			$removed = $true
+		} catch {
+			return "ERROR: Could not clear sandbox: $($_.Exception.Message)"
+		}
+	} elseif ($root) {
+		try { Unregister-MBTempPath -Path $root } catch {}
+	}
+	$script:MB.SandboxRoot = $null
+	$script:MB.SandboxId = $null
+	$script:MB.SandboxLast = $null
+	if ($removed) {
+		return "SUCCESS: Sandbox cleared ($root). Next SandBox call creates a fresh tree."
+	}
+	return "SUCCESS: No active sandbox to clear."
+}
+
+function Clear-MBSandboxAll {
+	$base = Get-MBSandboxBasePath
+	$script:MB.SandboxRoot = $null
+	$script:MB.SandboxId = $null
+	$script:MB.SandboxLast = $null
+
+	if (-not (Test-Path -LiteralPath $base)) {
+		return "SUCCESS: No MiniBotSandbox folder found ($base). Nothing to clear."
+	}
+
+	$kids = @()
+	try {
+		$kids = @(Get-ChildItem -LiteralPath $base -Force -ErrorAction Stop)
+	} catch {
+		return "ERROR: Could not list sandboxes under $base : $($_.Exception.Message)"
+	}
+
+	$n = $kids.Count
+	$failed = New-Object System.Collections.ArrayList
+	foreach ($k in $kids) {
+		try {
+			Remove-Item -LiteralPath $k.FullName -Recurse -Force -ErrorAction Stop
+		} catch {
+			[void]$failed.Add(("{0}: {1}" -f $k.Name, $_.Exception.Message))
+		}
+	}
+	try {
+		$left = @()
+		try { $left = @(Get-ChildItem -LiteralPath $base -Force -ErrorAction SilentlyContinue) } catch {}
+		if ($left.Count -eq 0) {
+			Remove-Item -LiteralPath $base -Force -ErrorAction SilentlyContinue
+		} else {
+			Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
+		}
+	} catch {}
+
+	if ($failed.Count -gt 0) {
+		return ("ERROR: Cleared with failures under {0} (found {1} entries). Failed: {2}" -f `
+			$base, $n, ($failed -join '; '))
+	}
+	return ("SUCCESS: Cleared all MiniBot sandboxes under {0} ({1} session folder(s)). Next SandBox call creates a fresh tree." -f $base, $n)
+}
+
+function Get-MBSandboxInfo {
+	$root = [string]$script:MB.SandboxRoot
+	$exists = $false
+	if ($root) {
+		try { $exists = Test-Path -LiteralPath $root } catch { $exists = $false }
+	}
+	$paths = $null
+	$pieceOrder = @()
+	$pieceCount = 0
+	if ($exists) {
+		$paths = [pscustomobject]@{
+			work     = (Join-Path $root 'work')
+			pieces   = (Join-Path $root 'work\pieces')
+			fixtures = (Join-Path $root 'fixtures')
+			out      = (Join-Path $root 'out')
+			state    = (Get-MBSandboxStatePath -Root $root)
+			composed = (Join-Path $root 'work\composed.ps1')
+		}
+		try {
+			$st = Read-MBSandboxState
+			$pieceOrder = @($st.order | ForEach-Object { [string]$_ })
+			$pieceCount = $pieceOrder.Count
+		} catch {}
+	}
+	$info = [pscustomobject]@{
+		active       = [bool]$exists
+		sandbox_id   = $(if ($script:MB.SandboxId) { [string]$script:MB.SandboxId } else { '' })
+		sandbox_root = $(if ($exists) { $root } else { '' })
+		note         = 'Incremental lab: SandBoxWrite pieces then SandBox piece/pieces + checks. Not a security boundary.'
+		workflow     = @(
+			'1) SandBoxWrite name + code (small function/block)',
+			'2) SandBox piece=name + assert/expect (check that piece)',
+			'3) Repeat; connect with SandBox pieces=[a,b,c] + glue code + checks',
+			'4) SandBox compose=true to write work\composed.ps1'
+		)
+		last         = $script:MB.SandboxLast
+		paths        = $paths
+		piece_order  = $pieceOrder
+		piece_count  = [int]$pieceCount
+	}
+	return ConvertTo-MBJson $info -Depth 8
+}
+
+function Invoke-SandBoxWrite {
+	$ArgsObj = $script:MB_ToolArgs
+	if ($null -eq $ArgsObj) { $ArgsObj = [pscustomobject]@{} }
+	$name = Get-MBProp $ArgsObj 'name'
+	$code = Convert-MBToCodeString (Get-MBProp $ArgsObj 'code')
+	$description = Get-MBProp $ArgsObj 'description'
+	$depends_on = Get-MBProp $ArgsObj 'depends_on'
+	if ($null -eq $depends_on) { $depends_on = Get-MBProp $ArgsObj 'dependsOn' }
+	if ($null -eq $name) { $name = '' } else { $name = [string]$name }
+	if ($null -eq $description) { $description = '' } else { $description = [string]$description }
+	if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($code)) {
+		return "ERROR: SandBoxWrite requires name and code. Got name-empty=$([string]::IsNullOrWhiteSpace($name)) code-empty=$([string]::IsNullOrWhiteSpace($code))."
+	}
+	$r = Save-MBSandboxPiece -Name $name -Code $code -Description $description -DependsOn $depends_on
+	if (-not $r.Ok) { return "ERROR: $($r.Error)" }
+	$st = Read-MBSandboxState
+	$depsOut = @()
+	try { $depsOut = @($r.DependsOn | ForEach-Object { [string]$_ }) } catch { $depsOut = @() }
+	return ConvertTo-MBJson ([pscustomobject]@{
+		ok           = $true
+		action       = 'write'
+		piece        = [string]$r.Name
+		path         = [string]$r.Path
+		sandbox_root = [string]$r.Root
+		depends_on   = $depsOut
+		order        = @($st.order | ForEach-Object { [string]$_ })
+		hint         = "Piece saved. Check: SandBox piece=$($r.Name). Deps auto-load when resolve_deps=true (default). Chain: pieces=[...] or depends_on on write."
+	}) -Depth 6
+}
+
+function Invoke-SandBoxList {
+	$root = Initialize-MBSandboxRoot
+	$st = Read-MBSandboxState
+	$items = New-Object System.Collections.ArrayList
+	$seen = @{}
+	foreach ($n in @($st.order)) {
+		$safe = Get-MBSandboxPieceName -Name $n
+		if (-not $safe -or $seen[$safe]) { continue }
+		$seen[$safe] = $true
+		$pp = Get-MBSandboxPiecePath -Name $safe
+		$meta = $st.pieces[$safe]
+		$exists = $false
+		try { $exists = Test-Path -LiteralPath $pp } catch {}
+		$lastOk = ''
+		$lastSum = ''
+		$lastAt = ''
+		$desc = ''
+		$deps = @()
+		try {
+			if ($meta -and $null -ne $meta.last_ok) {
+				$lastOk = if ($meta.last_ok) { 'true' } else { 'false' }
+			}
+			if ($meta -and $meta.last_summary) { $lastSum = [string]$meta.last_summary }
+			if ($meta -and $meta.last_at) { $lastAt = [string]$meta.last_at }
+			if ($meta -and $meta.description) { $desc = [string]$meta.description }
+			$deps = @(Get-MBSandboxPieceDeps -Name $safe -State $st)
+		} catch {}
+		[void]$items.Add([pscustomobject]@{
+			name         = [string]$safe
+			exists       = [bool]$exists
+			depends_on   = @($deps | ForEach-Object { [string]$_ })
+			last_ok      = [string]$lastOk
+			last_summary = [string]$lastSum
+			last_at      = [string]$lastAt
+			description  = [string]$desc
+			file         = "work\pieces\$safe.ps1"
+		})
+	}
+	$piecesDir = Join-Path $root 'work\pieces'
+	if (Test-Path -LiteralPath $piecesDir) {
+		Get-ChildItem -LiteralPath $piecesDir -Filter '*.ps1' -File -ErrorAction SilentlyContinue | ForEach-Object {
+			$safe = Get-MBSandboxPieceName -Name $_.BaseName
+			if ($safe -and -not $seen[$safe]) {
+				$seen[$safe] = $true
+				[void]$items.Add([pscustomobject]@{
+					name         = [string]$safe
+					exists       = $true
+					depends_on   = @()
+					last_ok      = ''
+					last_summary = ''
+					last_at      = ''
+					description  = ''
+					file         = "work\pieces\$safe.ps1"
+				})
+			}
+		}
+	}
+	$arr = @($items.ToArray())
+	$passed = @($arr | Where-Object { $_.last_ok -eq 'true' }).Count
+	$failed = @($arr | Where-Object { $_.last_ok -eq 'false' }).Count
+	$unknown = @($arr | Where-Object { $_.last_ok -eq '' }).Count
+	return ConvertTo-MBJson ([pscustomobject]@{
+		ok           = $true
+		sandbox_root = [string]$root
+		count        = [int]$arr.Count
+		passed       = [int]$passed
+		failed       = [int]$failed
+		unchecked    = [int]$unknown
+		pieces       = $arr
+		hint         = 'Build small then SandBoxWrite then SandBox piece=... + checks then pieces=[...] to connect.'
+	}) -Depth 8
+}
+
+function Convert-MBSandboxAssertList {
+	param($Assert)
+	$list = New-Object System.Collections.Generic.List[string]
+	if ($null -eq $Assert) { return @() }
+	# Normalize single string / one-element JSON array (PS 5.1)
+	if ($Assert -is [string]) {
+		if (-not [string]::IsNullOrWhiteSpace($Assert)) { [void]$list.Add($Assert.Trim()) }
+		return @($list)
+	}
+	if ($Assert -is [System.Management.Automation.PSObject] -and -not ($Assert -is [System.Array])) {
+		# Expand list-like objects; else one expression from known keys
+		$expr = Get-MBProp $Assert 'expr'
+		if (-not $expr) { $expr = Get-MBProp $Assert 'expression' }
+		if (-not $expr) { $expr = Get-MBProp $Assert 'assert' }
+		if ($expr) {
+			[void]$list.Add([string]$expr)
+			return @($list)
+		}
+	}
+	foreach ($a in @(Convert-MBForceArray $Assert)) {
+		if ($null -eq $a) { continue }
+		if ($a -is [string]) {
+			if (-not [string]::IsNullOrWhiteSpace($a)) { [void]$list.Add($a.Trim()) }
+			continue
+		}
+		$ex = Get-MBProp $a 'expr'
+		if (-not $ex) { $ex = Get-MBProp $a 'expression' }
+		if ($ex) { [void]$list.Add([string]$ex); continue }
+		$s = [string]$a
+		if (-not [string]::IsNullOrWhiteSpace($s) -and $s -notmatch '^@{') { [void]$list.Add($s.Trim()) }
+	}
+	return @($list)
+}
+
+function Test-MBSandboxAssertExpr {
+	param(
+		$Expression = $null,
+		$Result = $null,
+		$Stdout = $null,
+		$Stderr = $null,
+		$ExitCode = 0
+	)
+	$expr = if ($null -eq $Expression) { '' } else { [string]$Expression }
+	$expr = $expr.Trim()
+	if ($expr -match '^(?i)Result\b' -and $expr -notmatch '\$Result') {
+		$expr = '$' + $expr
+	}
+	$stdoutS = if ($null -eq $Stdout) { '' } else { [string]$Stdout }
+	$stderrS = if ($null -eq $Stderr) { '' } else { [string]$Stderr }
+	$exitN = Convert-MBToInt -Value $ExitCode -Default 0
+
+	$check = @{
+		name   = $expr
+		pass   = $false
+		detail = $null
+	}
+	if ([string]::IsNullOrWhiteSpace($expr)) {
+		$check.detail = 'empty assert'
+		return $check
+	}
+	if ($expr -match '(?i)\b(Invoke-Expression|iex|Add-Type|New-Object\s+Net\.|Start-Process|Remove-Item\s+.*-Recurse|Format-Volume)\b') {
+		$check.detail = 'assert blocked: disallowed construct in assert expression'
+		return $check
+	}
+	if ($null -eq $Result -and $expr -match '(?i)\$Result\b') {
+		$check.detail = '`$Result is null. Set `$Result = @{ ... } in the snippet (lab auto-exports JSON) or Write-Output (ConvertTo-Json) / out\result.json.'
+		return $check
+	}
+	try {
+		$wrapper = [scriptblock]::Create(
+			"param(`$Result, `$Stdout, `$Stderr, `$ExitCode)`r`n$expr"
+		)
+		$r = & $wrapper $Result $stdoutS $stderrS $exitN
+		if ($r -is [bool]) {
+			$check.pass = $r
+		} elseif ($null -eq $r) {
+			$check.pass = $false
+			$check.detail = 'assert returned $null (treat as fail)'
+		} elseif ($r -is [string]) {
+			$check.pass = Convert-MBToBool -Value $r -Default $false
+			if (-not $check.pass) { $check.detail = "assert returned string: $r" }
+		} else {
+			$check.pass = [bool]$r
+			if (-not $check.pass) { $check.detail = "assert returned: $r" }
+		}
+	} catch {
+		$check.pass = $false
+		$check.detail = $_.Exception.Message
+	}
+	return $check
+}
+
+function Get-MBSandboxJsonResult {
+	param(
+		$Stdout = $null,
+		$SandboxRoot = $null
+	)
+	if (-not [string]::IsNullOrWhiteSpace([string]$SandboxRoot)) {
+		$rj = Join-Path ([string]$SandboxRoot) 'out\result.json'
+		if (Test-Path -LiteralPath $rj) {
+			try {
+				$raw = [System.IO.File]::ReadAllText($rj)
+				if (-not [string]::IsNullOrWhiteSpace($raw)) {
+					return ($raw | ConvertFrom-Json)
+				}
+			} catch {}
+		}
+	}
+	if ([string]::IsNullOrWhiteSpace([string]$Stdout)) { return $null }
+	$t = ([string]$Stdout).Trim()
+	$lines = @($t -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+	for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+		$line = [string]$lines[$i]
+		$trim = $line.Trim()
+		if ($trim.StartsWith('{') -or $trim.StartsWith('[')) {
+			try { return ($trim | ConvertFrom-Json) } catch {}
+		}
+	}
+	try { return ($t | ConvertFrom-Json) } catch {}
+	return $null
+}
+
+function Invoke-SandBox {
+	$ArgsObj = $script:MB_ToolArgs
+	if ($null -eq $ArgsObj) { $ArgsObj = [pscustomobject]@{} }
+
+	$code = Convert-MBToCodeString (Get-MBProp $ArgsObj 'code')
+	$path = Get-MBProp $ArgsObj 'path'
+	$piece = Get-MBProp $ArgsObj 'piece'
+	$pieces = Get-MBProp $ArgsObj 'pieces'
+	$save_as = Get-MBProp $ArgsObj 'save_as'
+	$compose = Get-MBProp $ArgsObj 'compose'
+	$test_script = Convert-MBToCodeString (Get-MBProp $ArgsObj 'test_script')
+	$timeout_sec = Get-MBProp $ArgsObj 'timeout_sec'
+	$expect_exit = Get-MBProp $ArgsObj 'expect_exit'
+	$expect_stdout = Get-MBProp $ArgsObj 'expect_stdout'
+	$expect_stdout_regex = Get-MBProp $ArgsObj 'expect_stdout_regex'
+	$expect_stderr_empty = Get-MBProp $ArgsObj 'expect_stderr_empty'
+	$assert = Get-MBProp $ArgsObj 'assert'
+	$stdin = Get-MBProp $ArgsObj 'stdin'
+	$resolve_deps = Get-MBProp $ArgsObj 'resolve_deps'
+	$merge_results = Get-MBProp $ArgsObj 'merge_results'
+	$skip_approval = $false
+
+	if ($null -eq $path) { $path = '' } else { $path = [string]$path }
+	if ($null -eq $piece) { $piece = '' } else {
+		if ($piece -is [System.Array]) { $piece = [string](@($piece)[0]) }
+		else { $piece = [string]$piece }
+	}
+	if ($null -eq $save_as) { $save_as = '' } else { $save_as = [string]$save_as }
+	if ($null -ne $expect_stdout) { $expect_stdout = [string]$expect_stdout }
+	if ($null -ne $expect_stdout_regex) { $expect_stdout_regex = [string]$expect_stdout_regex }
+	if ($null -eq $stdin) { $stdin = '' } else { $stdin = [string]$stdin }
+	$compose = Convert-MBToBool -Value $compose -Default $false
+	$expect_stderr_empty = Convert-MBToBool -Value $expect_stderr_empty -Default $false
+	$timeout_sec = Convert-MBToInt -Value $timeout_sec -Default 30
+	$doResolveDeps = if ($null -eq $resolve_deps) { $true } else { Convert-MBToBool -Value $resolve_deps -Default $true }
+	$doMergeResults = if ($null -eq $merge_results) { $true } else { Convert-MBToBool -Value $merge_results -Default $true }
+	$pieceList = @(Convert-MBSandboxPiecesList -Pieces $pieces)
+	$assertList = @(Convert-MBSandboxAssertList -Assert $assert)
+	$runOrderMeta = $null
+
+	$root = Initialize-MBSandboxRoot
+	$work = Join-Path $root 'work'
+	$outDir = Join-Path $root 'out'
+	$mainPath = Join-Path $work 'main.ps1'
+	$testPath = Join-Path $work 'test.ps1'
+	$runnerPath = Join-Path $work '_runner.ps1'
+	$composedPath = Join-Path $work 'composed.ps1'
+	$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+	$singlePiece = Get-MBSandboxPieceName -Name $piece
+	$saveName = Get-MBSandboxPieceName -Name $save_as
+	$trackedPieces = New-Object System.Collections.ArrayList
+
+	if ($saveName -and -not [string]::IsNullOrWhiteSpace($code)) {
+		$depsForSave = Get-MBProp $ArgsObj 'depends_on'
+		$wr = Save-MBSandboxPiece -Name $saveName -Code $code -DependsOn $depsForSave
+		if (-not $wr.Ok) { return "ERROR: save_as failed: $($wr.Error)" }
+		[void]$trackedPieces.Add($saveName)
+	}
+
+	$hasCode = -not [string]::IsNullOrWhiteSpace($code)
+	$hasPath = -not [string]::IsNullOrWhiteSpace($path)
+	$sourceLabel = ''
+	$entryBody = ''
+	$useCompose = $false
+
+	if ($pieceList.Count -gt 0 -or $singlePiece) {
+		$requested = @()
+		if ($pieceList.Count -gt 0) { $requested = @($pieceList) }
+		elseif ($singlePiece) { $requested = @($singlePiece) }
+
+		$runOrderMeta = Resolve-MBSandboxRunOrder -RequestedNames $requested -IncludeDependencies $doResolveDeps
+		if (-not $runOrderMeta.Ok) {
+			return "ERROR: piece order: $($runOrderMeta.Error)"
+		}
+		$orderedPieces = @($runOrderMeta.Order)
+		if ($orderedPieces.Count -eq 0) {
+			return "ERROR: No pieces to run after dependency resolution."
+		}
+
+		$glue = ''
+		if ($hasCode -and -not $saveName) { $glue = $code }
+		elseif ($hasCode -and $saveName) { $glue = '' }
+
+		$built = Build-MBSandboxComposeScript -PieceNames $orderedPieces -GlueCode $glue -TestScript $test_script `
+			-AsTestHarness (-not [string]::IsNullOrWhiteSpace($test_script)) `
+			-MergeResults $doMergeResults
+		if (-not $built.Ok) { return "ERROR: $($built.Error)" }
+		$entryBody = $built.Text
+		if ($orderedPieces.Count -eq 1 -and -not $glue) {
+			$sourceLabel = "piece:$($orderedPieces[0])"
+		} else {
+			$sourceLabel = 'pieces:' + ($orderedPieces -join '+')
+			if ($glue) { $sourceLabel += '+glue' }
+			if ($doResolveDeps) { $sourceLabel += '+deps' }
+			if ($doMergeResults) { $sourceLabel += '+merge' }
+		}
+		foreach ($n in $orderedPieces) {
+			$ns = [string]$n
+			if ($ns -and -not ($trackedPieces -contains $ns)) { [void]$trackedPieces.Add($ns) }
+		}
+		$pieceList = $orderedPieces
+		$useCompose = $true
+	}
+	elseif ($hasPath) {
+		$src = Resolve-MBPath $path
+		if (-not (Test-Path -LiteralPath $src)) {
+			$alt = Join-Path $work $path
+			if (Test-Path -LiteralPath $alt) { $src = $alt }
+			else { return "ERROR: path not found: $path" }
+		}
+		try { $entryBody = [System.IO.File]::ReadAllText($src) } catch {
+			return "ERROR: Cannot read path: $($_.Exception.Message)"
+		}
+		$sourceLabel = "path:$src"
+		if (-not [string]::IsNullOrWhiteSpace($test_script)) {
+			$entryBody = @"
+$entryBody
+
+# --- test_script ---
+$test_script
+"@
+		}
+	}
+	elseif ($hasCode) {
+		$entryBody = [string]$code
+		$sourceLabel = 'code'
+		if (-not [string]::IsNullOrWhiteSpace($test_script)) {
+			$entryBody = $null  # signal dual-file path below
+		}
+	}
+	else {
+		return "ERROR: Provide code=, path=, piece=, or pieces=[...] (build with SandBoxWrite first)."
+	}
+
+	$expectExitExplicit = ($null -ne $expect_exit -and "$expect_exit" -ne '')
+	$expectExitCode = if ($expectExitExplicit) { Convert-MBToInt -Value $expect_exit -Default 0 } else { 0 }
+	$hasValidate = $false
+	if ($expectExitExplicit) { $hasValidate = $true }
+	if (-not [string]::IsNullOrWhiteSpace($expect_stdout)) { $hasValidate = $true }
+	if (-not [string]::IsNullOrWhiteSpace($expect_stdout_regex)) { $hasValidate = $true }
+	if ($expect_stderr_empty) { $hasValidate = $true }
+	if ($assertList.Count -gt 0) { $hasValidate = $true }
+	if (-not [string]::IsNullOrWhiteSpace($test_script)) { $hasValidate = $true }
+
+	if (-not $skip_approval) {
+		$codeShow = if ($null -ne $entryBody) { [string]$entryBody } else { [string]$code }
+		if ($codeShow.Length -gt 1400) { $codeShow = $codeShow.Substring(0, 1397) + '...' }
+		$checksDesc = @()
+		$checksDesc += "expect_exit=$expectExitCode"
+		if ($expect_stdout) { $checksDesc += "expect_stdout=$expect_stdout" }
+		if ($expect_stdout_regex) { $checksDesc += "expect_stdout_regex=$expect_stdout_regex" }
+		if ($expect_stderr_empty) { $checksDesc += 'expect_stderr_empty=true' }
+		foreach ($a in $assertList) { $checksDesc += "assert: $a" }
+		if ($test_script) { $checksDesc += 'test_script=yes' }
+		if ($compose) { $checksDesc += 'compose=true → work\composed.ps1' }
+		if ($doResolveDeps) { $checksDesc += 'resolve_deps=true' }
+		if ($doMergeResults) { $checksDesc += 'merge_results=true' }
+		if ($trackedPieces.Count -gt 0) { $checksDesc += 'pieces=' + ($trackedPieces -join ',') }
+		$details = @"
+SandBox run (incremental code lab - NOT a security boundary)
+Root: $root
+Source: $sourceLabel
+Timeout: ${timeout_sec}s
+
+Checks / options:
+$(($checksDesc | ForEach-Object { "  - $_" }) -join "`n")
+"@
+		if (-not (Request-Confirmation -Title "SandBox requires approval" -Details $details -Code ([string]$codeShow) -CodeLang 'ps')) {
+			return "BLOCKED BY USER: SandBox run denied by operator."
+		}
+	}
+
+	if ($timeout_sec -le 0) { $timeout_sec = 30 }
+	if ($timeout_sec -gt 600) { $timeout_sec = 600 }
+	$timeoutMs = $timeout_sec * 1000
+
+	try {
+		$entry = $mainPath
+		if ($null -eq $entryBody -and $hasCode) {
+			[System.IO.File]::WriteAllText($mainPath, [string]$code, $utf8NoBom)
+			$testBody = @"
+. (Join-Path `$PSScriptRoot 'main.ps1')
+$test_script
+"@
+			[System.IO.File]::WriteAllText($testPath, $testBody, $utf8NoBom)
+			$entry = $testPath
+			if ($compose) {
+				[System.IO.File]::WriteAllText($composedPath, [string]$code, $utf8NoBom)
+			}
+		} else {
+			[System.IO.File]::WriteAllText($mainPath, [string]$entryBody, $utf8NoBom)
+			$entry = $mainPath
+			if ($compose -or $useCompose) {
+				if ($pieceList.Count -gt 0) {
+					$glue = ''
+					if ($hasCode -and -not $saveName) { $glue = $code }
+					$comp = Build-MBSandboxComposeScript -PieceNames $pieceList -GlueCode $glue -MergeResults $doMergeResults
+					if ($comp.Ok) {
+						[System.IO.File]::WriteAllText($composedPath, $comp.Text, $utf8NoBom)
+					}
+				} else {
+					[System.IO.File]::WriteAllText($composedPath, [string]$entryBody, $utf8NoBom)
+				}
+			}
+		}
+
+		# Dot-source so snippet variables (e.g. $Result) stay in-process.
+		$runner = @"
+`$ErrorActionPreference = 'Continue'
+`$env:MB_SANDBOX_ROOT = @'
+$root
+'@
+`$env:MB_SANDBOX_WORK = @'
+$work
+'@
+`$env:MB_SANDBOX_OUT = @'
+$outDir
+'@
+Set-Location -LiteralPath @'
+$work
+'@
+`$___mbExit = 0
+try {
+	. @'
+$entry
+'@
+	if (-not `$?) { `$___mbExit = 1 }
+	if (`$null -ne `$LASTEXITCODE -and `$LASTEXITCODE -ne 0) { `$___mbExit = [int]`$LASTEXITCODE }
+} catch {
+	`$_ | Out-String | Write-Host -ForegroundColor Red
+	`$___mbExit = 1
+}
+try {
+	if (Get-Variable -Name Result -ErrorAction SilentlyContinue) {
+		`$___mbR = Get-Variable -Name Result -ValueOnly -ErrorAction SilentlyContinue
+		if (`$null -ne `$___mbR) {
+			`$___mbJson = `$___mbR | ConvertTo-Json -Depth 12 -Compress
+			if (-not [string]::IsNullOrWhiteSpace(`$___mbJson)) {
+				Write-Output `$___mbJson
+				try {
+					`$___mbOutFile = Join-Path `$env:MB_SANDBOX_OUT 'result.json'
+					[System.IO.File]::WriteAllText(`$___mbOutFile, `$___mbJson)
+				} catch {}
+			}
+		}
+	}
+} catch {}
+exit `$___mbExit
+"@
+		[System.IO.File]::WriteAllText($runnerPath, $runner, $utf8NoBom)
+	} catch {
+		return "ERROR: Failed to write sandbox scripts: $($_.Exception.Message)"
+	}
+
+	$psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+	if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+
+	$argLine = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$runnerPath`""
+	$rr = Invoke-MBProcessCapture -FileName ([string]$psExe) -Arguments ([string]$argLine) -WorkingDir ([string]$work) -TimeoutMs ([int]$timeoutMs)
+
+	$stdout = [string]$rr.StdOut
+	$stderr = [string]$rr.StdErr
+	$exitCode = [int]$rr.ExitCode
+	if ($rr.TimedOut) { $exitCode = -1 }
+	if ($rr.Cancelled) { $exitCode = -1 }
+
+	$maxStream = 8000
+	$stdoutFull = $stdout
+	$stderrFull = $stderr
+	if ($stdout.Length -gt $maxStream) { $stdout = $stdout.Substring(0, $maxStream) + "`n...[stdout truncated]..." }
+	if ($stderr.Length -gt $maxStream) { $stderr = $stderr.Substring(0, $maxStream) + "`n...[stderr truncated]..." }
+
+	# Assert list as ArrayList of PSCustomObject (PS 5.1 JSON-safe)
+	$checks = New-Object System.Collections.ArrayList
+	$runOk = (-not $rr.TimedOut) -and (-not $rr.Cancelled)
+
+	if ($rr.TimedOut) {
+		[void]$checks.Add((New-MBSandboxCheck -Name 'timeout' -Pass $false -Detail "exceeded ${timeout_sec}s"))
+		$runOk = $false
+	} elseif ($rr.Cancelled) {
+		[void]$checks.Add((New-MBSandboxCheck -Name 'cancelled' -Pass $false -Detail 'interrupted by operator'))
+		$runOk = $false
+	} else {
+		[void]$checks.Add((New-MBSandboxCheck -Name 'completed' -Pass $true))
+	}
+
+	$exitPass = ($exitCode -eq $expectExitCode)
+	[void]$checks.Add((New-MBSandboxCheck -Name 'exit' -Pass $exitPass -Expected $expectExitCode -Actual $exitCode))
+
+	$validateOk = $true
+	$phase = if ($hasValidate) { 'validate' } else { 'run' }
+
+	if ($hasValidate) {
+		if (-not [string]::IsNullOrWhiteSpace($expect_stdout)) {
+			$normOut = ($stdoutFull -replace "`r`n", "`n" -replace "`r", "`n").TrimEnd()
+			$normExp = ($expect_stdout -replace "`r`n", "`n" -replace "`r", "`n").TrimEnd()
+			$pass = ($normOut -eq $normExp) -or ($normOut.Contains($normExp))
+			$expShow = if ($normExp.Length -gt 200) { $normExp.Substring(0, 197) + '...' } else { $normExp }
+			$actShow = if ($normOut.Length -gt 200) { $normOut.Substring(0, 197) + '...' } else { $normOut }
+			[void]$checks.Add((New-MBSandboxCheck -Name 'expect_stdout' -Pass $pass -Expected $expShow -Actual $actShow))
+			if (-not $pass) { $validateOk = $false }
+		}
+		if (-not [string]::IsNullOrWhiteSpace($expect_stdout_regex)) {
+			$pass = $false; $detail = ''
+			try { $pass = [bool][regex]::IsMatch($stdoutFull, $expect_stdout_regex) } catch { $detail = $_.Exception.Message }
+			[void]$checks.Add((New-MBSandboxCheck -Name 'expect_stdout_regex' -Pass $pass -Expected $expect_stdout_regex -Detail $detail))
+			if (-not $pass) { $validateOk = $false }
+		}
+		if ($expect_stderr_empty) {
+			$pass = [string]::IsNullOrWhiteSpace($stderrFull)
+			$actShow = if ($stderrFull.Length -gt 200) { $stderrFull.Substring(0, 197) + '...' } else { $stderrFull }
+			[void]$checks.Add((New-MBSandboxCheck -Name 'expect_stderr_empty' -Pass $pass -Actual $actShow))
+			if (-not $pass) { $validateOk = $false }
+		}
+		if ($assertList.Count -gt 0) {
+			$parsed = Get-MBSandboxJsonResult -Stdout $stdoutFull -SandboxRoot $root
+			foreach ($expr in $assertList) {
+				$c = Test-MBSandboxAssertExpr -Expression $expr -Result $parsed -Stdout $stdoutFull -Stderr $stderrFull -ExitCode $exitCode
+				$cPass = $false
+				$cDetail = ''
+				$cName = [string]$expr
+				try { $cPass = [bool]$c.pass } catch {}
+				try { if ($c.detail) { $cDetail = [string]$c.detail } } catch {}
+				try { if ($c.name) { $cName = [string]$c.name } } catch {}
+				[void]$checks.Add((New-MBSandboxCheck -Name 'assert' -Pass $cPass -Expr $cName -Detail $cDetail))
+				if (-not $cPass) { $validateOk = $false }
+			}
+		}
+	} else {
+		$validateOk = $exitPass
+	}
+
+	$ok = $runOk -and $validateOk -and $exitPass
+	if ($rr.TimedOut -or $rr.Cancelled) { $ok = $false }
+
+	$failed = @($checks | Where-Object { -not $_.pass })
+	$summary = if ($ok) { 'PASS' }
+		elseif ($rr.TimedOut) { 'FAIL: timeout' }
+		elseif ($rr.Cancelled) { 'FAIL: cancelled' }
+		elseif ($failed.Count -gt 0) { 'FAIL: ' + ((@($failed | ForEach-Object { $_.name })) -join ', ') }
+		else { 'FAIL' }
+
+	if ($trackedPieces.Count -gt 0) {
+		try {
+			Update-MBSandboxPieceStatus -Names @($trackedPieces) -Ok $ok -Summary $summary
+		} catch {}
+	}
+
+	# Avoid $null composed_path issues with PS 5.1 converters
+	$composedPathOut = ''
+	try {
+		$cp = [string]$composedPath
+		if (($compose -or $useCompose) -and -not [string]::IsNullOrWhiteSpace($cp) -and (Test-Path -LiteralPath $cp)) {
+			$composedPathOut = $cp
+		}
+	} catch {
+		$composedPathOut = ''
+	}
+
+	$hintText = 'Fix the failing piece or checks, then re-run SandBox.'
+	if ($ok) {
+		if ($trackedPieces.Count -gt 1) {
+			$hintText = 'Connected pieces passed. Next: add another piece, or compose=true and copy composed.ps1 with WriteFile/EditFile.'
+		} elseif ($trackedPieces.Count -eq 1) {
+			$hintText = "Piece '$($trackedPieces[0])' passed. Add the next piece with SandBoxWrite, then SandBox pieces=[...] to connect."
+		} else {
+			$hintText = 'Checks passed. For multi-step builds use SandBoxWrite + piece/pieces.'
+		}
+	}
+
+	# Plain hashtable + PSCustomObject checks (PS 5.1 safe)
+	$checksArr = @($checks | ForEach-Object { $_ })
+	$piecesArr = @($trackedPieces | ForEach-Object { [string]$_ })
+	$resultShape = ''
+	if ($doMergeResults -and $piecesArr.Count -gt 0) {
+		$resultShape = 'by_piece + merged (+ top-level keys from merged). Assert: $Result.merged.X or $Result.by_piece.name.X or $Result.X'
+	}
+	$payload = [pscustomobject]@{
+		ok             = [bool]$ok
+		phase          = [string]$phase
+		summary        = [string]$summary
+		exit_code      = [int]$exitCode
+		duration_ms    = [int]$rr.ElapsedMs
+		timed_out      = [bool]$rr.TimedOut
+		cancelled      = [bool]$rr.Cancelled
+		sandbox_root   = [string]$root
+		sandbox_id     = [string]$script:MB.SandboxId
+		work_dir       = [string]$work
+		source         = [string]$sourceLabel
+		pieces_used    = $piecesArr
+		run_order      = $piecesArr
+		resolve_deps   = [bool]$doResolveDeps
+		merge_results  = [bool]$doMergeResults
+		composed_path  = [string]$composedPathOut
+		stdout         = [string]$stdout
+		stderr         = [string]$stderr
+		checks         = $checksArr
+		hint           = [string]$hintText
+		result_shape   = [string]$resultShape
+	}
+
+	$script:MB.SandboxLast = [pscustomobject]@{
+		ok          = [bool]$ok
+		summary     = [string]$summary
+		exit_code   = [int]$exitCode
+		duration_ms = [int]$rr.ElapsedMs
+		pieces      = $piecesArr
+		at          = (Get-Date).ToString('o')
+	}
+
+	$jsonOut = ConvertTo-MBJson $payload -Depth 10
+
+	try {
+		$lastPath = Join-Path $outDir 'last.json'
+		[System.IO.File]::WriteAllText($lastPath, [string]$jsonOut, $utf8NoBom)
+	} catch {}
+
+	return [string]$jsonOut
+}
+
+function Invoke-ClearSandBox {
+	param(
+		[object]$all = $null,
+		[object]$clear_all = $null
+	)
+	$doAll = $false
+	foreach ($v in @($all, $clear_all)) {
+		if ($null -eq $v) { continue }
+		if ($v -is [bool]) { if ($v) { $doAll = $true } }
+		else {
+			$s = ([string]$v).Trim().ToLowerInvariant()
+			if ($s -match '^(1|true|yes|y|on|all|global|machine|\*)$') { $doAll = $true }
+		}
+	}
+	if ($doAll) { return (Clear-MBSandboxAll) }
+	return (Clear-MBSandboxRoot)
+}
+
+function Invoke-GetSandBoxInfo {
+	return (Get-MBSandboxInfo)
+}
+
 function Invoke-RunCommand {
-	param([string]$command, [string]$shell = "powershell", [bool]$confirm = $true)
-	if (-not $confirm) { return "SAFETY: confirm=false required for RunCommand" }
+	param(
+		[string]$command,
+		[string]$shell = "powershell",
+		[int]$timeout_sec = 0
+	)
+	if ([string]::IsNullOrWhiteSpace($command)) { return "ERROR: Empty command" }
+	$timeoutMs = if ($timeout_sec -gt 0) { $timeout_sec * 1000 } else { $CommandTimeoutSec * 1000 }
+	$wd = $script:MB.WorkingDir
+
 	try {
 		if ($shell -eq "cmd") {
-			cmd /c $command 2>&1 | Out-String
+			# force UTF-8 code page for high-bit characters
+			$rr = Invoke-MBProcessCapture -FileName "cmd.exe" -Arguments "/c chcp 65001>nul & $command" -WorkingDir $wd -TimeoutMs $timeoutMs
 		} else {
-			Invoke-Expression $command 2>&1 | Out-String
+			# -NoProfile; UTF-8 console for high-bit characters
+			$psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+			if (-not (Test-Path -LiteralPath $psExe)) {
+				$psExe = "powershell.exe"
+			}
+			$wrapped = @"
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+try { [Console]::InputEncoding  = [System.Text.Encoding]::UTF8 } catch {}
+`$OutputEncoding = [System.Text.Encoding]::UTF8
+try { chcp 65001 | Out-Null } catch {}
+$command
+"@
+			$enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapped))
+			$rr = Invoke-MBProcessCapture -FileName $psExe -Arguments "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc" -WorkingDir $wd -TimeoutMs $timeoutMs
 		}
-	} catch { "ERROR: $_" }
+		if ($rr.Cancelled) {
+			$script:MB.Interrupt = $true
+		}
+		$parts = @()
+		if ($rr.TimedOut) { $parts += "ERROR: Command timed out after $([math]::Round($timeoutMs/1000))s" }
+		if ($rr.Cancelled) { $parts += "CANCELLED: Interrupted by user (ESC)" }
+		if ($rr.StdOut) { $parts += (Sanitize-MBText -Text $rr.StdOut.TrimEnd()) }
+		if ($rr.StdErr) { $parts += "STDERR:`n$(Sanitize-MBText -Text $rr.StdErr.TrimEnd())" }
+		if (-not $rr.TimedOut -and -not $rr.Cancelled) {
+			$parts += "EXIT_CODE: $($rr.ExitCode) ($($rr.ElapsedMs) ms)"
+		}
+		return Limit-MBResult ($parts -join "`n`n")
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
-function Invoke-ListDirectory { param([string]$path = ".") if (-not (Test-Path $path)) { return "ERROR: Path not found" }; Get-ChildItem $path | Select-Object Name, Length, LastWriteTime, Mode | ConvertTo-Json -Depth 3 -Compress }
+function Invoke-ListDirectory {
+	param([string]$path = ".")
+	$path = Resolve-MBPath $path
+	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Path not found: $path" }
+	try {
+		$all = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)
+		$total = $all.Count
+		$items = @(
+			$all |
+				Select-Object Name, Length, LastWriteTime, Mode, @{N='Type';E={ if ($_.PSIsContainer) { 'Dir' } else { 'File' } }} |
+				Select-Object -First 500
+		)
+		return ConvertTo-MBJson @{
+			path      = $path
+			total     = $total
+			count     = $items.Count
+			truncated = ($total -gt $items.Count)
+			items     = $items
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-SearchFiles {
+	param(
+		[string]$path,
+		[string]$pattern,
+		[string]$glob = "*.*",
+		[bool]$recursive = $true,
+		[bool]$ignoreCase = $true,
+		[int]$maxResults = 50
+	)
+	$path = Resolve-MBPath $path
+	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Path not found: $path" }
+	if ($maxResults -le 0) { $maxResults = 50 }
+	if ($maxResults -gt 200) { $maxResults = 200 }
+
+	$skipExt = @(
+		'.exe','.dll','.sys','.drv','.ocx','.com','.scr','.msi','.msp','.cab',
+		'.dmp','.hdmp','.mdmp','.zip','.rar','.7z','.tar','.gz','.iso','.wim',
+		'.png','.jpg','.jpeg','.gif','.bmp','.ico','.webp','.mp4','.avi','.mkv','.mp3','.wav',
+		'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.db','.sqlite','.bin','.pak'
+	)
+
+	try {
+		$gciParams = @{
+			LiteralPath = $path
+			File        = $true
+			ErrorAction = 'SilentlyContinue'
+		}
+		if ($recursive) { $gciParams['Recurse'] = $true }
+		if ($glob) { $gciParams['Filter'] = $glob }
+
+		$files = Get-ChildItem @gciParams | Select-Object -First 2000
+		$ssParams = @{ Pattern = $pattern; SimpleMatch = $false; ErrorAction = 'SilentlyContinue' }
+		if ($ignoreCase) { $ssParams['CaseSensitive'] = $false } else { $ssParams['CaseSensitive'] = $true }
+
+		$matches = @()
+		$skippedBinary = 0
+		$scanned = 0
+		foreach ($f in $files) {
+			if ((Test-MBInterrupt)) { break }
+			if ($f.Length -gt 5MB) { continue }
+			$ext = $f.Extension.ToLowerInvariant()
+			if ($skipExt -contains $ext) { $skippedBinary++; continue }
+			$scanned++
+			try {
+				$hits = Select-String -LiteralPath $f.FullName @ssParams | Select-Object -First 10
+				foreach ($h in $hits) {
+					$matches += [pscustomobject]@{
+						path = $f.FullName
+						line = $h.LineNumber
+						text = $h.Line.Trim()
+					}
+					if ($matches.Count -ge $maxResults) { break }
+				}
+			} catch {}
+			if ($matches.Count -ge $maxResults) { break }
+		}
+
+		return ConvertTo-MBJson @{
+			root          = $path
+			pattern       = $pattern
+			glob          = $glob
+			filesConsidered = @($files).Count
+			filesScanned  = $scanned
+			skippedBinary = $skippedBinary
+			matchCount    = $matches.Count
+			truncated    = ($matches.Count -ge $maxResults)
+			matches       = $matches
+		} -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-DiffText {
+	param(
+		[string]$left,
+		[string]$right,
+		[bool]$leftIsFile = $false,
+		[bool]$rightIsFile = $false
+	)
+	try {
+		if ($leftIsFile) {
+			$lp = Resolve-MBPath $left
+			$left = [System.IO.File]::ReadAllText($lp)
+		}
+		if ($rightIsFile) {
+			$rp = Resolve-MBPath $right
+			$right = [System.IO.File]::ReadAllText($rp)
+		}
+		$lLines = ($left -split "`r?`n", -1)
+		$rLines = ($right -split "`r?`n", -1)
+		$max = [math]::Max($lLines.Count, $rLines.Count)
+		$out = New-Object System.Collections.Generic.List[string]
+		$diffs = 0
+		for ($i = 0; $i -lt $max; $i++) {
+			$l = if ($i -lt $lLines.Count) { $lLines[$i] } else { $null }
+			$r = if ($i -lt $rLines.Count) { $rLines[$i] } else { $null }
+			$n = $i + 1
+			if ($l -ceq $r) { continue }
+			$diffs++
+			if ($null -ne $l -and $null -ne $r) {
+				$out.Add("- ${n}: $l")
+				$out.Add("+ ${n}: $r")
+			} elseif ($null -ne $l) {
+				$out.Add("- ${n}: $l")
+			} else {
+				$out.Add("+ ${n}: $r")
+			}
+			if ($out.Count -ge 200) {
+				$out.Add("... diff truncated ...")
+				break
+			}
+		}
+		if ($diffs -eq 0) { return "No differences." }
+		return Limit-MBResult (("Diff lines changed (approx): $diffs`n" + ($out -join "`n")))
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-GetWorkingDirectory {
+	ConvertTo-MBJson @{ cwd = $script:MB.WorkingDir; exists = (Test-Path -LiteralPath $script:MB.WorkingDir) }
+}
+
+function Invoke-SetWorkingDirectory {
+	param([string]$path)
+	$path = Resolve-MBPath $path
+	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Path not found: $path" }
+	if (-not (Get-Item -LiteralPath $path).PSIsContainer) { return "ERROR: Not a directory: $path" }
+	$script:MB.WorkingDir = $path
+	try { Set-Location -LiteralPath $path } catch {}
+	try { Refresh-MBWpfStickyFromSession } catch {}
+	return "WORKING_DIR: $path"
+}
+
+function Invoke-GetEnvironment {
+	param([string]$name)
+	if ($name) {
+		$v = [Environment]::GetEnvironmentVariable($name)
+		return ConvertTo-MBJson @{ name = $name; value = $v }
+	}
+	$pathEntries = @()
+	if ($env:PATH) { $pathEntries = $env:PATH -split ';' | Where-Object { $_ } | Select-Object -First 40 }
+	$info = @{
+		USERNAME = $env:USERNAME
+		USERDOMAIN = $env:USERDOMAIN
+		COMPUTERNAME = $env:COMPUTERNAME
+		USERPROFILE = $env:USERPROFILE
+		TEMP = $env:TEMP
+		SystemRoot = $env:SystemRoot
+		PROCESSOR_ARCHITECTURE = $env:PROCESSOR_ARCHITECTURE
+		NUMBER_OF_PROCESSORS = $env:NUMBER_OF_PROCESSORS
+		PATH_entries = $pathEntries
+	}
+	return ConvertTo-MBJson $info
+}
+
+function Invoke-SetEnvironment {
+	param(
+		[string]$name,
+		[string]$value,
+		[string]$target = 'Process'
+	)
+	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name is required." }
+	$t = ([string]$target).Trim()
+	if ([string]::IsNullOrWhiteSpace($t)) { $t = 'Process' }
+	$scopeMap = @{
+		'process' = 'Process'; 'proc' = 'Process'; 'session' = 'Process'
+		'user' = 'User'; 'machine' = 'Machine'; 'system' = 'Machine'
+	}
+	$key = $t.ToLowerInvariant()
+	if (-not $scopeMap.ContainsKey($key)) {
+		return "ERROR: target must be Process, User, or Machine."
+	}
+	$scope = $scopeMap[$key]
+	$val = if ($null -eq $value) { '' } else { [string]$value }
+	if ($scope -ne 'Process') {
+		$details = "Set environment variable [$scope]:`n  $name = $val"
+		if (-not (Request-Confirmation -Title "SetEnvironment requires approval" -Details $details)) {
+			return "BLOCKED BY USER: SetEnvironment denied."
+		}
+	}
+	try {
+		[Environment]::SetEnvironmentVariable($name, $val, $scope)
+		if ($scope -ne 'Process') {
+			try { [Environment]::SetEnvironmentVariable($name, $val, 'Process') } catch {}
+		}
+		return ConvertTo-MBJson @{
+			ok     = $true
+			name   = $name
+			value  = $val
+			target = $scope
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
 
 function Invoke-GetSystemInfo {
-	$info = @{
-		ComputerName = $env:COMPUTERNAME
-		UserName	 = $env:USERNAME
-		OS			 = [System.Environment]::OSVersion.VersionString
-		PSVersion	 = $PSVersionTable.PSVersion.ToString()
-		RAM_GB		 = [math]::round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
-		CPU			 = (Get-CimInstance Win32_Processor).Name
-		IPs			 = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceIndex -ne 1 }).IPAddress
+	try {
+		$cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+		$os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+		$cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+		$ips = @()
+		try {
+			$ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+				Where-Object { $_.InterfaceAlias -notmatch 'Loopback' -and $_.IPAddress -notlike '169.254.*' } |
+				Select-Object -ExpandProperty IPAddress)
+		} catch {}
+		$info = @{
+			ComputerName = $env:COMPUTERNAME
+			UserName     = $env:USERNAME
+			Domain       = $cs.Domain
+			Manufacturer = $cs.Manufacturer
+			Model        = $cs.Model
+			OS           = $os.Caption
+			OSVersion    = $os.Version
+			Build        = $os.BuildNumber
+			Arch         = $os.OSArchitecture
+			PSVersion    = $PSVersionTable.PSVersion.ToString()
+			RAM_GB       = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+			CPU          = if ($cpu) { $cpu.Name } else { "Unknown" }
+			IPs          = $ips
+			AgentCWD     = $script:MB.WorkingDir
+		}
+		return ConvertTo-MBJson $info
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
 	}
-	$info | ConvertTo-Json -Depth 3 -Compress
 }
 
-function Invoke-GetProcessList { Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 Id, Name, CPU, WorkingSet | ConvertTo-Json -Depth 2 -Compress }
+function Invoke-GetProcessList {
+	param([int]$limit = 15)
+	if ($limit -le 0) { $limit = 15 }
+	Get-Process -ErrorAction SilentlyContinue |
+		Sort-Object CPU -Descending |
+		Select-Object -First $limit Id, ProcessName, CPU, @{N='WS_MB';E={[math]::Round($_.WorkingSet64/1MB,1)}} |
+		ConvertTo-Json -Depth 2 -Compress
+}
+
+function Invoke-GetProcessTree {
+	param(
+		[int]$root_pid = 0,
+		[int]$max_depth = 6,
+		[int]$max_nodes = 200
+	)
+	if ($max_depth -le 0) { $max_depth = 6 }
+	if ($max_depth -gt 12) { $max_depth = 12 }
+	if ($max_nodes -le 0) { $max_nodes = 200 }
+	if ($max_nodes -gt 500) { $max_nodes = 500 }
+	try {
+		$procs = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+			Select-Object ProcessId, ParentProcessId, Name, CommandLine)
+		$byId = @{}
+		foreach ($p in $procs) {
+			$byId[[int]$p.ProcessId] = $p
+		}
+		$children = @{}
+		foreach ($p in $procs) {
+			$pp = [int]$p.ParentProcessId
+			if (-not $children.ContainsKey($pp)) { $children[$pp] = New-Object System.Collections.ArrayList }
+			[void]$children[$pp].Add([int]$p.ProcessId)
+		}
+		$roots = New-Object System.Collections.ArrayList
+		if ($root_pid -gt 0) {
+			if (-not $byId.ContainsKey($root_pid)) {
+				return "ERROR: process id $root_pid not found."
+			}
+			[void]$roots.Add($root_pid)
+		} else {
+			foreach ($p in $procs) {
+				$procId = [int]$p.ProcessId
+				$pp = [int]$p.ParentProcessId
+				if ($pp -le 0 -or $pp -eq $procId -or -not $byId.ContainsKey($pp)) {
+					[void]$roots.Add($procId)
+				}
+			}
+		}
+		$nodes = New-Object System.Collections.ArrayList
+		$visited = @{}
+		$stack = New-Object System.Collections.Stack
+		foreach ($r in $roots) {
+			$stack.Push(@{ Id = $r; Depth = 0 })
+		}
+		while ($stack.Count -gt 0 -and $nodes.Count -lt $max_nodes) {
+			$cur = $stack.Pop()
+			$id = [int]$cur.Id
+			$depth = [int]$cur.Depth
+			if ($visited.ContainsKey($id)) { continue }
+			$visited[$id] = $true
+			if (-not $byId.ContainsKey($id)) { continue }
+			$p = $byId[$id]
+			$cmd = [string]$p.CommandLine
+			if ($cmd.Length -gt 160) { $cmd = $cmd.Substring(0, 157) + '...' }
+			[void]$nodes.Add([ordered]@{
+				pid         = $id
+				ppid        = [int]$p.ParentProcessId
+				name        = [string]$p.Name
+				depth       = $depth
+				commandLine = $cmd
+			})
+			if ($depth -ge $max_depth) { continue }
+			if ($children.ContainsKey($id)) {
+				$kids = @($children[$id] | Sort-Object -Descending)
+				foreach ($k in $kids) {
+					if (-not $visited.ContainsKey($k)) {
+						$stack.Push(@{ Id = $k; Depth = ($depth + 1) })
+					}
+				}
+			}
+		}
+		return ConvertTo-MBJson @{
+			root_pid   = $root_pid
+			max_depth  = $max_depth
+			count      = $nodes.Count
+			truncated  = ($nodes.Count -ge $max_nodes)
+			nodes      = @($nodes)
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-GetNetConnections {
+	param(
+		[string]$state = '',
+		[int]$port = 0,
+		[int]$max = 100
+	)
+	if ($max -le 0) { $max = 100 }
+	if ($max -gt 500) { $max = 500 }
+	try {
+		$conn = $null
+		try {
+			$conn = @(Get-NetTCPConnection -ErrorAction Stop)
+		} catch {
+			$raw = & netstat.exe -ano 2>$null
+			$rows = New-Object System.Collections.ArrayList
+			foreach ($line in @($raw)) {
+				if ($line -notmatch '^\s*TCP\s+') { continue }
+				$parts = ($line.Trim() -split '\s+')
+				if ($parts.Count -lt 5) { continue }
+				$local = $parts[1]; $remote = $parts[2]; $st = $parts[3]; $owningPid = $parts[4]
+				$lp = 0
+				if ($local -match ':(\d+)$') { $lp = [int]$Matches[1] }
+				if ($port -gt 0 -and $lp -ne $port) { continue }
+				if ($state -and $st -notmatch [regex]::Escape($state)) { continue }
+				[void]$rows.Add([ordered]@{
+					protocol = 'TCP'; local = $local; remote = $remote
+					state = $st; pid = [int]$owningPid; process = $null
+				})
+				if ($rows.Count -ge $max) { break }
+			}
+			return ConvertTo-MBJson @{ count = $rows.Count; connections = @($rows); source = 'netstat' }
+		}
+		if ($state) {
+			$conn = @($conn | Where-Object { $_.State -like $state })
+		}
+		if ($port -gt 0) {
+			$conn = @($conn | Where-Object { $_.LocalPort -eq $port -or $_.RemotePort -eq $port })
+		}
+		$conn = @($conn | Select-Object -First $max)
+		$procMap = @{}
+		try {
+			Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $procMap[$_.Id] = $_.ProcessName }
+		} catch {}
+		$rows = @(foreach ($c in $conn) {
+			$pn = $null
+			try { if ($procMap.ContainsKey([int]$c.OwningProcess)) { $pn = $procMap[[int]$c.OwningProcess] } } catch {}
+			[ordered]@{
+				protocol      = 'TCP'
+				localAddress  = [string]$c.LocalAddress
+				localPort     = [int]$c.LocalPort
+				remoteAddress = [string]$c.RemoteAddress
+				remotePort    = [int]$c.RemotePort
+				state         = [string]$c.State
+				pid           = [int]$c.OwningProcess
+				process       = $pn
+			}
+		})
+		return ConvertTo-MBJson @{
+			count       = $rows.Count
+			connections = $rows
+			source      = 'Get-NetTCPConnection'
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
 
 function Invoke-Clipboard {
 	param([string]$action, [string]$text)
-	if ($action -eq "read") { [System.Windows.Forms.Clipboard]::GetText() }
-	elseif ($action -eq "write" -and $text) { [System.Windows.Forms.Clipboard]::SetText($text); "Clipboard write successful" }
-	else { "ERROR: Invalid action" }
+	try {
+		if ($action -eq "read") {
+			if (-not (Request-Confirmation -Title "Clipboard read requires approval" -Details "The agent wants to read the Windows clipboard (may contain secrets/passwords).")) {
+				return "BLOCKED BY USER: Clipboard read denied."
+			}
+			Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+			$t = [System.Windows.Forms.Clipboard]::GetText()
+			if ([string]::IsNullOrEmpty($t)) { return "(clipboard empty)" }
+			return Limit-MBResult $t
+		}
+		elseif ($action -eq "write") {
+			if (-not (Request-Confirmation -Title "Clipboard write requires approval" -Details "Write text to clipboard ($($text.Length) chars).")) {
+				return "BLOCKED BY USER: Clipboard write denied."
+			}
+			Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+			[System.Windows.Forms.Clipboard]::SetText([string]$text)
+			return "Clipboard write successful"
+		}
+		return "ERROR: Invalid action (use read|write)"
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Get-MBUserDesktopPath {
+	$desk = [Environment]::GetFolderPath('Desktop')
+	if ([string]::IsNullOrWhiteSpace($desk)) {
+		$desk = Join-Path $env:USERPROFILE 'Desktop'
+	}
+	return $desk
+}
+
+function Resolve-MBViewScreenSavePath {
+	param([string]$Path = '')
+	$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+	$defaultName = "MiniBot-view-$stamp.png"
+
+	if ([string]::IsNullOrWhiteSpace($Path)) {
+		return (Join-Path (Get-MBUserDesktopPath) $defaultName)
+	}
+
+	$p = $Path.Trim().Trim('"').Trim("'")
+	if ($p -match '^(?i)desktop|~\\Desktop|~/Desktop$') {
+		return (Join-Path (Get-MBUserDesktopPath) $defaultName)
+	}
+	if ($p -eq '~') {
+		return (Join-Path (Get-MBUserDesktopPath) $defaultName)
+	}
+
+	$resolved = Resolve-MBPath $p
+	$isDir = $false
+	if (Test-Path -LiteralPath $resolved -PathType Container) {
+		$isDir = $true
+	} elseif ($p.EndsWith('\') -or $p.EndsWith('/')) {
+		$isDir = $true
+	} elseif (-not [System.IO.Path]::HasExtension($resolved)) {
+		$isDir = $true
+	}
+
+	if ($isDir) {
+		if (-not (Test-Path -LiteralPath $resolved)) {
+			try { New-Item -ItemType Directory -Path $resolved -Force | Out-Null } catch {}
+		}
+		return (Join-Path $resolved $defaultName)
+	}
+
+	if (-not $resolved.ToLowerInvariant().EndsWith('.png')) {
+		$resolved = $resolved + '.png'
+	}
+	return $resolved
+}
+
+function Invoke-ViewScreen {
+	param(
+		[string]$path = '',
+		[bool]$save = $false,
+		[string]$monitor = 'primary',
+		[int]$x = -1,
+		[int]$y = -1,
+		[int]$width = 0,
+		[int]$height = 0,
+		[int]$maxWidth = 1280
+	)
+	try {
+		Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+		Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+	} catch {
+		return "ERROR: System.Drawing / WinForms not available for ViewScreen: $($_.Exception.Message)"
+	}
+
+	$useRegion = ($width -gt 0 -and $height -gt 0)
+	$monLabel = if ([string]::IsNullOrWhiteSpace($monitor)) { 'primary' } else { $monitor.Trim() }
+	$saveToDisk = $save -or (-not [string]::IsNullOrWhiteSpace($path))
+
+	# Capture rect in physical pixels (WinForms Bounds can clip under DPI)
+	$rect = $null
+	try {
+		if ($script:HasDpiScreen) {
+			try { [MiniBot.Core.DpiScreen]::EnsureAware() } catch {}
+		}
+		if ($useRegion) {
+			$left = if ($x -ge 0) { $x } else { 0 }
+			$top  = if ($y -ge 0) { $y } else { 0 }
+			$rect = New-Object System.Drawing.Rectangle $left, $top, $width, $height
+			$monLabel = "region ${left},${top} ${width}x${height}"
+		} elseif ($script:HasDpiScreen) {
+			$ml = $monLabel.ToLowerInvariant()
+			if ($ml -eq 'all' -or $ml -eq 'virtual') {
+				$r = [MiniBot.Core.DpiScreen]::GetVirtualBounds()
+				$n = [MiniBot.Core.DpiScreen]::GetMonitorCount()
+				$rect = New-Object System.Drawing.Rectangle $r.X, $r.Y, $r.Width, $r.Height
+				$monLabel = "all ($n monitors, physical)"
+			} elseif ($ml -eq 'primary' -or $ml -eq '') {
+				$r = [MiniBot.Core.DpiScreen]::GetPrimaryBounds()
+				$rect = New-Object System.Drawing.Rectangle $r.X, $r.Y, $r.Width, $r.Height
+				$monLabel = 'primary (physical)'
+			} elseif ($ml -match '^\d+$') {
+				$idx = [int]$ml
+				$n = [MiniBot.Core.DpiScreen]::GetMonitorCount()
+				if ($idx -lt 0 -or $idx -ge $n) {
+					return "ERROR: monitor index $idx out of range (0..$($n - 1))"
+				}
+				$r = [MiniBot.Core.DpiScreen]::GetMonitorBounds($idx)
+				$rect = New-Object System.Drawing.Rectangle $r.X, $r.Y, $r.Width, $r.Height
+				$monLabel = "monitor $idx (physical)"
+			} else {
+				return "ERROR: monitor must be primary, all, or a 0-based index"
+			}
+		} else {
+			# Fallback capture (may clip under DPI scale)
+			$screens = [System.Windows.Forms.Screen]::AllScreens
+			$ml = $monLabel.ToLowerInvariant()
+			if ($ml -eq 'all' -or $ml -eq 'virtual') {
+				$vb = [System.Windows.Forms.SystemInformation]::VirtualScreen
+				$rect = New-Object System.Drawing.Rectangle $vb.X, $vb.Y, $vb.Width, $vb.Height
+				$monLabel = "all ($($screens.Length) monitors)"
+			} elseif ($ml -eq 'primary' -or $ml -eq '') {
+				$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+				$rect = New-Object System.Drawing.Rectangle $b.X, $b.Y, $b.Width, $b.Height
+				$monLabel = 'primary'
+			} elseif ($ml -match '^\d+$') {
+				$idx = [int]$ml
+				if ($idx -lt 0 -or $idx -ge $screens.Length) {
+					return "ERROR: monitor index $idx out of range (0..$($screens.Length - 1))"
+				}
+				$b = $screens[$idx].Bounds
+				$rect = New-Object System.Drawing.Rectangle $b.X, $b.Y, $b.Width, $b.Height
+				$monLabel = "monitor $idx"
+			} else {
+				return "ERROR: monitor must be primary, all, or a 0-based index"
+			}
+		}
+	} catch {
+		return "ERROR: Could not resolve capture bounds: $($_.Exception.Message)"
+	}
+
+	$diskPath = $null
+	if ($saveToDisk) {
+		try {
+			$diskPath = Resolve-MBViewScreenSavePath -Path $path
+		} catch {
+			return "ERROR: Could not resolve save path: $($_.Exception.Message)"
+		}
+	}
+
+
+	$bmp = $null
+	$g = $null
+	$scaled = $null
+	$ms = $null
+	try {
+		$saveHint = if ($saveToDisk) { " → $diskPath" } else { '' }
+		Write-Host "    view $monLabel ($($rect.Width)x$($rect.Height))$saveHint" -ForegroundColor DarkGray
+		$bmp = New-Object System.Drawing.Bitmap $rect.Width, $rect.Height
+		$g = [System.Drawing.Graphics]::FromImage($bmp)
+		$g.CopyFromScreen($rect.X, $rect.Y, 0, 0, $rect.Size, [System.Drawing.CopyPixelOperation]::SourceCopy)
+
+		$visionBmp = $bmp
+		if ($maxWidth -gt 0 -and $bmp.Width -gt $maxWidth) {
+			$newW = $maxWidth
+			$newH = [math]::Max(1, [int][math]::Round($bmp.Height * ($maxWidth / [double]$bmp.Width)))
+			$scaled = New-Object System.Drawing.Bitmap $newW, $newH
+			$sg = [System.Drawing.Graphics]::FromImage($scaled)
+			try {
+				$sg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+				$sg.DrawImage($bmp, 0, 0, $newW, $newH)
+			} finally {
+				$sg.Dispose()
+			}
+			$visionBmp = $scaled
+		}
+
+		$ms = New-Object System.IO.MemoryStream
+		$visionBmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+		$bytes = $ms.ToArray()
+		$b64 = [Convert]::ToBase64String($bytes)
+
+		if ($saveToDisk -and $diskPath) {
+			$dir = Split-Path -Parent $diskPath
+			if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+				New-Item -ItemType Directory -Path $dir -Force | Out-Null
+			}
+			$msFull = $null
+			try {
+				$msFull = New-Object System.IO.MemoryStream
+				$bmp.Save($msFull, [System.Drawing.Imaging.ImageFormat]::Png)
+				[System.IO.File]::WriteAllBytes($diskPath, $msFull.ToArray())
+			} finally {
+				if ($msFull) { try { $msFull.Dispose() } catch {} }
+			}
+			Write-Host "    saved: $diskPath" -ForegroundColor Green
+		}
+
+		$script:MB.PendingVision = @{
+			Base64    = $b64
+			Width     = $visionBmp.Width
+			Height    = $visionBmp.Height
+			SizeBytes = $bytes.Length
+			Label     = $monLabel
+			Mime      = 'image/png'
+			SavedPath = $(if ($saveToDisk) { $diskPath } else { $null })
+		}
+
+		if ($saveToDisk) {
+			$uxLines = @(
+				"SAVED_TO: $diskPath"
+				"Tell the user this exact path in your next reply."
+				"If they also wanted a description, briefly describe the screen too."
+			) -join "`n"
+		} else {
+			$uxLines = @(
+				"LOOK_ONLY: no file written."
+				"Describe what you see to the user. Do not invent a save path."
+			) -join "`n"
+		}
+
+		$payload = [ordered]@{
+			success       = $true
+			storage       = $(if ($saveToDisk) { 'memory+disk' } else { 'memory' })
+			path          = $(if ($saveToDisk) { $diskPath } else { $null })
+			SAVED_TO      = $(if ($saveToDisk) { $diskPath } else { $null })
+			savedFullRes  = [bool]$saveToDisk
+			monitor       = $monLabel
+			capture       = @{ x = $rect.X; y = $rect.Y; width = $rect.Width; height = $rect.Height }
+			image         = @{ width = $visionBmp.Width; height = $visionBmp.Height }
+			dpiAware      = [bool]$script:HasDpiScreen
+			sizeBytes     = $bytes.Length
+			sizeKB        = [math]::Round($bytes.Length / 1KB, 1)
+			visionPending = $true
+		}
+		$script:MB.PendingVision.Kind = 'screen'
+		return ($uxLines + "`n" + (ConvertTo-MBJson $payload -Depth 4))
+	} catch {
+		return "ERROR: ViewScreen failed: $($_.Exception.Message)"
+	} finally {
+		if ($ms) { try { $ms.Dispose() } catch {} }
+		if ($g) { try { $g.Dispose() } catch {} }
+		if ($scaled) { try { $scaled.Dispose() } catch {} }
+		if ($bmp) { try { $bmp.Dispose() } catch {} }
+	}
+}
+
+function Set-MBPendingVisionFromBitmap {
+	param(
+		$Bitmap,
+		[int]$MaxWidth = 1280,
+		[string]$Label = 'image',
+		[string]$SourcePath = '',
+		[string]$Kind = 'image',
+		[string]$Mime = 'image/png'
+	)
+	$scaled = $null
+	$ms = $null
+	try {
+		$visionBmp = $Bitmap
+		if ($MaxWidth -gt 0 -and $Bitmap.Width -gt $MaxWidth) {
+			$newW = $MaxWidth
+			$newH = [math]::Max(1, [int][math]::Round($Bitmap.Height * ($MaxWidth / [double]$Bitmap.Width)))
+			$scaled = New-Object System.Drawing.Bitmap $newW, $newH
+			$sg = [System.Drawing.Graphics]::FromImage($scaled)
+			try {
+				$sg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+				$sg.DrawImage($Bitmap, 0, 0, $newW, $newH)
+			} finally { $sg.Dispose() }
+			$visionBmp = $scaled
+		}
+		$ms = New-Object System.IO.MemoryStream
+		$fmt = [System.Drawing.Imaging.ImageFormat]::Png
+		$outMime = 'image/png'
+		if ($Mime -match 'jpeg|jpg') {
+			$fmt = [System.Drawing.Imaging.ImageFormat]::Jpeg
+			$outMime = 'image/jpeg'
+		}
+		$visionBmp.Save($ms, $fmt)
+		$bytes = $ms.ToArray()
+		$b64 = [Convert]::ToBase64String($bytes)
+		$script:MB.PendingVision = @{
+			Base64     = $b64
+			Width      = $visionBmp.Width
+			Height     = $visionBmp.Height
+			SizeBytes  = $bytes.Length
+			Label      = $Label
+			Mime       = $outMime
+			SourcePath = $SourcePath
+			SavedPath  = $null
+			Kind       = $Kind
+		}
+		return $script:MB.PendingVision
+	} finally {
+		if ($ms) { try { $ms.Dispose() } catch {} }
+		if ($scaled) { try { $scaled.Dispose() } catch {} }
+	}
+}
+
+function Invoke-ReadImage {
+	param(
+		[string]$path,
+		[int]$maxWidth = 1280
+	)
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required." }
+	$full = Resolve-MBPath -Path $path
+	if (-not (Test-Path -LiteralPath $full)) { return "ERROR: File not found: $full" }
+	$item = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
+	if (-not $item -or $item.PSIsContainer) { return "ERROR: Path is not a file: $full" }
+	$ext = $item.Extension.ToLowerInvariant()
+	$okExt = @('.png','.jpg','.jpeg','.gif','.bmp','.tif','.tiff','.webp')
+	if ($okExt -notcontains $ext) {
+		return "ERROR: Unsupported image type '$ext'. Use: png, jpg, jpeg, gif, bmp, tif, webp."
+	}
+	$maxMb = 40
+	if ($item.Length -gt ($maxMb * 1MB)) {
+		return "ERROR: Image too large ($([math]::Round($item.Length/1MB,1)) MB). Max ~${maxMb} MB."
+	}
+	try {
+		Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+	} catch {
+		return "ERROR: System.Drawing not available: $($_.Exception.Message)"
+	}
+	$bmp = $null
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$bmp = New-Object System.Drawing.Bitmap $fs
+		$mime = switch ($ext) {
+			{ $_ -in @('.jpg','.jpeg') } { 'image/jpeg' }
+			'.gif' { 'image/gif' }
+			'.bmp' { 'image/bmp' }
+			'.webp' { 'image/webp' }
+			default { 'image/png' }
+		}
+		$sendMime = if ($ext -in @('.jpg','.jpeg')) { 'image/jpeg' } else { 'image/png' }
+		$label = [System.IO.Path]::GetFileName($full)
+		$pv = Set-MBPendingVisionFromBitmap -Bitmap $bmp -MaxWidth $maxWidth -Label $label -SourcePath $full -Kind 'file' -Mime $sendMime
+		Write-Host ("    read image {0} ({1}x{2} → vision {3}x{4})" -f $label, $bmp.Width, $bmp.Height, $pv.Width, $pv.Height) -ForegroundColor DarkGray
+		$ux = @(
+			"IMAGE_LOADED: $full"
+			"Vision payload pending for next model reply (describe what you see)."
+			"Do not invent other paths."
+		) -join "`n"
+		$payload = [ordered]@{
+			success       = $true
+			path          = $full
+			visionPending = $true
+			image         = @{ width = $pv.Width; height = $pv.Height; sourceWidth = $bmp.Width; sourceHeight = $bmp.Height }
+			sizeBytes     = $pv.SizeBytes
+			sizeKB        = [math]::Round($pv.SizeBytes / 1KB, 1)
+			mime          = $pv.Mime
+		}
+		return ($ux + "`n" + (ConvertTo-MBJson $payload -Depth 4))
+	} catch {
+		$msg = $_.Exception.Message
+		if ($ext -eq '.webp') {
+			$msg += " (WebP may need a newer GDI+ / codec on this machine — try PNG or JPEG.)"
+		}
+		return "ERROR: ReadImage failed: $msg"
+	} finally {
+		if ($bmp) { try { $bmp.Dispose() } catch {} }
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+}
+
+function Test-MBPdfTextGarbled {
+	param([string]$Text)
+	if ([string]::IsNullOrWhiteSpace($Text)) {
+		return @{ Garbled = $true; Reason = 'empty'; Score = 1.0 }
+	}
+	$t = $Text.Trim()
+	if ($t.Length -lt 12) {
+		return @{ Garbled = $true; Reason = 'too_short'; Score = 0.9 }
+	}
+
+	$total = $t.Length
+	$letters = 0; $digits = 0; $spaces = 0; $asciiPrint = 0; $high = 0; $pua = 0
+	foreach ($ch in $t.ToCharArray()) {
+		$c = [int][char]$ch
+		if ([char]::IsWhiteSpace($ch)) { $spaces++; continue }
+		if ([char]::IsLetter($ch)) { $letters++ }
+		if ([char]::IsDigit($ch)) { $digits++ }
+		if ($c -ge 32 -and $c -le 126) { $asciiPrint++ }
+		elseif ($c -ge 0xE000 -and $c -le 0xF8FF) { $pua++ }
+		elseif ($c -gt 255) { $high++ }
+	}
+	$nonSpace = [math]::Max(1, $total - $spaces)
+	$letterRatio = $letters / [double]$nonSpace
+	$asciiRatio = $asciiPrint / [double]$nonSpace
+	$weirdRatio = ($pua + $high) / [double]$nonSpace
+
+	$tokens = @([regex]::Split($t, '\s+') | Where-Object { $_ -and $_.Length -gt 0 })
+	$tokenCount = [math]::Max(1, $tokens.Count)
+	$good = 0
+	foreach ($tok in $tokens) {
+		if ($tok -match '^[A-Za-z]{2,24}$' -and $tok -match '[aeiouyAEIOUY]') { $good++; continue }
+		if ($tok -match '^\d{1,12}([./\-]\d{1,12}){0,4}$') { $good++; continue }
+		if ($tok -match '^[A-Za-z]{1,8}\d{2,12}[A-Za-z0-9\-]*$') { $good++; continue }
+		if ($tok -match '^\d{2,12}[A-Za-z]{1,6}$') { $good++; continue }
+		if ($tok -match '^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$') { $good++; continue }
+		if ($tok -match '^(https?://|www\.)\S+$') { $good++; continue }
+		if ($tok -match '^[\$€£]?\d+([.,]\d{2})?%?$') { $good++; continue }
+		if ($tok -match '^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\-/,]?\d' ) { $good++; continue }
+	}
+	$goodRatio = $good / [double]$tokenCount
+
+	$score = 0.0
+	$reasons = New-Object System.Collections.Generic.List[string]
+	if ($weirdRatio -gt 0.20) { $score += 0.45; [void]$reasons.Add('high_unicode') }
+	if ($asciiRatio -lt 0.50 -and $nonSpace -ge 20) { $score += 0.35; [void]$reasons.Add('low_ascii') }
+	if ($letterRatio -lt 0.28 -and $nonSpace -ge 40) { $score += 0.25; [void]$reasons.Add('few_letters') }
+	if ($goodRatio -lt 0.22 -and $tokenCount -ge 6) { $score += 0.40; [void]$reasons.Add('low_word_quality') }
+	elseif ($goodRatio -lt 0.35 -and $tokenCount -ge 12) { $score += 0.25; [void]$reasons.Add('mediocre_words') }
+
+	if ($t -match '[\uFFFD\u0000-\u0008\u000B\u000C\u000E-\u001F]{2,}') {
+		$score += 0.3
+		[void]$reasons.Add('control_noise')
+	}
+
+	$garbled = $score -ge 0.45
+	$reason = if ($reasons.Count -gt 0) { ($reasons -join '+') } else { 'ok' }
+	return @{
+		Garbled   = [bool]$garbled
+		Reason    = $reason
+		Score     = [math]::Round([math]::Min(1.0, $score), 3)
+		GoodRatio = [math]::Round($goodRatio, 3)
+		Tokens    = $tokenCount
+	}
+}
+
+function Wait-MBWinRTOp {
+	param($Async, [type]$ResultType, [int]$TimeoutMs = 60000)
+	if (-not $Async) { throw "WinRT async op is null" }
+	try {
+		Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+	} catch {
+		throw "System.Runtime.WindowsRuntime not available: $($_.Exception.Message)"
+	}
+	$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+		$_.Name -eq 'AsTask' -and $_.IsGenericMethodDefinition -and
+		$_.GetParameters().Count -eq 1 -and
+		$_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+	} | Select-Object -First 1
+	if (-not $asTask) { throw "WinRT AsTask(IAsyncOperation) not found" }
+	$netTask = $asTask.MakeGenericMethod($ResultType).Invoke($null, @($Async))
+	if (-not $netTask.Wait($TimeoutMs)) { throw "WinRT operation timed out after ${TimeoutMs}ms" }
+	if ($netTask.IsFaulted) { throw $netTask.Exception.GetBaseException() }
+	return $netTask.Result
+}
+
+function Wait-MBWinRTAction {
+	param($Async, [int]$TimeoutMs = 60000)
+	if (-not $Async) { throw "WinRT async action is null" }
+	try {
+		Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+	} catch {
+		throw "System.Runtime.WindowsRuntime not available: $($_.Exception.Message)"
+	}
+	$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+		$_.Name -eq 'AsTask' -and -not $_.IsGenericMethodDefinition -and
+		$_.GetParameters().Count -eq 1 -and
+		(
+			$_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' -or
+			$_.GetParameters()[0].ParameterType.FullName -eq 'Windows.Foundation.IAsyncAction'
+		)
+	} | Select-Object -First 1
+	if (-not $asTask) { throw "WinRT AsTask(IAsyncAction) not found" }
+	$netTask = $asTask.Invoke($null, @($Async))
+	if (-not $netTask.Wait($TimeoutMs)) { throw "WinRT action timed out after ${TimeoutMs}ms" }
+	if ($netTask.IsFaulted) { throw $netTask.Exception.GetBaseException() }
+}
+
+function Get-MBPdfRenderCliPath {
+	param([string[]]$Names)
+	foreach ($n in $Names) {
+		$cmd = Get-Command $n -ErrorAction SilentlyContinue
+		if ($cmd -and $cmd.Source) { return [string]$cmd.Source }
+	}
+	$extra = @(
+		"${env:ProgramFiles}\poppler\Library\bin\pdftoppm.exe",
+		"${env:ProgramFiles}\poppler\bin\pdftoppm.exe",
+		"${env:ProgramFiles(x86)}\poppler\Library\bin\pdftoppm.exe",
+		"${env:ProgramFiles}\ImageMagick-*\magick.exe",
+		"${env:ProgramFiles}\gs\gs*\bin\gswin64c.exe",
+		"${env:ProgramFiles}\gs\gs*\bin\gswin32c.exe",
+		"${env:ProgramFiles(x86)}\gs\gs*\bin\gswin32c.exe"
+	)
+	foreach ($pat in $extra) {
+		$hit = Get-Item -Path $pat -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($hit) { return $hit.FullName }
+	}
+	return $null
+}
+
+function Invoke-MBPdfRenderPageBitmap {
+	param(
+		[string]$Path,
+		[int]$Page = 1,
+		[int]$Dpi = 150,
+		[int]$DestWidth = 1600
+	)
+	if ($Page -lt 1) { $Page = 1 }
+	if ($Dpi -lt 72) { $Dpi = 72 }
+	if ($Dpi -gt 300) { $Dpi = 300 }
+	$errors = New-Object System.Collections.Generic.List[string]
+
+	# PDF path 1: Windows.Data.Pdf (WinRT)
+	try {
+		Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+		Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+		$null = [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime]
+		$null = [Windows.Data.Pdf.PdfPageRenderOptions, Windows.Data.Pdf, ContentType = WindowsRuntime]
+		$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+		$null = [Windows.Storage.StorageFolder, Windows.Storage, ContentType = WindowsRuntime]
+		$null = [Windows.Storage.CreationCollisionOption, Windows.Storage, ContentType = WindowsRuntime]
+		$null = [Windows.Storage.FileAccessMode, Windows.Storage, ContentType = WindowsRuntime]
+
+		$file = Wait-MBWinRTOp -Async ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) -ResultType ([Windows.Storage.StorageFile])
+		$doc = Wait-MBWinRTOp -Async ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) -ResultType ([Windows.Data.Pdf.PdfDocument])
+		$pageCount = [int]$doc.PageCount
+		if ($pageCount -lt 1) { throw "PDF reports 0 pages" }
+		if ($Page -gt $pageCount) { $Page = $pageCount }
+		$pdfPage = $doc.GetPage([uint32]($Page - 1))
+		try {
+			# Prefer temp PNG via WinRT (PS 5.1 DataReader is flaky)
+			$tmpPng = New-MBTempFile -Prefix 'minibot-pdf-winrt' -Extension '.png'
+			try {
+				$folderPath = [System.IO.Path]::GetDirectoryName($tmpPng)
+				$fileName = [System.IO.Path]::GetFileName($tmpPng)
+				$folder = Wait-MBWinRTOp -Async ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($folderPath)) -ResultType ([Windows.Storage.StorageFolder])
+				$outFile = Wait-MBWinRTOp -Async ($folder.CreateFileAsync($fileName, [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) -ResultType ([Windows.Storage.StorageFile])
+				$outStream = Wait-MBWinRTOp -Async ($outFile.OpenAsync([Windows.Storage.FileAccessMode]::ReadWrite)) -ResultType ([Windows.Storage.Streams.IRandomAccessStream])
+				try {
+					$opts = $null
+					try {
+						$opts = [Windows.Data.Pdf.PdfPageRenderOptions]::new()
+						if ($DestWidth -gt 0) { try { $opts.DestinationWidth = [uint32]$DestWidth } catch {} }
+					} catch { $opts = $null }
+					if ($opts) {
+						try {
+							Wait-MBWinRTAction -Async ($pdfPage.RenderToStreamAsync($outStream, $opts))
+						} catch {
+							Wait-MBWinRTAction -Async ($pdfPage.RenderToStreamAsync($outStream))
+						}
+					} else {
+						Wait-MBWinRTAction -Async ($pdfPage.RenderToStreamAsync($outStream))
+					}
+				} finally {
+					try { $outStream.Dispose() } catch {}
+				}
+				if (-not (Test-Path -LiteralPath $tmpPng) -or (Get-Item -LiteralPath $tmpPng).Length -lt 32) {
+					throw "WinRT render wrote empty file"
+				}
+				$loaded = New-Object System.Drawing.Bitmap $tmpPng
+				$clone = New-Object System.Drawing.Bitmap $loaded
+				$loaded.Dispose()
+				return @{
+					Ok        = $true
+					Bitmap    = $clone
+					Method    = 'winrt'
+					Page      = $Page
+					PageCount = $pageCount
+					Error     = $null
+				}
+			} finally {
+				try { Remove-MBTempPath -Path $tmpPng } catch {}
+			}
+		} finally {
+			try { $pdfPage.Dispose() } catch {}
+		}
+	} catch {
+		[void]$errors.Add("winrt: $($_.Exception.Message)")
+	}
+
+	# PDF path 2: CLI (pdftoppm / magick / ghostscript)
+	$tmpDir = New-MBTempDir -Prefix 'minibot-pdf'
+	try {
+		$outBase = Join-Path $tmpDir 'page'
+
+		$pdftoppm = Get-MBPdfRenderCliPath -Names @('pdftoppm','pdftoppm.exe')
+		if ($pdftoppm) {
+			try {
+				$argLine = "-png -f $Page -l $Page -r $Dpi -singlefile `"$Path`" `"$outBase`""
+				$p = Start-Process -FilePath $pdftoppm -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
+				$png = Get-ChildItem -LiteralPath $tmpDir -Filter '*.png' -ErrorAction SilentlyContinue | Select-Object -First 1
+				if (-not $png) {
+					$argLine2 = "-png -f $Page -l $Page -r $Dpi `"$Path`" `"$outBase`""
+					$null = Start-Process -FilePath $pdftoppm -ArgumentList $argLine2 -Wait -PassThru -WindowStyle Hidden
+					$png = Get-ChildItem -LiteralPath $tmpDir -Filter '*.png' -ErrorAction SilentlyContinue | Select-Object -First 1
+				}
+				if ($png) {
+					Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+					$loaded = New-Object System.Drawing.Bitmap $png.FullName
+					$clone = New-Object System.Drawing.Bitmap $loaded
+					$loaded.Dispose()
+					return @{
+						Ok        = $true
+						Bitmap    = $clone
+						Method    = 'pdftoppm'
+						Page      = $Page
+						PageCount = $null
+						Error     = $null
+					}
+				}
+				[void]$errors.Add("pdftoppm: exit $($p.ExitCode), no png")
+			} catch {
+				[void]$errors.Add("pdftoppm: $($_.Exception.Message)")
+			}
+		}
+
+		$magick = Get-MBPdfRenderCliPath -Names @('magick','magick.exe','convert','convert.exe')
+		if ($magick) {
+			try {
+				$outPng = Join-Path $tmpDir 'magick.png'
+				$pdfArg = "{0}[{1}]" -f $Path, ($Page - 1)
+				$magickArgs = if ($magick -match 'magick(\.exe)?$') {
+					@('convert', '-density', "$Dpi", "`"$pdfArg`"", '-quality', '90', "`"$outPng`"")
+				} else {
+					@('-density', "$Dpi", "`"$pdfArg`"", '-quality', '90', "`"$outPng`"")
+				}
+				$p = Start-Process -FilePath $magick -ArgumentList $magickArgs -Wait -PassThru -WindowStyle Hidden
+				if (Test-Path -LiteralPath $outPng) {
+					Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+					$loaded = New-Object System.Drawing.Bitmap $outPng
+					$clone = New-Object System.Drawing.Bitmap $loaded
+					$loaded.Dispose()
+					return @{
+						Ok        = $true
+						Bitmap    = $clone
+						Method    = 'imagemagick'
+						Page      = $Page
+						PageCount = $null
+						Error     = $null
+					}
+				}
+				[void]$errors.Add("magick: exit $($p.ExitCode)")
+			} catch {
+				[void]$errors.Add("magick: $($_.Exception.Message)")
+			}
+		}
+
+		$gs = Get-MBPdfRenderCliPath -Names @('gswin64c','gswin64c.exe','gswin32c','gswin32c.exe','gs','gs.exe')
+		if ($gs) {
+			try {
+				$outPng = Join-Path $tmpDir 'gs.png'
+				$gsLine = "-dNOPAUSE -dBATCH -dSAFER -sDEVICE=png16m -r$Dpi -dFirstPage=$Page -dLastPage=$Page -sOutputFile=`"$outPng`" `"$Path`""
+				$p = Start-Process -FilePath $gs -ArgumentList $gsLine -Wait -PassThru -WindowStyle Hidden
+				if (Test-Path -LiteralPath $outPng) {
+					Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+					$loaded = New-Object System.Drawing.Bitmap $outPng
+					$clone = New-Object System.Drawing.Bitmap $loaded
+					$loaded.Dispose()
+					return @{
+						Ok        = $true
+						Bitmap    = $clone
+						Method    = 'ghostscript'
+						Page      = $Page
+						PageCount = $null
+						Error     = $null
+					}
+				}
+				[void]$errors.Add("ghostscript: exit $($p.ExitCode)")
+			} catch {
+				[void]$errors.Add("ghostscript: $($_.Exception.Message)")
+			}
+		}
+	} finally {
+		try { Remove-MBTempPath -Path $tmpDir } catch {}
+	}
+
+	return @{
+		Ok        = $false
+		Bitmap    = $null
+		Method    = $null
+		Page      = $Page
+		PageCount = $null
+		Error     = (($errors | Select-Object -First 6) -join ' | ')
+	}
+}
+
+function Invoke-ReadPdf {
+	param(
+		[string]$path,
+		[int]$maxChars = 50000,
+		[int]$page = 1,
+		[bool]$render = $false,
+		[bool]$autoVision = $true,
+		[int]$maxWidth = 1280
+	)
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required." }
+	$full = Resolve-MBPath -Path $path
+	if (-not (Test-Path -LiteralPath $full)) { return "ERROR: File not found: $full" }
+	$item = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
+	if (-not $item -or $item.PSIsContainer) { return "ERROR: Path is not a file: $full" }
+	if ($item.Extension.ToLowerInvariant() -ne '.pdf') {
+		return "ERROR: Not a .pdf file: $full"
+	}
+	if ($item.Length -gt 80MB) {
+		return "ERROR: PDF too large ($([math]::Round($item.Length/1MB,1)) MB)."
+	}
+	if ($maxChars -le 0) { $maxChars = 50000 }
+	if ($maxChars -gt 200000) { $maxChars = 200000 }
+	if ($page -lt 1) { $page = 1 }
+	if ($maxWidth -le 0) { $maxWidth = 1280 }
+
+	if (-not ("MiniBot.Core.PdfText" -as [type])) {
+		$pdfCs = @'
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace MiniBot.Core {
+	public static class PdfText {
+		static readonly Regex StreamRx = new Regex(@"stream\r?\n", RegexOptions.Compiled);
+		static readonly Regex EndStreamRx = new Regex(@"\r?\nendstream", RegexOptions.Compiled);
+		static readonly Regex FlateRx = new Regex(@"/Filter\s*/FlateDecode|/Filter\s*\[\s*/FlateDecode", RegexOptions.Compiled);
+
+		public static string Extract(byte[] pdf, int maxChars) {
+			if (pdf == null || pdf.Length < 8) return "";
+			var sb = new StringBuilder(Math.Min(maxChars, 65536));
+			string raw = Encoding.GetEncoding(28591).GetString(pdf);
+			int pos = 0;
+			while (pos < raw.Length && sb.Length < maxChars) {
+				Match ms = StreamRx.Match(raw, pos);
+				if (!ms.Success) break;
+				int dataStart = ms.Index + ms.Length;
+				Match me = EndStreamRx.Match(raw, dataStart);
+				if (!me.Success) break;
+				int dataEnd = me.Index;
+				int headerStart = Math.Max(0, ms.Index - 500);
+				string header = raw.Substring(headerStart, ms.Index - headerStart);
+				byte[] payload = Encoding.GetEncoding(28591).GetBytes(raw.Substring(dataStart, dataEnd - dataStart));
+				string decoded = null;
+				if (FlateRx.IsMatch(header))
+					decoded = TryInflate(payload);
+				if (decoded == null)
+					decoded = Encoding.GetEncoding(28591).GetString(payload);
+				AppendPdfStrings(decoded, sb, maxChars);
+				pos = me.Index + me.Length;
+			}
+			if (sb.Length < 32)
+				AppendPdfStrings(raw, sb, maxChars);
+			string text = sb.ToString();
+			text = Regex.Replace(text, "[ \t\f\v]+", " ");
+			text = Regex.Replace(text, "\n{3,}", "\n\n");
+			return text.Trim();
+		}
+
+		static string TryInflate(byte[] data) {
+			for (int skip = 0; skip <= 2; skip++) {
+				if (data.Length <= skip) continue;
+				try {
+					using (var input = new MemoryStream(data, skip, data.Length - skip))
+					using (var def = new DeflateStream(input, CompressionMode.Decompress))
+					using (var output = new MemoryStream()) {
+						def.CopyTo(output);
+						return Encoding.GetEncoding(28591).GetString(output.ToArray());
+					}
+				} catch { }
+			}
+			return null;
+		}
+
+		static void AppendPdfStrings(string content, StringBuilder sb, int maxChars) {
+			if (string.IsNullOrEmpty(content)) return;
+			int i = 0;
+			while (i < content.Length && sb.Length < maxChars) {
+				char c = content[i];
+				if (c == '(') {
+					i++;
+					var part = new StringBuilder();
+					int depth = 1;
+					while (i < content.Length && depth > 0 && sb.Length + part.Length < maxChars) {
+						char ch = content[i++];
+						if (ch == '\\' && i < content.Length) {
+							char n = content[i++];
+							switch (n) {
+								case 'n': part.Append('\n'); break;
+								case 'r': part.Append('\r'); break;
+								case 't': part.Append('\t'); break;
+								case 'b': part.Append('\b'); break;
+								case 'f': part.Append('\f'); break;
+								case '(': part.Append('('); break;
+								case ')': part.Append(')'); break;
+								case '\\': part.Append('\\'); break;
+								default:
+									if (n >= '0' && n <= '7') {
+										string oct = n.ToString();
+										for (int k = 0; k < 2 && i < content.Length && content[i] >= '0' && content[i] <= '7'; k++)
+											oct += content[i++];
+										try { part.Append((char)Convert.ToInt32(oct, 8)); } catch { part.Append(n); }
+									} else part.Append(n);
+									break;
+							}
+							continue;
+						}
+						if (ch == '(') { depth++; part.Append(ch); continue; }
+						if (ch == ')') { depth--; if (depth == 0) break; part.Append(ch); continue; }
+						part.Append(ch);
+					}
+					int look = i;
+					while (look < content.Length && char.IsWhiteSpace(content[look])) look++;
+					bool isText = false;
+					if (look < content.Length) {
+						if (content[look] == 'T' && look + 1 < content.Length && (content[look + 1] == 'j' || content[look + 1] == 'J'))
+							isText = true;
+						else if (content[look] == '\'' || content[look] == '"')
+							isText = true;
+					}
+					string s = part.ToString();
+					if ((isText || s.Length >= 4) && LooksLikeText(s)) {
+						sb.Append(s);
+						if (!s.EndsWith(" ") && !s.EndsWith("\n")) sb.Append(' ');
+					}
+					continue;
+				}
+				if (c == '<' && i + 1 < content.Length && content[i + 1] != '<') {
+					int end = content.IndexOf('>', i + 1);
+					if (end > i && end - i < 512) {
+						string hex = content.Substring(i + 1, end - i - 1).Replace(" ", "").Replace("\n", "").Replace("\r", "");
+						if (hex.Length >= 4 && (hex.Length % 2) == 0 && Regex.IsMatch(hex, "^[0-9A-Fa-f]+$")) {
+							try {
+								var bytes = new byte[hex.Length / 2];
+								for (int h = 0; h < bytes.Length; h++)
+									bytes[h] = Convert.ToByte(hex.Substring(h * 2, 2), 16);
+								string s = Encoding.ASCII.GetString(bytes);
+								if (LooksLikeText(s)) { sb.Append(s); sb.Append(' '); }
+							} catch { }
+						}
+						i = end + 1;
+						continue;
+					}
+				}
+				i++;
+			}
+		}
+
+		static bool LooksLikeText(string s) {
+			if (string.IsNullOrWhiteSpace(s)) return false;
+			int printable = 0;
+			foreach (char ch in s) {
+				if (ch == '\n' || ch == '\r' || ch == '\t' || (ch >= 32 && ch != 127)) printable++;
+			}
+			return printable >= Math.Max(2, (int)(s.Length * 0.55));
+		}
+	}
+}
+'@
+		try {
+			Add-Type -TypeDefinition $pdfCs -Language CSharp -ErrorAction Stop
+		} catch {
+			return "ERROR: PdfText helper failed to load: $($_.Exception.Message)"
+		}
+	}
+
+	try {
+		$bytes = [System.IO.File]::ReadAllBytes($full)
+		if ($bytes.Length -lt 5 -or [System.Text.Encoding]::ASCII.GetString($bytes, 0, [Math]::Min(5, $bytes.Length)) -notlike '%PDF*') {
+			return "ERROR: File does not look like a PDF: $full"
+		}
+		$text = [MiniBot.Core.PdfText]::Extract($bytes, [int]$maxChars)
+		$truncated = $false
+		if ($text -and $text.Length -ge $maxChars) {
+			$text = $text.Substring(0, $maxChars)
+			$truncated = $true
+		}
+		if ($null -eq $text) { $text = '' }
+
+		$g = Test-MBPdfTextGarbled -Text $text
+		$empty = [string]::IsNullOrWhiteSpace($text)
+		$needVision = [bool]$render -or ($autoVision -and ($empty -or $g.Garbled))
+
+		if (-not $needVision) {
+			$ux = "PDF_TEXT: $full ($($text.Length) chars$(if ($truncated) { ', truncated' } else { '' }))"
+			try {
+				Write-MBDebugLog -Step 'READPDF_TEXT' -Detail ("file={0} chars={1}" -f ([IO.Path]::GetFileName($full)), $text.Length)
+			} catch {}
+			return ($ux + "`n`n" + $text)
+		}
+
+		$reason = if ($render) { 'render_requested' } elseif ($empty) { 'no_text' } else { "garbled:$($g.Reason)" }
+		try {
+			Write-MBDebugLog -Step 'READPDF_VISION_TRY' -Detail ("file={0} reason={1} page={2} textChars={3}" -f ([IO.Path]::GetFileName($full)), $reason, $page, $text.Length)
+		} catch {}
+
+		$bmp = $null
+		try {
+			$rend = Invoke-MBPdfRenderPageBitmap -Path $full -Page $page -Dpi 150 -DestWidth ([math]::Max($maxWidth, 1200))
+			if (-not $rend.Ok -or -not $rend.Bitmap) {
+				$note = "Text extract failed/garbled ($reason) and page render failed."
+				if ($rend.Error) { $note += " Render errors: $($rend.Error)" }
+				$note += " Workarounds: install poppler (pdftoppm), ImageMagick, or Ghostscript; or export page as PNG and ReadImage."
+				$preview = ''
+				if (-not $empty -and $text.Length -gt 0) {
+					$preview = if ($text.Length -gt 800) { $text.Substring(0, 800) + '...' } else { $text }
+				}
+				try {
+					Write-MBDebugLog -Step 'READPDF_VISION_FAIL' -Detail ("file={0} err={1}" -f ([IO.Path]::GetFileName($full)), $rend.Error)
+				} catch {}
+				return ConvertTo-MBJson ([ordered]@{
+					success       = $false
+					path          = $full
+					chars         = $text.Length
+					garbled       = [bool]$g.Garbled
+					garbledScore  = $g.Score
+					garbledReason = $g.Reason
+					visionPending = $false
+					page          = $page
+					note          = $note
+					textPreview   = $preview
+				}) -Depth 4
+			}
+
+			$bmp = $rend.Bitmap
+			$label = "{0} p{1}" -f [System.IO.Path]::GetFileName($full), $rend.Page
+			$pv = Set-MBPendingVisionFromBitmap -Bitmap $bmp -MaxWidth $maxWidth -Label $label -SourcePath $full -Kind 'pdf' -Mime 'image/png'
+			try {
+				Write-MBDebugLog -Step 'READPDF_VISION_OK' -Detail ("file={0} method={1} {2}x{3}" -f $label, $rend.Method, $pv.Width, $pv.Height)
+			} catch {}
+
+			$uxLines = @(
+				"PDF_VISION: $full (page $($rend.Page)$(if ($rend.PageCount) { " of $($rend.PageCount)" } else { '' }) rendered via $($rend.Method))"
+				"Reason: $reason (custom/CID fonts or scan - text layer unusable)."
+				"Vision payload pending for next model reply - READ THE DOCUMENT VISUALLY and extract key fields."
+				"Do not invent values not visible on the page. Do not claim text-extract worked."
+				"Cost: only this page was rendered. Do not ReadPdf other pages unless the user needs them or this page cannot answer."
+			)
+			if (-not $empty -and $g.Garbled) {
+				$uxLines += "Ignored garbled text extract ($($text.Length) chars, score=$($g.Score), $($g.Reason)). Trust vision only."
+			}
+
+			$payload = [ordered]@{
+				success       = $true
+				path          = $full
+				mode          = 'vision'
+				reason        = $reason
+				garbled       = [bool]($g.Garbled -or $empty)
+				garbledScore  = $g.Score
+				garbledReason = $g.Reason
+				page          = $rend.Page
+				pageCount     = $rend.PageCount
+				renderMethod  = $rend.Method
+				visionPending = $true
+				image         = @{ width = $pv.Width; height = $pv.Height }
+				sizeBytes     = $pv.SizeBytes
+				sizeKB        = [math]::Round($pv.SizeBytes / 1KB, 1)
+				textChars     = $text.Length
+				truncated    = $truncated
+			}
+			return (($uxLines -join "`n") + "`n" + (ConvertTo-MBJson $payload -Depth 5))
+		} finally {
+			if ($bmp) { try { $bmp.Dispose() } catch {} }
+		}
+	} catch {
+		return "ERROR: ReadPdf failed: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetBSODInfo {
 	$minidumpPath = "C:\Windows\Minidump"
 	$result = @{}
 	if (Test-Path $minidumpPath) {
-		$dumps = Get-ChildItem $minidumpPath -Filter *.dmp | Sort-Object LastWriteTime -Descending
-		$result.Minidumps = $dumps | Select-Object Name, LastWriteTime, Length
-	} else { $result.Minidumps = "No minidump folder found" }
+		$dumps = Get-ChildItem $minidumpPath -Filter *.dmp -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+		$result.Minidumps = @($dumps | Select-Object Name, LastWriteTime, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}})
+	} else {
+		$result.Minidumps = "No minidump folder found"
+	}
 	$bsodEvents = Get-WinEvent -FilterHashtable @{LogName='System'; ID=41,1001; Level=2,3} -MaxEvents 20 -ErrorAction SilentlyContinue |
-		Select-Object TimeCreated, Id, Message
-	$result.RecentBSODEvents = $bsodEvents
-	$result | ConvertTo-Json -Compress -Depth 3
+		Select-Object TimeCreated, Id, ProviderName, @{N='Message';E={ if ($_.Message.Length -gt 300) { $_.Message.Substring(0,300) + '...' } else { $_.Message } }}
+	$result.RecentBSODEvents = @($bsodEvents)
+	ConvertTo-MBJson $result -Depth 4
 }
 
 function Invoke-GetEventLogs {
 	param([int]$hours = 72)
+	if ($hours -le 0) { $hours = 72 }
 	$start = (Get-Date).AddHours(-$hours)
-	$general = Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2,3; StartTime=$start} -MaxEvents 150 -ErrorAction SilentlyContinue |
-		Select-Object TimeCreated, LogName, LevelDisplayName, Id, ProviderName, Message
-	$disk = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='*disk*','*ntfs*','*stor*'; Level=1,2,3; StartTime=$start} -MaxEvents 100 -ErrorAction SilentlyContinue |
-		Select-Object TimeCreated, Id, Message
-	@{ GeneralEvents = $general; DiskIO_Errors = $disk } | ConvertTo-Json -Compress -Depth 3
+	$general = Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2,3; StartTime=$start} -MaxEvents 120 -ErrorAction SilentlyContinue |
+		Select-Object TimeCreated, LogName, LevelDisplayName, Id, ProviderName, @{N='Message';E={ if ($_.Message -and $_.Message.Length -gt 240) { $_.Message.Substring(0,240) + '...' } else { $_.Message } }}
+	$disk = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='*disk*','*ntfs*','*stor*'; Level=1,2,3; StartTime=$start} -MaxEvents 80 -ErrorAction SilentlyContinue |
+		Select-Object TimeCreated, Id, ProviderName, @{N='Message';E={ if ($_.Message -and $_.Message.Length -gt 240) { $_.Message.Substring(0,240) + '...' } else { $_.Message } }}
+	ConvertTo-MBJson @{ hours = $hours; GeneralEvents = @($general); DiskIO_Errors = @($disk) } -Depth 4
 }
 
 function Invoke-GetDiskHealth {
-	$disks = Get-PhysicalDisk | Select-Object FriendlyName, MediaType, BusType, HealthStatus, OperationalStatus, Size
-	$smart = Get-PhysicalDisk | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue |
-		Select-Object DeviceId, Temperature, ReadErrorsCorrected, ReadErrorsUncorrected
-	@{ PhysicalDisks = $disks; SMART = $smart } | ConvertTo-Json -Compress -Depth 3
+	try {
+		$disks = Get-PhysicalDisk -ErrorAction Stop | Select-Object FriendlyName, MediaType, BusType, HealthStatus, OperationalStatus, @{N='SizeGB';E={[math]::Round($_.Size/1GB,1)}}
+		$smart = Get-PhysicalDisk -ErrorAction SilentlyContinue | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue |
+			Select-Object DeviceId, Temperature, ReadErrorsCorrected, ReadErrorsUncorrected, WriteErrorsCorrected, WriteErrorsUncorrected
+		ConvertTo-MBJson @{ PhysicalDisks = @($disks); SMART = @($smart) } -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetDiskSpace {
-	param([string]$path = "C:\")
-	$drives = Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, @{N='FreeGB';E={[math]::round($_.SizeRemaining/1GB,1)}}, @{N='TotalGB';E={[math]::round($_.Size/1GB,1)}}
-	$topFolders = Get-ChildItem $path -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-		$size = (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-		[pscustomobject]@{Folder=$_.FullName; SizeGB=[math]::round($size/1GB,2)}
-	} | Sort-Object SizeGB -Descending | Select-Object -First 10
-	@{ Drives = $drives; TopLargeFolders = $topFolders } | ConvertTo-Json -Compress -Depth 3
+	param(
+		[string]$path = "C:\",
+		[bool]$deep = $true,
+		[int]$timeout_sec = 45,
+		[int]$top = 10
+	)
+	try {
+		$path = Resolve-MBPath $path
+		if ($top -le 0) { $top = 10 }
+		if ($top -gt 40) { $top = 40 }
+		if ($timeout_sec -le 0) { $timeout_sec = 45 }
+		$timeoutMs = $timeout_sec * 1000
+
+		$drives = Get-Volume -ErrorAction SilentlyContinue | Where-Object DriveLetter |
+			Select-Object DriveLetter, FileSystemLabel, HealthStatus,
+				@{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,1)}},
+				@{N='TotalGB';E={[math]::Round($_.Size/1GB,1)}},
+				@{N='UsedPct';E={ if ($_.Size -gt 0) { [math]::Round((1 - $_.SizeRemaining/$_.Size)*100,1) } else { 0 } }}
+
+		$topFolders = @()
+		$scanMode = 'none'
+		$scanEngine = 'none'
+		$scanMs = 0L
+		$scanTimedOut = $false
+		$scanCancelled = $false
+
+		if (Test-Path -LiteralPath $path) {
+			if ($script:HasDiskWalk) {
+				# FindFirstFileExW + LARGE_FETCH; parallel top-level walks
+				try { [MiniBot.Core.DiskWalk]::CancelRequested = $false } catch {}
+				$sw = [System.Diagnostics.Stopwatch]::StartNew()
+				$entries = [MiniBot.Core.DiskWalk]::TopFolders($path, [int]$top, [bool]$deep, [int]$timeoutMs, 64)
+				$sw.Stop()
+				$scanMs = $sw.ElapsedMilliseconds
+				$scanEngine = 'findfirstfileex_large_fetch'
+				$scanMode = if ($deep) { 'recursive_top_parallel' } else { 'one_level_top_parallel' }
+				$topFolders = New-Object System.Collections.ArrayList
+				foreach ($e in @($entries)) {
+					if ($null -eq $e) { continue }
+					if ($e.TimedOut) { $scanTimedOut = $true }
+					if ($e.Cancelled) { $scanCancelled = $true }
+					[void]$topFolders.Add([pscustomobject]@{
+						Folder    = [string]$e.Path
+						SizeGB    = [math]::Round(([int64]$e.Bytes) / 1GB, 2)
+						SizeBytes = [int64]$e.Bytes
+						Files     = [int]$e.Files
+						TimedOut  = [bool]$e.TimedOut
+					})
+				}
+				$topFolders = @($topFolders)
+				if ($entries -and $entries.Count -gt 0 -and $entries[0].ElapsedMs -gt 0) {
+					$scanMs = [int64]$entries[0].ElapsedMs
+				}
+			} else {
+				$dirs = @(Get-ChildItem -LiteralPath $path -Directory -Force -ErrorAction SilentlyContinue | Select-Object -First 40)
+				$scanMode = if ($deep) { 'recursive_top_ps' } else { 'one_level_top_ps' }
+				$scanEngine = 'powershell'
+				$sw = [System.Diagnostics.Stopwatch]::StartNew()
+				$topFolders = @(
+					$dirs | ForEach-Object {
+						if ((Test-MBInterrupt)) { return }
+						$sum = 0L
+						try {
+							if ($deep) {
+								$sum = [int64]((Get-ChildItem -LiteralPath $_.FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
+									Measure-Object -Property Length -Sum).Sum)
+							} else {
+								$sum = [int64]((Get-ChildItem -LiteralPath $_.FullName -File -Force -ErrorAction SilentlyContinue |
+									Measure-Object -Property Length -Sum).Sum)
+							}
+						} catch { $sum = 0L }
+						[pscustomobject]@{
+							Folder    = $_.FullName
+							SizeGB    = [math]::Round(($sum / 1GB), 2)
+							SizeBytes = $sum
+						}
+					} | Sort-Object SizeBytes -Descending | Select-Object -First $top
+				)
+				$sw.Stop()
+				$scanMs = $sw.ElapsedMilliseconds
+			}
+		}
+
+		$note = if ($scanEngine -eq 'findfirstfileex_large_fetch') {
+			if ($deep) {
+				'Top folders sized with Win32 FindFirstFileEx (LARGE_FETCH); parallel walks; reparse points skipped.'
+			} else {
+				'One-level file sizes via FindFirstFileEx. Pass deep=true for full recursive under each top-level folder.'
+			}
+		} else {
+			'DiskWalk C# helper unavailable; PowerShell enumeration used (slower).'
+		}
+
+		ConvertTo-MBJson @{
+			Drives          = @($drives)
+			TopLargeFolders = @($topFolders)
+			ScannedPath     = $path
+			FolderScanMode  = $scanMode
+			ScanEngine      = $scanEngine
+			ScanMs          = $scanMs
+			Deep            = [bool]$deep
+			TimedOut        = [bool]$scanTimedOut
+			Cancelled       = [bool]$scanCancelled
+			Note            = $note
+		} -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetInstalledSoftware {
-	Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* |
-		Select-Object DisplayName, DisplayVersion, Publisher, InstallDate | Where-Object DisplayName |
-		ConvertTo-Json -Compress -Depth 2
+	param(
+		[string]$name = '',
+		[int]$max = 200
+	)
+	try {
+		if ($max -le 0) { $max = 200 }
+		if ($max -gt 1000) { $max = 1000 }
+		$keys = @(
+			'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+			'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+		)
+		$all = @(
+			Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+				Where-Object DisplayName |
+				Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
+				Sort-Object DisplayName
+		)
+		$total = $all.Count
+		if (-not [string]::IsNullOrWhiteSpace($name)) {
+			$n = $name.Trim()
+			$all = @($all | Where-Object {
+				$_.DisplayName -like "*$n*" -or
+				($_.Publisher -and $_.Publisher -like "*$n*")
+			})
+		}
+		$truncated = ($all.Count -gt $max)
+		$slice = @($all | Select-Object -First $max)
+		return Limit-MBResult (ConvertTo-MBJson @{
+			total     = $total
+			matched   = $all.Count
+			returned  = $slice.Count
+			truncated = $truncated
+			filter    = $(if ($name) { $name } else { $null })
+			software  = $slice
+		} -Depth 4)
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetDriverInfo {
@@ -486,90 +9357,99 @@ function Invoke-GetDriverInfo {
 		[int]$limit = 50,
 		[bool]$showAll = $false
 	)
-
 	try {
-		$drivers = Get-WmiObject Win32_PnPSignedDriver |
-			Select-Object DeviceName, DriverVersion, Manufacturer, IsSigned
-
+		$drivers = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop |
+			Select-Object DeviceName, DriverVersion, Manufacturer, IsSigned, DriverDate)
 		$total = $drivers.Count
-		$unsigned = $drivers | Where-Object { -not $_.IsSigned }
+		$unsigned = @($drivers | Where-Object { -not $_.IsSigned })
 
 		if ([string]::IsNullOrWhiteSpace($filter) -and -not $showAll) {
-			return @{
-				TotalDrivers	  = $total
-				UnsignedCount	  = $unsigned.Count
-				MicrosoftCount	  = ($drivers | Where-Object Manufacturer -like "*Microsoft*").Count
-				TopManufacturers  = ($drivers | Group-Object Manufacturer | Sort-Object Count -Descending | Select-Object -First 8 Name, Count)
-				Note = "Use the 'filter' parameter for focused results (e.g. 'unsigned', 'realtek', 'network'). Avoid showAll=true unless absolutely necessary."
-			} | ConvertTo-Json -Compress -Depth 3
+			return ConvertTo-MBJson @{
+				TotalDrivers     = $total
+				UnsignedCount    = $unsigned.Count
+				MicrosoftCount   = @($drivers | Where-Object { $_.Manufacturer -like '*Microsoft*' }).Count
+				TopManufacturers = @($drivers | Group-Object Manufacturer | Sort-Object Count -Descending | Select-Object -First 8 Name, Count)
+				Note = "Use filter for focused results (unsigned, realtek, network...). Avoid showAll unless needed."
+			} -Depth 4
 		}
 
 		$filtered = $drivers
-
-		if ($filter -match 'unsigned|not signed|unsigned only') {
-			$filtered = $unsigned
-		}
-		elseif ($filter -match 'microsoft') {
-			$filtered = $filtered | Where-Object Manufacturer -like "*Microsoft*"
-		}
-		elseif ($filter -match 'realtek') {
-			$filtered = $filtered | Where-Object { $_.Manufacturer -like "*Realtek*" -or $_.DeviceName -like "*Realtek*" }
-		}
-		elseif ($filter -match 'nvidia|geforce') {
-			$filtered = $filtered | Where-Object { $_.Manufacturer -like "*NVIDIA*" -or $_.DeviceName -like "*NVIDIA*" }
-		}
-		elseif ($filter -match 'network|ethernet|wifi|wireless|lan') {
-			$filtered = $filtered | Where-Object { $_.DeviceName -match 'Network|Ethernet|WiFi|Wireless|LAN|WAN Miniport' }
-		}
-		elseif ($filter -match 'audio|sound') {
-			$filtered = $filtered | Where-Object { $_.DeviceName -match 'Audio|Sound|Realtek.*Audio' }
-		}
-		elseif ($filter -match 'storage|disk|nvme|ssd|sata') {
-			$filtered = $filtered | Where-Object { $_.DeviceName -match 'Storage|Disk|NVMe|SSD|SATA|AHCI' }
-		}
+		if ($filter -match '(?i)unsigned|not signed') { $filtered = $unsigned }
+		elseif ($filter -match '(?i)microsoft') { $filtered = @($filtered | Where-Object Manufacturer -like '*Microsoft*') }
+		elseif ($filter -match '(?i)realtek') { $filtered = @($filtered | Where-Object { $_.Manufacturer -like '*Realtek*' -or $_.DeviceName -like '*Realtek*' }) }
+		elseif ($filter -match '(?i)nvidia|geforce') { $filtered = @($filtered | Where-Object { $_.Manufacturer -like '*NVIDIA*' -or $_.DeviceName -like '*NVIDIA*' }) }
+		elseif ($filter -match '(?i)network|ethernet|wifi|wireless|lan') { $filtered = @($filtered | Where-Object { $_.DeviceName -match 'Network|Ethernet|Wi-?Fi|Wireless|LAN|WAN Miniport' }) }
+		elseif ($filter -match '(?i)audio|sound') { $filtered = @($filtered | Where-Object { $_.DeviceName -match 'Audio|Sound|Realtek.*Audio' }) }
+		elseif ($filter -match '(?i)storage|disk|nvme|ssd|sata') { $filtered = @($filtered | Where-Object { $_.DeviceName -match 'Storage|Disk|NVMe|SSD|SATA|AHCI' }) }
 		elseif ($filter) {
-			$filtered = $filtered | Where-Object {
-				$_.DeviceName -like "*$filter*" -or $_.Manufacturer -like "*$filter*"
-			}
+			$filtered = @($filtered | Where-Object { $_.DeviceName -like "*$filter*" -or $_.Manufacturer -like "*$filter*" })
 		}
 
 		if (-not $showAll -and $filtered.Count -gt $limit) {
-			$filtered = $filtered | Select-Object -First $limit
+			$filtered = @($filtered | Select-Object -First $limit)
 		}
 
-		return @{
-			TotalDrivers   = $total
-			FilteredCount  = $filtered.Count
-			FilterUsed	   = if ($filter) { $filter } else { "None (showing top $limit)" }
-			Drivers		   = $filtered
-		} | ConvertTo-Json -Compress -Depth 3
-
-	}
-	catch {
+		return ConvertTo-MBJson @{
+			TotalDrivers  = $total
+			FilteredCount = $filtered.Count
+			FilterUsed    = $(if ($filter) { $filter } else { "top $limit" })
+			Drivers       = $filtered
+		} -Depth 4
+	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
 }
 
 function Invoke-GetStartupItems {
-	$auto = Get-CimInstance Win32_StartupCommand | Select-Object Name, Command, Location
-	$services = Get-Service | Where-Object StartType -eq 'Automatic' | Select-Object Name, Status
-	@{ StartupPrograms = $auto; AutoServices = $services } | ConvertTo-Json -Compress
+	try {
+		$auto = Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue |
+			Select-Object Name, Command, Location, User
+		$services = Get-Service -ErrorAction SilentlyContinue |
+			Where-Object { $_.StartType -eq 'Automatic' } |
+			Select-Object Name, Status, DisplayName
+		ConvertTo-MBJson @{ StartupPrograms = @($auto); AutoServices = @($services) } -Depth 3
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetMemoryInfo {
-	$mem = Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory
-	$top = Get-Process | Sort-Object WorkingSet -Descending | Select-Object -First 10 Name, @{N='MemoryMB';E={[math]::round($_.WorkingSet/1MB,1)}}
-	@{ TotalRAM_MB = $mem.TotalVisibleMemorySize; FreeRAM_MB = $mem.FreePhysicalMemory; TopConsumers = $top } | ConvertTo-Json -Compress
+	try {
+		$os = Get-CimInstance Win32_OperatingSystem
+		$totalMB = [math]::Round($os.TotalVisibleMemorySize / 1024, 1)
+		$freeMB  = [math]::Round($os.FreePhysicalMemory / 1024, 1)
+		$top = Get-Process -ErrorAction SilentlyContinue |
+			Sort-Object WorkingSet64 -Descending |
+			Select-Object -First 10 Name, @{N='MemoryMB';E={[math]::Round($_.WorkingSet64/1MB,1)}}
+		ConvertTo-MBJson @{
+			TotalRAM_MB = $totalMB
+			FreeRAM_MB  = $freeMB
+			UsedPct     = [math]::Round((($totalMB - $freeMB) / [math]::Max($totalMB,1)) * 100, 1)
+			TopConsumers = @($top)
+		} -Depth 3
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetNetworkInfo {
-	$adapters = Get-NetAdapter | Select-Object Name, Status, MacAddress, LinkSpeed
-	$ip = Get-NetIPConfiguration | Select-Object InterfaceAlias, IPv4Address, DNSServer
-	$OriginalProgressPreference = $Global:ProgressPreference
-	$Global:ProgressPreference = 'SilentlyContinue'
-	$ping = Test-NetConnection 8.8.8.8 -InformationLevel Quiet
-	$Global:ProgressPreference = $OriginalProgressPreference
-	@{ Adapters = $adapters; IPConfig = $ip; InternetTest = $ping } | ConvertTo-Json -Compress
+	try {
+		$adapters = Get-NetAdapter -ErrorAction SilentlyContinue |
+			Select-Object Name, Status, MacAddress, LinkSpeed, InterfaceDescription
+		$ip = Get-NetIPConfiguration -ErrorAction SilentlyContinue |
+			Select-Object InterfaceAlias,
+				@{N='IPv4';E={ @($_.IPv4Address.IPAddress) -join ', ' }},
+				@{N='DNS';E={ @($_.DNSServer.ServerAddresses) -join ', ' }},
+				@{N='Gateway';E={ @($_.IPv4DefaultGateway.NextHop) -join ', ' }}
+		$OriginalProgressPreference = $Global:ProgressPreference
+		$Global:ProgressPreference = 'SilentlyContinue'
+		$ping = $false
+		try { $ping = Test-NetConnection 8.8.8.8 -InformationLevel Quiet -WarningAction SilentlyContinue } catch {}
+		$Global:ProgressPreference = $OriginalProgressPreference
+		ConvertTo-MBJson @{ Adapters = @($adapters); IPConfig = @($ip); InternetTest = $ping } -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetWindowsUpdateStatus {
@@ -577,27 +9457,39 @@ function Invoke-GetWindowsUpdateStatus {
 		if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
 			Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
 			$updates = Get-WUList -ErrorAction SilentlyContinue | Select-Object Title, KB, Size
-			@{ PendingUpdates = $updates; LastBoot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime } | ConvertTo-Json -Compress
+			ConvertTo-MBJson @{
+				PendingUpdates = @($updates)
+				LastBoot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+			} -Depth 3
 		} else {
-			"PSWindowsUpdate module not installed. Run: Install-Module PSWindowsUpdate -Force"
+			return "PSWindowsUpdate module not installed. Run: Install-Module PSWindowsUpdate -Force"
 		}
-	} catch { "ERROR: $_" }
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetSystemUptime {
 	$os = Get-CimInstance Win32_OperatingSystem
-	@{ UptimeDays = [math]::round(((Get-Date) - $os.LastBootUpTime).TotalDays, 2); LastBoot = $os.LastBootUpTime } | ConvertTo-Json -Compress
+	$uptime = (Get-Date) - $os.LastBootUpTime
+	ConvertTo-MBJson @{
+		UptimeDays = [math]::Round($uptime.TotalDays, 2)
+		Uptime     = "{0}d {1}h {2}m" -f $uptime.Days, $uptime.Hours, $uptime.Minutes
+		LastBoot   = $os.LastBootUpTime.ToString("s")
+	}
 }
 
 function Invoke-RunQuickDiagnostics {
-	$bundle = @{
-		BSOD = Invoke-GetBSODInfo
-		Events = Invoke-GetEventLogs -hours 48
-		DiskHealth = Invoke-GetDiskHealth
-		DiskSpace = Invoke-GetDiskSpace
-		Memory = Invoke-GetMemoryInfo
+	$bundle = [ordered]@{
+		GeneratedAt = (Get-Date).ToString("s")
+		Uptime      = Invoke-GetSystemUptime
+		BSOD        = Invoke-GetBSODInfo
+		Events      = Invoke-GetEventLogs -hours 48
+		DiskHealth  = Invoke-GetDiskHealth
+		DiskSpace   = Invoke-GetDiskSpace -deep:$false -timeout_sec 20 -top 8
+		Memory      = Invoke-GetMemoryInfo
 	}
-	$bundle | ConvertTo-Json -Compress -Depth 4
+	Limit-MBResult (ConvertTo-MBJson $bundle -Depth 8) 40000
 }
 
 function Invoke-RunRepairTool {
@@ -606,9 +9498,7 @@ function Invoke-RunRepairTool {
 		[string]$driveLetter,
 		[string]$arguments
 	)
-
-	$tool = $tool.ToLower()
-
+	$tool = "$tool".ToLower()
 	$command = switch ($tool) {
 		"sfc" {
 			if ($arguments) { "sfc $arguments" } else { "sfc /scannow" }
@@ -618,79 +9508,1362 @@ function Invoke-RunRepairTool {
 			if ($arguments) { "chkdsk $drive $arguments" } else { "chkdsk $drive /scan" }
 		}
 		"dism" {
-			if ($arguments) {
-				"DISM $arguments"
-			} else {
-				"DISM /Online /Cleanup-Image /RestoreHealth"
-			}
+			if ($arguments) { "DISM $arguments" } else { "DISM /Online /Cleanup-Image /RestoreHealth" }
 		}
 		default { return "ERROR: Unknown tool '$tool'. Use sfc, dism, or chkdsk." }
 	}
 
 	$details = "Tool: $tool"
 	if ($driveLetter) { $details += "`nDrive: $driveLetter" }
-	if ($arguments)	  { $details += "`nArguments: $arguments" }
-	$details += "`n`nThis will execute:`n`t$command"
+	if ($arguments) { $details += "`nArguments: $arguments" }
+	$details += "`n`nExecutes:`n  $command"
 
-	if (-not (Request-Confirmation -Title "REPAIR TOOL ACTION REQUIRES APPROVAL" -Details $details)) {
+	if (-not (Request-Confirmation -Title "Repair tool requires approval" -Details $details)) {
 		return "BLOCKED BY USER: Repair action denied by operator."
 	}
+	return Invoke-RunCommand -command $command -shell "cmd" -timeout_sec 7200
+}
 
+function Invoke-GetServiceStatus {
+	param(
+		[string]$name,
+		[string]$status = '',
+		[int]$max = 250
+	)
+	if ($max -le 0) { $max = 250 }
+	if ($max -gt 1000) { $max = 1000 }
 	try {
-		return Invoke-RunCommand -command $command -confirm $true
-	}
-	catch {
+		if ($name) {
+			return (Get-Service -Name $name -ErrorAction Stop |
+				Select-Object Name, Status, StartType, DisplayName |
+				ConvertTo-Json -Compress)
+		}
+		$svcs = @(Get-Service -ErrorAction Stop)
+		if ($status) {
+			$svcs = @($svcs | Where-Object { $_.Status -like $status })
+		}
+		$total = $svcs.Count
+		$svcs = @($svcs | Sort-Object Name | Select-Object -First $max)
+		$rows = @($svcs | Select-Object Name, Status, StartType, DisplayName)
+		return ConvertTo-MBJson @{
+			count     = $rows.Count
+			total     = $total
+			truncated = ($total -gt $rows.Count)
+			services  = $rows
+		}
+	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
 }
 
-function Invoke-GetServiceStatus {
+function Invoke-ControlService {
+	param(
+		[string]$name,
+		[string]$action,
+		[string]$startup_type
+	)
+	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name is required." }
+	if ([string]::IsNullOrWhiteSpace($action)) { return "ERROR: action is required (start|stop|restart|set_startup)." }
+	$action = $action.Trim().ToLowerInvariant()
+	if ($action -notin @('start','stop','restart','set_startup')) {
+		return "ERROR: action must be start, stop, restart, or set_startup."
+	}
+
+	$startMap = @{
+		'automatic'             = 'Automatic'
+		'auto'                  = 'Automatic'
+		'manual'                = 'Manual'
+		'disabled'              = 'Disabled'
+		'automaticdelayedstart' = 'Automatic'
+		'delayed'               = 'Automatic'
+		'delayedauto'           = 'Automatic'
+	}
+	$wantStartup = $null
+	$wantDelayed = $false
+	if (-not [string]::IsNullOrWhiteSpace($startup_type)) {
+		$key = ($startup_type -replace '[\s_-]','').ToLowerInvariant()
+		if (-not $startMap.ContainsKey($key)) {
+			return "ERROR: startup_type must be Automatic, Manual, Disabled, or AutomaticDelayedStart."
+		}
+		$wantStartup = $startMap[$key]
+		if ($key -in @('automaticdelayedstart','delayed','delayedauto')) { $wantDelayed = $true }
+	}
+	if ($action -eq 'set_startup' -and -not $wantStartup) {
+		return "ERROR: set_startup requires startup_type."
+	}
+
+	try {
+		$svc = Get-Service -Name $name -ErrorAction Stop
+	} catch {
+		return "ERROR: Service not found: $name — $($_.Exception.Message)"
+	}
+
+	$details = "Service: $($svc.Name) ($($svc.DisplayName))`nCurrent: Status=$($svc.Status) StartType=$($svc.StartType)`nAction: $action"
+	if ($wantStartup) {
+		$details += "`nStartupType: $wantStartup"
+		if ($wantDelayed) { $details += " (DelayedAutoStart)" }
+	}
+	if (-not (Request-Confirmation -Title "ControlService requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Service control denied by operator."
+	}
+
+	try {
+		switch ($action) {
+			'start' {
+				if ($svc.Status -eq 'Running') {
+					return ConvertTo-MBJson @{ success = $true; note = "Already running"; service = ($svc | Select-Object Name, Status, StartType, DisplayName) }
+				}
+				Start-Service -Name $svc.Name -ErrorAction Stop
+			}
+			'stop' {
+				if ($svc.Status -eq 'Stopped') {
+					return ConvertTo-MBJson @{ success = $true; note = "Already stopped"; service = ($svc | Select-Object Name, Status, StartType, DisplayName) }
+				}
+				Stop-Service -Name $svc.Name -Force -ErrorAction Stop
+			}
+			'restart' {
+				Restart-Service -Name $svc.Name -Force -ErrorAction Stop
+			}
+			'set_startup' {
+			}
+		}
+
+		if ($wantStartup -or $action -eq 'set_startup') {
+			Set-Service -Name $svc.Name -StartupType $wantStartup -ErrorAction Stop
+			if ($wantDelayed) {
+				try {
+					$regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
+					if (Test-Path -LiteralPath $regPath) {
+						Set-ItemProperty -LiteralPath $regPath -Name DelayedAutoStart -Value 1 -Type DWord -Force -ErrorAction Stop
+					}
+				} catch {
+					# Best-effort; service start type still set
+				}
+			} elseif ($wantStartup -eq 'Automatic') {
+				try {
+					$regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
+					if (Test-Path -LiteralPath $regPath) {
+						$prop = Get-ItemProperty -LiteralPath $regPath -Name DelayedAutoStart -ErrorAction SilentlyContinue
+						if ($null -ne $prop -and $null -ne $prop.DelayedAutoStart) {
+							Set-ItemProperty -LiteralPath $regPath -Name DelayedAutoStart -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+						}
+					}
+				} catch {}
+			}
+		}
+
+		$after = Get-Service -Name $svc.Name -ErrorAction Stop
+		$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
+		return ConvertTo-MBJson @{
+			success = $true
+			message = "$prefix`: ControlService $action on $($after.Name)"
+			service = ($after | Select-Object Name, Status, StartType, DisplayName)
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Format-MBByteSize {
+	param([int64]$Bytes)
+	if ($Bytes -lt 0) { return '?' }
+	if ($Bytes -lt 1024) { return ("{0} B" -f $Bytes) }
+	if ($Bytes -lt 1MB) { return ("{0:N1} KB" -f ($Bytes / 1KB)) }
+	if ($Bytes -lt 1GB) { return ("{0:N1} MB" -f ($Bytes / 1MB)) }
+	return ("{0:N2} GB" -f ($Bytes / 1GB))
+}
+
+function Write-MBDownloadProgress {
+	param(
+		[string]$Label = 'Downloading',
+		[int]$Percent = -1,
+		[int64]$Bytes = 0,
+		[int64]$TotalBytes = 0,
+		[ValidateSet('start','update','done','fail')]
+		[string]$Phase = 'update',
+		[string]$Detail = ''
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	$lab = ([string]$Label).Trim()
+	if ($lab.Length -eq 0) { $lab = 'Downloading' }
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind       = 'dl-progress'
+		Text       = $lab
+		Percent    = [int]$Percent
+		Bytes      = [int64]$Bytes
+		TotalBytes = [int64]$TotalBytes
+		Phase      = [string]$Phase
+		Detail     = [string]$Detail
+		Color      = 'Cyan'
+		NoNewline  = $true
+		MdNoLinks  = 1
+	})
+}
+
+function Invoke-MBHttpDownload {
+	param(
+		[Parameter(Mandatory)]
+		[string]$Url,
+		[Parameter(Mandatory)]
+		[string]$OutPath,
+		[int]$TimeoutSec = 900,
+		[int64]$MaxBytes = 0,
+		[string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiniBot/2.8',
+		[string]$Label = 'Downloading',
+		[switch]$ShowProgress
+	)
+	if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($OutPath)) {
+		return @{ ok = $false; error = 'url/out required' }
+	}
+	if ($TimeoutSec -lt 15) { $TimeoutSec = 15 }
+	try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls } catch {}
+
+	$dir = Split-Path -Parent $OutPath
+	if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+		New-Item -ItemType Directory -Path $dir -Force | Out-Null
+	}
+
+	$response = $null
+	$inStream = $null
+	$outStream = $null
+	$wrotePartial = $false
+	$finalUrl = $Url
+	$contentType = $null
+	$total = [int64]0
+	$contentLength = [int64]-1
+	$lastPct = -1
+	$lastTick = 0
+
+	try {
+		if ($ShowProgress) {
+			Write-MBDownloadProgress -Label $Label -Percent 0 -Bytes 0 -TotalBytes 0 -Phase start
+		}
+
+		$uri = New-Object System.Uri ($Url)
+		$req = [System.Net.HttpWebRequest]::Create($uri)
+		$req.Method = 'GET'
+		$req.Timeout = [Math]::Min(30000, $TimeoutSec * 1000)
+		$req.ReadWriteTimeout = $TimeoutSec * 1000
+		$req.AllowAutoRedirect = $true
+		try { $req.MaximumAutomaticRedirections = 15 } catch {}
+		$req.UserAgent = $UserAgent
+		$req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+
+		$response = $req.GetResponse()
+		try { $finalUrl = [string]$response.ResponseUri.AbsoluteUri } catch {}
+		try { $contentType = [string]$response.ContentType } catch {}
+		try { $contentLength = [int64]$response.ContentLength } catch { $contentLength = -1 }
+		if ($MaxBytes -gt 0 -and $contentLength -gt 0 -and $contentLength -gt $MaxBytes) {
+			throw (New-Object System.Exception ("Content-Length {0} bytes exceeds max {1}." -f $contentLength, $MaxBytes))
+		}
+
+		$inStream = $response.GetResponseStream()
+		$outStream = New-Object System.IO.FileStream -ArgumentList @($OutPath, [System.IO.FileMode]::Create)
+		$wrotePartial = $true
+		$buffer = New-Object byte[] 16384
+		$count = $inStream.Read($buffer, 0, $buffer.Length)
+		$total = [int64]$count
+		while ($count -gt 0) {
+			if (Test-MBInterrupt) {
+				throw (New-Object System.Exception 'Download interrupted by user.')
+			}
+			if ($MaxBytes -gt 0 -and $total -gt $MaxBytes) {
+				throw (New-Object System.Exception ("Download exceeded max size ({0} bytes)." -f $MaxBytes))
+			}
+			$outStream.Write($buffer, 0, $count)
+			$count = $inStream.Read($buffer, 0, $buffer.Length)
+			$total = $total + [int64]$count
+
+			if ($ShowProgress) {
+				$now = [Environment]::TickCount
+				$should = $false
+				$pct = -1
+				if ($contentLength -gt 0) {
+					$totalKb = [Math]::Max(1.0, [Math]::Floor($contentLength / 1024.0))
+					$doneKb = [Math]::Floor($total / 1024.0)
+					$pct = [int](($doneKb / $totalKb) * 100)
+					if ($pct -gt 100) { $pct = 100 }
+					if ($pct -ne $lastPct) { $should = $true; $lastPct = $pct }
+				} else {
+					if (($now - $lastTick) -ge 200 -or $lastTick -eq 0) { $should = $true; $lastTick = $now }
+				}
+				if ($should) {
+					$totShow = if ($contentLength -gt 0) { $contentLength } else { [int64]0 }
+					Write-MBDownloadProgress -Label $Label -Percent $pct -Bytes $total -TotalBytes $totShow -Phase update
+				}
+			}
+		}
+		$outStream.Flush()
+		$outStream.Close(); $outStream = $null
+		$inStream.Close(); $inStream = $null
+		$response.Close(); $response = $null
+
+		if ($total -lt 1) {
+			throw (New-Object System.Exception 'empty download body')
+		}
+		if ($ShowProgress) {
+			$totShow = if ($contentLength -gt 0) { $contentLength } else { $total }
+			Write-MBDownloadProgress -Label $Label -Percent 100 -Bytes $total -TotalBytes $totShow -Phase done
+		}
+		return @{
+			ok           = $true
+			path         = $OutPath
+			bytes        = $total
+			final_url    = $finalUrl
+			content_type = $contentType
+			content_length = $contentLength
+		}
+	} catch {
+		$err = $_.Exception.Message
+		if ($ShowProgress) {
+			try { Write-MBDownloadProgress -Label $Label -Percent -1 -Bytes $total -TotalBytes 0 -Phase fail -Detail $err } catch {}
+		}
+		if ($outStream) { try { $outStream.Close() } catch {} }
+		if ($inStream) { try { $inStream.Close() } catch {} }
+		if ($response) { try { $response.Close() } catch {} }
+		if ($wrotePartial -and (Test-Path -LiteralPath $OutPath)) {
+			try { Remove-Item -LiteralPath $OutPath -Force -ErrorAction SilentlyContinue } catch {}
+		}
+		return @{ ok = $false; error = $err; bytes = $total }
+	} finally {
+		if ($outStream) { try { $outStream.Dispose() } catch {} }
+		if ($inStream) { try { $inStream.Dispose() } catch {} }
+		if ($response) { try { $response.Dispose() } catch {} }
+	}
+}
+
+function Invoke-DownloadFile {
+	param(
+		[string]$url,
+		[string]$path,
+		[bool]$overwrite = $false,
+		[int]$max_mb = 100,
+		[int]$timeout_sec = 120
+	)
+	if ([string]::IsNullOrWhiteSpace($url)) { return "ERROR: url is required." }
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required." }
+	if ($url -notmatch '^(?i)https?://') { return "ERROR: url must start with http:// or https://" }
+
+	if ($max_mb -le 0) { $max_mb = 100 }
+	if ($max_mb -gt 512) { $max_mb = 512 }
+	if ($timeout_sec -le 0) { $timeout_sec = 120 }
+	if ($timeout_sec -gt 3600) { $timeout_sec = 3600 }
+	$maxBytes = [int64]$max_mb * 1MB
+
+	$dest = Resolve-MBPath $path
+	if ((Test-Path -LiteralPath $dest) -and -not $overwrite) {
+		return "ERROR: Destination exists (set overwrite=true): $dest"
+	}
+	$parent = Split-Path -Parent $dest
+	if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+		return "ERROR: Parent directory does not exist: $parent"
+	}
+
+	$details = "Download URL to local path:`n`n  URL:  $url`n  Path: $dest`n  Max:  ${max_mb} MB`n  Overwrite: $overwrite`n  Timeout: ${timeout_sec}s"
+	if (-not (Request-Confirmation -Title "DownloadFile requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Download denied by operator."
+	}
+
+	$leaf = [System.IO.Path]::GetFileName($dest)
+	if ([string]::IsNullOrWhiteSpace($leaf)) { $leaf = 'file' }
+	$r = Invoke-MBHttpDownload -Url $url -OutPath $dest -TimeoutSec $timeout_sec -MaxBytes $maxBytes `
+		-UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiniBot/2.8 DownloadFile' `
+		-Label ("Downloading {0}" -f $leaf) -ShowProgress
+	if (-not $r.ok) {
+		return "ERROR: $($r.error)"
+	}
+	$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
+	return ConvertTo-MBJson @{
+		success      = $true
+		message      = "$prefix`: Downloaded $($r.bytes) bytes to $dest"
+		path         = $dest
+		bytes        = $r.bytes
+		url          = $url
+		final_url    = $r.final_url
+		content_type = $r.content_type
+		max_mb       = $max_mb
+	}
+}
+
+function Invoke-ExpandArchive {
+	param(
+		[string]$path,
+		[string]$destination,
+		[bool]$force = $false
+	)
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required." }
+	if ([string]::IsNullOrWhiteSpace($destination)) { return "ERROR: destination is required." }
+
+	$src = Resolve-MBPath $path
+	$dest = Resolve-MBPath $destination
+	if (-not (Test-Path -LiteralPath $src)) { return "ERROR: Archive not found: $src" }
+	if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { return "ERROR: path must be a file: $src" }
+	$ext = [System.IO.Path]::GetExtension($src)
+	if ($ext -notin @('.zip','.ZIP')) {
+		return "ERROR: Only .zip archives are supported (got extension '$ext')."
+	}
+
+	$details = "Extract archive:`n`n  Archive: $src`n  Dest:    $dest`n  Force:   $force"
+	if (-not (Request-Confirmation -Title "ExpandArchive requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Extract denied by operator."
+	}
+
+	try {
+		if (-not (Test-Path -LiteralPath $dest)) {
+			New-Item -ItemType Directory -Path $dest -Force -ErrorAction Stop | Out-Null
+		}
+		$expandParams = @{
+			LiteralPath     = $src
+			DestinationPath = $dest
+			ErrorAction     = 'Stop'
+		}
+		$eaCmd = Get-Command Expand-Archive -ErrorAction SilentlyContinue
+		if ($force -and $eaCmd -and $eaCmd.Parameters.ContainsKey('Force')) {
+			$expandParams['Force'] = $true
+		}
+		Expand-Archive @expandParams
+		$entries = @(Get-ChildItem -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 50)
+		$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
+		return ConvertTo-MBJson @{
+			success     = $true
+			message     = "$prefix`: Extracted $src -> $dest"
+			path        = $src
+			destination = $dest
+			sample      = @($entries | ForEach-Object {
+				[ordered]@{
+					name = $_.Name
+					full = $_.FullName
+					type = $(if ($_.PSIsContainer) { 'dir' } else { 'file' })
+					size = $(if (-not $_.PSIsContainer) { [int64]$_.Length } else { $null })
+				}
+			})
+		} -Depth 5
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-CompressArchive {
+	param(
+		[string]$path,
+		[string]$destination,
+		[bool]$force = $false
+	)
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required." }
+	if ([string]::IsNullOrWhiteSpace($destination)) { return "ERROR: destination is required." }
+
+	$src = Resolve-MBPath $path
+	$dest = Resolve-MBPath $destination
+	if (-not (Test-Path -LiteralPath $src)) { return "ERROR: Source not found: $src" }
+
+	$destExt = [System.IO.Path]::GetExtension($dest)
+	if ($destExt -and $destExt.ToLowerInvariant() -ne '.zip') {
+		return "ERROR: destination must end with .zip (got '$destExt')."
+	}
+	if (-not $destExt) { $dest = "$dest.zip" }
+
+	if ((Test-Path -LiteralPath $dest) -and -not $force) {
+		return "ERROR: Destination zip exists (set force=true): $dest"
+	}
+
+	$parent = Split-Path -Parent $dest
+	if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+		return "ERROR: Parent directory does not exist: $parent"
+	}
+
+	$details = "Create zip archive:`n`n  Source: $src`n  Zip:    $dest`n  Force:  $force"
+	if (-not (Request-Confirmation -Title "CompressArchive requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Compress denied by operator."
+	}
+
+	try {
+		if ((Test-Path -LiteralPath $dest) -and $force) {
+			Remove-Item -LiteralPath $dest -Force -ErrorAction Stop
+		}
+		Compress-Archive -Path $src -DestinationPath $dest -ErrorAction Stop
+		$fi = Get-Item -LiteralPath $dest -ErrorAction Stop
+		$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
+		return ConvertTo-MBJson @{
+			success     = $true
+			message     = "$prefix`: Compressed $src -> $dest"
+			path        = $src
+			destination = $dest
+			bytes       = [int64]$fi.Length
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-FindPSModule {
+	param(
+		[string]$name,
+		[int]$max_results = 15
+	)
+	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name is required." }
+	if ($max_results -le 0) { $max_results = 15 }
+	if ($max_results -gt 50) { $max_results = 50 }
+
+	try {
+		if (-not (Get-Command Find-Module -ErrorAction SilentlyContinue)) {
+			return "ERROR: Find-Module not available. Install PowerShellGet: Install-Module PowerShellGet -Scope CurrentUser -Force"
+		}
+		$mods = @(Find-Module -Name $name -ErrorAction Stop | Select-Object -First $max_results)
+		if ($mods.Count -eq 0) {
+			return ConvertTo-MBJson @{ success = $true; count = 0; modules = @(); query = $name }
+		}
+		$rows = @($mods | ForEach-Object {
+			[ordered]@{
+				Name        = $_.Name
+				Version     = [string]$_.Version
+				Author      = [string]$_.Author
+				Description = $(if ($_.Description) { ([string]$_.Description).Substring(0, [math]::Min(200, ([string]$_.Description).Length)) } else { '' })
+				Repository  = [string]$_.Repository
+			}
+		})
+		return ConvertTo-MBJson @{
+			success = $true
+			count   = $rows.Count
+			query   = $name
+			modules = $rows
+		} -Depth 5
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-GetInstalledPSModule {
 	param([string]$name)
-	if ($name) {
-		Get-Service $name -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType, DisplayName | ConvertTo-Json -Compress
-	} else {
-		Get-Service | Select-Object Name, Status, StartType, DisplayName | ConvertTo-Json -Compress
+	try {
+		$gciParams = @{ ListAvailable = $true; ErrorAction = 'Stop' }
+		if (-not [string]::IsNullOrWhiteSpace($name)) {
+			$gciParams['Name'] = $name
+		}
+		$mods = @(Get-Module @gciParams | Sort-Object Name, Version -Descending)
+		$seen = @{}
+		$rows = New-Object System.Collections.ArrayList
+		foreach ($m in $mods) {
+			if ($seen.ContainsKey($m.Name)) { continue }
+			$seen[$m.Name] = $true
+			[void]$rows.Add([ordered]@{
+				Name        = $m.Name
+				Version     = [string]$m.Version
+				ModuleBase  = [string]$m.ModuleBase
+				Author      = [string]$m.Author
+				Description = $(if ($m.Description) {
+					$d = [string]$m.Description
+					if ($d.Length -gt 160) { $d.Substring(0, 160) + '...' } else { $d }
+				} else { '' })
+			})
+			if ($rows.Count -ge 80) { break }
+		}
+		return ConvertTo-MBJson @{
+			success = $true
+			count   = $rows.Count
+			filter  = $(if ($name) { $name } else { $null })
+			modules = @($rows)
+		} -Depth 5
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-InstallPSModule {
+	param(
+		[string]$name,
+		[string]$version,
+		[string]$scope = 'CurrentUser',
+		[bool]$allow_prerelease = $false
+	)
+	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name is required." }
+	if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue)) {
+		return "ERROR: Install-Module not available. Install PowerShellGet first."
+	}
+
+	$scopeNorm = if ([string]::IsNullOrWhiteSpace($scope)) { 'CurrentUser' } else { $scope.Trim() }
+	if ($scopeNorm -notin @('CurrentUser','AllUsers')) {
+		return "ERROR: scope must be CurrentUser or AllUsers."
+	}
+	if ($scopeNorm -eq 'AllUsers') {
+		$isAdmin = $false
+		try {
+			$wi = [Security.Principal.WindowsIdentity]::GetCurrent()
+			$wp = New-Object Security.Principal.WindowsPrincipal($wi)
+			$isAdmin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+		} catch {}
+		if (-not $isAdmin) {
+			return "ERROR: AllUsers scope requires an elevated (Administrator) PowerShell session."
+		}
+	}
+
+	$details = "Install PowerShell module from PSGallery:`n`n  Name:    $name`n  Scope:   $scopeNorm"
+	if ($version) { $details += "`n  Version: $version" }
+	if ($allow_prerelease) { $details += "`n  Prerelease: yes" }
+	$details += "`n`nUses Install-Module (may download from internet)."
+	if (-not (Request-Confirmation -Title "InstallPSModule requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Module install denied by operator."
+	}
+
+	try {
+		$ip = @{
+			Name         = $name
+			Scope        = $scopeNorm
+			Force        = $true
+			AllowClobber = $true
+			ErrorAction  = 'Stop'
+			Repository   = 'PSGallery'
+		}
+		if ($version) { $ip['RequiredVersion'] = $version }
+
+		$imCmd = Get-Command Install-Module -ErrorAction SilentlyContinue
+		$imParams = @()
+		if ($imCmd) { $imParams = @($imCmd.Parameters.Keys) }
+		if ($imParams -contains 'AcceptLicense') { $ip['AcceptLicense'] = $true }
+		if ($allow_prerelease -and ($imParams -contains 'AllowPrerelease')) {
+			$ip['AllowPrerelease'] = $true
+		}
+
+		Install-Module @ip
+
+		$installed = @(Get-Module -ListAvailable -Name $name -ErrorAction SilentlyContinue |
+			Sort-Object Version -Descending | Select-Object -First 3)
+		$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
+		return ConvertTo-MBJson @{
+			success  = $true
+			message  = "$prefix`: Install-Module $name (scope=$scopeNorm)"
+			name     = $name
+			scope    = $scopeNorm
+			modules  = @($installed | ForEach-Object {
+				[ordered]@{ Name = $_.Name; Version = [string]$_.Version; ModuleBase = $_.ModuleBase }
+			})
+		} -Depth 5
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-UpdatePSModule {
+	param(
+		[string]$name,
+		[string]$scope
+	)
+	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name is required." }
+	if (-not (Get-Command Update-Module -ErrorAction SilentlyContinue)) {
+		return "ERROR: Update-Module not available. Install PowerShellGet first."
+	}
+
+	$before = @(Get-Module -ListAvailable -Name $name -ErrorAction SilentlyContinue |
+		Sort-Object Version -Descending | Select-Object -First 1)
+	if ($before.Count -eq 0) {
+		return "ERROR: Module '$name' is not installed. Use InstallPSModule first."
+	}
+
+	$details = "Update installed PowerShell module:`n`n  Name: $name`n  Current: $([string]$before[0].Version)"
+	if ($scope) { $details += "`n  Scope: $scope" }
+	$details += "`n`nUses Update-Module (may download from internet)."
+	if (-not (Request-Confirmation -Title "UpdatePSModule requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Module update denied by operator."
+	}
+
+	try {
+		$up = @{
+			Name        = $name
+			Force       = $true
+			ErrorAction = 'Stop'
+		}
+		if (-not [string]::IsNullOrWhiteSpace($scope)) {
+			# Pass -Scope to Update-Module only if the param exists (PS 5.1)
+			$up['Scope'] = $scope.Trim()
+		}
+		try {
+			Update-Module @up
+		} catch {
+			if ($up.ContainsKey('Scope')) {
+				$up.Remove('Scope')
+				Update-Module @up
+			} else {
+				throw
+			}
+		}
+
+		$after = @(Get-Module -ListAvailable -Name $name -ErrorAction SilentlyContinue |
+			Sort-Object Version -Descending | Select-Object -First 3)
+		$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
+		return ConvertTo-MBJson @{
+			success = $true
+			message = "$prefix`: Update-Module $name"
+			name    = $name
+			before  = $(if ($before[0]) { [string]$before[0].Version } else { $null })
+			modules = @($after | ForEach-Object {
+				[ordered]@{ Name = $_.Name; Version = [string]$_.Version; ModuleBase = $_.ModuleBase }
+			})
+		} -Depth 5
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
 	}
 }
 
 function Invoke-ReadRegistry {
 	param([string]$path)
-	if (Test-Path $path) {
-		Get-ItemProperty -Path $path | ConvertTo-Json -Compress -Depth 3
-	} else { "ERROR: Registry path not found: $path" }
+	try {
+		if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Registry path not found: $path" }
+		Get-ItemProperty -LiteralPath $path -ErrorAction Stop |
+			Select-Object * -ExcludeProperty PSPath, PSParentPath, PSChildName, PSDrive, PSProvider |
+			ConvertTo-Json -Compress -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-SetRegistry {
+	param(
+		[string]$path,
+		[string]$name,
+		[string]$value,
+		[string]$type = 'String'
+	)
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required (e.g. HKCU:\\Software\\...)." }
+	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name (value name) is required. Use (default) for default value." }
+	$typeMap = @{
+		'string' = 'String'; 'expandstring' = 'ExpandString'; 'expand' = 'ExpandString'
+		'multistring' = 'MultiString'; 'multi' = 'MultiString'
+		'dword' = 'DWord'; 'int' = 'DWord'; 'qword' = 'QWord'; 'binary' = 'Binary'
+	}
+	$tKey = ($type -replace '[\s_-]', '').ToLowerInvariant()
+	if (-not $typeMap.ContainsKey($tKey)) {
+		return "ERROR: type must be String, ExpandString, MultiString, DWord, QWord, or Binary."
+	}
+	$propType = $typeMap[$tKey]
+	$val = $value
+	if ($propType -eq 'DWord' -or $propType -eq 'QWord') {
+		try { $val = [long]$value } catch { return "ERROR: value must be numeric for $propType." }
+	} elseif ($propType -eq 'MultiString') {
+		$val = @([string]$value -split "`n|;" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+	} elseif ($propType -eq 'Binary') {
+		try {
+			$hex = ([string]$value) -replace '\s', ''
+			$val = New-Object byte[] ($hex.Length / 2)
+			for ($i = 0; $i -lt $val.Length; $i++) {
+				$val[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
+			}
+		} catch {
+			return "ERROR: Binary value must be hex string."
+		}
+	}
+	$details = "Write registry:`n  path  = $path`n  name  = $name`n  type  = $propType`n  value = $value"
+	if (-not (Request-Confirmation -Title "SetRegistry requires approval" -Details $details)) {
+		return "BLOCKED BY USER: SetRegistry denied."
+	}
+	try {
+		if (-not (Test-Path -LiteralPath $path)) {
+			New-Item -Path $path -Force -ErrorAction Stop | Out-Null
+		}
+		$n = $name
+		if ($n -eq '(default)' -or $n -eq '(Default)' -or $n -eq '@') { $n = '(default)' }
+		Set-ItemProperty -LiteralPath $path -Name $n -Value $val -Type $propType -Force -ErrorAction Stop
+		return ConvertTo-MBJson @{
+			ok    = $true
+			path  = $path
+			name  = $n
+			type  = $propType
+			value = $value
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-FindFiles {
+	param(
+		[string]$path = '.',
+		[string]$glob = '*',
+		[int]$modified_within_days = 0,
+		[long]$min_bytes = 0,
+		[long]$max_bytes = 0,
+		[switch]$recursive,
+		[int]$max = 100
+	)
+	if ($max -le 0) { $max = 100 }
+	if ($max -gt 500) { $max = 500 }
+	$root = Resolve-MBPath -Path $path
+	if (-not (Test-Path -LiteralPath $root)) { return "ERROR: path not found: $root" }
+	$g = if ([string]::IsNullOrWhiteSpace($glob)) { '*' } else { $glob }
+	try {
+		$gci = @{
+			LiteralPath = $root
+			File        = $true
+			ErrorAction = 'SilentlyContinue'
+			Force       = $true
+		}
+		if ($recursive) { $gci['Recurse'] = $true }
+		if ($g -notmatch '[\\/]') { $gci['Filter'] = $g }
+		$files = @(Get-ChildItem @gci)
+		if ($g -match '[\\/]') {
+			$files = @($files | Where-Object { $_.Name -like $g -or $_.FullName -like $g })
+		}
+		if ($modified_within_days -gt 0) {
+			$cut = (Get-Date).AddDays(-[double]$modified_within_days)
+			$files = @($files | Where-Object { $_.LastWriteTime -ge $cut })
+		}
+		if ($min_bytes -gt 0) {
+			$files = @($files | Where-Object { $_.Length -ge $min_bytes })
+		}
+		if ($max_bytes -gt 0) {
+			$files = @($files | Where-Object { $_.Length -le $max_bytes })
+		}
+		$total = $files.Count
+		$files = @($files | Sort-Object LastWriteTime -Descending | Select-Object -First $max)
+		$rows = @(foreach ($f in $files) {
+			[ordered]@{
+				path     = $f.FullName
+				name     = $f.Name
+				bytes    = [long]$f.Length
+				modified = $f.LastWriteTime.ToString('s')
+				created  = $f.CreationTime.ToString('s')
+			}
+		})
+		return ConvertTo-MBJson @{
+			root      = $root
+			glob      = $g
+			count     = $rows.Count
+			total     = $total
+			truncated = ($total -gt $rows.Count)
+			files     = $rows
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetPowerInfo {
-	$reportPath = Join-Path $env:TEMP ([System.IO.Path]::GetRandomFileName() + ".html")
+	$reportPath = New-MBTempFile -Prefix 'mb-battery' -Extension '.html'
 	try {
-		powercfg /batteryreport /output $reportPath | Out-Null
-		if (-not (Test-Path $reportPath)) { return "ERROR: Battery report was not generated" }
-
-		$html = Get-Content $reportPath -Raw -ErrorAction SilentlyContinue
-
-		$designCap	 = if ($html -match 'Design Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { 'N/A' }
-		$fullCap	 = if ($html -match 'Full Charge Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { 'N/A' }
-		$cycleCount	 = if ($html -match 'Cycle Count</td>\s*<td[^>]*>(\d+)</td>') { $matches[1] } else { 'N/A' }
-		$lastFull	 = if ($html -match 'Last Full Charge.*?<td[^>]*>([^<]+)</td>') { $matches[1].Trim() } else { 'N/A' }
-
-		$healthPct = 'N/A'
-		if ($designCap -ne 'N/A' -and $fullCap -ne 'N/A' -and $designCap -gt 0) {
-			$healthPct = [math]::Round( ([double]$fullCap / [double]$designCap) * 100 , 1)
+		$p = Start-Process -FilePath "powercfg.exe" -ArgumentList "/batteryreport","/output",$reportPath -Wait -PassThru -WindowStyle Hidden
+		if (-not (Test-Path $reportPath)) {
+			$scheme = powercfg /getactivescheme 2>&1 | Out-String
+			return ConvertTo-MBJson @{
+				Note = "No battery report generated (desktop or unsupported)."
+				ActiveScheme = $scheme.Trim()
+			}
 		}
-
-		Remove-Item $reportPath -Force -ErrorAction SilentlyContinue
-
-		@{
-			DesignCapacity_mWh	   = $designCap
+		$html = Get-Content $reportPath -Raw -ErrorAction SilentlyContinue
+		$designCap = if ($html -match 'Design Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { 'N/A' }
+		$fullCap   = if ($html -match 'Full Charge Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { 'N/A' }
+		$cycleCount = if ($html -match 'Cycle Count</td>\s*<td[^>]*>(\d+)</td>') { $matches[1] } else { 'N/A' }
+		$healthPct = 'N/A'
+		if ($designCap -ne 'N/A' -and $fullCap -ne 'N/A' -and [double]$designCap -gt 0) {
+			$healthPct = [math]::Round(([double]$fullCap / [double]$designCap) * 100, 1)
+		}
+		ConvertTo-MBJson @{
+			DesignCapacity_mWh     = $designCap
 			FullChargeCapacity_mWh = $fullCap
 			EstimatedHealthPercent = $healthPct
-			CycleCount			   = $cycleCount
-			LastFullCharge		   = $lastFull
-			Note				   = "Battery report generated and cleaned up from temp storage"
-		} | ConvertTo-Json -Compress
+			CycleCount             = $cycleCount
+		}
 	} catch {
-		if (Test-Path $reportPath) { Remove-Item $reportPath -Force -ErrorAction SilentlyContinue }
-		"ERROR: $_"
+		return "ERROR: $($_.Exception.Message)"
+	} finally {
+		try { Remove-MBTempPath -Path $reportPath } catch {}
+	}
+}
+
+function Invoke-GetScheduledTasks {
+	param(
+		[int]$days = 7,
+		[string]$filter,
+		[bool]$includeDisabled = $false,
+		[string]$exportPath
+	)
+	try {
+		$allTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+		if ($allTasks.Count -eq 0) {
+			return ConvertTo-MBJson @{ Error = "No scheduled tasks found or insufficient permissions." }
+		}
+		$cutoff = (Get-Date).AddDays(-[math]::Abs($days))
+		$taskDetails = @()
+		$systemTasks = @()
+		$recentTasks = @()
+		$enabledCount = 0
+
+		foreach ($task in $allTasks) {
+			if ((Test-MBInterrupt)) { break }
+			$info = $null
+			try { $info = $task | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue } catch {}
+
+			$triggerTypes = @()
+			if ($task.Triggers) {
+				foreach ($trig in $task.Triggers) {
+					$tType = "Unknown"
+					if ($trig.PSObject.Properties['CimClass']) {
+						$tType = $trig.CimClass.CimClassName -replace 'MSFT_Task','' -replace 'Trigger',''
+					}
+					$triggerTypes += $tType
+				}
+			}
+
+			$principal = if ($task.Principal) { $task.Principal.UserId } else { $null }
+			$isSystem = $principal -and ($principal -match 'SYSTEM')
+			$lastRun = if ($info -and $info.LastRunTime -and $info.LastRunTime.Year -gt 2000) { $info.LastRunTime } else { $null }
+			$isRecent = $lastRun -and ($lastRun -gt $cutoff)
+			$execute = $null
+			$arguments = ""
+			if ($task.Actions) {
+				$firstAction = $task.Actions | Select-Object -First 1
+				if ($firstAction) {
+					$execute = $firstAction.Execute
+					if ($firstAction.Arguments) { $arguments = $firstAction.Arguments }
+				}
+			}
+			$stateStr = if ($task.State) { $task.State.ToString() } else { "Unknown" }
+			$isEnabled = $stateStr -in @('Ready','Running','Queued')
+
+			$detail = [pscustomobject]@{
+				TaskName       = $task.TaskName
+				TaskPath       = $task.TaskPath
+				State          = $stateStr
+				Enabled        = $isEnabled
+				LastRunTime    = if ($lastRun) { $lastRun.ToString("yyyy-MM-dd HH:mm:ss") } else { "Never" }
+				NextRunTime    = if ($info -and $info.NextRunTime -and $info.NextRunTime.Year -gt 2000) { $info.NextRunTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "N/A" }
+				LastTaskResult = if ($info) { $info.LastTaskResult } else { $null }
+				Principal      = $principal
+				IsSystem       = [bool]$isSystem
+				Execute        = $execute
+				Arguments      = $arguments
+				TriggerTypes   = if ($triggerTypes.Count -gt 0) { ($triggerTypes -join '; ') } else { "None" }
+			}
+
+			$include = $true
+			if (-not $includeDisabled -and -not $isEnabled) { $include = $false }
+			if ($filter) {
+				$f = $filter.Trim().ToLower()
+				if ($f -eq 'system' -and -not $isSystem) { $include = $false }
+				elseif ($f -eq 'enabled' -and -not $isEnabled) { $include = $false }
+				elseif ($f -eq 'recent' -and -not $isRecent) { $include = $false }
+				elseif ($f -notin @('system','enabled','recent')) {
+					if (-not ($task.TaskName.ToLower().Contains($f) -or $task.TaskPath.ToLower().Contains($f))) {
+						$include = $false
+					}
+				}
+			}
+
+			if ($include) { $taskDetails += $detail }
+			if ($isSystem) { $systemTasks += $detail }
+			if ($isRecent -and $isEnabled) { $recentTasks += $detail }
+			if ($isEnabled) { $enabledCount++ }
+		}
+
+		$taskDetails = @($taskDetails | Select-Object -First 150)
+		$systemTasks = @($systemTasks | Select-Object -First 80)
+		$recentTasks = @($recentTasks | Select-Object -First 80)
+
+		$result = @{
+			Summary = @{
+				TotalTasks          = $allTasks.Count
+				EnabledTasks        = $enabledCount
+				SystemLevelTasks    = $systemTasks.Count
+				RecentActivityTasks = $recentTasks.Count
+				DaysLookback        = $days
+				FilterApplied       = $(if ($filter) { $filter } else { "None" })
+			}
+			Tasks       = $taskDetails
+			SystemTasks = $systemTasks
+			RecentTasks = $recentTasks
+		}
+
+		if ($exportPath) {
+			$exportPath = Resolve-MBPath $exportPath
+			if (-not (Request-Confirmation -Title "Export scheduled tasks CSV" -Details "Export $($taskDetails.Count) tasks to:`n  $exportPath")) {
+				$result.ExportStatus = "BLOCKED BY USER"
+			} else {
+				try {
+					$taskDetails | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8 -Force
+					$result.ExportStatus = "SUCCESS: $exportPath"
+				} catch {
+					$result.ExportStatus = "ERROR: $($_.Exception.Message)"
+				}
+			}
+		}
+
+		return Limit-MBResult (ConvertTo-MBJson $result -Depth 6)
+	} catch {
+		return ConvertTo-MBJson @{ Error = "GetScheduledTasks failed: $($_.Exception.Message)" }
+	}
+}
+
+function Convert-IfJson {
+	param($val)
+	if ($val -is [string] -and $val.Trim().StartsWith('{')) {
+		try { return $val | ConvertFrom-Json -ErrorAction Stop } catch { return $val }
+	}
+	return $val
+}
+
+function Invoke-MakeHttpRequest {
+	param(
+		[string]$method = "GET",
+		[Parameter(Mandatory = $true)][string]$url,
+		[object]$headers = $null,
+		[object]$params = $null,
+		[object]$json_body = $null,
+		[object]$form_data = $null,
+		[string]$raw_data = $null,
+		[string]$bearer_token = $null,
+		[string]$basic_auth_username = $null,
+		[string]$basic_auth_password = $null,
+		[object]$cookies = $null,
+		[string]$content_type = $null,
+		[bool]$verify_ssl = $true,
+		[string]$user_agent = $null,
+		[int]$timeout = 0
+	)
+
+	$headers   = Convert-IfJson $headers
+	$params    = Convert-IfJson $params
+	$json_body = Convert-IfJson $json_body
+	$form_data = Convert-IfJson $form_data
+	$cookies   = Convert-IfJson $cookies
+
+	$headerHash = @{}
+	if ($headers) {
+		if ($headers -is [hashtable]) { $headerHash = $headers.Clone() }
+		else {
+			foreach ($p in $headers.PSObject.Properties) { $headerHash[$p.Name] = [string]$p.Value }
+		}
+	}
+	if ($user_agent) { $headerHash['User-Agent'] = $user_agent }
+	elseif (-not $headerHash.ContainsKey('User-Agent')) {
+		$headerHash['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 MiniBot/1.0'
+	}
+
+	if ($params) {
+		$q = @()
+		if ($params -is [hashtable]) {
+			foreach ($k in $params.Keys) { $q += ("{0}={1}" -f [uri]::EscapeDataString([string]$k), [uri]::EscapeDataString([string]$params[$k])) }
+		} else {
+			foreach ($p in $params.PSObject.Properties) {
+				$q += ("{0}={1}" -f [uri]::EscapeDataString($p.Name), [uri]::EscapeDataString([string]$p.Value))
+			}
+		}
+		if ($q.Count -gt 0) {
+			$sep = if ($url -match '\?') { '&' } else { '?' }
+			$url = $url + $sep + ($q -join '&')
+		}
+	}
+
+	$iwr = @{
+		Uri             = $url
+		Method          = $method.ToUpper()
+		Headers         = $headerHash
+		UseBasicParsing = $true
+		TimeoutSec      = $(if ($timeout -gt 0) { $timeout } else { 30 })
+	}
+
+	if (-not $verify_ssl -and $PSVersionTable.PSVersion.Major -ge 7) {
+		$iwr['SkipCertificateCheck'] = $true
+	}
+
+	if ($basic_auth_username -and $basic_auth_password) {
+		$pair = "{0}:{1}" -f $basic_auth_username, $basic_auth_password
+		$headerHash['Authorization'] = "Basic " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
+		$iwr['Headers'] = $headerHash
+	} elseif ($bearer_token) {
+		$headerHash['Authorization'] = "Bearer $bearer_token"
+		$iwr['Headers'] = $headerHash
+	}
+
+	if ($content_type) {
+		$headerHash['Content-Type'] = $content_type
+		$iwr['Headers'] = $headerHash
+	}
+
+	if ($json_body) {
+		$iwr['Body'] = ($json_body | ConvertTo-Json -Depth 10 -Compress)
+		if (-not $headerHash.ContainsKey('Content-Type')) {
+			$headerHash['Content-Type'] = 'application/json'
+			$iwr['Headers'] = $headerHash
+		}
+	} elseif ($form_data) {
+		$iwr['Body'] = $form_data
+	} elseif ($raw_data) {
+		$iwr['Body'] = $raw_data
+	}
+
+	if ($cookies) {
+		$cookieParts = @()
+		if ($cookies -is [hashtable]) {
+			foreach ($k in $cookies.Keys) { $cookieParts += "$k=$($cookies[$k])" }
+		} else {
+			foreach ($p in $cookies.PSObject.Properties) { $cookieParts += "$($p.Name)=$($p.Value)" }
+		}
+		if ($cookieParts.Count -gt 0) {
+			$headerHash['Cookie'] = ($cookieParts -join '; ')
+			$iwr['Headers'] = $headerHash
+		}
+	}
+
+	$hasCreds = $false
+	if ($bearer_token -or ($basic_auth_username -and $basic_auth_password)) { $hasCreds = $true }
+	if ($headerHash.ContainsKey('Authorization') -or $headerHash.ContainsKey('authorization')) { $hasCreds = $true }
+	if (-not (Request-MBNetworkApproval -Method $method -Url $url -HasCredentials $hasCreds -ToolName 'MakeHttpRequest')) {
+		return "BLOCKED BY USER: HTTP request denied by operator."
+	}
+
+	try {
+		$resp = Invoke-WebRequest @iwr -ErrorAction Stop
+		$respHeaders = @{}
+		foreach ($h in $resp.Headers.GetEnumerator()) {
+			$respHeaders[[string]$h.Key] = ($h.Value -join ', ')
+		}
+		$bodyText = [string]$resp.Content
+		$parsedBody = $bodyText
+		try { $parsedBody = $bodyText | ConvertFrom-Json -ErrorAction Stop } catch {}
+		if ($bodyText.Length -gt 120000) {
+			$bodyText = $bodyText.Substring(0, 120000) + "`n... [truncated]"
+			if ($parsedBody -is [string]) { $parsedBody = $bodyText }
+		}
+		$finalUrl = $url
+		try { $finalUrl = $resp.BaseResponse.ResponseUri.AbsoluteUri } catch {}
+		return Limit-MBResult (ConvertTo-MBJson @{
+			success        = $true
+			status_code    = [int]$resp.StatusCode
+			headers        = $respHeaders
+			body           = $parsedBody
+			final_url      = $finalUrl
+			content_length = $resp.RawContentLength
+		} -Depth 8)
+	} catch {
+		$status = $null
+		if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch {} }
+		return ConvertTo-MBJson @{
+			success     = $false
+			error       = $_.Exception.Message
+			status_code = $status
+		}
+	}
+}
+
+function Invoke-BrowsePage {
+	param(
+		[Parameter(Mandatory = $true)][string]$url,
+		[int]$max_length = 12000,
+		[bool]$verify_ssl = $true,
+		[string]$user_agent = $null,
+		[bool]$extract_links = $false
+	)
+	if (-not (Request-MBNetworkApproval -Method 'GET' -Url $url -HasCredentials $false -ToolName 'BrowsePage')) {
+		return "BLOCKED BY USER: BrowsePage denied by operator."
+	}
+	$ua = if ($user_agent) { $user_agent } else {
+		'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+	}
+	$iwr = @{
+		Uri             = $url
+		UseBasicParsing = $true
+		TimeoutSec      = 30
+		Headers         = @{ 'User-Agent' = $ua }
+	}
+	if (-not $verify_ssl -and $PSVersionTable.PSVersion.Major -ge 7) {
+		$iwr['SkipCertificateCheck'] = $true
+	}
+
+	try {
+		$resp = Invoke-WebRequest @iwr -ErrorAction Stop
+		$html = [string]$resp.Content
+		$finalUrl = $url
+		try { $finalUrl = $resp.BaseResponse.ResponseUri.AbsoluteUri } catch {}
+
+		if ($script:HasNative) {
+			$text = [MiniBot.Core.Native]::HtmlToText($html, $max_length)
+			$result = $text + "`n**URL:** $finalUrl"
+		} else {
+			$title = if ($html -match '<title[^>]*>(.*?)</title>') { ($matches[1] -replace '\s+', ' ').Trim() } else { "No title" }
+			$html2 = [regex]::Replace($html, '<script[^>]*>.*?</script>', ' ', 'Singleline,IgnoreCase')
+			$html2 = [regex]::Replace($html2, '<style[^>]*>.*?</style>', ' ', 'Singleline,IgnoreCase')
+			$text = [regex]::Replace($html2, '<[^>]+>', ' ')
+			$text = [System.Net.WebUtility]::HtmlDecode($text)
+			$text = ($text -replace '\s+', ' ').Trim()
+			if ($text.Length -gt $max_length) { $text = $text.Substring(0, $max_length) + "`n`n[content truncated]" }
+			$result = "**Title:** $title`n**URL:** $finalUrl`n`n**Content:**`n$text"
+		}
+
+		if ($extract_links) {
+			$links = @()
+			$linkRegex = '<a[^>]+href=["'']([^"'' >]+)["''][^>]*>(.*?)</a>'
+			$ms = [regex]::Matches($html, $linkRegex, 'IgnoreCase')
+			$count = 0
+			foreach ($m in $ms) {
+				if ($count -ge 15) { break }
+				$href = $m.Groups[1].Value.Trim()
+				if ($href -match '^https?://') {
+					$linkText = ($m.Groups[2].Value -replace '<[^>]+>', '').Trim()
+					if (-not $linkText) { $linkText = $href }
+					$links += "- ${linkText}: $href"
+					$count++
+				}
+			}
+			if ($links.Count -gt 0) {
+				$result += "`n`n**Links:**`n" + ($links -join "`n")
+			}
+		}
+		return $result
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-ConvertGitHubUrl {
+	param([string]$github_url)
+	if (-not $github_url -or $github_url -notmatch 'github\.com') {
+		return ConvertTo-MBJson @{ error = "Not a valid GitHub URL"; input = $github_url }
+	}
+	if ($github_url -match 'raw\.githubusercontent\.com') {
+		return ConvertTo-MBJson @{ type = "raw"; raw_url = $github_url; message = "Already a raw URL" }
+	}
+	try {
+		$uri = [System.Uri]$github_url
+		$parts = @($uri.AbsolutePath.Trim('/').Split('/') | Where-Object { $_ })
+		if ($parts.Count -lt 2) { throw "Invalid GitHub path" }
+		$owner = $parts[0]; $repo = $parts[1]
+		if ($parts.Count -eq 2) {
+			return ConvertTo-MBJson @{
+				type = "repo_root"; owner = $owner; repo = $repo
+				suggested_raw_urls = @(
+					"https://raw.githubusercontent.com/$owner/$repo/main/README.md",
+					"https://raw.githubusercontent.com/$owner/$repo/master/README.md"
+				)
+			}
+		}
+		$action = $parts[2].ToLower()
+		if ($action -in @('blob','tree') -and $parts.Count -ge 4) {
+			$ref = $parts[3]
+			$filePath = if ($parts.Count -gt 4) { $parts[4..($parts.Count-1)] -join '/' } else { '' }
+			if ($action -eq 'tree') {
+				return ConvertTo-MBJson @{
+					type = "directory"
+					raw_base = "https://raw.githubusercontent.com/$owner/$repo/$ref/$filePath/"
+					message = "Directory listing - use ListGitHubDirectory or BrowsePage"
+				}
+			}
+			$rawUrl = "https://raw.githubusercontent.com/$owner/$repo/$ref/$filePath"
+			return ConvertTo-MBJson @{ type = "file"; raw_url = $rawUrl; owner = $owner; repo = $repo; ref = $ref; path = $filePath }
+		}
+		return ConvertTo-MBJson @{ type = "other"; message = "Use BrowsePage on the original URL" }
+	} catch {
+		return ConvertTo-MBJson @{ error = $_.Exception.Message; input = $github_url }
+	}
+}
+
+function Invoke-GetGitHubRawFile {
+	param([string]$github_url, [int]$max_length = 15000)
+	$convertResult = Invoke-ConvertGitHubUrl -github_url $github_url | ConvertFrom-Json
+	if ($convertResult.error) { return "ERROR: $($convertResult.error)" }
+	$rawUrl = $null
+	if ($convertResult.raw_url) { $rawUrl = $convertResult.raw_url }
+	elseif ($convertResult.suggested_raw_urls) { $rawUrl = @($convertResult.suggested_raw_urls)[0] }
+	else { return "Could not determine raw URL. Original: $github_url" }
+	try {
+		$content = Invoke-BrowsePage -url $rawUrl -max_length $max_length -extract_links $false
+		return "Successfully fetched: $rawUrl`n`n$content"
+	} catch {
+		return "Failed to fetch $rawUrl`nError: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-ListGitHubDirectory {
+	param([string]$github_url, [string]$ref = "main")
+	try {
+		$owner = $null; $repo = $null; $subPath = ''
+		if ($github_url -match 'github\.com/([^/]+)/([^/]+)(?:/(?:tree|blob)/([^/]+)(?:/(.*))?)?') {
+			$owner = $matches[1]
+			$repo = $matches[2]
+			if ($matches[3]) { $ref = $matches[3] }
+			if ($matches[4]) { $subPath = ($matches[4] -replace '/$', '') }
+		} else {
+			return "ERROR: Invalid GitHub repository URL"
+		}
+		$testUrls = @(
+			"https://api.github.com/repos/$owner/$repo/git/trees/${ref}?recursive=1",
+			"https://api.github.com/repos/$owner/$repo/git/trees/main?recursive=1",
+			"https://api.github.com/repos/$owner/$repo/git/trees/master?recursive=1"
+		)
+		$content = $null
+		$usedRef = $ref
+		foreach ($u in $testUrls) {
+			$result = Invoke-MakeHttpRequest -method "GET" -url $u
+			$data = $result | ConvertFrom-Json
+			if ($data.success -and $data.body.tree) {
+				$content = $data.body
+				if ($u -match '/trees/([^/?]+)') { $usedRef = $matches[1] }
+				break
+			}
+		}
+		if (-not $content) {
+			$htmlUrl = "https://github.com/$owner/$repo/tree/$ref$(if ($subPath) { '/' + $subPath })"
+			return "API access limited. Try:`n$htmlUrl`n`n" + (Invoke-BrowsePage -url $htmlUrl -max_length 8000)
+		}
+		$tree = @($content.tree)
+		if ($subPath) {
+			$prefix = $subPath.Trim('/') + '/'
+			$tree = @($tree | Where-Object {
+				$_.path -eq $subPath -or $_.path.StartsWith($prefix)
+			} | ForEach-Object {
+				$p = [string]$_.path
+				if ($p -eq $subPath) { $_ }
+				else {
+					$rel = $p.Substring($prefix.Length)
+					[pscustomobject]@{ type = $_.type; path = $rel; size = $_.size }
+				}
+			})
+		}
+		$items = @($tree | ForEach-Object {
+			[pscustomobject]@{
+				type = $_.type
+				path = $_.path
+				size_kb = if ($_.size) { [math]::Round($_.size/1024, 1) } else { $null }
+			}
+		} | Sort-Object type, path | Select-Object -First 400)
+		return Limit-MBResult (ConvertTo-MBJson @{
+			repo = "$owner/$repo"
+			ref = $usedRef
+			path = $(if ($subPath) { $subPath } else { '/' })
+			total_items = $items.Count
+			files = @($items | Where-Object type -eq 'blob').Count
+			directories = @($items | Where-Object type -eq 'tree').Count
+			items = $items
+		} -Depth 4)
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Test-MBModelsApiResponse {
+	param($Response)
+	if (-not $Response) { return $false }
+	try {
+		$ct = [string]$Response.Headers['Content-Type']
+		if ($ct -and $ct -notmatch '(?i)json') {
+			if ($ct -match '(?i)html|text/html') { return $false }
+		}
+	} catch {}
+	$body = $null
+	try { $body = [string]$Response.Content } catch { return $false }
+	if ([string]::IsNullOrWhiteSpace($body)) { return $false }
+	$trim = $body.TrimStart()
+	if ($trim.StartsWith('<')) { return $false }
+	if (-not ($trim.StartsWith('{') -or $trim.StartsWith('['))) { return $false }
+	try {
+		$obj = $body | ConvertFrom-Json -ErrorAction Stop
+		if ($null -eq $obj) { return $false }
+		if ($obj.data) { return $true }
+		if ($obj.models) { return $true }
+		if ($obj -is [System.Array] -and $obj.Count -gt 0) { return $true }
+		if ($obj.id -or $obj.model) { return $true }
+		return $false
+	} catch {
+		return $false
 	}
 }
 
@@ -702,427 +10875,10979 @@ function Test-ModelConnection {
 		[string]$Password,
 		[int]$TimeoutSeconds = 8
 	)
+	$raw = [string]$BaseUrl
+	if ([string]::IsNullOrWhiteSpace($raw)) {
+		try { $raw = [string]$script:BaseUrl } catch { $raw = '' }
+	}
+	if ([string]::IsNullOrWhiteSpace($raw)) { $raw = [string](Get-Variable -Name BaseUrl -ValueOnly -ErrorAction SilentlyContinue) }
+	if ([string]::IsNullOrWhiteSpace($raw)) { $raw = 'http://127.0.0.1:8080' }
+	$raw = $raw.Trim()
+	while ($raw.EndsWith('/')) { $raw = $raw.Substring(0, $raw.Length - 1) }
+	$raw = $raw -replace '/chat/completions\s*$', '' -replace '/models\s*$', ''
+	$raw = $raw -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
+	while ($raw.EndsWith('/')) { $raw = $raw.Substring(0, $raw.Length - 1) }
 
-	$testUrl = "$BaseUrl/models"
+	$bases = New-Object System.Collections.Generic.List[string]
+	[void]$bases.Add($raw)
+	if ($raw -match '/v1$') {
+		$root = $raw -replace '/v1$', ''
+		if ($root -and -not $bases.Contains($root)) { [void]$bases.Add($root) }
+	} else {
+		$v1 = $raw + '/v1'
+		if (-not $bases.Contains($v1)) { [void]$bases.Add($v1) }
+	}
 
+	$headers = @{}
+	$authType = 'None'
+	if ($Username -and $Password) {
+		$credBytes = [System.Text.Encoding]::UTF8.GetBytes("${Username}:${Password}")
+		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
+		$authType = 'Basic'
+	} elseif (Test-MBShouldSendAuthHeader -Username $Username -Password $Password) {
+		$headers['Authorization'] = "Bearer $ApiKey"
+		$authType = 'Bearer'
+	}
+
+	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+	try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
+
+	$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+	$lastFail = $null
+	$OriginalProgressPreference = $Global:ProgressPreference
+	$Global:ProgressPreference = 'SilentlyContinue'
 	try {
-		$headers = @{}
-
-		if ($Username -and $Password) {
-			$credBytes = [System.Text.Encoding]::UTF8.GetBytes("$Username`:$Password")
-			$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
-			$authType = "Basic"
-		} else {
-			$headers['Authorization'] = "Bearer none"
-			$authType = "Bearer"
+		foreach ($base in $bases) {
+			$testUrl = "$base/models"
+			try {
+				$response = Invoke-WebRequest -Uri $testUrl -Method GET -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
+				if ([int]$response.StatusCode -ne 200) {
+					$lastFail = [pscustomobject]@{
+						Success = $false; StatusCode = [int]$response.StatusCode
+						Message = "HTTP $($response.StatusCode) from $testUrl"
+						AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
+					}
+					continue
+				}
+				if (-not (Test-MBModelsApiResponse -Response $response)) {
+					$lastFail = [pscustomobject]@{
+						Success = $false; StatusCode = 200
+						Message = "Got HTTP 200 from $testUrl but body is not a models API (need OpenAI/llama.cpp JSON, not HTML). Use the llama.cpp / API base (e.g. :8081), not the Open-WebUI web UI port."
+						AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
+					}
+					continue
+				}
+				$stopwatch.Stop()
+				try { $script:MB.ResolvedApiBase = $base } catch {}
+				return [pscustomobject]@{
+					Success    = $true
+					StatusCode = 200
+					Message    = "Connection successful ($($stopwatch.ElapsedMilliseconds) ms) → $base"
+					AuthType   = $authType
+					ElapsedMs  = $stopwatch.ElapsedMilliseconds
+					BaseUrl    = $base
+				}
+			} catch [System.Net.WebException] {
+				$statusCode = $null
+				try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+				if ($statusCode -in 401, 403) {
+					$stopwatch.Stop()
+					return [pscustomobject]@{
+						Success = $false; StatusCode = $statusCode
+						Message = "Authentication failed ($statusCode) for $base"
+						AuthType = $authType
+						ElapsedMs = $stopwatch.ElapsedMilliseconds
+						BaseUrl = $base
+					}
+				}
+				$msg = if ($statusCode) {
+					"Server returned HTTP $statusCode from $testUrl"
+				} else {
+					"$($_.Exception.Message)`nFailed to connect to: $testUrl"
+				}
+				$lastFail = [pscustomobject]@{
+					Success = $false; StatusCode = $statusCode; Message = $msg
+					AuthType = $authType
+					ElapsedMs = $stopwatch.ElapsedMilliseconds
+					BaseUrl = $base
+				}
+			} catch {
+				$lastFail = [pscustomobject]@{
+					Success = $false; StatusCode = $null
+					Message = "Unexpected error on $testUrl : $($_.Exception.Message)"
+					AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
+				}
+			}
 		}
-
-		$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-		$OriginalProgressPreference = $Global:ProgressPreference
-		$Global:ProgressPreference = 'SilentlyContinue'
-		$response = Invoke-WebRequest -Uri $testUrl -Method GET -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
+	} finally {
 		$Global:ProgressPreference = $OriginalProgressPreference
-		$stopwatch.Stop()
-
-		return [pscustomobject]@{
-			Success	   = ($response.StatusCode -eq 200)
-			StatusCode = $response.StatusCode
-			Message	   = if ($response.StatusCode -eq 200) { "Connection successful" } else { "Server responded with $($response.StatusCode)" }
-			AuthType   = $authType
-			ElapsedMs  = $stopwatch.ElapsedMilliseconds
-		}
+		if ($stopwatch -and $stopwatch.IsRunning) { try { $stopwatch.Stop() | Out-Null } catch {} }
 	}
-	catch [System.Net.WebException] {
-		if ($stopwatch) { $stopwatch.Stop() | Out-Null }
-		$statusCode = $_.Exception.Response.StatusCode.value__
 
-		if ($statusCode -eq 401 -or $statusCode -eq 403) {
-			return [pscustomobject]@{
-				Success	   = $false
-				StatusCode = $statusCode
-				Message	   = "Authentication failed (401/403) - bad or missing credentials"
-				AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
-				ElapsedMs  = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
-			}
-		}
-		elseif ($statusCode) {
-			return [pscustomobject]@{
-				Success	   = $false
-				StatusCode = $statusCode
-				Message	   = "Server reachable but returned HTTP $statusCode"
-				AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
-				ElapsedMs  = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
-			}
-		}
-		else {
-			return [pscustomobject]@{
-				Success	   = $false
-				StatusCode = $null
-				Message	   = "$($_.Exception.Message)`n`nFailed to connect to: $BaseUrl`n"
-				AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
-				ElapsedMs  = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
-			}
-		}
-	}
-	catch {
-		return [pscustomobject]@{
-			Success	   = $false
-			StatusCode = $null
-			Message	   = "Unexpected error: $($_.Exception.Message)"
-			AuthType   = if ($Username -and $Password) { "Basic" } else { "Bearer" }
-			ElapsedMs  = 0
-		}
+	if ($lastFail) { return $lastFail }
+	return [pscustomobject]@{
+		Success = $false; StatusCode = $null
+		Message = "Failed to connect to: $raw"
+		AuthType = $authType; ElapsedMs = 0; BaseUrl = $raw
 	}
 }
 
-# STREAMING COMMUNICATION
 function Invoke-ModelStreaming {
-	param([array]$Messages)
-
-	$body = @{
-		model		= $Model
-		messages	= $Messages
-		tools		= $Tools
-		tool_choice = "auto"
-		temperature = $Temperature
-		max_tokens	= $MaxTokens
-		stream		= $true
-	} | ConvertTo-Json -Depth 20 -Compress
-
-	Write-Host ""
-	$script:isThinking = $true
-
-	$script:animRunspace = [runspacefactory]::CreateRunspace($Host)
-	$script:animRunspace.Open()
-
-	$script:animPs = [powershell]::Create()
-	$script:animPs.Runspace = $script:animRunspace
-
-	$null = $script:animPs.AddScript(${function:thinkingAnimation})
-	$null = $script:animPs.AddArgument($AgentName)
-
-	$script:animAsyncResult = $script:animPs.BeginInvoke()
-
-	Add-Type -AssemblyName System.Net.Http | Out-Null
-
-	$client	 = $null
-	$stream	 = $null
-	$reader	 = $null
-	$startedOutput = $false
-	$fullContent   = ""
-	$toolCalls	   = @{}
-	$hasToolCalls  = $false
+	param(
+		[array]$Messages,
+		[int]$RetryCount = 4
+	)
 
 	try {
-		$client = New-Object System.Net.Http.HttpClient
-		$client.Timeout = [TimeSpan]::FromMinutes(8)
+	Write-MBDebugLog -Step 'STREAM_BEGIN' -Detail ("msgs={0}" -f @($Messages).Count)
+	$apiBase = Get-MBApiBaseUrl
+	$completionsUrl = "$apiBase/chat/completions"
+	Write-MBDebugLog -Step 'STREAM_URL' -Detail $completionsUrl
 
-		$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, "$BaseUrl/chat/completions")
-		$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $ApiKey)
+	try { Write-Host "" } catch {}
+	Write-MBDebugLog -Step 'STREAM_THINK_START'
+	try { Start-MBThinkingAnimation -Name $AgentName } catch {
+		Write-MBDebugLog -Step 'STREAM_THINK_START_ERR' -Detail $_.Exception.Message
+	}
 
-		if ($NPMUser -and $NPMPass) {
-			$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$NPMUser`:$NPMPass")
-			$authBase64 = [Convert]::ToBase64String($authBytes)
-			$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $authBase64)
+	$attempt = 0
+	$lastError = $null
+	$didHardCompact = $false
+	$workMessages = @($Messages)
+
+	try {
+		Write-MBDebugLog -Step 'STREAM_BUDGET_BEGIN'
+		try { Stop-MBAnimation } catch {}
+		$workMessages = @(Ensure-MBPromptBudget -Messages $workMessages -TargetPct 0.72)
+		$script:Messages = $workMessages
+		Write-MBDebugLog -Step 'STREAM_BUDGET_OK' -Detail ("msgs={0}" -f @($workMessages).Count)
+		try { Start-MBThinkingAnimation -Name $AgentName } catch {}
+	} catch {
+		Write-MBDebugLog -Step 'STREAM_BUDGET_ERR' -Detail $_.Exception.Message
+		try { Start-MBThinkingAnimation -Name $AgentName } catch {}
+	}
+
+	while ($attempt -le $RetryCount) {
+		$attempt++
+		$startedOutput = $false
+		$fullContent   = ""
+		$toolCalls     = @{}
+		$hasToolCalls  = $false
+		$finishReason  = $null
+		$streamParseDrops = 0
+		$haveUsageThisStream = $false
+		$script:MB.LastServerCompletionTokens = 0
+		$client = $null
+		$stream = $null
+		$reader = $null
+		$httpResponse = $null
+		$script:MB.StreamCancel = $false
+
+		$body = $null
+		Write-MBDebugLog -Step 'STREAM_ATTEMPT' -Detail ("n={0}" -f $attempt)
+		try {
+			$workMessages = @(Ensure-MBPromptBudget -Messages $workMessages -TargetPct $(if ($attempt -gt 2) { 0.55 } else { 0.70 }))
+			$workMessages = @(Repair-MBMessagesEncoding -Messages $workMessages)
+			$activeTools = @(Get-MBActiveTools)
+			Write-MBDebugLog -Step 'STREAM_BODY_BUILD' -Detail ("tools={0}" -f @($activeTools).Count)
+			$reqMaxTok = Get-MBRequestMaxTokens -Messages $workMessages
+			$body = New-MBChatRequestBody -Messages $workMessages -Tools $activeTools -ModelName $Model -Temp $Temperature -MaxTok $reqMaxTok -Stream $true
+			$script:MB.LastBodyChars = $body.Length
+			Write-MBDebugLog -Step 'STREAM_BODY_OK' -Detail ("chars={0} max_tokens={1}" -f $body.Length, $reqMaxTok)
+		} catch {
+			$lastError = "Failed to build request body: $($_.Exception.Message)"
+			Write-MBDebugLog -Step 'STREAM_BODY_ERR' -Detail $lastError
+			Stop-MBAnimation
+			if (-not $didHardCompact) {
+				$didHardCompact = $true
+				Write-MBWarn "Body build failed - hard-compacting context and retrying..."
+				try {
+					$workMessages = @(Manage-MBContext -Messages $workMessages -ForceCompact)
+					$script:Messages = $workMessages
+				} catch {}
+				Start-Sleep -Milliseconds 300
+				Start-MBThinkingAnimation -Name $AgentName
+				continue
+			}
+			Write-MBErr $lastError
+			return $null
 		}
 
-		$request.Content = New-Object System.Net.Http.StringContent($body, [System.Text.Encoding]::UTF8, "application/json")
+		if ([string]::IsNullOrWhiteSpace($body) -or -not $body.Trim().StartsWith('{')) {
+			$lastError = "Request body empty or not JSON"
+			Write-MBDebugLog -Step 'STREAM_BODY_INVALID'
+			Stop-MBAnimation
+			Write-MBErr $lastError
+			return $null
+		}
 
-		$httpResponse = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
-		$stream = $httpResponse.Content.ReadAsStreamAsync().Result
-		$reader = New-Object System.IO.StreamReader($stream)
+		$cts = $null
+		try {
+			Write-MBDebugLog -Step 'STREAM_HTTP_BEGIN'
+			$client = Get-MBSharedHttpClient
+			$cts = New-Object System.Threading.CancellationTokenSource
+			$script:MB.ActiveHttpClient = $client
+			$script:MB.ActiveCts = $cts
 
-		while (-not $reader.EndOfStream) {
-			$line = $reader.ReadLine()
-			if ([string]::IsNullOrWhiteSpace($line)) { continue }
-			if ($line -eq "data: [DONE]") { break }
+			$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $completionsUrl)
 
-			if ($line.StartsWith("data: ")) {
+			if ($script:MB.NpmUser -and $script:MB.NpmPass) {
+				$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$($script:MB.NpmUser):$($script:MB.NpmPass)")
+				$authBase64 = [Convert]::ToBase64String($authBytes)
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $authBase64)
+			} elseif (Test-MBShouldSendAuthHeader) {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", [string]$ApiKey)
+			}
+
+			try {
+				[void]$request.Headers.Accept.Add([System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::Parse("text/event-stream"))
+				[void]$request.Headers.Accept.Add([System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::Parse("application/json"))
+			} catch {}
+
+			# Body as UTF-8 bytes (Get-MBUtf8JsonBytes)
+			# PS 5.1 ByteArrayContent: avoid New-Object unpack of byte[]
+			$bodyBytes = Get-MBUtf8JsonBytes -Json ([string]$body)
+			$request.Content = New-Object System.Net.Http.ByteArrayContent (,[byte[]]$bodyBytes)
+			$request.Content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue ("application/json")
+			$request.Content.Headers.ContentType.CharSet = "utf-8"
+
+			Write-MBDebugLog -Step 'STREAM_SENDASYNC'
+			$sendTask = $client.SendAsync(
+				$request,
+				[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+				$cts.Token
+			)
+			while (-not $sendTask.IsCompleted) {
+				if ((Test-MBInterrupt)) {
+					try { $cts.Cancel() } catch {}
+					try { $client.CancelPendingRequests() } catch {}
+					break
+				}
+				Start-Sleep -Milliseconds 40
+			}
+
+			if ($script:MB.Interrupt -or $sendTask.IsCanceled) {
+				Write-MBDebugLog -Step 'STREAM_SEND_CANCELLED'
+				throw [OperationCanceledException]::new("aborted by user")
+			}
+			if ($sendTask.IsFaulted) {
+				Write-MBDebugLog -Step 'STREAM_SEND_FAULTED'
+				if ($sendTask.Exception) { throw $sendTask.Exception.GetBaseException() }
+				throw "SendAsync failed"
+			}
+
+			$httpResponse = $sendTask.Result
+			Write-MBDebugLog -Step 'STREAM_HEADERS' -Detail ("status={0}" -f ([int]$httpResponse.StatusCode))
+
+			if (-not $httpResponse.IsSuccessStatusCode) {
+				$errBody = ""
+				try { $errBody = $httpResponse.Content.ReadAsStringAsync().Result } catch {}
+				if ($errBody.Length -gt 500) { $errBody = $errBody.Substring(0, 500) + '...' }
+				$code = [int]$httpResponse.StatusCode
+				$hint = ""
+				if ($code -eq 405) {
+					$hint = " — wrong API base (often Open-WebUI web UI port). Use llama.cpp/OpenAI base that serves POST /chat/completions (e.g. http://HOST:8081), not the web UI."
+				}
+				throw ("HTTP {0} {1} {2}{3} [{4}]" -f $code, $httpResponse.ReasonPhrase, $errBody, $hint, $completionsUrl)
+			}
+
+			$stream = $httpResponse.Content.ReadAsStreamAsync().Result
+			$reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true, 8192, $true)
+			$script:MB.ActiveStream = $stream
+			$script:MB.ActiveReader = $reader
+			Write-MBDebugLog -Step 'STREAM_READ_LOOP'
+
+			while ($true) {
+				if ((Test-MBInterrupt)) { break }
+
+				$readTask = $null
+				try {
+					$readTask = $reader.ReadLineAsync()
+				} catch {
+					if ($script:MB.Interrupt) { break }
+					throw
+				}
+
+				while ($readTask -and -not $readTask.IsCompleted) {
+					if ((Test-MBInterrupt)) {
+						try { $cts.Cancel() } catch {}
+						try { $client.CancelPendingRequests() } catch {}
+						try { $reader.Dispose() } catch {}
+						try { $stream.Dispose() } catch {}
+						break
+					}
+					Start-Sleep -Milliseconds 30
+				}
+
+				if ($script:MB.Interrupt) { break }
+				if (-not $readTask) { break }
+				if ($readTask.IsCanceled) { break }
+				if ($readTask.IsFaulted) {
+					if ($script:MB.Interrupt) { break }
+					$exMsg = ""
+					try { $exMsg = $readTask.Exception.GetBaseException().Message } catch {}
+					if ($exMsg -match 'cancel|abort|disposed|closed') { break }
+					throw $readTask.Exception.GetBaseException()
+				}
+
+				$line = $null
+				try { $line = $readTask.Result } catch {
+					if ($script:MB.Interrupt) { break }
+					break
+				}
+				if ($null -eq $line) { break }
+
+				if ([string]::IsNullOrWhiteSpace($line)) { continue }
+				if ($line -eq "data: [DONE]" -or $line.Trim() -eq "data: [DONE]") { break }
+				if (-not $line.StartsWith("data: ")) { continue }
+
 				$json = $line.Substring(6).Trim()
 				if ([string]::IsNullOrWhiteSpace($json)) { continue }
 
-				try { $chunk = $json | ConvertFrom-Json } catch { continue }
-				$delta = $chunk.choices[0].delta
-
-				if ($delta.tool_calls) {
-					$hasToolCalls = $true
-					foreach ($tc in $delta.tool_calls) {
-						$idx = $tc.index
-						if (-not $toolCalls.ContainsKey($idx)) {
-							$toolCalls[$idx] = @{ id = $tc.id; type = $tc.type; function = @{ name = ""; arguments = "" } }
-						}
-						if ($tc.function.name)		{ $toolCalls[$idx].function.name	  += $tc.function.name }
-						if ($tc.function.arguments) { $toolCalls[$idx].function.arguments += $tc.function.arguments }
-					}
-				}
-
-				if ($delta.content) {
-					if (-not $startedOutput) {
-						if ($script:animPs) {
+				$chunk = $null
+				try {
+					$chunk = $json | ConvertFrom-Json -ErrorAction Stop
+				} catch {
+					$streamParseDrops++
+					$rescued = $null
+					try {
+						if ($json -match '"content"\s*:\s*"((?:\\.|[^"\\])*)"') {
 							try {
-								if ($script:animPs.InvocationStateInfo.State -notin @('Completed','Failed','Stopped')) {
-									$script:animPs.Stop() | Out-Null
-								}
-							} catch {}
-							try { $script:animPs.Dispose() } catch {}
-							try { $script:animRunspace.Close() } catch {}
-							try { $script:animRunspace.Dispose() } catch {}
-							$script:animPs = $null
-							$script:animRunspace = $null
+								$rescued = ('"' + $matches[1] + '"') | ConvertFrom-Json -ErrorAction Stop
+							} catch {
+								$rescued = [regex]::Replace([string]$matches[1], '\\([\\"/bfnrt])', {
+									param($m)
+									switch ($m.Groups[1].Value) {
+										'\' { '\' } '"' { '"' } '/' { '/' }
+										'b' { "`b" } 'f' { "`f" } 'n' { "`n" } 'r' { "`r" } 't' { "`t" }
+										default { $m.Value }
+									}
+								})
+								$rescued = [regex]::Replace([string]$rescued, '\\u([0-9a-fA-F]{4})', {
+									param($m)
+									[char][int]('0x' + $m.Groups[1].Value)
+								})
+							}
 						}
-
-						Write-Host "`r$(' ' * 70)`r" -NoNewline
-						Write-Host "[" -NoNewLine -ForegroundColor DarkGray
-						Write-Host "$AgentName" -NoNewLine -ForegroundColor DarkRed
-						Write-Host "-" -NoNewLine -ForegroundColor DarkGray
-						Write-Host "Agent" -NoNewLine -ForegroundColor DarkRed
-						Write-Host "] " -NoNewLine -ForegroundColor DarkGray
-						$startedOutput = $true
-						$script:isThinking = $false
+					} catch {}
+					if ($rescued) {
+						if (-not $startedOutput) {
+							if ([int]$script:MB.FirstTokenTick -eq 0) {
+								$script:MB.FirstTokenTick = [Environment]::TickCount
+							}
+							Stop-MBAnimation
+							try { Write-MBThoughtStamp } catch {}
+							$nowWork = [Environment]::TickCount
+							$script:MB.WorkStartTick = $nowWork
+							try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = $nowWork } } catch {}
+							try { Reset-MBMdStream } catch {}
+							Write-MBBrand -NoNewline
+							Write-Host " " -NoNewline
+							$startedOutput = $true
+						}
+						Write-MBStreamChunk -Text $rescued
+						$fullContent += $rescued
 					}
-
-					Write-Host $delta.content -NoNewline
-					$fullContent += $delta.content
+					continue
 				}
 
-				if (($stepInterrupt) -or $script:interruptRequested) {
-					Reset-InterruptFlag
-					break
+				$choice0 = $null
+				if ($chunk.choices -and @($chunk.choices).Count -gt 0) {
+					$choice0 = $chunk.choices[0]
+				}
+				if ($choice0) {
+					$fr = Get-MBProp $choice0 'finish_reason'
+					if (-not $fr) { $fr = Get-MBProp (Get-MBProp $choice0 'delta') 'finish_reason' }
+					if ($fr -and [string]$fr -ne '' -and [string]$fr -ne 'null') {
+						$finishReason = [string]$fr
+					}
+				}
+
+				$usage = Get-MBProp $chunk 'usage'
+				if ($usage) {
+					$pt = Get-MBProp $usage 'prompt_tokens'
+					$ct = Get-MBProp $usage 'completion_tokens'
+					if ($null -ne $pt) {
+						$script:MB.LastServerPromptTokens = [int]$pt
+						$script:MB.TokenCountSource = 'usage'
+						$script:MB.TokCacheKey = ''  # force recount after history changes
+						$script:MB.LastCtxTokens = [int]$pt
+					}
+					if ($null -ne $ct) {
+						$script:MB.LastServerCompletionTokens = [int]$ct
+						$haveUsageThisStream = $true
+					}
+				}
+
+				if (-not $choice0) { continue }
+				$delta = Get-MBProp $choice0 'delta'
+
+				if ($delta -and $delta.tool_calls) {
+					$hasToolCalls = $true
+					foreach ($tc in @($delta.tool_calls)) {
+						$idx = 0
+						if ($null -ne $tc.index) { $idx = [int]$tc.index }
+						if (-not $toolCalls.ContainsKey($idx)) {
+							$toolCalls[$idx] = @{
+								id = $(if ($tc.id) { $tc.id } else { "call_$idx" })
+								type = $(if ($tc.type) { $tc.type } else { "function" })
+								function = @{ name = ""; arguments = "" }
+							}
+						}
+						if ($tc.id) { $toolCalls[$idx].id = $tc.id }
+						if ($tc.type) { $toolCalls[$idx].type = $tc.type }
+						if ($tc.function) {
+							if ($tc.function.name) { $toolCalls[$idx].function.name += [string]$tc.function.name }
+							if ($null -ne $tc.function.arguments) { $toolCalls[$idx].function.arguments += [string]$tc.function.arguments }
+						}
+					}
+				}
+
+				$piece = $null
+				if ($delta -and $null -ne (Get-MBProp $delta 'content') -and [string](Get-MBProp $delta 'content') -ne '') {
+					$piece = [string](Get-MBProp $delta 'content')
+				} else {
+					$msgObj = Get-MBProp $choice0 'message'
+					if ($msgObj) {
+						$mc = Get-MBProp $msgObj 'content'
+						if ($mc -is [string] -and $mc.Length -gt 0) {
+							if ($fullContent.Length -eq 0) {
+								$piece = $mc
+							} elseif ($mc.Length -gt $fullContent.Length -and $mc.StartsWith($fullContent)) {
+								$piece = $mc.Substring($fullContent.Length)
+							}
+						}
+					}
+				}
+
+				if ($null -ne $piece -and $piece.Length -gt 0) {
+					if (-not $startedOutput) {
+						Write-MBDebugLog -Step 'STREAM_FIRST_TOKEN' -Detail ("len={0}" -f $piece.Length)
+						if ([int]$script:MB.FirstTokenTick -eq 0) {
+							$script:MB.FirstTokenTick = [Environment]::TickCount
+						}
+						try { Stop-MBAnimation } catch { Write-MBDebugLog -Step 'STREAM_STOP_ANIM_ERR' -Detail $_.Exception.Message }
+						try { Write-MBThoughtStamp } catch {}
+						$nowWork = [Environment]::TickCount
+						$script:MB.WorkStartTick = $nowWork
+						try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = $nowWork } } catch {}
+						try {
+							Write-MBDebugLog -Step 'STREAM_WRITE_BRAND'
+							try { Reset-MBMdStream } catch {}
+							Write-MBBrand -NoNewline
+							Write-Host " " -NoNewline
+							Write-MBDebugLog -Step 'STREAM_WRITE_BRAND_OK'
+						} catch {
+							Write-MBDebugLog -Step 'STREAM_WRITE_BRAND_ERR' -Detail $_.Exception.Message
+						}
+						$startedOutput = $true
+					}
+					try { Write-MBStreamChunk -Text $piece } catch {
+						Write-MBDebugLog -Step 'STREAM_CHUNK_ERR' -Detail $_.Exception.Message
+					}
+					$fullContent += $piece
 				}
 			}
-		}
-	}
-	finally {
-		if ($script:animPs) {
-			try {
-				if ($script:animPs.InvocationStateInfo.State -notin @('Completed','Failed','Stopped')) {
-					$script:animPs.Stop() | Out-Null
+
+			if ($script:MB.IsThinking -or $script:MB.AnimPs) {
+				Stop-MBAnimation
+			} else {
+				$script:MB.IsThinking = $false
+			}
+			if ($startedOutput) {
+				try { [Console]::Out.Flush() } catch {}
+				try { Write-MBMdStreamFlush } catch {
+					Write-MBDebugLog -Step 'STREAM_MARKDOWN_FLUSH_ERR' -Detail $_.Exception.Message
 				}
-			} catch {}
-			try { $script:animPs.Dispose() } catch {}
-			try { $script:animRunspace.Close() } catch {}
-			try { $script:animRunspace.Dispose() } catch {}
-			$script:animPs = $null
-			$script:animRunspace = $null
-		}
+				Write-Host ""
+				try {
+					if (-not $script:MB.Interrupt) { Write-MBWorkedStamp }
+				} catch {}
+			} elseif ($hasToolCalls -and -not $script:MB.Interrupt) {
+				try { Write-MBThoughtStamp } catch {}
+			}
 
-		if (-not $startedOutput) {
-			Write-Host "`r$(' ' * 70)`r" -NoNewline
-			$script:isThinking = $false
-		}
+			$ctDone = [int]$script:MB.LastServerCompletionTokens
+			if ($finishReason) { $script:MB.LastFinishReason = [string]$finishReason }
+			$truncated = Test-MBReplyIncomplete -Text $fullContent -FinishReason $finishReason `
+				-HasToolCalls $hasToolCalls -CompletionTokens $ctDone -HaveUsage $haveUsageThisStream
+			if ($truncated -and $fullContent.Length -gt 0 -and -not $hasToolCalls) {
+				$frShow = if ($finishReason) { $finishReason } else { 'unknown' }
+				Write-MBReplyStatus -Title 'reply incomplete' -Meta @(
+					('finish: {0}' -f $frShow)
+					('{0:N0} chars' -f $fullContent.Length)
+					('{0:N0} tok' -f $ctDone)
+				) -Hint 'auto-continue if enabled' -DebugOnly -Muted
+			} elseif ($streamParseDrops -gt 0 -and $fullContent.Length -gt 0) {
+				Write-MBReplyStatus -Title 'stream recovered' -Meta @(
+					('{0} malformed chunk(s)' -f $streamParseDrops)
+				) -Muted -DebugOnly
+			}
 
-		if ($reader)  { try { $reader.Dispose() }  catch {} }
-		if ($stream)  { try { $stream.Dispose() }  catch {} }
-		if ($client)  { try { $client.Dispose() }  catch {} }
-	}
+			if ($script:MB.Interrupt) {
+				$hasToolCalls = $false
+				$toolCalls.Clear()
+				return [pscustomobject]@{
+					choices     = @(@{ message = @{ role = 'assistant'; content = (Sanitize-MBText -Text $(if ($fullContent) { $fullContent } else { '' })) } })
+					ok          = $false
+					interrupted = $true
+					finish_reason = $finishReason
+				}
+			}
 
-	if ($script:interruptRequested) {
-		$hasToolCalls = $false
-		$toolCalls.Clear()
-	}
+			if ($workMessages -ne $Messages -and $script:Messages) {
+			}
 
-	$finalMessage = @{ role = "assistant"; content = if ($fullContent) { $fullContent } else { $null } }
+			$finalMessage = @{
+				role    = 'assistant'
+				content = Sanitize-MBText -Text $(if ($fullContent) { $fullContent } else { "" })
+			}
+			if ($hasToolCalls -and $toolCalls.Count -gt 0) {
+				$tcList = New-Object System.Collections.ArrayList
+				foreach ($key in ($toolCalls.Keys | Sort-Object)) {
+					$tc = $toolCalls[$key]
+					if ([string]::IsNullOrWhiteSpace($tc.function.name)) { continue }
+					$argStr = Sanitize-MBText -Text ([string]$tc.function.arguments)
+					if ([string]::IsNullOrWhiteSpace($argStr)) { $argStr = '{}' }
+					[void]$tcList.Add(@{
+						id       = Sanitize-MBText -Text ([string]$tc.id)
+						type     = 'function'
+						function = @{
+							name      = Sanitize-MBText -Text ([string]$tc.function.name)
+							arguments = $argStr
+						}
+					})
+				}
+				if ($tcList.Count -gt 0) {
+					$finalMessage['tool_calls'] = @($tcList.ToArray())
+				}
+			}
 
-	if ($hasToolCalls) {
-		$finalMessage.tool_calls = @()
-		foreach ($key in ($toolCalls.Keys | Sort-Object)) {
-			$tc = $toolCalls[$key]
-			$finalMessage.tool_calls += @{
-				id		 = $tc.id
-				type	 = $tc.type
-				function = @{ name = $tc.function.name; arguments = $tc.function.arguments }
+			if ($script:MB.PendingVision) {
+				Clear-MBPendingVision
+			}
+
+			Write-MBDebugLog -Step 'STREAM_SUCCESS' -Detail ("chars={0} tools={1} finish={2}" -f $fullContent.Length, $hasToolCalls, $finishReason)
+			return [pscustomobject]@{
+				choices       = @(@{ message = $finalMessage })
+				ok            = $true
+				finish_reason = $finishReason
+				truncated     = [bool]$truncated
+				completion_tokens = $ctDone
 			}
 		}
+		catch {
+			$lastError = Get-MBDeepErrorMessage $_
+			Write-MBDebugLog -Step 'STREAM_HTTP_CATCH' -Detail $lastError
+			Stop-MBAnimation
+
+			if ($script:MB.Interrupt -or $lastError -match 'abort|cancel|OperationCanceled') {
+				$script:MB.Interrupt = $true
+				Write-MBDebugLog -Step 'STREAM_INTERRUPTED'
+				return [pscustomobject]@{ choices = @(@{ message = @{ role = 'assistant'; content = '' } }); ok = $false; interrupted = $true }
+			}
+
+			$script:MB.ApiFailures++
+
+			$isTransient = $false
+			$isPayload   = $false
+			$isUtf8Poison = $false
+			if ($lastError -match 'HTTP (408|429|500|502|503|504)\b') { $isTransient = $true }
+			if ($lastError -match 'timed out|timeout|connection.*(reset|closed|refused)|unable to connect|actively refused|NameResolution|SSL/TLS|TaskCanceled|HttpRequestException') {
+				$isTransient = $true
+			}
+			if ($lastError -match 'HTTP 400\b|context|too (large|long)|token|payload|invalid_request') {
+				$isPayload = $true
+			}
+			# scrub history before compact on encoding error
+			if ($lastError -match 'ill-formed UTF-8|invalid UTF-8|parse_error\.101|invalid string:\s*ill-formed') {
+				$isUtf8Poison = $true
+				$isPayload = $true
+			}
+
+			$canRetry = ($attempt -le $RetryCount) -and ($isTransient -or $isPayload -or $attempt -le 2)
+
+			if ($canRetry) {
+				$waitMs = [math]::Min(8000, 500 * [math]::Pow(2, [math]::Min($attempt, 4)))
+				$waitMs = [int]($waitMs + (Get-Random -Minimum 0 -Maximum 400))
+
+				if ($isUtf8Poison) {
+					Write-MBWarn "Server rejected request (ill-formed UTF-8 in JSON) - scrubbing message encoding..."
+					try {
+						$workMessages = @(Repair-MBMessagesEncoding -Messages $workMessages)
+						$script:Messages = $workMessages
+					} catch {}
+				}
+
+				$looksLikeOom = ($lastError -match 'HTTP 500\b|ggml|memory pool|GGML_ASSERT|out of memory|OOM|not enough space')
+				if ((-not $isUtf8Poison -and ($isPayload -or $looksLikeOom -or ($lastError -match 'HTTP 500\b'))) -or ($isUtf8Poison -and $attempt -gt 1)) {
+					$didHardCompact = $true
+					Write-MBWarn "Server error - trimming context and retrying..."
+					try {
+						$workMessages = @(Ensure-MBPromptBudget -Messages $workMessages -TargetPct 0.45 -MaxPasses 8)
+						$workMessages = @(Manage-MBContext -Messages $workMessages -ForceCompact)
+						$workMessages = @(Ensure-MBPromptBudget -Messages $workMessages -TargetPct 0.50 -MaxPasses 4)
+						$workMessages = @(Repair-MBMessagesEncoding -Messages $workMessages)
+						$script:Messages = $workMessages
+					} catch {
+						try {
+							$workMessages = @(Compact-MBHistory -Messages $workMessages -Aggressive)
+							$workMessages = @(Repair-MBMessagesEncoding -Messages $workMessages)
+							$script:Messages = $workMessages
+						} catch {}
+					}
+				}
+
+				$shortErr = $lastError
+				if ($shortErr.Length -gt 180) { $shortErr = $shortErr.Substring(0, 177) + '...' }
+				Write-MBWarn ("Request failed (attempt {0}/{1}): {2}" -f $attempt, ($RetryCount + 1), $shortErr)
+				Write-Host ("  retrying in {0}ms  →  {1}" -f $waitMs, $completionsUrl) -ForegroundColor DarkGray
+				Start-Sleep -Milliseconds $waitMs
+				Start-MBThinkingAnimation -Name $AgentName
+				continue
+			}
+		}
+		finally {
+			if ($reader) { try { $reader.Dispose() } catch {} }
+			if ($stream) { try { $stream.Dispose() } catch {} }
+			if ($httpResponse) { try { $httpResponse.Dispose() } catch {} }
+			if ($cts) { try { $cts.Dispose() } catch {} }
+			Clear-MBActiveHttp
+		}
 	}
 
-	return [pscustomobject]@{ choices = @(@{ message = $finalMessage }) }
+	Write-MBDebugLog -Step 'STREAM_FAILED_RETRIES' -Detail $lastError
+	Write-MBErr "Model request failed after retries: $lastError"
+	Write-Host "  endpoint: $completionsUrl" -ForegroundColor DarkGray
+	Write-Host "  tip: 502 often means proxy/upstream overload - wait a moment and /retry" -ForegroundColor DarkGray
+	return $null
+	} catch {
+		Write-MBDebugLog -Step 'STREAM_FATAL' -Detail $_.Exception.Message
+		try { Stop-MBAnimation } catch {}
+		try {
+			Show-MBWpfError -Title 'Model stream error' -Message 'The model request crashed while streaming.' -Exception $_.Exception
+		} catch {
+			try { Write-MBErr "Model stream error: $($_.Exception.Message)" } catch {}
+		}
+		return $null
+	} finally {
+		Write-MBDebugLog -Step 'STREAM_FINALLY'
+		try { Stop-MBAnimation } catch {}
+	}
 }
 
-# MAIN
-function Start-LocalAgent {
-	$testParams = @{
-		BaseUrl		   = $BaseUrl
-		TimeoutSeconds = 8
-	}
-
-	$NPMUser = $null
-	$NPMPass = $null
-
-	$connTest = Test-ModelConnection @testParams
-
-	if (-not $connTest.Success -and ($connTest.StatusCode -in 401,403)) {
-		$NpmCreds = Get-NPMCreds -StoreCredentials $StoreCredentials
-		$NPMUser = $NpmCreds.User
-		$NPMPass = $NpmCreds.Pass
-
-		if ($NPMUser -and $NPMPass) {
-			$testParams['Username'] = $NPMUser
-			$testParams['Password'] = $NPMPass
-			$connTest = Test-ModelConnection @testParams
+function Invoke-MBCompletion {
+	param(
+		[array]$Messages,
+		[int]$MaxTok = 500,
+		[double]$Temp = 0.15,
+		[int]$TimeoutSec = 45
+	)
+	if (-not $Messages -or @($Messages).Count -eq 0) { return $null }
+	$apiBase = Get-MBApiBaseUrl
+	$completionsUrl = "$apiBase/chat/completions"
+	try {
+		$norm = @(Normalize-MBMessagesForApi -Messages $Messages)
+		$req = @{
+			model       = $Model
+			messages    = $norm
+			temperature = $Temp
+			max_tokens  = $MaxTok
+			stream      = $false
 		}
-	}
+		$body = ConvertTo-MBRequestJson -Object $req -Depth 12
+		$bodyBytes = Get-MBUtf8JsonBytes -Json ([string]$body)
 
-	if (-not $connTest.Success) {
-		Write-Host ""
-		Write-Host "==============================================================" -ForegroundColor DarkRed
-		Write-Host "                    CONNECTION TEST FAILED" -ForegroundColor Red
-		Write-Host "==============================================================" -ForegroundColor DarkRed
-		Write-Host "                   - Cannot start session -"
-		Write-Host ""
-		Write-Host "Reason: $($connTest.Message)" -ForegroundColor Yellow
-
-		if ($connTest.StatusCode -in 401,403) {
-			$credPath = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Explorer\thumbcache_32.dat"
-			if (Test-Path $credPath) {
-				Remove-Item $credPath -Force -ErrorAction SilentlyContinue
+		$client = Get-MBSharedHttpClient
+		$cts = New-Object System.Threading.CancellationTokenSource
+		try {
+			$cts.CancelAfter([TimeSpan]::FromSeconds([math]::Max(10, $TimeoutSec)))
+			$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $completionsUrl)
+			if ($script:MB.NpmUser -and $script:MB.NpmPass) {
+				$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$($script:MB.NpmUser):$($script:MB.NpmPass)")
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", ([Convert]::ToBase64String($authBytes)))
+			} elseif (Test-MBShouldSendAuthHeader) {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", [string]$ApiKey)
 			}
-			Write-Host "Your credentials appear to be invalid or expired." -ForegroundColor DarkYellow
+			$request.Content = New-Object System.Net.Http.ByteArrayContent (,[byte[]]$bodyBytes)
+			$request.Content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue ("application/json")
+			$request.Content.Headers.ContentType.CharSet = "utf-8"
+
+			$script:MB.ActiveHttpClient = $client
+			$script:MB.ActiveCts = $cts
+			$sendTask = $client.SendAsync($request, $cts.Token)
+			while (-not $sendTask.IsCompleted) {
+				if ((Test-MBInterrupt)) {
+					try { $cts.Cancel() } catch {}
+					return $null
+				}
+				Start-Sleep -Milliseconds 40
+			}
+			if ($sendTask.IsCanceled -or $script:MB.Interrupt) { return $null }
+			if ($sendTask.IsFaulted) { return $null }
+			$httpResponse = $sendTask.Result
+			try {
+				if (-not $httpResponse.IsSuccessStatusCode) { return $null }
+				$text = $httpResponse.Content.ReadAsStringAsync().Result
+				if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+				$obj = $text | ConvertFrom-Json -ErrorAction Stop
+				$msg = $null
+				if ($obj.choices -and @($obj.choices).Count -gt 0) {
+					$msg = $obj.choices[0].message
+				}
+				$content = Get-MBProp $msg 'content'
+				if ([string]::IsNullOrWhiteSpace([string]$content)) { return $null }
+				return (Sanitize-MBText -Text ([string]$content)).Trim()
+			} finally {
+				if ($httpResponse) { try { $httpResponse.Dispose() } catch {} }
+			}
+		} finally {
+			try { $cts.Dispose() } catch {}
+			Clear-MBActiveHttp
+		}
+	} catch {
+		return $null
+	}
+}
+
+function Invoke-MBModelSummary {
+	param(
+		[string]$Material,
+		[int]$MaxTok = 450
+	)
+	if (-not $script:MB.ModelCompact) { return $null }
+	if ([string]::IsNullOrWhiteSpace($Material)) { return $null }
+	$mat = Sanitize-MBText -Text $Material
+	if ($mat.Length -gt 14000) {
+		$mat = $mat.Substring(0, 7000) + "`n...\n" + $mat.Substring($mat.Length - 6000)
+	}
+	$msgs = @(
+		@{
+			role    = 'system'
+			content = 'You compress agent conversation history into a dense sticky digest. Output plain text only: max 12 short bullets covering goals, key findings, file paths, errors, commands tried, and decisions. No tools. No preamble.'
+		}
+		@{
+			role    = 'user'
+			content = "Summarize this excerpt for future context:`n`n$mat"
+		}
+	)
+	return (Invoke-MBCompletion -Messages $msgs -MaxTok $MaxTok -Temp 0.1 -TimeoutSec 20)
+}
+
+function Get-MBToolFingerprint {
+	param(
+		[string]$Name,
+		$ArgsObj
+	)
+	if (-not $ArgsObj) { $ArgsObj = [pscustomobject]@{} }
+	$parts = New-Object System.Collections.ArrayList
+	[void]$parts.Add(([string]$Name).ToLowerInvariant())
+
+	switch -Regex ($Name) {
+		'^RunCommand$' {
+			$cmd = [string](Get-MBProp $ArgsObj 'command')
+			$shell = [string](Get-MBProp $ArgsObj 'shell' 'powershell')
+			$cmd = ($cmd -replace '\s+', ' ').Trim().ToLowerInvariant()
+			[void]$parts.Add($shell.ToLowerInvariant())
+			[void]$parts.Add($cmd)
+		}
+		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^SandBox$|^SandBoxWrite$' {
+			foreach ($k in @('path','search','replace','pattern','glob','head','tail','offset','length','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description')) {
+				if (Test-MBHasProp $ArgsObj $k) {
+					$v = Get-MBProp $ArgsObj $k
+					if ($null -ne $v) {
+						$s = [string]$v
+						if ($s.Length -gt 200) { $s = $s.Substring(0, 200) }
+						[void]$parts.Add("$k=$s")
+					}
+				}
+			}
+			if (Test-MBHasProp $ArgsObj 'edits') {
+				try {
+					$ed = Get-MBProp $ArgsObj 'edits'
+					$ej = $ed | ConvertTo-Json -Compress -Depth 4
+					if ($ej.Length -gt 240) { $ej = $ej.Substring(0, 240) }
+					[void]$parts.Add("edits=$ej")
+				} catch {
+					[void]$parts.Add('edits=1')
+				}
+			}
+			if (Test-MBHasProp $ArgsObj 'assert') {
+				try {
+					$aj = (Get-MBProp $ArgsObj 'assert') | ConvertTo-Json -Compress -Depth 4
+					if ($aj.Length -gt 200) { $aj = $aj.Substring(0, 200) }
+					[void]$parts.Add("assert=$aj")
+				} catch {
+					[void]$parts.Add('assert=1')
+				}
+			}
+			if (Test-MBHasProp $ArgsObj 'pieces') {
+				try {
+					$pj = (Get-MBProp $ArgsObj 'pieces') | ConvertTo-Json -Compress -Depth 4
+					if ($pj.Length -gt 160) { $pj = $pj.Substring(0, 160) }
+					[void]$parts.Add("pieces=$pj")
+				} catch {
+					[void]$parts.Add('pieces=1')
+				}
+			}
+		}
+		'^GetEventLogs$|^GetProcessList$|^GetServiceStatus$|^GetDriverInfo$|^GetScheduledTasks$|^GetDiskSpace$' {
+			foreach ($p in $ArgsObj.PSObject.Properties) {
+				if ($null -ne $p.Value -and "$($p.Value)" -ne '') {
+					[void]$parts.Add("$($p.Name)=$($p.Value)")
+				}
+			}
+		}
+		'^MakeHttpRequest$|^BrowsePage$|^GetGitHubRawFile$|^ListGitHubDirectory$|^ConvertGitHubUrl$|^DownloadFile$' {
+			foreach ($k in @('method','url','github_url','ref','max_length','path','overwrite','max_mb','timeout_sec')) {
+				if (Test-MBHasProp $ArgsObj $k) {
+					$v = Get-MBProp $ArgsObj $k
+					if ($null -ne $v) { [void]$parts.Add("$k=$v") }
+				}
+			}
+		}
+		'^ControlService$|^ExpandArchive$|^CompressArchive$|^FindPSModule$|^GetInstalledPSModule$|^InstallPSModule$|^UpdatePSModule$' {
+			foreach ($k in @('name','action','startup_type','path','destination','force','version','scope','allow_prerelease','max_results')) {
+				if (Test-MBHasProp $ArgsObj $k) {
+					$v = Get-MBProp $ArgsObj $k
+					if ($null -ne $v -and "$v" -ne '') { [void]$parts.Add("$k=$v") }
+				}
+			}
+		}
+		default {
+			try {
+				$j = ConvertTo-Json -InputObject $ArgsObj -Depth 6 -Compress
+				[void]$parts.Add(($j -replace '\s+', ''))
+			} catch {
+				[void]$parts.Add('args')
+			}
+		}
+	}
+
+	return ($parts -join '||')
+}
+
+function Test-MBToolLoopGuard {
+	param(
+		[string]$Name,
+		$ArgsObj
+	)
+
+	$fp = Get-MBToolFingerprint -Name $Name -ArgsObj $ArgsObj
+	$preview = [string]$script:MB.LastToolPreview
+	if ($preview.Length -gt 600) { $preview = $preview.Substring(0, 597) + '...' }
+	if (-not $preview) { $preview = '(previous result not retained)' }
+
+	$alreadyConfirmedThisTurn = $false
+	foreach ($x in @($script:MB.LoopConfirmedFps)) {
+		if ($x -eq $fp) { $alreadyConfirmedThisTurn = $true; break }
+	}
+
+	if ($script:MB.LastToolFp -eq $fp -and ($alreadyConfirmedThisTurn -or $script:MB.LastToolAction -eq 'confirmed_ran')) {
+		$script:MB.LoopGuardsFired++
+		Write-Host "    loop-guard: HARD STOP (already retested once)" -ForegroundColor Red
+		$msg = @"
+LOOP GUARD HARD STOP: You already re-ran this exact tool call once this turn (timing retest used up).
+
+Tool: $Name
+
+Repeating it again will NOT help. The same command with the same arguments produces the same result unless wall-clock time or external state changed - and you already spent your one retest.
+
+Previous result (truncated):
+$preview
+
+REQUIRED: Stop calling this tool with these args. Do one of:
+1) Use a DIFFERENT tool or DIFFERENT arguments
+2) Synthesize an answer for the user from results you already have
+3) Ask the user what to do next
+
+Do NOT reconfirm or re-request this same call.
+"@
+		$script:MB.LastToolAction = 'confirmed_ran'
+		return @{ Block = $true; Message = $msg; Fingerprint = $fp }
+	}
+
+	if ($script:MB.LastToolFp -eq $fp -and $script:MB.LastToolAction -eq 'ran') {
+		$script:MB.LastToolAction = 'warned'
+		$script:MB.LoopGuardsFired++
+		Write-Host "    loop-guard: blocked - same command will not magically change" -ForegroundColor Yellow
+
+		$msg = @"
+LOOP GUARD: You just ran this exact tool call. It was NOT executed again.
+
+Tool: $Name
+
+IMPORTANT - same command ⇒ same result:
+- Re-running the identical tool with identical arguments will NOT produce new information.
+- The OS/file/service state does not change because you asked twice in a row.
+- Do NOT keep confirming or retrying this call expecting a different outcome.
+
+The ONLY valid reason to run it again is a deliberate timing/poll check, e.g.:
+- waiting for a long job (DISM, download, service start) to finish
+- guessing whether an async change has completed after real time passed
+If that is NOT what you are doing, you are stuck in a loop.
+
+Previous result (truncated) - USE THIS, do not re-fetch the same thing:
+$preview
+
+What to do instead:
+1) Analyze the previous result and continue the investigation with a different tool or different args
+2) Or report findings to the user
+3) ONLY if you are polling over time: call this exact tool ONE more time to confirm a timing retest (allowed once). After that, further repeats are hard-blocked.
+"@
+		return @{ Block = $true; Message = $msg; Fingerprint = $fp }
+	}
+
+	if ($script:MB.LastToolFp -eq $fp -and $script:MB.LastToolAction -eq 'warned') {
+		if ($alreadyConfirmedThisTurn) {
+			$script:MB.LoopGuardsFired++
+			return @{
+				Block = $true
+				Fingerprint = $fp
+				Message = "LOOP GUARD HARD STOP: Timing retest already used for this call. Change approach."
+			}
+		}
+		Write-Host "    loop-guard: one timing retest allowed - executing" -ForegroundColor Green
+		return @{ Block = $false; Confirmed = $true; Fingerprint = $fp }
+	}
+
+	return @{ Block = $false; Confirmed = $false; Fingerprint = $fp }
+}
+
+function Register-MBToolExecution {
+	param(
+		[string]$Fingerprint,
+		[string]$ResultPreview,
+		[bool]$WasConfirmed = $false
+	)
+	$script:MB.LastToolFp = $Fingerprint
+	if ($WasConfirmed) {
+		$script:MB.LastToolAction = 'confirmed_ran'
+		$exists = $false
+		foreach ($x in @($script:MB.LoopConfirmedFps)) {
+			if ($x -eq $Fingerprint) { $exists = $true; break }
+		}
+		if (-not $exists) {
+			[void]$script:MB.LoopConfirmedFps.Add($Fingerprint)
+		}
+	} else {
+		$script:MB.LastToolAction = 'ran'
+	}
+	$prev = Sanitize-MBText -Text ([string]$ResultPreview)
+	if ($prev.Length -gt 800) { $prev = $prev.Substring(0, 797) + '...' }
+	$script:MB.LastToolPreview = $prev
+}
+
+function Reset-MBToolLoopGuard {
+	$script:MB.LastToolFp = $null
+	$script:MB.LastToolAction = $null
+	$script:MB.LastToolPreview = ''
+	try { $script:MB.LoopConfirmedFps.Clear() } catch {
+		$script:MB.LoopConfirmedFps = New-Object System.Collections.ArrayList
+	}
+}
+
+# Setup / tune and installer tools
+function Ensure-MBAudioEndpoint {
+	if ('MiniBot.Core.AudioVolume' -as [type]) { return $true }
+	$cs = @'
+using System;
+using System.Runtime.InteropServices;
+namespace MiniBot.Core {
+	[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+	class MMDeviceEnumeratorComObject { }
+	[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+	interface IMMDeviceEnumerator {
+		int NotImpl1();
+		[PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+	}
+	[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+	interface IMMDevice {
+		[PreserveSig] int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+	}
+	[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+	interface IAudioEndpointVolume {
+		int NotImpl1(); int NotImpl2();
+		[PreserveSig] int SetMasterVolumeLevelScalar(float fLevel, Guid pguidEventContext);
+		[PreserveSig] int GetMasterVolumeLevelScalar(out float pfLevel);
+		int NotImpl3(); int NotImpl4(); int NotImpl5(); int NotImpl6();
+		[PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, Guid pguidEventContext);
+		[PreserveSig] int GetMute(out bool pbMute);
+	}
+	public static class AudioVolume {
+		static IAudioEndpointVolume GetVol() {
+			var enu = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+			IMMDevice dev;
+			Marshal.ThrowExceptionForHR(enu.GetDefaultAudioEndpoint(0, 1, out dev));
+			Guid iid = typeof(IAudioEndpointVolume).GUID;
+			object o;
+			Marshal.ThrowExceptionForHR(dev.Activate(ref iid, 23, IntPtr.Zero, out o));
+			return (IAudioEndpointVolume)o;
+		}
+		public static float GetLevel() {
+			float v; Marshal.ThrowExceptionForHR(GetVol().GetMasterVolumeLevelScalar(out v)); return v;
+		}
+		public static void SetLevel(float v) {
+			if (v < 0f) v = 0f; if (v > 1f) v = 1f;
+			Marshal.ThrowExceptionForHR(GetVol().SetMasterVolumeLevelScalar(v, Guid.Empty));
+		}
+		public static bool GetMute() {
+			bool m; Marshal.ThrowExceptionForHR(GetVol().GetMute(out m)); return m;
+		}
+		public static void SetMute(bool m) {
+			Marshal.ThrowExceptionForHR(GetVol().SetMute(m, Guid.Empty));
+		}
+	}
+}
+'@
+	try {
+		Add-Type -TypeDefinition $cs -Language CSharp -ErrorAction Stop
+		return $true
+	} catch {
+		return $false
+	}
+}
+
+function Invoke-AudioVolume {
+	param(
+		[string]$action = 'get',
+		[int]$level = -1
+	)
+	$a = ([string]$action).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($a)) { $a = 'get' }
+	if (-not (Ensure-MBAudioEndpoint)) {
+		return "ERROR: Audio endpoint helper failed to load (Core Audio COM)."
+	}
+	try {
+		if ($a -eq 'get') {
+			$pct = [int][math]::Round([MiniBot.Core.AudioVolume]::GetLevel() * 100)
+			$mute = [bool][MiniBot.Core.AudioVolume]::GetMute()
+			return ConvertTo-MBJson ([ordered]@{ ok = $true; level = $pct; mute = $mute })
+		}
+		if ($a -eq 'mute' -or $a -eq 'unmute' -or $a -eq 'set') {
+			$details = switch ($a) {
+				'mute' { 'Mute default playback device.' }
+				'unmute' { 'Unmute default playback device.' }
+				default {
+					if ($level -lt 0 -or $level -gt 100) { return "ERROR: level must be 0-100 for action=set." }
+					"Set default playback volume to $level%."
+				}
+			}
+			if (-not (Request-Confirmation -Title "AudioVolume requires approval" -Details $details)) {
+				return "BLOCKED BY USER: AudioVolume denied."
+			}
+			if ($a -eq 'mute') { [MiniBot.Core.AudioVolume]::SetMute($true) }
+			elseif ($a -eq 'unmute') { [MiniBot.Core.AudioVolume]::SetMute($false) }
+			else {
+				[MiniBot.Core.AudioVolume]::SetLevel(($level / 100.0))
+				if ([MiniBot.Core.AudioVolume]::GetMute() -and $level -gt 0) {
+					[MiniBot.Core.AudioVolume]::SetMute($false)
+				}
+			}
+			$pct = [int][math]::Round([MiniBot.Core.AudioVolume]::GetLevel() * 100)
+			$mute = [bool][MiniBot.Core.AudioVolume]::GetMute()
+			return ConvertTo-MBJson ([ordered]@{ ok = $true; action = $a; level = $pct; mute = $mute })
+		}
+		return "ERROR: action must be get|set|mute|unmute."
+	} catch {
+		return "ERROR: AudioVolume failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-DisplayBrightness {
+	param(
+		[string]$action = 'get',
+		[int]$level = -1
+	)
+	$a = ([string]$action).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($a)) { $a = 'get' }
+	try {
+		$m = Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction SilentlyContinue |
+			Select-Object -First 1
+		$methods = Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods -ErrorAction SilentlyContinue |
+			Select-Object -First 1
+		if (-not $m) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok          = $false
+				supported   = $false
+				note        = 'No WmiMonitorBrightness instance (common on desktops / external monitors).'
+			})
+		}
+		$cur = [int]$m.CurrentBrightness
+		if ($a -eq 'get') {
+			return ConvertTo-MBJson ([ordered]@{
+				ok        = $true
+				supported = $true
+				level     = $cur
+				levels    = @($m.Level)
+			})
+		}
+		if ($a -ne 'set') { return "ERROR: action must be get|set." }
+		if ($level -lt 0 -or $level -gt 100) { return "ERROR: level must be 0-100." }
+		if (-not $methods) {
+			return "ERROR: Brightness methods not available on this display."
+		}
+		if (-not (Request-Confirmation -Title "DisplayBrightness requires approval" -Details "Set internal display brightness to $level% (current $cur%).")) {
+			return "BLOCKED BY USER: DisplayBrightness denied."
+		}
+		Invoke-CimMethod -InputObject $methods -MethodName WmiSetBrightness -Arguments @{ Timeout = 1; Brightness = [byte]$level } -ErrorAction Stop | Out-Null
+		$m2 = Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction SilentlyContinue | Select-Object -First 1
+		$now = if ($m2) { [int]$m2.CurrentBrightness } else { $level }
+		return ConvertTo-MBJson ([ordered]@{ ok = $true; supported = $true; level = $now; requested = $level })
+	} catch {
+		return "ERROR: DisplayBrightness failed: $($_.Exception.Message)"
+	}
+}
+
+function Get-MBWindowsOptionCatalog {
+	return [ordered]@{
+		'explorer.hidden_files' = @{ values = @('show','hide'); desc = 'Show/hide hidden files in Explorer' }
+		'explorer.file_extensions' = @{ values = @('show','hide'); desc = 'Show/hide known file extensions' }
+		'explorer.compact_mode' = @{ values = @('on','off'); desc = 'Win11 Explorer compact spacing' }
+		'explorer.classic_context_menu' = @{ values = @('on','off'); desc = 'Win11 classic right-click menu' }
+		'uac' = @{ values = @('enable','disable'); desc = 'UAC EnableLUA (reboot may be required)' }
+		'power.max_performance' = @{ values = @('on'); desc = 'High performance plan + no sleep/hibernate + USB/PCI power tweaks' }
+		'power.plan' = @{ values = @('high_performance','balanced','power_saver'); desc = 'Activate a built-in power scheme' }
+		'boot.f8_legacy' = @{ values = @('on','off'); desc = 'bcdedit BOOTMENUPOLICY LEGACY/STANDARD' }
+		'network.discovery' = @{ values = @('on','off'); desc = 'Firewall rule group Network Discovery' }
+		'network.file_sharing' = @{ values = @('on','off'); desc = 'Firewall rule group File and Printer Sharing' }
+		'timezone' = @{ values = @('<tzutil id>'); desc = 'tzutil /s e.g. Eastern Standard Time' }
+		'time.sync' = @{ values = @('now'); desc = 'Resync Windows Time (w32tm)' }
+		'bitlocker.off' = @{ values = @('off'); desc = 'manage-bde -off on drive (Device Encryption)' }
+		'edge.web_widget' = @{ values = @('off','on'); desc = 'Edge WebWidgetAllowed policy' }
+		'registry.periodic_backup' = @{ values = @('on','off'); desc = 'EnablePeriodicBackup for reg backups' }
+		'cleanmgr.autoclean' = @{ values = @('run'); desc = 'CLEANMGR /Autoclean on drive' }
+	}
+}
+
+function Invoke-ListWindowsOptions {
+	$cat = Get-MBWindowsOptionCatalog
+	$rows = @()
+	foreach ($k in @($cat.Keys)) {
+		$rows += [ordered]@{
+			option = $k
+			values = @($cat[$k].values)
+			desc   = [string]$cat[$k].desc
+		}
+	}
+	return ConvertTo-MBJson ([ordered]@{ ok = $true; options = $rows }) -Depth 6
+}
+
+function ConvertTo-MBProcessArgumentString {
+	# One Args element = raw line; multi = quote tokens that have spaces
+	param([string[]]$Args)
+	if ($null -eq $Args -or $Args.Count -eq 0) { return '' }
+	if ($Args.Count -eq 1) { return [string]$Args[0] }
+	$parts = New-Object System.Collections.ArrayList
+	foreach ($a in $Args) {
+		$s = if ($null -eq $a) { '' } else { [string]$a }
+		if ($s -match '[\s"]') {
+			$s = '"' + ($s -replace '"', '""') + '"'
+		}
+		[void]$parts.Add($s)
+	}
+	return (($parts | ForEach-Object { $_ }) -join ' ')
+}
+
+function Get-MBPackageInstallArgs {
+	param($Package)
+	if (-not $Package) { return '' }
+	try {
+		if ($null -ne $Package.install) { return [string]$Package.install }
+	} catch {}
+	try {
+		if ($null -ne $Package.args) { return [string]$Package.args }
+	} catch {}
+	return ''
+}
+
+function Test-MBPackageInteractive {
+	param($Package)
+	if (-not $Package) { return $false }
+	try {
+		if ($null -ne $Package.interactive) { return [bool]$Package.interactive }
+	} catch {}
+	try {
+		if ($Package.runs_scan) { return $true }
+	} catch {}
+	try {
+		if ([string]$Package.id -eq 'adwcleaner') { return $true }
+	} catch {}
+	return $false
+}
+
+function Invoke-MBSetupStartWait {
+	# Wait for installer exit; no IO redirect. -Interactive = visible UI.
+	param(
+		[Parameter(Mandatory)]
+		[string]$FilePath,
+		[string]$InstallArgs = '',
+		[int]$TimeoutSec = 1200,
+		[switch]$Interactive
+	)
+	if ([string]::IsNullOrWhiteSpace($FilePath)) {
+		return @{ ok = $false; exit = -1; out = ''; err = 'path required'; cmd = '' }
+	}
+	if (-not (Test-Path -LiteralPath $FilePath)) {
+		return @{ ok = $false; exit = -1; out = ''; err = "missing: $FilePath"; cmd = '' }
+	}
+	if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
+	$fp = ([string]$FilePath).Trim().Trim('"')
+	$tail = ([string]$InstallArgs)
+	if ($null -eq $tail) { $tail = '' }
+	$tail = $tail.Trim()
+
+	$isMsi = ($fp -match '(?i)\.msi$')
+	$psi = New-Object System.Diagnostics.ProcessStartInfo
+	if ($Interactive) {
+		$psi.UseShellExecute = $true
+		$psi.RedirectStandardOutput = $false
+		$psi.RedirectStandardError = $false
+		$psi.CreateNoWindow = $false
+		$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+	} else {
+		$psi.UseShellExecute = $false
+		$psi.RedirectStandardOutput = $false
+		$psi.RedirectStandardError = $false
+		$psi.CreateNoWindow = $true
+	}
+	try { $psi.WorkingDirectory = [System.IO.Path]::GetDirectoryName($fp) } catch {}
+
+	if ($isMsi) {
+		$psi.FileName = 'msiexec.exe'
+		$argLine = '/i "' + $fp + '"'
+		if ($tail.Length -gt 0) { $argLine = $argLine + ' ' + $tail }
+		$psi.Arguments = $argLine
+	} else {
+		$psi.FileName = $fp
+		$psi.Arguments = $tail
+	}
+	$cmd = ('{0} {1}' -f $psi.FileName, $psi.Arguments).Trim()
+
+	$p = New-Object System.Diagnostics.Process
+	$p.StartInfo = $psi
+	try {
+		[void]$p.Start()
+	} catch {
+		return @{ ok = $false; exit = -1; out = ''; err = $_.Exception.Message; cmd = $cmd }
+	}
+	if ($Interactive) {
+		try {
+			Ensure-MBConNative
+			Start-Sleep -Milliseconds 400
+			if (-not $p.HasExited) {
+				try { [void][MiniBot.WpfNative.MBCon]::AllowSetForegroundWindow(-1) } catch {}
+				try { $p.Refresh() } catch {}
+				for ($i = 0; $i -lt 15 -and -not $p.HasExited; $i++) {
+					$h = [IntPtr]::Zero
+					try { $h = $p.MainWindowHandle } catch { $h = [IntPtr]::Zero }
+					if ($h -ne [IntPtr]::Zero) {
+						try { [void][MiniBot.WpfNative.MBCon]::ShowWindow($h, 9) } catch {}
+						try { [void][MiniBot.WpfNative.MBCon]::BringWindowToTop($h) } catch {}
+						try { [void][MiniBot.WpfNative.MBCon]::SetForegroundWindow($h) } catch {}
+						break
+					}
+					Start-Sleep -Milliseconds 200
+					try { $p.Refresh() } catch {}
+				}
+			}
+		} catch {}
+	}
+	$timedOut = $false
+	if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+		$timedOut = $true
+		try { $p.Kill() } catch {}
+		try { [void]$p.WaitForExit(5000) } catch {}
+	}
+	if ($timedOut) {
+		return @{ ok = $false; exit = -1; out = ''; err = 'timeout'; cmd = $cmd }
+	}
+	$exit = -1
+	try { $exit = $p.ExitCode } catch {}
+	# 3010 reboot required; 1641 reboot initiated
+	$ok = ($exit -eq 0) -or ($exit -in @(3010, 1641))
+	return @{ ok = $ok; exit = $exit; out = ''; err = ''; cmd = $cmd; interactive = [bool]$Interactive }
+}
+
+function Invoke-MBSetupNative {
+	# Async stdout/stderr drain (sync ReadToEnd after WaitForExit can deadlock).
+	param([string]$File, [string[]]$Args, [int]$TimeoutSec = 30)
+	if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
+	$psi = New-Object System.Diagnostics.ProcessStartInfo
+	$psi.FileName = $File
+	$psi.Arguments = ConvertTo-MBProcessArgumentString -Args $Args
+	$psi.UseShellExecute = $false
+	$psi.RedirectStandardOutput = $true
+	$psi.RedirectStandardError = $true
+	$psi.CreateNoWindow = $true
+	$p = New-Object System.Diagnostics.Process
+	$p.StartInfo = $psi
+	try {
+		[void]$p.Start()
+	} catch {
+		return @{ ok = $false; exit = -1; out = ''; err = $_.Exception.Message }
+	}
+	$outTask = $p.StandardOutput.ReadToEndAsync()
+	$errTask = $p.StandardError.ReadToEndAsync()
+	$timedOut = $false
+	if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+		$timedOut = $true
+		try { $p.Kill() } catch {}
+		try { [void]$p.WaitForExit(3000) } catch {}
+	}
+	try { [void]$outTask.Wait(3000) } catch {}
+	try { [void]$errTask.Wait(3000) } catch {}
+	$o = ''
+	$e = ''
+	try { if ($outTask.IsCompleted) { $o = [string]$outTask.Result } } catch {}
+	try { if ($errTask.IsCompleted) { $e = [string]$errTask.Result } } catch {}
+	if ($timedOut) {
+		return @{ ok = $false; exit = -1; out = $o; err = $(if ($e) { "timeout; $e" } else { 'timeout' }) }
+	}
+	$exit = -1
+	try { $exit = $p.ExitCode } catch {}
+	return @{ ok = ($exit -eq 0); exit = $exit; out = $o; err = $e }
+}
+
+function Enable-MBFirewallGroup {
+	param(
+		[Parameter(Mandatory)]
+		[string]$GroupName,
+		[int]$TimeoutSec = 15
+	)
+	$detail = ''
+	try {
+		$rules = @(Get-NetFirewallRule -DisplayGroup $GroupName -ErrorAction SilentlyContinue)
+		if ($rules.Count -gt 0) {
+			$rules | Enable-NetFirewallRule -ErrorAction SilentlyContinue
+			return @{ ok = $true; method = 'Enable-NetFirewallRule'; group = $GroupName; rules = $rules.Count }
+		}
+		$detail = 'no rules for DisplayGroup'
+	} catch {
+		$detail = $_.Exception.Message
+	}
+	$arg = 'advfirewall firewall set rule group="{0}" new enable=Yes' -f $GroupName
+	$r = Invoke-MBSetupNative -File 'netsh.exe' -Args @($arg) -TimeoutSec $TimeoutSec
+	return @{
+		ok     = $true
+		method = 'netsh'
+		group  = $GroupName
+		exit   = $r.exit
+		detail = $(if ($r.ok) { 'enabled' } elseif ($r.err) { [string]$r.err } else { $detail })
+	}
+}
+
+function Invoke-SetWindowsOption {
+	param(
+		[string]$option,
+		[string]$value,
+		[string]$drive = 'C:'
+	)
+	if ([string]::IsNullOrWhiteSpace($option)) { return "ERROR: option is required. Call ListWindowsOptions." }
+	if ($null -eq $value) { $value = '' }
+	$opt = $option.Trim().ToLowerInvariant()
+	$val = ([string]$value).Trim()
+	$valL = $val.ToLowerInvariant()
+	$drv = ([string]$drive).Trim()
+	if ([string]::IsNullOrWhiteSpace($drv)) { $drv = 'C:' }
+	if ($drv -notmatch ':$') { $drv = $drv + ':' }
+
+	$cat = Get-MBWindowsOptionCatalog
+	if (-not $cat.Contains($opt) -and $opt -ne 'timezone') {
+		if (-not $cat.Contains($opt)) {
+			return "ERROR: Unknown option '$option'. Call ListWindowsOptions."
+		}
+	}
+
+	$details = "SetWindowsOption`n  option = $opt`n  value  = $val`n  drive  = $drv"
+	if (-not (Request-Confirmation -Title "SetWindowsOption requires approval" -Details $details)) {
+		return "BLOCKED BY USER: SetWindowsOption denied."
+	}
+
+	try {
+		switch -Regex ($opt) {
+			'^explorer\.hidden_files$' {
+				$d = if ($valL -in @('show','on','1','true')) { 1 } elseif ($valL -in @('hide','off','0','false')) { 2 } else { return "ERROR: value show|hide" }
+				reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v Hidden /t REG_DWORD /d $d /f | Out-Null
+				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL; applied = $d }
+			}
+			'^explorer\.file_extensions$' {
+				$d = if ($valL -in @('show','on','1','true')) { 0 } elseif ($valL -in @('hide','off','0','false')) { 1 } else { return "ERROR: value show|hide" }
+				reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v HideFileExt /t REG_DWORD /d $d /f | Out-Null
+				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL; applied = $d }
+			}
+			'^explorer\.compact_mode$' {
+				$d = if ($valL -in @('on','1','true','enable')) { 1 } elseif ($valL -in @('off','0','false','disable')) { 0 } else { return "ERROR: value on|off" }
+				reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v UseCompactMode /t REG_DWORD /d $d /f | Out-Null
+				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL }
+			}
+			'^explorer\.classic_context_menu$' {
+				$key = 'HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
+				if ($valL -in @('on','1','true','enable')) {
+					reg.exe add $key /f /ve /d '' | Out-Null
+				} elseif ($valL -in @('off','0','false','disable')) {
+					reg.exe delete 'HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}' /f 2>$null | Out-Null
+				} else { return "ERROR: value on|off" }
+				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL; note = 'Explorer restart may be required' }
+			}
+			'^uac$' {
+				$d = if ($valL -in @('enable','on','1','true')) { 1 } elseif ($valL -in @('disable','off','0','false')) { 0 } else { return "ERROR: value enable|disable" }
+				reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' /v EnableLUA /t REG_DWORD /d $d /f | Out-Null
+				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL; note = 'Reboot may be required for UAC change' }
+			}
+			'^power\.plan$' {
+				$map = @{
+					'high_performance' = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+					'balanced'         = '381b4222-f694-41f0-9685-ff5bb260df2e'
+					'power_saver'      = 'a1841308-3541-4fab-bc81-f71556f20b4a'
+				}
+				if (-not $map.ContainsKey($valL)) { return "ERROR: value high_performance|balanced|power_saver" }
+				$r = Invoke-MBSetupNative -File 'powercfg.exe' -Args @('/setactive', $map[$valL])
+				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $valL; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			'^power\.max_performance$' {
+				$cmds = @(
+					@('/change','monitor-timeout-ac','0'),
+					@('/change','monitor-timeout-dc','0'),
+					@('/change','standby-timeout-ac','0'),
+					@('/change','standby-timeout-dc','0'),
+					@('/change','hibernate-timeout-ac','0'),
+					@('/change','hibernate-timeout-dc','0'),
+					@('/hibernate','off'),
+					@('/setACvalueIndex','scheme_current','sub_buttons','lidAction','0'),
+					@('/setDCvalueIndex','scheme_current','sub_buttons','lidAction','0'),
+					@('/setACvalueindex','scheme_current','sub_pciexpress','ASPM','0'),
+					@('/setDCvalueindex','scheme_current','sub_pciexpress','ASPM','0'),
+					@('/setACvalueindex','scheme_current','2a737441-1930-4402-8d77-b2bebba308a3','48e6b7a6-50f5-4782-a5d4-53bb8f07e226','0'),
+					@('/setDCvalueindex','scheme_current','2a737441-1930-4402-8d77-b2bebba308a3','48e6b7a6-50f5-4782-a5d4-53bb8f07e226','0'),
+					@('/setactive','scheme_current')
+				)
+				$null = Invoke-MBSetupNative -File 'powercfg.exe' -Args @('/setactive','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
+				$steps = @()
+				foreach ($c in $cmds) {
+					$r = Invoke-MBSetupNative -File 'powercfg.exe' -Args $c
+					$steps += [ordered]@{ args = ($c -join ' '); ok = $r.ok; exit = $r.exit }
+				}
+				return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; steps = $steps }) -Depth 6
+			}
+			'^boot\.f8_legacy$' {
+				$pol = if ($valL -in @('on','1','true','legacy','enable')) { 'LEGACY' } elseif ($valL -in @('off','0','false','standard','disable')) { 'STANDARD' } else { return "ERROR: value on|off" }
+				$r = Invoke-MBSetupNative -File 'bcdedit.exe' -Args @('/set','{default}','bootmenupolicy', $pol)
+				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $pol; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			'^network\.discovery$' {
+				$en = if ($valL -in @('on','1','true','enable','yes')) { 'Yes' } elseif ($valL -in @('off','0','false','disable','no')) { 'No' } else { return "ERROR: value on|off" }
+				if ($en -eq 'Yes') {
+					$r = Enable-MBFirewallGroup -GroupName 'Network Discovery' -TimeoutSec 15
+					return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; value = $en; method = $r.method; detail = $r.detail })
+				}
+				$arg = 'advfirewall firewall set rule group="Network Discovery" new enable=No'
+				$r = Invoke-MBSetupNative -File 'netsh.exe' -Args @($arg) -TimeoutSec 15
+				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $en; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			'^network\.file_sharing$' {
+				$en = if ($valL -in @('on','1','true','enable','yes')) { 'Yes' } elseif ($valL -in @('off','0','false','disable','no')) { 'No' } else { return "ERROR: value on|off" }
+				if ($en -eq 'Yes') {
+					$r = Enable-MBFirewallGroup -GroupName 'File and Printer Sharing' -TimeoutSec 15
+					return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; value = $en; method = $r.method; detail = $r.detail })
+				}
+				$arg = 'advfirewall firewall set rule group="File and Printer Sharing" new enable=No'
+				$r = Invoke-MBSetupNative -File 'netsh.exe' -Args @($arg) -TimeoutSec 15
+				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $en; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			'^timezone$' {
+				if ([string]::IsNullOrWhiteSpace($val)) { return "ERROR: value must be a tzutil id (e.g. Eastern Standard Time)" }
+				$r = Invoke-MBSetupNative -File 'tzutil.exe' -Args @('/s', $val)
+				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $val; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			'^time\.sync$' {
+				$null = Invoke-MBSetupNative -File 'w32tm.exe' -Args @('/config','/manualpeerlist:time.windows.com')
+				$null = Invoke-MBSetupNative -File 'net.exe' -Args @('stop','w32time')
+				reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' /v Type /t REG_SZ /d NTP /f | Out-Null
+				$null = Invoke-MBSetupNative -File 'sc.exe' -Args @('config','w32time','start=','demand')
+				$null = Invoke-MBSetupNative -File 'net.exe' -Args @('start','w32time')
+				$r = Invoke-MBSetupNative -File 'w32tm.exe' -Args @('/resync')
+				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			'^bitlocker\.off$' {
+				$r = Invoke-MBSetupNative -File 'manage-bde.exe' -Args @('-off', $drv) -TimeoutSec 300
+				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; drive = $drv; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			'^edge\.web_widget$' {
+				$d = if ($valL -in @('off','0','false','disable')) { 0 } elseif ($valL -in @('on','1','true','enable')) { 1 } else { return "ERROR: value on|off" }
+				reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\Edge' /v WebWidgetAllowed /t REG_DWORD /d $d /f | Out-Null
+				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL }
+			}
+			'^registry\.periodic_backup$' {
+				$d = if ($valL -in @('on','1','true','enable')) { 1 } elseif ($valL -in @('off','0','false','disable')) { 0 } else { return "ERROR: value on|off" }
+				reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\Session Manager\Configuration Manager' /v EnablePeriodicBackup /t REG_DWORD /d $d /f | Out-Null
+				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL }
+			}
+			'^cleanmgr\.autoclean$' {
+				$letter = $drv.TrimEnd(':')
+				$r = Invoke-MBSetupNative -File 'cleanmgr.exe' -Args @("/d",$letter,'/Autoclean') -TimeoutSec 600
+				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; drive = $drv; exit = $r.exit })
+			}
+			default { return "ERROR: Unhandled option '$opt'." }
+		}
+	} catch {
+		return "ERROR: SetWindowsOption failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-SystemRestore {
+	param(
+		[string]$action,
+		[string]$description = '',
+		[string]$drive = 'C:'
+	)
+	$a = ([string]$action).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($a)) { return "ERROR: action required (status|enable|disable|create|list)." }
+	$drv = ([string]$drive).Trim()
+	if ([string]::IsNullOrWhiteSpace($drv)) { $drv = 'C:' }
+	if ($drv -notmatch ':$') { $drv = $drv + ':' }
+
+	try {
+		if ($a -eq 'status' -or $a -eq 'list') {
+			$pts = @()
+			try {
+				$pts = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue | Select-Object -First 25 SequenceNumber, Description, CreationTime, RestorePointType)
+			} catch {}
+			$enabled = $null
+			try {
+				$sr = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -ErrorAction SilentlyContinue
+				$enabled = $sr
+			} catch {}
+			return ConvertTo-MBJson ([ordered]@{
+				ok      = $true
+				action  = $a
+				drive   = $drv
+				points  = $pts
+			}) -Depth 5
+		}
+		if ($a -eq 'enable') {
+			if (-not (Request-Confirmation -Title "SystemRestore requires approval" -Details "Enable System Restore on $drv")) {
+				return "BLOCKED BY USER: SystemRestore enable denied."
+			}
+			Enable-ComputerRestore -Drive $drv -ErrorAction Stop
+			return ConvertTo-MBJson @{ ok = $true; action = 'enable'; drive = $drv }
+		}
+		if ($a -eq 'disable') {
+			if (-not (Request-Confirmation -Title "SystemRestore requires approval" -Details "Disable System Restore on $drv")) {
+				return "BLOCKED BY USER: SystemRestore disable denied."
+			}
+			Disable-ComputerRestore -Drive $drv -ErrorAction Stop
+			return ConvertTo-MBJson @{ ok = $true; action = 'disable'; drive = $drv }
+		}
+		if ($a -eq 'create') {
+			$desc = if ([string]::IsNullOrWhiteSpace($description)) { "MiniBot restore point $(Get-Date -Format 'yyyy-MM-dd HH:mm')" } else { $description }
+			if (-not (Request-Confirmation -Title "SystemRestore requires approval" -Details "Create restore point:`n  $desc")) {
+				return "BLOCKED BY USER: SystemRestore create denied."
+			}
+			Checkpoint-Computer -Description $desc -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+			return ConvertTo-MBJson @{ ok = $true; action = 'create'; description = $desc }
+		}
+		return "ERROR: action must be status|enable|disable|create|list."
+	} catch {
+		return "ERROR: SystemRestore failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-UninstallSoftware {
+	param(
+		[string]$name,
+		[string]$product_code = ''
+	)
+	if ([string]::IsNullOrWhiteSpace($name) -and [string]::IsNullOrWhiteSpace($product_code)) {
+		return "ERROR: name or product_code required. Prefer GetInstalledSoftware first (system group)."
+	}
+	$roots = @(
+		'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+		'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+		'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+	)
+	$hits = New-Object System.Collections.ArrayList
+	foreach ($root in $roots) {
+		if (-not (Test-Path -LiteralPath $root)) { continue }
+		Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+			try {
+				$p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+				if (-not $p) { return }
+				$dn = [string]$p.DisplayName
+				if ([string]::IsNullOrWhiteSpace($dn)) { return }
+				$guid = $_.PSChildName
+				$match = $false
+				if ($product_code -and ($guid -eq $product_code -or $guid -eq $product_code.Trim('{}'))) { $match = $true }
+				elseif ($name -and $dn -like "*$name*") { $match = $true }
+				if (-not $match) { return }
+				[void]$hits.Add([ordered]@{
+					name             = $dn
+					version          = [string]$p.DisplayVersion
+					publisher        = [string]$p.Publisher
+					key              = $guid
+					uninstall        = [string]$p.UninstallString
+					quiet_uninstall  = [string]$p.QuietUninstallString
+					path             = $_.PSPath
+				})
+			} catch {}
+		}
+	}
+	if ($hits.Count -eq 0) {
+		return "ERROR: No installed software matched name='$name' product_code='$product_code'."
+	}
+	if ($hits.Count -gt 1 -and -not $product_code) {
+		$names = ($hits | ForEach-Object { $_.name }) -join '; '
+		return "ERROR: Multiple matches ($($hits.Count)): $names. Narrow name= or pass product_code=."
+	}
+	$h = $hits[0]
+	$cmd = if ($h.quiet_uninstall) { [string]$h.quiet_uninstall } else { [string]$h.uninstall }
+	if ([string]::IsNullOrWhiteSpace($cmd)) {
+		return "ERROR: No uninstall string for '$($h.name)'."
+	}
+	$details = "Uninstall software:`n  name = $($h.name)`n  version = $($h.version)`n  cmd = $cmd"
+	if (-not (Request-Confirmation -Title "UninstallSoftware requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Uninstall denied."
+	}
+	try {
+		if ($cmd -match '(?i)msiexec') {
+			$r = Invoke-MBSetupNative -File 'cmd.exe' -Args @('/c', $cmd) -TimeoutSec 900
+			return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; name = $h.name; exit = $r.exit; out = $r.out; err = $r.err })
+		}
+		$r = Invoke-MBSetupNative -File 'cmd.exe' -Args @('/c', $cmd) -TimeoutSec 900
+		return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; name = $h.name; exit = $r.exit; out = $r.out; err = $r.err; note = 'Uninstall launched; some installers need GUI completion.' })
+	} catch {
+		return "ERROR: Uninstall failed: $($_.Exception.Message)"
+	}
+}
+
+function Get-MBInstallerCatalog {
+	if ($script:MBInstallerCatalog -and @($script:MBInstallerCatalog.Keys).Count -gt 0) {
+		return $script:MBInstallerCatalog
+	}
+	return [ordered]@{}
+}
+
+function Write-MBSetupProgress {
+	# Progress: settings same-line OK/FAIL; software blank + Installed/Not Installed
+	param(
+		[ValidateSet('start','ok','fail','info')]
+		[string]$Phase,
+		[int]$Index = 0,
+		[int]$Total = 0,
+		[string]$Title = '',
+		[string]$Detail = '',
+		[switch]$Software
+	)
+	$title = ([string]$Title).Trim()
+	if ($title.Length -eq 0) { $title = 'step' }
+	$startLabel = $title
+	if ($Phase -eq 'start') {
+		if ($startLabel -match '^(?i)Enable\s+(.+)$') { $startLabel = "Enabling $($Matches[1])" }
+		elseif ($startLabel -match '^(?i)Disable\s+(.+)$') { $startLabel = "Disabling $($Matches[1])" }
+		elseif ($startLabel -match '^(?i)Create\s+(.+)$') { $startLabel = "Creating $($Matches[1])" }
+		elseif ($startLabel -match '^(?i)Show\s+(.+)$') { $startLabel = "Showing $($Matches[1])" }
+		elseif ($startLabel -match '^(?i)Set\s+(.+)$') { $startLabel = "Setting $($Matches[1])" }
+		elseif ($startLabel -match '^(?i)Sync\s+(.+)$') { $startLabel = "Syncing $($Matches[1])" }
+		elseif ($startLabel -match '^(?i)SOFTWARE:\s*(.+)$') { $startLabel = $Matches[1] }
+	}
+	$prefix = if ($Total -gt 0 -and $Index -gt 0) {
+		"{0}/{1}" -f $Index, $Total
+	} else {
+		''
+	}
+	$detail = ([string]$Detail).Trim()
+	if ($null -eq $script:MB.SetupProgressOpenLine) { $script:MB.SetupProgressOpenLine = $false }
+	try {
+		switch ($Phase) {
+			'start' {
+				if ($script:MB.SetupProgressOpenLine) {
+					Write-Host ''
+					$script:MB.SetupProgressOpenLine = $false
+				}
+				$msg = if ($prefix) { "{0} {1}..." -f $prefix, $startLabel } else { "{0}..." -f $startLabel }
+				Write-Host ("  {0}" -f $msg) -ForegroundColor Cyan -NoNewline
+				$script:MB.SetupProgressOpenLine = $true
+			}
+			'ok' {
+				if ($Software) {
+					if ($script:MB.SetupProgressOpenLine) {
+						Write-Host ''
+						$script:MB.SetupProgressOpenLine = $false
+					}
+					Write-Host ''
+					$msg = if ($detail) { "  Installed  ($detail)" } else { '  Installed' }
+					Write-Host $msg -ForegroundColor Green
+					Write-Host ''
+				} else {
+					$msg = if ($detail) { " OK  ($detail)" } else { ' OK' }
+					if ($script:MB.SetupProgressOpenLine) {
+						Write-Host $msg -ForegroundColor Green
+						$script:MB.SetupProgressOpenLine = $false
+					} else {
+						Write-Host ("  {0}" -f $msg.TrimStart()) -ForegroundColor Green
+					}
+				}
+			}
+			'fail' {
+				if ($Software) {
+					if ($script:MB.SetupProgressOpenLine) {
+						Write-Host ''
+						$script:MB.SetupProgressOpenLine = $false
+					}
+					Write-Host ''
+					$msg = if ($detail) { "  Not Installed  - $detail" } else { '  Not Installed' }
+					Write-Host $msg -ForegroundColor Red
+					Write-Host ''
+				} else {
+					$msg = if ($detail) { " FAIL - $detail" } else { ' FAIL' }
+					if ($script:MB.SetupProgressOpenLine) {
+						Write-Host $msg -ForegroundColor Red
+						$script:MB.SetupProgressOpenLine = $false
+					} else {
+						Write-Host ("  {0}" -f $msg.TrimStart()) -ForegroundColor Red
+					}
+				}
+			}
+			'info' {
+				if ($script:MB.SetupProgressOpenLine) {
+					Write-Host ''
+					$script:MB.SetupProgressOpenLine = $false
+				}
+				$msg = if ($detail) { "{0}: {1}" -f $title, $detail } else { $title }
+				Write-Host ("    {0}" -f $msg) -ForegroundColor DarkGray
+			}
+		}
+	} catch {}
+}
+
+function Get-MBSevenZipPath {
+	@(
+		"${env:ProgramFiles}\7-Zip\7z.exe",
+		"${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+	) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+}
+
+function Invoke-MBEnsureSevenZipForExtract {
+	param(
+		[string]$Reason = 'extract a package archive',
+		[bool]$SkipExtraApprovals = $false
+	)
+	$z7 = Get-MBSevenZipPath
+	if ($z7) {
+		if (-not $SkipExtraApprovals) {
+			$details = "Use installed 7-Zip to $Reason`n  path = $z7"
+			if (-not (Request-Confirmation -Title "Use 7-Zip for extraction?" -Details $details)) {
+				return @{ ok = $false; error = 'operator denied use of 7-Zip for extraction' }
+			}
+		}
+		return @{ ok = $true; path = $z7; installed = $false }
+	}
+
+	if ($SkipExtraApprovals) {
+		return @{ ok = $false; error = '7-Zip not installed and extra approvals skipped' }
+	}
+	$details = @(
+		"7-Zip is required to $Reason (built-in .NET zip extract failed or is unavailable)."
+		"MiniBot can download and silent-install 7-Zip from the catalog at the top of MiniBot.ps1, then continue."
+		"Temp files are cleaned up after."
+	) -join "`n"
+	if (-not (Request-Confirmation -Title "Install 7-Zip for extraction?" -Details $details)) {
+		return @{ ok = $false; error = 'operator denied 7-Zip install for extraction' }
+	}
+	$cat = Get-MBInstallerCatalog
+	if (-not $cat.Contains('7zip')) {
+		return @{ ok = $false; error = '7zip package missing from MBInstallerCatalog (top of script)' }
+	}
+	$work = New-MBTempDir -Prefix 'MiniBot7z'
+	try {
+		$r = Invoke-MBSetupInstallPackage -Package $cat['7zip'] -WorkDir $work -Cleanup $true -SkipExtraApprovals $true
+		if (-not $r.ok) {
+			return @{ ok = $false; error = "7-Zip install failed: $($r.error)$($r.err)" }
+		}
+		$z7 = Get-MBSevenZipPath
+		if (-not $z7) {
+			return @{ ok = $false; error = '7-Zip install finished but 7z.exe was not found' }
+		}
+		return @{ ok = $true; path = $z7; installed = $true }
+	} finally {
+		try { Remove-MBTempPath -Path $work } catch {}
+	}
+}
+
+function Get-MBNewMachineSoftwareManifest {
+	# Entire installer catalog for NewMachineSetup software steps.
+	$cat = Get-MBInstallerCatalog
+	$list = New-Object System.Collections.ArrayList
+	foreach ($key in @($cat.Keys)) {
+		[void]$list.Add($cat[$key])
+	}
+	return @($list)
+}
+
+function Invoke-MBSetupDownloadFile {
+	param(
+		[string]$Url,
+		[string]$OutPath,
+		[int]$TimeoutSec = 900,
+		[string]$Label = ''
+	)
+	if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($OutPath)) {
+		return @{ ok = $false; error = 'url/out required' }
+	}
+	$lab = ([string]$Label).Trim()
+	if ($lab.Length -eq 0) {
+		$leaf = [System.IO.Path]::GetFileName($OutPath)
+		$lab = if ($leaf) { "Downloading $leaf" } else { 'Downloading' }
+	} elseif ($lab -notmatch '(?i)^download') {
+		$lab = "Downloading $lab"
+	}
+	$r = Invoke-MBHttpDownload -Url $Url -OutPath $OutPath -TimeoutSec $TimeoutSec `
+		-UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiniBot-Installers' `
+		-Label $lab -ShowProgress
+	if (-not $r.ok) {
+		return @{ ok = $false; error = $(if ($r.error) { $r.error } else { 'download failed' }) }
+	}
+	if (-not (Test-Path -LiteralPath $OutPath)) {
+		return @{ ok = $false; error = 'download failed or file missing' }
+	}
+	$len = [int64]$r.bytes
+	try { $len = (Get-Item -LiteralPath $OutPath).Length } catch {}
+	if ($len -lt 64) { return @{ ok = $false; error = "download too small ($len bytes)" } }
+	return @{ ok = $true; path = $OutPath; bytes = $len; final_url = $r.final_url }
+}
+
+function Invoke-MBSetupInstallPackage {
+	param(
+		$Package,
+		[string]$WorkDir,
+		[bool]$Cleanup = $true,
+		[bool]$SkipExtraApprovals = $false
+	)
+	if (-not $Package) { return @{ ok = $false; error = 'no package' } }
+	$kind = [string]$Package.kind
+	$name = [string]$Package.name
+	$created = New-Object System.Collections.ArrayList
+	$ownWorkDir = $false
+
+	try {
+		if ($kind -eq 'open_url') {
+			Write-MBSetupProgress -Phase info -Title $name -Detail 'opening URL'
+			try {
+				Start-Process -FilePath ([string]$Package.url) -ErrorAction Stop | Out-Null
+				return @{ ok = $true; name = $name; kind = 'open_url'; url = [string]$Package.url }
+			} catch {
+				try {
+					Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', 'start', '', [string]$Package.url) -WindowStyle Hidden | Out-Null
+					return @{ ok = $true; name = $name; kind = 'open_url'; url = [string]$Package.url }
+				} catch {
+					return @{ ok = $false; name = $name; kind = 'open_url'; error = $_.Exception.Message }
+				}
+			}
+		}
+
+		if ([string]::IsNullOrWhiteSpace($WorkDir)) {
+			$WorkDir = New-MBTempDir -Prefix 'MiniBotInstall'
+			$ownWorkDir = $true
 		} else {
-			Write-Host "The model server appears to be unreachable or misconfigured." -ForegroundColor DarkYellow
+			if (-not (Test-Path -LiteralPath $WorkDir)) {
+				New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+			}
+			try { Register-MBTempPath -Path $WorkDir } catch {}
+		}
+
+		$out = Join-Path $WorkDir ([string]$Package.file)
+		$dl = Invoke-MBSetupDownloadFile -Url ([string]$Package.url) -OutPath $out -TimeoutSec 900 -Label $name
+		if (-not $dl.ok) {
+			return @{ ok = $false; name = $name; phase = 'download'; error = $dl.error }
+		}
+		[void]$created.Add($out)
+		Write-MBSetupProgress -Phase info -Title $name -Detail ("downloaded {0}" -f (Format-MBByteSize ([int64]$dl.bytes)))
+
+		if ($kind -eq 'zip_msi') {
+			$entry = [string]$Package.zip_entry
+			if ([string]::IsNullOrWhiteSpace($entry)) { $entry = 'GoogleChromeStandaloneEnterprise64.msi' }
+			$msiPath = Join-Path $WorkDir $entry
+			$extracted = $false
+			$netErr = $null
+			try {
+				Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+				$zip = [System.IO.Compression.ZipFile]::OpenRead($out)
+				try {
+					foreach ($e in $zip.Entries) {
+						if ($e.Name -eq $entry -or ($e.FullName -replace '\\','/') -like "*/$entry" -or $e.FullName -eq $entry) {
+							[System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $msiPath, $true)
+							$extracted = $true
+							break
+						}
+					}
+					if (-not $extracted) {
+						foreach ($e in $zip.Entries) {
+							if ($e.Name -match '\.msi$') {
+								$msiPath = Join-Path $WorkDir $e.Name
+								[System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $msiPath, $true)
+								$extracted = $true
+								break
+							}
+						}
+					}
+					if (-not $extracted) { throw "zip missing $entry" }
+				} finally { $zip.Dispose() }
+			} catch {
+				$netErr = $_.Exception.Message
+				$extracted = $false
+			}
+
+			if (-not $extracted) {
+				$ens = Invoke-MBEnsureSevenZipForExtract -Reason "extract MSI from $name zip" -SkipExtraApprovals $SkipExtraApprovals
+				if (-not $ens.ok) {
+					return @{ ok = $false; name = $name; phase = 'extract'; error = $ens.error; net_error = $netErr }
+				}
+				$r7 = Invoke-MBSetupNative -File $ens.path -Args @('e', '-y', "-o$WorkDir", $out, $entry) -TimeoutSec 300
+				if (-not (Test-Path -LiteralPath $msiPath)) {
+					$msiPath = Get-ChildItem -LiteralPath $WorkDir -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+				}
+				if (-not $msiPath -or -not (Test-Path -LiteralPath $msiPath)) {
+					return @{ ok = $false; name = $name; phase = 'extract'; error = "7z extract failed: $($r7.err)"; exit = $r7.exit }
+				}
+			}
+			[void]$created.Add($msiPath)
+			Write-MBSetupProgress -Phase info -Title $name -Detail 'installing MSI (silent)'
+			$inst = Get-MBPackageInstallArgs -Package $Package
+			$r = Invoke-MBSetupStartWait -FilePath $msiPath -InstallArgs $inst -TimeoutSec 1200
+			$okExit = $r.ok -or ($r.exit -in @(0, 3010, 1641))
+			return @{
+				ok = $okExit; name = $name; phase = 'install'; kind = 'zip_msi'
+				exit = $r.exit; err = $r.err; out = $r.out; final_url = $dl.final_url
+				msi = $msiPath; cmd = $r.cmd
+			}
+		}
+
+		if ($kind -eq 'msi') {
+			Write-MBSetupProgress -Phase info -Title $name -Detail 'installing MSI (silent)'
+			$inst = Get-MBPackageInstallArgs -Package $Package
+			$r = Invoke-MBSetupStartWait -FilePath $out -InstallArgs $inst -TimeoutSec 1200
+			$okExit = $r.ok -or ($r.exit -in @(0, 3010, 1641))
+			return @{
+				ok = $okExit; name = $name; phase = 'install'; kind = 'msi'
+				exit = $r.exit; err = $r.err; final_url = $dl.final_url; cmd = $r.cmd
+			}
+		}
+
+		$isInteractive = Test-MBPackageInteractive -Package $Package
+		$runLabel = if ($isInteractive -or $Package.runs_scan -or $Package.id -eq 'adwcleaner') {
+			'running scan/clean (interactive UI)'
+		} else {
+			'installing (silent)'
+		}
+		Write-MBSetupProgress -Phase info -Title $name -Detail $runLabel
+		$inst = Get-MBPackageInstallArgs -Package $Package
+		if ($isInteractive) {
+			$r = Invoke-MBSetupStartWait -FilePath $out -InstallArgs $inst -TimeoutSec 1200 -Interactive
+		} else {
+			$r = Invoke-MBSetupStartWait -FilePath $out -InstallArgs $inst -TimeoutSec 1200
+		}
+		$okExit = $r.ok -or ($r.exit -in @(0, 3010, 1641))
+		return @{
+			ok = $okExit; name = $name; phase = 'install'; kind = 'exe'
+			exit = $r.exit; err = $r.err; final_url = $dl.final_url; cmd = $r.cmd
+			interactive = $isInteractive
+		}
+	} catch {
+		return @{ ok = $false; name = $name; phase = 'install'; error = $_.Exception.Message }
+	} finally {
+		if ($Cleanup) {
+			foreach ($f in @($created)) {
+				try { if ($f) { Remove-MBTempPath -Path $f } } catch {}
+			}
+			if ($ownWorkDir -and $WorkDir) {
+				try { Remove-MBTempPath -Path $WorkDir } catch {}
+			} elseif ($WorkDir) {
+				# Caller-owned dir may still hold payload files; unregister only if empty after file cleanup
+				try {
+					$left = @(Get-ChildItem -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue)
+					if ($left.Count -eq 0) { Remove-MBTempPath -Path $WorkDir }
+				} catch {}
+			}
+		}
+	}
+}
+
+function Invoke-ListInstallers {
+	$cat = Get-MBInstallerCatalog
+	$rows = @()
+	foreach ($key in @($cat.Keys)) {
+		$p = $cat[$key]
+		$runsScan = $false
+		try { $runsScan = [bool]$p.runs_scan } catch { $runsScan = ($p.id -eq 'adwcleaner') }
+		$rows += [ordered]@{
+			id        = [string]$p.id
+			name      = [string]$p.name
+			kind      = [string]$p.kind
+			install   = (Get-MBPackageInstallArgs -Package $p)
+			runs_scan = $runsScan
+			note      = [string]$p.note
+		}
+	}
+	return ConvertTo-MBJson ([ordered]@{
+		ok       = $true
+		count    = $rows.Count
+		note     = 'Silent installs; temp files cleaned after each package. ADWCleaner runs a scan/clean.'
+		packages = $rows
+	}) -Depth 6
+}
+
+function Invoke-InstallPackage {
+	param(
+		[string]$package = '',
+		$packages = $null
+	)
+	$ids = New-Object System.Collections.ArrayList
+	if ($packages) {
+		foreach ($x in @($packages)) {
+			if ($x -and [string]$x -ne '') { [void]$ids.Add(([string]$x).Trim().ToLowerInvariant()) }
+		}
+	}
+	if (-not [string]::IsNullOrWhiteSpace($package)) {
+		[void]$ids.Add($package.Trim().ToLowerInvariant())
+	}
+	$ids = @($ids | Select-Object -Unique)
+	if ($ids.Count -eq 0) {
+		return "ERROR: package= or packages= required. Call ListInstallers for ids (7zip, chrome, adobe_reader, adwcleaner, vlc)."
+	}
+
+	$cat = Get-MBInstallerCatalog
+	$unknown = @()
+	$plan = @()
+	foreach ($id in $ids) {
+		if (-not $cat.Contains($id)) { $unknown += $id; continue }
+		$plan += $cat[$id]
+	}
+	if ($unknown.Count -gt 0) {
+		return "ERROR: Unknown package id(s): $($unknown -join ', '). Call ListInstallers."
+	}
+
+	$detail = New-Object System.Collections.ArrayList
+	[void]$detail.Add('Silent install from catalog (temp downloads cleaned after):')
+	[void]$detail.Add('')
+	foreach ($p in $plan) {
+		$runsScan = $false
+		try { $runsScan = [bool]$p.runs_scan } catch { $runsScan = ($p.id -eq 'adwcleaner') }
+		$line = " - $($p.id): $($p.name) [$($p.kind)] $(Get-MBPackageInstallArgs -Package $p)"
+		if ($runsScan) { $line += '  ** will run a scan **' }
+		elseif ($p.kind -eq 'open_url') { $line += '  (open URL only)' }
+		[void]$detail.Add($line)
+	}
+	if (-not (Request-Confirmation -Title "InstallPackage requires approval" -Details (($detail | ForEach-Object { $_ }) -join "`n"))) {
+		return "BLOCKED BY USER: InstallPackage denied."
+	}
+
+	$workRoot = New-MBTempDir -Prefix 'MiniBotInstall'
+	$results = New-Object System.Collections.ArrayList
+	$total = $plan.Count
+	$idx = 0
+	try {
+		Write-Host ("  InstallPackage: {0} package(s), silent" -f $total) -ForegroundColor DarkCyan
+		foreach ($pkg in $plan) {
+			$idx++
+			$label = [string]$pkg.name
+			Write-MBSetupProgress -Phase start -Index $idx -Total $total -Title $label
+			$sub = Join-Path $workRoot ([string]$pkg.id)
+			New-Item -ItemType Directory -Path $sub -Force | Out-Null
+			try { Register-MBTempPath -Path $sub } catch {}
+			$r = Invoke-MBSetupInstallPackage -Package $pkg -WorkDir $sub -Cleanup $true
+			$row = [ordered]@{ id = [string]$pkg.id; name = [string]$pkg.name }
+			foreach ($k in @($r.Keys)) { $row[$k] = $r[$k] }
+			[void]$results.Add($row)
+			if ($row.ok) {
+				Write-MBSetupProgress -Phase ok -Index $idx -Total $total -Title $label -Software
+			} else {
+				$err = if ($row.error) { [string]$row.error } elseif ($row.err) { [string]$row.err } else { 'failed' }
+				Write-MBSetupProgress -Phase fail -Index $idx -Total $total -Title $label -Detail $err -Software
+			}
+			try { Remove-MBTempPath -Path $sub } catch {}
+		}
+	} finally {
+		try { Remove-MBTempPath -Path $workRoot } catch {}
+	}
+	$okN = @($results | Where-Object { $_.ok }).Count
+	Write-Host ("  InstallPackage done: {0}/{1} Installed" -f $okN, $total) -ForegroundColor $(if ($okN -eq $total) { 'Green' } else { 'Yellow' })
+	return ConvertTo-MBJson ([ordered]@{
+		ok     = ($okN -eq $results.Count)
+		passed = $okN
+		total  = $results.Count
+		note    = 'Silent installs; downloads cleaned after each package.'
+		results = @($results)
+	}) -Depth 8
+}
+
+function Invoke-NewMachineSetup {
+	param(
+		[bool]$dry_run = $false,
+		[string]$timezone = '',
+		[bool]$skip_restore_point = $false,
+		[bool]$skip_software = $false
+	)
+
+	$steps = New-Object System.Collections.ArrayList
+	$add = {
+		param($list, $id, $title, $scriptblock, $section = 'settings')
+		[void]$list.Add([ordered]@{ id = $id; title = $title; run = $scriptblock; section = $section })
+	}
+	if (-not $skip_restore_point) {
+		& $add $steps 'restore_enable' 'Enable System Restore on C:' { Enable-ComputerRestore -Drive 'C:\' -ErrorAction SilentlyContinue; @{ ok = $true } }
+		& $add $steps 'restore_point' 'Create restore point' {
+			Checkpoint-Computer -Description "MiniBot NewMachineSetup $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -RestorePointType MODIFY_SETTINGS -ErrorAction SilentlyContinue
+			@{ ok = $true }
+		}
+	}
+	& $add $steps 'boot_f8' 'Enable legacy F8 boot menu' {
+		$r = Invoke-MBSetupNative -File 'bcdedit.exe' -Args @('/set','{default}','bootmenupolicy','LEGACY')
+		@{ ok = $r.ok; exit = $r.exit; detail = $r.out }
+	}
+	& $add $steps 'power_max' 'Max performance power settings' {
+		@{ ok = $true }
+	}
+	& $add $steps 'explorer_hidden' 'Show hidden files' {
+		reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v Hidden /t REG_DWORD /d 1 /f | Out-Null
+		@{ ok = $true }
+	}
+	& $add $steps 'explorer_ext' 'Show file extensions' {
+		reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v HideFileExt /t REG_DWORD /d 0 /f | Out-Null
+		@{ ok = $true }
+	}
+	& $add $steps 'win11_explorer' 'Win11 compact mode + classic context menu (if Win11)' {
+		$cap = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+		if ($cap -match 'Windows 11') {
+			reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v UseCompactMode /t REG_DWORD /d 1 /f | Out-Null
+			reg.exe add 'HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32' /f /ve /d '' | Out-Null
+			@{ ok = $true; win11 = $true }
+		} else { @{ ok = $true; win11 = $false; skipped = $true } }
+	}
+	& $add $steps 'edge_widget' 'Disable Edge web widget' {
+		reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\Edge' /v WebWidgetAllowed /t REG_DWORD /d 0 /f | Out-Null
+		@{ ok = $true }
+	}
+	& $add $steps 'reg_backup' 'Enable periodic registry backups' {
+		reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\Session Manager\Configuration Manager' /v EnablePeriodicBackup /t REG_DWORD /d 1 /f | Out-Null
+		@{ ok = $true }
+	}
+	& $add $steps 'network_discovery' 'Enable Network Discovery' {
+		Enable-MBFirewallGroup -GroupName 'Network Discovery' -TimeoutSec 15
+	}
+	& $add $steps 'file_sharing' 'Enable File and Printer Sharing' {
+		Enable-MBFirewallGroup -GroupName 'File and Printer Sharing' -TimeoutSec 15
+	}
+	if (-not [string]::IsNullOrWhiteSpace($timezone)) {
+		$tz = [string]$timezone
+		$tzSb = {
+			$r = Invoke-MBSetupNative -File 'tzutil.exe' -Args @('/s', $tz)
+			@{ ok = $r.ok; exit = $r.exit }
+		}.GetNewClosure()
+		& $add $steps 'timezone' "Set timezone: $tz" $tzSb
+	}
+	& $add $steps 'time_sync' 'Sync Windows time' {
+		$null = Invoke-MBSetupNative -File 'w32tm.exe' -Args @('/config','/manualpeerlist:time.windows.com')
+		$null = Invoke-MBSetupNative -File 'net.exe' -Args @('stop','w32time')
+		reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' /v Type /t REG_SZ /d NTP /f | Out-Null
+		$null = Invoke-MBSetupNative -File 'net.exe' -Args @('start','w32time')
+		$r = Invoke-MBSetupNative -File 'w32tm.exe' -Args @('/resync')
+		@{ ok = $true; resync_exit = $r.exit }
+	}
+	& $add $steps 'bitlocker_off' 'Disable Device Encryption on C: (manage-bde -off)' {
+		$r = Invoke-MBSetupNative -File 'manage-bde.exe' -Args @('-off', 'C:') -TimeoutSec 300
+		@{ ok = $r.ok; exit = $r.exit; out = $r.out; err = $r.err }
+	}
+
+	$software = @()
+	if (-not $skip_software) {
+		$software = @(Get-MBNewMachineSoftwareManifest)
+		foreach ($pkg in $software) {
+			$stepId = 'sw_' + [string]$pkg.id
+			$runsScan = $false
+			try { $runsScan = [bool]$pkg.runs_scan } catch { $runsScan = $false }
+			if ($pkg.kind -eq 'open_url') {
+				$title = "SOFTWARE: Open $($pkg.name)"
+			} elseif ($runsScan -or $pkg.id -eq 'adwcleaner') {
+				$title = "SOFTWARE: Download + run $($pkg.name) (will run a scan)"
+			} else {
+				$title = "SOFTWARE: Download + install $($pkg.name)"
+			}
+			& $add $steps $stepId $title { @{ ok = $true } } 'software'
+		}
+	}
+
+	$plan = @($steps | ForEach-Object { [ordered]@{ id = $_.id; title = $_.title; section = $_.section } })
+	$dryNote = 'ADWCleaner will run a scan if software is included. Device Encryption is turned off during setup. UAC is not changed.'
+	if ($dry_run) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok             = $true
+			dry_run        = $true
+			skip_software  = [bool]$skip_software
+			note           = $dryNote
+			settings_steps = @($plan | Where-Object { $_.section -ne 'software' })
+			software       = @($software | ForEach-Object {
+				$rs = $false
+				try { $rs = [bool]$_.runs_scan } catch { $rs = ($_.id -eq 'adwcleaner') }
+				[ordered]@{ id = $_.id; name = $_.name; runs_scan = $rs }
+			})
+			steps          = $plan
+		}) -Depth 6
+	}
+
+	$detailLines = New-Object System.Collections.ArrayList
+	[void]$detailLines.Add('NewMachineSetup')
+	[void]$detailLines.Add('This will change Windows settings' + $(if (-not $skip_software) { ' and download/install software' } else { ' only (software skipped)' }) + '.')
+	[void]$detailLines.Add('')
+	[void]$detailLines.Add('SETTINGS:')
+	foreach ($p in $plan) {
+		if ($p.section -eq 'software') { continue }
+		[void]$detailLines.Add("  - $($p.title)")
+	}
+	if (-not $skip_software) {
+		[void]$detailLines.Add('')
+		[void]$detailLines.Add('SOFTWARE - silent download/install:')
+		foreach ($pkg in $software) {
+			$runsScan = $false
+			try { $runsScan = [bool]$pkg.runs_scan } catch { $runsScan = ($pkg.id -eq 'adwcleaner') }
+			if ($pkg.kind -eq 'open_url') {
+				[void]$detailLines.Add("  - $($pkg.name) (open URL)")
+			} elseif ($runsScan) {
+				[void]$detailLines.Add("  - $($pkg.name) (will run a scan)")
+			} else {
+				[void]$detailLines.Add("  - $($pkg.name)")
+			}
+		}
+	}
+	if (-not (Request-Confirmation -Title "NewMachineSetup requires approval" -Details (($detailLines | ForEach-Object { $_ }) -join "`n"))) {
+		return "BLOCKED BY USER: NewMachineSetup denied."
+	}
+
+	$workDir = $null
+	if (-not $skip_software) {
+		try { $workDir = New-MBTempDir -Prefix 'MiniBotSetup' } catch { $workDir = $null }
+	}
+
+	$results = New-Object System.Collections.ArrayList
+	$pkgById = @{}
+	foreach ($pkg in $software) { $pkgById['sw_' + [string]$pkg.id] = $pkg }
+
+	$totalSteps = $steps.Count
+	$stepIdx = 0
+	Write-Host ("  NewMachineSetup: {0} step(s), silent installers" -f $totalSteps) -ForegroundColor DarkCyan
+
+	try {
+		foreach ($s in $steps) {
+			$stepIdx++
+			$row = [ordered]@{ id = $s.id; title = $s.title; section = $s.section; ok = $false }
+			Write-MBSetupProgress -Phase start -Index $stepIdx -Total $totalSteps -Title ([string]$s.title)
+			try {
+				if ($s.id -eq 'power_max') {
+					$null = Invoke-MBSetupNative -File 'powercfg.exe' -Args @('/setactive','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
+					foreach ($c in @(
+						@('/change','monitor-timeout-ac','0'),
+						@('/change','monitor-timeout-dc','0'),
+						@('/change','standby-timeout-ac','0'),
+						@('/change','standby-timeout-dc','0'),
+						@('/change','hibernate-timeout-ac','0'),
+						@('/change','hibernate-timeout-dc','0'),
+						@('/hibernate','off'),
+						@('/setACvalueIndex','scheme_current','sub_buttons','lidAction','0'),
+						@('/setDCvalueIndex','scheme_current','sub_buttons','lidAction','0'),
+						@('/setACvalueindex','scheme_current','sub_pciexpress','ASPM','0'),
+						@('/setDCvalueindex','scheme_current','sub_pciexpress','ASPM','0'),
+						@('/setACvalueindex','scheme_current','2a737441-1930-4402-8d77-b2bebba308a3','48e6b7a6-50f5-4782-a5d4-53bb8f07e226','0'),
+						@('/setDCvalueindex','scheme_current','2a737441-1930-4402-8d77-b2bebba308a3','48e6b7a6-50f5-4782-a5d4-53bb8f07e226','0'),
+						@('/setactive','scheme_current')
+					)) { $null = Invoke-MBSetupNative -File 'powercfg.exe' -Args $c }
+					$row.ok = $true
+				} elseif ($s.section -eq 'software' -and $pkgById.ContainsKey($s.id)) {
+					$inst = Invoke-MBSetupInstallPackage -Package $pkgById[$s.id] -WorkDir $workDir
+					foreach ($k in @($inst.Keys)) { $row[$k] = $inst[$k] }
+					if ($null -eq $row.ok) { $row.ok = [bool]$inst.ok }
+				} else {
+					$r = & $s.run
+					if ($r -is [hashtable] -or $r -is [System.Collections.IDictionary]) {
+						foreach ($k in @($r.Keys)) { $row[$k] = $r[$k] }
+						if ($null -eq $row.ok) { $row.ok = $true }
+					} else { $row.ok = $true }
+				}
+			} catch {
+				$row.ok = $false
+				$row.error = $_.Exception.Message
+			}
+			$isSoftware = ($s.section -eq 'software')
+			if ($row.ok) {
+				if ($isSoftware) {
+					Write-MBSetupProgress -Phase ok -Index $stepIdx -Total $totalSteps -Title ([string]$s.title) -Software
+				} else {
+					Write-MBSetupProgress -Phase ok -Index $stepIdx -Total $totalSteps -Title ([string]$s.title)
+				}
+			} else {
+				$err = if ($row.error) { [string]$row.error } elseif ($row.err) { [string]$row.err } else { 'failed' }
+				if ($isSoftware) {
+					Write-MBSetupProgress -Phase fail -Index $stepIdx -Total $totalSteps -Title ([string]$s.title) -Detail $err -Software
+				} else {
+					Write-MBSetupProgress -Phase fail -Index $stepIdx -Total $totalSteps -Title ([string]$s.title) -Detail $err
+				}
+			}
+			[void]$results.Add($row)
+		}
+	} finally {
+		if ($workDir) { try { Remove-MBTempPath -Path $workDir } catch {} }
+	}
+
+	$okN = @($results | Where-Object { $_.ok }).Count
+	$swOk = @($results | Where-Object { $_.section -eq 'software' -and $_.ok }).Count
+	$swTotal = @($results | Where-Object { $_.section -eq 'software' }).Count
+	$doneNote = 'Device Encryption was turned off during setup. ADWCleaner runs a scan when included. Failed downloads often mean a vendor URL changed.'
+	Write-Host ("  NewMachineSetup done: {0}/{1} OK" -f $okN, $totalSteps) -ForegroundColor $(if ($okN -eq $totalSteps) { 'Green' } else { 'Yellow' })
+	return ConvertTo-MBJson ([ordered]@{
+		ok             = ($okN -eq $results.Count)
+		passed         = $okN
+		total          = $results.Count
+		software_ok    = $swOk
+		software_total = $swTotal
+		skip_software  = [bool]$skip_software
+		note           = $doneNote
+		results        = @($results)
+	}) -Depth 8
+}
+
+function Invoke-MBTool {
+	param(
+		[string]$Name,
+		$ArgsObj
+	)
+	if (-not $ArgsObj) { $ArgsObj = [pscustomobject]@{} }
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+	$resolvedName = Resolve-MBToolName -Name $Name
+	if ($resolvedName -and $resolvedName -ne $Name) {
+		$Name = $resolvedName
+	}
+
+	if ($Name -and -not (Test-MBToolNameActive -Name $Name)) {
+		$allNames = @($Tools | ForEach-Object { $_.function.name })
+		$sw.Stop()
+		$script:MB.LastToolMs = $sw.ElapsedMilliseconds
+		$script:MB.ToolCalls++
+		try { Update-MBWpfLiveChrome } catch {}
+		$match = $null
+		foreach ($n in $allNames) {
+			if ($n -eq $Name -or $n.ToLowerInvariant() -eq $Name.ToLowerInvariant()) { $match = $n; break }
+		}
+		if (-not $match) { $match = Resolve-MBToolName -Name $Name }
+		if ($match) {
+			$hint = Get-MBToolEnableHint -ToolName $match
+			return "ERROR: Tool '$match' is not in the active tool list. $hint"
+		}
+		return "ERROR: Unknown tool '$Name'. Core has file/edit/shell tools. For others: EnableToolGroup using MAP (vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech) then call the real tool name. Do not invent tool names."
+	}
+
+	$guard = Test-MBToolLoopGuard -Name $Name -ArgsObj $ArgsObj
+	if ($guard.Block) {
+		$sw.Stop()
+		$script:MB.LastToolMs = $sw.ElapsedMilliseconds
+		$script:MB.ToolCalls++
+		try { Update-MBWpfLiveChrome } catch {}
+		return [string]$guard.Message
+	}
+	$fp = $guard.Fingerprint
+
+	try {
+		$result = switch ($Name) {
+			"ReadFile" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'head')   { $p['head']   = [int](Get-MBProp $ArgsObj 'head') }
+				if (Test-MBHasProp $ArgsObj 'tail')   { $p['tail']   = [int](Get-MBProp $ArgsObj 'tail') }
+				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = [int](Get-MBProp $ArgsObj 'offset') }
+				if (Test-MBHasProp $ArgsObj 'length') { $p['length'] = [int](Get-MBProp $ArgsObj 'length') }
+				Invoke-ReadFile @p
+			}
+			"WriteFile" {
+				Invoke-WriteFile -path (Get-MBProp $ArgsObj 'path') -content (Get-MBProp $ArgsObj 'content')
+			}
+			"EditFile" {
+				$p = @{
+					path    = (Get-MBProp $ArgsObj 'path')
+					search  = (Get-MBProp $ArgsObj 'search')
+					replace = (Get-MBProp $ArgsObj 'replace')
+				}
+				if (Test-MBHasProp $ArgsObj 'useRegex') { $p['useRegex'] = [bool](Get-MBProp $ArgsObj 'useRegex') }
+				if (Test-MBHasProp $ArgsObj 'replaceAll') { $p['replaceAll'] = [bool](Get-MBProp $ArgsObj 'replaceAll') }
+				if (Test-MBHasProp $ArgsObj 'occurrence') { $p['occurrence'] = [int](Get-MBProp $ArgsObj 'occurrence') }
+				if (Test-MBHasProp $ArgsObj 'edits') { $p['edits'] = (Get-MBProp $ArgsObj 'edits') }
+				Invoke-EditFile @p
+			}
+			"ApplyPatch" {
+				$p = @{ patch = (Get-MBProp $ArgsObj 'patch') }
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				Invoke-ApplyPatch @p
+			}
+			"RunCommand" {
+				$cmd = Get-MBProp $ArgsObj 'command'
+				$shell = Get-MBProp $ArgsObj 'shell' 'powershell'
+				$tsec = 0
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $tsec = [int](Get-MBProp $ArgsObj 'timeout_sec') }
+
+				if (Test-IsSafeCommand $cmd) {
+					Write-Host "    auto (whitelist)" -ForegroundColor Green
+					Invoke-RunCommand -command $cmd -shell $shell -timeout_sec $tsec
+				} else {
+					$cmdDetails = "Shell: $shell`nNot on the safe whitelist; may modify system state."
+					$codeLang = if ([string]$shell -match '^(?i)cmd') { 'bat' } else { 'ps' }
+					if (-not (Request-Confirmation -Title "RunCommand requires approval" -Details $cmdDetails -Code ([string]$cmd) -CodeLang $codeLang)) {
+						Write-Host "    denied" -ForegroundColor Red
+						"BLOCKED BY USER: The user denied this command. Stop and explain why approval is needed."
+					} else {
+						if ($script:MB.AutoApprove) {
+							if ($script:MB.ModeSwitch) { $script:MB.ModeSwitch = $false }
+							else { Write-Host "    auto-approve" -ForegroundColor Green }
+						} else {
+							Write-Host "    approved" -ForegroundColor Green
+						}
+						Invoke-RunCommand -command $cmd -shell $shell -timeout_sec $tsec
+					}
+				}
+			}
+			"ListDirectory" { Invoke-ListDirectory -path (Get-MBProp $ArgsObj 'path' '.') }
+			"SearchFiles" {
+				$p = @{
+					path    = (Get-MBProp $ArgsObj 'path')
+					pattern = (Get-MBProp $ArgsObj 'pattern')
+				}
+				if (Test-MBHasProp $ArgsObj 'glob')       { $p['glob'] = (Get-MBProp $ArgsObj 'glob') }
+				if (Test-MBHasProp $ArgsObj 'recursive')  { $p['recursive'] = [bool](Get-MBProp $ArgsObj 'recursive') }
+				if (Test-MBHasProp $ArgsObj 'ignoreCase') { $p['ignoreCase'] = [bool](Get-MBProp $ArgsObj 'ignoreCase') }
+				if (Test-MBHasProp $ArgsObj 'maxResults') { $p['maxResults'] = [int](Get-MBProp $ArgsObj 'maxResults') }
+				Invoke-SearchFiles @p
+			}
+			"FindFiles" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path' '.') }
+				if (Test-MBHasProp $ArgsObj 'glob') { $p['glob'] = (Get-MBProp $ArgsObj 'glob') }
+				if (Test-MBHasProp $ArgsObj 'modified_within_days') { $p['modified_within_days'] = [int](Get-MBProp $ArgsObj 'modified_within_days') }
+				if (Test-MBHasProp $ArgsObj 'min_bytes') { $p['min_bytes'] = [long](Get-MBProp $ArgsObj 'min_bytes') }
+				if (Test-MBHasProp $ArgsObj 'max_bytes') { $p['max_bytes'] = [long](Get-MBProp $ArgsObj 'max_bytes') }
+				if (Test-MBHasProp $ArgsObj 'recursive') { $p['recursive'] = [bool](Get-MBProp $ArgsObj 'recursive') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				Invoke-FindFiles @p
+			}
+			"ReadImage" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'maxWidth') { $p['maxWidth'] = [int](Get-MBProp $ArgsObj 'maxWidth') }
+				Invoke-ReadImage @p
+			}
+			"ReadPdf" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'maxChars') { $p['maxChars'] = [int](Get-MBProp $ArgsObj 'maxChars') }
+				if (Test-MBHasProp $ArgsObj 'page') { $p['page'] = [int](Get-MBProp $ArgsObj 'page') }
+				if (Test-MBHasProp $ArgsObj 'render') { $p['render'] = [bool](Get-MBProp $ArgsObj 'render') }
+				if (Test-MBHasProp $ArgsObj 'autoVision') { $p['autoVision'] = [bool](Get-MBProp $ArgsObj 'autoVision') }
+				if (Test-MBHasProp $ArgsObj 'maxWidth') { $p['maxWidth'] = [int](Get-MBProp $ArgsObj 'maxWidth') }
+				Invoke-ReadPdf @p
+			}
+			"DiffText" {
+				$p = @{ left = (Get-MBProp $ArgsObj 'left'); right = (Get-MBProp $ArgsObj 'right') }
+				if (Test-MBHasProp $ArgsObj 'leftIsFile')  { $p['leftIsFile']  = [bool](Get-MBProp $ArgsObj 'leftIsFile') }
+				if (Test-MBHasProp $ArgsObj 'rightIsFile') { $p['rightIsFile'] = [bool](Get-MBProp $ArgsObj 'rightIsFile') }
+				Invoke-DiffText @p
+			}
+			"GetWorkingDirectory" { Invoke-GetWorkingDirectory }
+			"SetWorkingDirectory" { Invoke-SetWorkingDirectory -path (Get-MBProp $ArgsObj 'path') }
+			"GetEnvironment"      { Invoke-GetEnvironment -name (Get-MBProp $ArgsObj 'name') }
+			"SetEnvironment" {
+				$p = @{
+					name  = (Get-MBProp $ArgsObj 'name')
+					value = (Get-MBProp $ArgsObj 'value')
+				}
+				if (Test-MBHasProp $ArgsObj 'target') { $p['target'] = (Get-MBProp $ArgsObj 'target') }
+				Invoke-SetEnvironment @p
+			}
+			"GetSystemInfo"       { Invoke-GetSystemInfo }
+			"GetProcessList" {
+				$lim = 15
+				if (Test-MBHasProp $ArgsObj 'limit') { $lim = [int](Get-MBProp $ArgsObj 'limit') }
+				Invoke-GetProcessList -limit $lim
+			}
+			"GetProcessTree" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'root_pid') { $p['root_pid'] = [int](Get-MBProp $ArgsObj 'root_pid') }
+				if (Test-MBHasProp $ArgsObj 'max_depth') { $p['max_depth'] = [int](Get-MBProp $ArgsObj 'max_depth') }
+				if (Test-MBHasProp $ArgsObj 'max_nodes') { $p['max_nodes'] = [int](Get-MBProp $ArgsObj 'max_nodes') }
+				Invoke-GetProcessTree @p
+			}
+			"GetNetConnections" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'state') { $p['state'] = (Get-MBProp $ArgsObj 'state') }
+				if (Test-MBHasProp $ArgsObj 'port') { $p['port'] = [int](Get-MBProp $ArgsObj 'port') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				Invoke-GetNetConnections @p
+			}
+			"Clipboard" {
+				Invoke-Clipboard -action (Get-MBProp $ArgsObj 'action') -text (Get-MBProp $ArgsObj 'text')
+			}
+			"ViewScreen" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path')     { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'save')     { $p['save'] = [bool](Get-MBProp $ArgsObj 'save') }
+				if (Test-MBHasProp $ArgsObj 'monitor')  { $p['monitor'] = (Get-MBProp $ArgsObj 'monitor') }
+				if (Test-MBHasProp $ArgsObj 'x')        { $p['x'] = [int](Get-MBProp $ArgsObj 'x') }
+				if (Test-MBHasProp $ArgsObj 'y')        { $p['y'] = [int](Get-MBProp $ArgsObj 'y') }
+				if (Test-MBHasProp $ArgsObj 'width')    { $p['width'] = [int](Get-MBProp $ArgsObj 'width') }
+				if (Test-MBHasProp $ArgsObj 'height')   { $p['height'] = [int](Get-MBProp $ArgsObj 'height') }
+				if (Test-MBHasProp $ArgsObj 'maxWidth') { $p['maxWidth'] = [int](Get-MBProp $ArgsObj 'maxWidth') }
+				Invoke-ViewScreen @p
+			}
+			"GetBSODInfo"             { Invoke-GetBSODInfo }
+			"GetEventLogs" {
+				$h = 72
+				if (Test-MBHasProp $ArgsObj 'hours') { $h = [int](Get-MBProp $ArgsObj 'hours') }
+				Invoke-GetEventLogs -hours $h
+			}
+			"GetDiskHealth"           { Invoke-GetDiskHealth }
+			"GetDiskSpace" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path' 'C:\') }
+				if (Test-MBHasProp $ArgsObj 'deep') { $p['deep'] = [bool](Get-MBProp $ArgsObj 'deep') }
+				if (Test-MBHasProp $ArgsObj 'top') { $p['top'] = [int](Get-MBProp $ArgsObj 'top') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
+				Invoke-GetDiskSpace @p
+			}
+			"GetInstalledSoftware" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'max')  { $p['max']  = [int](Get-MBProp $ArgsObj 'max') }
+				Invoke-GetInstalledSoftware @p
+			}
+			"GetDriverInfo" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'filter')  { $p['filter']  = (Get-MBProp $ArgsObj 'filter') }
+				if (Test-MBHasProp $ArgsObj 'limit')   { $p['limit']   = [int](Get-MBProp $ArgsObj 'limit') }
+				if (Test-MBHasProp $ArgsObj 'showAll') { $p['showAll'] = [bool](Get-MBProp $ArgsObj 'showAll') }
+				Invoke-GetDriverInfo @p
+			}
+			"GetStartupItems"         { Invoke-GetStartupItems }
+			"GetMemoryInfo"           { Invoke-GetMemoryInfo }
+			"GetNetworkInfo"          { Invoke-GetNetworkInfo }
+			"GetWindowsUpdateStatus"  { Invoke-GetWindowsUpdateStatus }
+			"GetSystemUptime"         { Invoke-GetSystemUptime }
+			"RunQuickDiagnostics"     { Invoke-RunQuickDiagnostics }
+			"RunRepairTool" {
+				$p = @{ tool = (Get-MBProp $ArgsObj 'tool') }
+				if (Test-MBHasProp $ArgsObj 'driveLetter') { $p['driveLetter'] = (Get-MBProp $ArgsObj 'driveLetter') }
+				if (Test-MBHasProp $ArgsObj 'arguments')   { $p['arguments']   = (Get-MBProp $ArgsObj 'arguments') }
+				Invoke-RunRepairTool @p
+			}
+			"GetServiceStatus" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'status') { $p['status'] = (Get-MBProp $ArgsObj 'status') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				Invoke-GetServiceStatus @p
+			}
+			"ControlService" {
+				$p = @{
+					name   = (Get-MBProp $ArgsObj 'name')
+					action = (Get-MBProp $ArgsObj 'action')
+				}
+				if (Test-MBHasProp $ArgsObj 'startup_type') { $p['startup_type'] = (Get-MBProp $ArgsObj 'startup_type') }
+				Invoke-ControlService @p
+			}
+			"DownloadFile" {
+				$p = @{
+					url  = (Get-MBProp $ArgsObj 'url')
+					path = (Get-MBProp $ArgsObj 'path')
+				}
+				if (Test-MBHasProp $ArgsObj 'overwrite')   { $p['overwrite']   = [bool](Get-MBProp $ArgsObj 'overwrite') }
+				if (Test-MBHasProp $ArgsObj 'max_mb')      { $p['max_mb']      = [int](Get-MBProp $ArgsObj 'max_mb') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
+				Invoke-DownloadFile @p
+			}
+			"ExpandArchive" {
+				$p = @{
+					path        = (Get-MBProp $ArgsObj 'path')
+					destination = (Get-MBProp $ArgsObj 'destination')
+				}
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = [bool](Get-MBProp $ArgsObj 'force') }
+				Invoke-ExpandArchive @p
+			}
+			"CompressArchive" {
+				$p = @{
+					path        = (Get-MBProp $ArgsObj 'path')
+					destination = (Get-MBProp $ArgsObj 'destination')
+				}
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = [bool](Get-MBProp $ArgsObj 'force') }
+				Invoke-CompressArchive @p
+			}
+			"FindPSModule" {
+				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'max_results') { $p['max_results'] = [int](Get-MBProp $ArgsObj 'max_results') }
+				Invoke-FindPSModule @p
+			}
+			"GetInstalledPSModule" {
+				Invoke-GetInstalledPSModule -name (Get-MBProp $ArgsObj 'name')
+			}
+			"InstallPSModule" {
+				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'version')          { $p['version'] = (Get-MBProp $ArgsObj 'version') }
+				if (Test-MBHasProp $ArgsObj 'scope')            { $p['scope'] = (Get-MBProp $ArgsObj 'scope') }
+				if (Test-MBHasProp $ArgsObj 'allow_prerelease') { $p['allow_prerelease'] = [bool](Get-MBProp $ArgsObj 'allow_prerelease') }
+				Invoke-InstallPSModule @p
+			}
+			"UpdatePSModule" {
+				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'scope') { $p['scope'] = (Get-MBProp $ArgsObj 'scope') }
+				Invoke-UpdatePSModule @p
+			}
+			"ReadRegistry"     { Invoke-ReadRegistry -path (Get-MBProp $ArgsObj 'path') }
+			"SetRegistry" {
+				$p = @{
+					path  = (Get-MBProp $ArgsObj 'path')
+					name  = (Get-MBProp $ArgsObj 'name')
+					value = (Get-MBProp $ArgsObj 'value')
+				}
+				if (Test-MBHasProp $ArgsObj 'type') { $p['type'] = (Get-MBProp $ArgsObj 'type') }
+				Invoke-SetRegistry @p
+			}
+			"GetPowerInfo"     { Invoke-GetPowerInfo }
+			"GetScheduledTasks" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'days')            { $p['days'] = [int](Get-MBProp $ArgsObj 'days') }
+				if (Test-MBHasProp $ArgsObj 'filter')          { $p['filter'] = (Get-MBProp $ArgsObj 'filter') }
+				if (Test-MBHasProp $ArgsObj 'includeDisabled') { $p['includeDisabled'] = [bool](Get-MBProp $ArgsObj 'includeDisabled') }
+				if (Test-MBHasProp $ArgsObj 'exportPath')      { $p['exportPath'] = (Get-MBProp $ArgsObj 'exportPath') }
+				Invoke-GetScheduledTasks @p
+			}
+			"MakeHttpRequest" {
+				$httpParams = @{
+					method = (Get-MBProp $ArgsObj 'method')
+					url    = (Get-MBProp $ArgsObj 'url')
+				}
+				foreach ($opt in @('headers','params','json_body','form_data','raw_data','bearer_token','basic_auth_username','basic_auth_password','cookies','content_type','user_agent')) {
+					if (Test-MBHasProp $ArgsObj $opt) {
+						$v = Get-MBProp $ArgsObj $opt
+						if ($null -ne $v) { $httpParams[$opt] = $v }
+					}
+				}
+				if (Test-MBHasProp $ArgsObj 'verify_ssl') { $httpParams['verify_ssl'] = [bool](Get-MBProp $ArgsObj 'verify_ssl') }
+				if (Test-MBHasProp $ArgsObj 'timeout')    { $httpParams['timeout']    = [int](Get-MBProp $ArgsObj 'timeout') }
+				Invoke-MakeHttpRequest @httpParams
+			}
+			"BrowsePage" {
+				$p = @{ url = (Get-MBProp $ArgsObj 'url') }
+				if (Test-MBHasProp $ArgsObj 'max_length')    { $p['max_length']    = [int](Get-MBProp $ArgsObj 'max_length') }
+				if (Test-MBHasProp $ArgsObj 'verify_ssl')    { $p['verify_ssl']    = [bool](Get-MBProp $ArgsObj 'verify_ssl') }
+				if (Test-MBHasProp $ArgsObj 'user_agent')    { $p['user_agent']    = (Get-MBProp $ArgsObj 'user_agent') }
+				if (Test-MBHasProp $ArgsObj 'extract_links') { $p['extract_links'] = [bool](Get-MBProp $ArgsObj 'extract_links') }
+				Invoke-BrowsePage @p
+			}
+			"ConvertGitHubUrl"    { Invoke-ConvertGitHubUrl -github_url (Get-MBProp $ArgsObj 'github_url') }
+			"GetGitHubRawFile" {
+				$ml = 15000
+				if (Test-MBHasProp $ArgsObj 'max_length') { $ml = [int](Get-MBProp $ArgsObj 'max_length') }
+				Invoke-GetGitHubRawFile -github_url (Get-MBProp $ArgsObj 'github_url') -max_length $ml
+			}
+			"ListGitHubDirectory" {
+				$ref = "main"
+				if (Test-MBHasProp $ArgsObj 'ref') { $ref = (Get-MBProp $ArgsObj 'ref') }
+				Invoke-ListGitHubDirectory -github_url (Get-MBProp $ArgsObj 'github_url') -ref $ref
+			}
+			"SandBoxWrite" {
+				$script:MB_ToolArgs = $ArgsObj
+				try { Invoke-SandBoxWrite } finally { $script:MB_ToolArgs = $null }
+			}
+			"SandBox" {
+				$script:MB_ToolArgs = $ArgsObj
+				try { Invoke-SandBox } finally { $script:MB_ToolArgs = $null }
+			}
+			"SandBoxList"    { Invoke-SandBoxList }
+			"GetSandBoxInfo" { Invoke-GetSandBoxInfo }
+			"ClearSandBox"   {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'all') { $p['all'] = (Get-MBProp $ArgsObj 'all') }
+				if (Test-MBHasProp $ArgsObj 'clear_all') { $p['clear_all'] = (Get-MBProp $ArgsObj 'clear_all') }
+				Invoke-ClearSandBox @p
+			}
+			"SpeakText" {
+				$p = @{ text = (Get-MBProp $ArgsObj 'text') }
+				if (Test-MBHasProp $ArgsObj 'rate') { $p['rate'] = [int](Get-MBProp $ArgsObj 'rate') }
+				if (Test-MBHasProp $ArgsObj 'wait') { $p['wait'] = [bool](Get-MBProp $ArgsObj 'wait') }
+				Invoke-SpeakText @p
+			}
+			"AudioVolume" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'action') { $p['action'] = (Get-MBProp $ArgsObj 'action') }
+				if (Test-MBHasProp $ArgsObj 'level') { $p['level'] = [int](Get-MBProp $ArgsObj 'level') }
+				Invoke-AudioVolume @p
+			}
+			"DisplayBrightness" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'action') { $p['action'] = (Get-MBProp $ArgsObj 'action') }
+				if (Test-MBHasProp $ArgsObj 'level') { $p['level'] = [int](Get-MBProp $ArgsObj 'level') }
+				Invoke-DisplayBrightness @p
+			}
+			"ListWindowsOptions" { Invoke-ListWindowsOptions }
+			"SetWindowsOption" {
+				$p = @{
+					option = (Get-MBProp $ArgsObj 'option')
+					value  = (Get-MBProp $ArgsObj 'value')
+				}
+				if (Test-MBHasProp $ArgsObj 'drive') { $p['drive'] = (Get-MBProp $ArgsObj 'drive') }
+				Invoke-SetWindowsOption @p
+			}
+			"SystemRestore" {
+				$p = @{ action = (Get-MBProp $ArgsObj 'action') }
+				if (Test-MBHasProp $ArgsObj 'description') { $p['description'] = (Get-MBProp $ArgsObj 'description') }
+				if (Test-MBHasProp $ArgsObj 'drive') { $p['drive'] = (Get-MBProp $ArgsObj 'drive') }
+				Invoke-SystemRestore @p
+			}
+			"UninstallSoftware" {
+				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'product_code') { $p['product_code'] = (Get-MBProp $ArgsObj 'product_code') }
+				Invoke-UninstallSoftware @p
+			}
+			"NewMachineSetup" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'dry_run') { $p['dry_run'] = [bool](Get-MBProp $ArgsObj 'dry_run') }
+				if (Test-MBHasProp $ArgsObj 'timezone') { $p['timezone'] = (Get-MBProp $ArgsObj 'timezone') }
+				if (Test-MBHasProp $ArgsObj 'skip_restore_point') { $p['skip_restore_point'] = [bool](Get-MBProp $ArgsObj 'skip_restore_point') }
+				if (Test-MBHasProp $ArgsObj 'skip_software') { $p['skip_software'] = [bool](Get-MBProp $ArgsObj 'skip_software') }
+				Invoke-NewMachineSetup @p
+			}
+			"ListInstallers" {
+				Invoke-ListInstallers
+			}
+			"InstallPackage" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'package') { $p['package'] = (Get-MBProp $ArgsObj 'package') }
+				if (Test-MBHasProp $ArgsObj 'packages') { $p['packages'] = (Get-MBProp $ArgsObj 'packages') }
+				Invoke-InstallPackage @p
+			}
+			"EnableToolGroup" { Enable-MBToolGroup -Group (Get-MBProp $ArgsObj 'group') }
+			"ListToolGroups"  { Get-MBToolGroupsStatus }
+			default {
+				$hint = Get-MBToolEnableHint -ToolName $Name
+				$resolved = Resolve-MBToolName -Name $Name
+				if ($resolved) {
+					"ERROR: Tool '$resolved' is not dispatched (inactive group or typo). $hint"
+				} else {
+					"ERROR: Unknown tool '$Name'. $hint"
+				}
+			}
+		}
+	} catch {
+		$exType = try { $_.Exception.GetType().FullName } catch { 'Exception' }
+		$stack = ''
+		try {
+			if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+				$stack = [string]$_.InvocationInfo.PositionMessage
+			}
+		} catch {}
+		$result = "ERROR in ${Name}: [$exType] $($_.Exception.Message)"
+		if ($stack) { $result += "`n$stack" }
+		if ("$($_.Exception.Message)" -match 'types do not match|cannot convert|parameterbinding') {
+			$result += "`nHINT: SandBox tools read args via `$script:MB_ToolArgs (no typed params). If you still see this, an internal helper is typed — report the stack above."
+		}
+	}
+
+	$sw.Stop()
+	$script:MB.LastToolMs = $sw.ElapsedMilliseconds
+	$script:MB.ToolCalls++
+	try { Update-MBWpfLiveChrome } catch {}
+
+	$text = if ($null -eq $result) { "" } elseif ($result -is [string]) { $result } else { ($result | Out-String).Trim() }
+	$text = Limit-MBResult $text
+
+	if ($guard -and -not $guard.Block) {
+		$previewNote = $text
+		$wasConfirmed = $false
+		if ($guard.Confirmed) {
+			$previewNote = "[timing retest - one-shot]`n" + $text
+			$wasConfirmed = $true
+		}
+		Register-MBToolExecution -Fingerprint $fp -ResultPreview $previewNote -WasConfirmed $wasConfirmed
+	}
+
+	return $text
+}
+
+
+function Get-MBAuthHeaders {
+	$h = @{
+		'Content-Type' = 'application/json'
+		'Accept'       = 'application/json'
+	}
+	if ($script:MB.NpmUser -and $script:MB.NpmPass) {
+		$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$($script:MB.NpmUser):$($script:MB.NpmPass)")
+		$h['Authorization'] = "Basic " + [Convert]::ToBase64String($authBytes)
+	} elseif (Test-MBShouldSendAuthHeader) {
+		$h['Authorization'] = "Bearer $ApiKey"
+	}
+	return $h
+}
+
+function Invoke-MBServerJson {
+	param(
+		[string]$Method = 'POST',
+		[Parameter(Mandatory = $true)][string]$Path,
+		$BodyObject = $null,
+		[int]$TimeoutSec = 20
+	)
+	$apiBase = (Get-MBApiBaseUrl).TrimEnd('/')
+	$path = '/' + ($Path.TrimStart('/'))
+	$url = $apiBase + $path
+	$headers = Get-MBAuthHeaders
+	if ($headers -is [hashtable] -and $headers.ContainsKey('Content-Type')) {
+		$headers.Remove('Content-Type')
+	}
+	$iwr = @{
+		Uri             = $url
+		Method          = $Method.ToUpper()
+		Headers         = $headers
+		UseBasicParsing = $true
+		TimeoutSec      = $TimeoutSec
+	}
+	if ($null -ne $BodyObject -and $Method.ToUpper() -ne 'GET') {
+		$json = ConvertTo-MBRequestJson -Object $BodyObject -Depth 30
+		$iwr['Body'] = [byte[]](Get-MBUtf8JsonBytes -Json $json)
+		$iwr['ContentType'] = 'application/json; charset=utf-8'
+	}
+	$prev = $Global:ProgressPreference
+	try {
+		$Global:ProgressPreference = 'SilentlyContinue'
+		$resp = Invoke-WebRequest @iwr -ErrorAction Stop
+		$text = [string]$resp.Content
+		if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+		try { return ($text | ConvertFrom-Json -ErrorAction Stop) } catch { return $text }
+	} finally {
+		$Global:ProgressPreference = $prev
+	}
+}
+
+function Get-MBTokenizeCount {
+	param([AllowNull()][string]$Text)
+	if ($null -eq $Text) { $Text = '' }
+	if ($script:MB.ServerTokenize -eq $false) { return -1 }
+	$Text = Sanitize-MBText -Text ([string]$Text)
+
+	$body = @{
+		content       = $Text
+		add_special   = $false
+		parse_special = $true
+	}
+	foreach ($path in @('tokenize', 'v1/tokenize')) {
+		try {
+			$obj = Invoke-MBServerJson -Method POST -Path $path -BodyObject $body -TimeoutSec 30
+			if ($null -eq $obj) { continue }
+			$tokens = Get-MBProp $obj 'tokens'
+			if ($null -eq $tokens) { continue }
+			$arr = @($tokens)
+			$script:MB.ServerTokenize = $true
+			return [int]$arr.Count
+		} catch {
+			continue
+		}
+	}
+	return -1
+}
+
+function Get-MBApplyTemplatePrompt {
+	param([array]$Messages)
+	$norm = @(Normalize-MBMessagesForApi -Messages $Messages)
+	$body = @{ messages = $norm }
+	foreach ($path in @('apply-template', 'v1/apply-template')) {
+		try {
+			$obj = Invoke-MBServerJson -Method POST -Path $path -BodyObject $body -TimeoutSec 30
+			if ($null -eq $obj) { continue }
+			$p = Get-MBProp $obj 'prompt'
+			if ($p) { return [string]$p }
+		} catch {
+			continue
+		}
+	}
+	return $null
+}
+
+function Get-MBEstimatedPromptTokens {
+	param(
+		[int]$MsgChars,
+		[int]$ToolPayloadChars,
+		[int]$ToolsTok
+	)
+	$toolTokEst = [math]::Ceiling([math]::Max(0, $ToolPayloadChars) / 2.5)
+	$otherChars = [math]::Max(0, $MsgChars - $ToolPayloadChars)
+	$otherTokEst = [math]::Ceiling($otherChars / 3.0)
+	return [int]($toolTokEst + $otherTokEst + [math]::Max(0, $ToolsTok))
+}
+
+function Get-MBAccuratePromptTokens {
+	param(
+		[array]$Messages,
+		[int]$MsgChars = 0,
+		[int]$ToolPayloadChars = 0
+	)
+
+	$toolsTok = [int]$script:MB.ToolsOverheadTok
+	$cacheKey = '{0}|{1}|{2}|{3}' -f @($Messages).Count, $MsgChars, $toolsTok, $script:MB.WorkingDir
+	$now = Get-Date
+	if ($script:MB.TokCacheKey -eq $cacheKey -and $script:MB.TokCacheTokens -gt 0) {
+		$age = ($now - [datetime]$script:MB.TokCacheAt).TotalSeconds
+		if ($age -ge 0 -and $age -lt 8) {
+			return [pscustomobject]@{ Tokens = [int]$script:MB.TokCacheTokens; Source = [string]$script:MB.TokenCountSource }
+		}
+	}
+
+	if ($script:MB.ServerTokenize -ne $false) {
+		try {
+			$prompt = Get-MBApplyTemplatePrompt -Messages $Messages
+			if (-not $prompt) {
+				$parts = New-Object System.Collections.ArrayList
+				foreach ($m in @(Normalize-MBMessagesForApi -Messages $Messages)) {
+					$r = [string](Get-MBProp $m 'role')
+					$c = Sanitize-MBText -Text ([string](Get-MBProp $m 'content'))
+					[void]$parts.Add("${r}: $c")
+					$tcs = Get-MBProp $m 'tool_calls'
+					if ($tcs) {
+						try { [void]$parts.Add((ConvertTo-MBRequestJson -Object $tcs -Depth 8)) } catch {}
+					}
+				}
+				$prompt = ($parts -join "`n")
+			}
+			$n = Get-MBTokenizeCount -Text $prompt
+			if ($n -ge 0) {
+				$total = $n + [math]::Max(0, $toolsTok)
+				$script:MB.TokCacheKey = $cacheKey
+				$script:MB.TokCacheTokens = $total
+				$script:MB.TokCacheAt = $now
+				$script:MB.TokenCountSource = 'server'
+				return [pscustomobject]@{ Tokens = $total; Source = 'server' }
+			}
+		} catch {}
+		if ($null -eq $script:MB.ServerTokenize) {
+			$script:MB.ServerTokenize = $false
+		}
+	}
+
+	if ([int]$script:MB.LastServerPromptTokens -gt 0) {
+		$script:MB.TokenCountSource = 'usage'
+		return [pscustomobject]@{ Tokens = [int]$script:MB.LastServerPromptTokens; Source = 'usage' }
+	}
+
+	$est = Get-MBEstimatedPromptTokens -MsgChars $MsgChars -ToolPayloadChars $ToolPayloadChars -ToolsTok $toolsTok
+	$script:MB.TokenCountSource = 'estimate'
+	$script:MB.TokCacheKey = $cacheKey
+	$script:MB.TokCacheTokens = $est
+	$script:MB.TokCacheAt = $now
+	return [pscustomobject]@{ Tokens = $est; Source = 'estimate' }
+}
+
+function Get-MBEffectivePromptBudget {
+	$window = [math]::Max(2048, [int]$script:MB.ContextWindow)
+	$reserve = Get-MBCompletionReserve
+	$usable = $window - $reserve
+	if ($usable -lt 1024) { $usable = [math]::Max(1024, $window - 512) }
+	return $usable
+}
+
+function Get-MBCompletionReserve {
+	$window = [math]::Max(2048, [int]$script:MB.ContextWindow)
+	$want = [math]::Max(1024, [int]$MaxTokens)
+	# Allow large MaxTokens on large context windows
+	$maxShare = [math]::Floor($window * 0.60)
+	if ($maxShare -lt 1024) { $maxShare = [math]::Floor($window * 0.45) }
+	if ($want -gt $maxShare) { $want = $maxShare }
+	if ($want -lt 512) { $want = 512 }
+	return [int]$want
+}
+
+function Get-MBRequestMaxTokens {
+	param(
+		[array]$Messages,
+		[int]$Floor = 1024
+	)
+	$cap = [math]::Max(256, [int]$MaxTokens)
+	$window = [math]::Max(2048, [int]$script:MB.ContextWindow)
+	$promptTok = 0
+	try {
+		$est = Get-MBContextEstimate -Messages $Messages
+		$promptTok = [int]$est.PromptTokens
+	} catch {
+		try { $promptTok = [int]$script:MB.LastCtxTokens } catch { $promptTok = 0 }
+	}
+	if ($promptTok -lt 0) { $promptTok = 0 }
+	$overhead = 256
+	try {
+		$to = [int]$script:MB.ToolsOverheadTok
+		if ($to -gt 0) { $overhead = [math]::Max(256, [math]::Min(8000, [int]($to * 0.15) + 256)) }
+	} catch {}
+	$room = $window - $promptTok - $overhead
+	if ($room -lt $Floor) { $room = $Floor }
+	$use = [math]::Min($cap, $room)
+	if ($use -lt $Floor -and $room -ge $Floor) { $use = $Floor }
+	if ($use -lt 256) { $use = 256 }
+	try { $script:MB.LastRequestMaxTokens = [int]$use } catch {}
+	return [int]$use
+}
+
+function Initialize-MBToolsOverhead {
+	try {
+		$activeTools = @(Get-MBActiveTools)
+		$tj = ConvertTo-Json -InputObject $activeTools -Depth 20 -Compress
+		$script:MB.ToolsOverheadChars = $tj.Length
+		$n = Get-MBTokenizeCount -Text $tj
+		if ($n -ge 0) {
+			$script:MB.ToolsOverheadTok = $n
+		} else {
+			$script:MB.ToolsOverheadTok = [math]::Ceiling($tj.Length / 2.4)
+		}
+	} catch {
+		$script:MB.ToolsOverheadChars = 40000
+		$script:MB.ToolsOverheadTok = 16000
+	}
+}
+
+function Initialize-MBTokenCounting {
+	try {
+		$n = Get-MBTokenizeCount -Text 'hello'
+		if ($n -ge 0) {
+			$script:MB.ServerTokenize = $true
+			$script:MB.TokenizeProbeTok = $n
+		} else {
+			$script:MB.ServerTokenize = $false
+			$script:MB.TokenizeProbeTok = -1
+		}
+	} catch {
+		$script:MB.ServerTokenize = $false
+		$script:MB.TokenizeProbeTok = -1
+	}
+}
+
+function Get-MBMessageCharCount {
+	param($Message)
+	if ($null -eq $Message) { return 0 }
+	$n = 0
+	$c = Get-MBProp $Message 'content'
+	if ($null -ne $c) { $n += ([string]$c).Length }
+	$role = Get-MBProp $Message 'role'
+	if ($role) { $n += ([string]$role).Length + 8 }
+	$tcid = Get-MBProp $Message 'tool_call_id'
+	if ($tcid) { $n += ([string]$tcid).Length + 16 }
+	$tcs = Get-MBProp $Message 'tool_calls'
+	if ($tcs) {
+		try {
+			$n += (ConvertTo-Json -InputObject $tcs -Depth 8 -Compress).Length
+		} catch {
+			$n += 200
+		}
+	}
+	return $n
+}
+
+function Get-MBContextEstimate {
+	param(
+		[array]$Messages,
+		[switch]$ForceRefresh
+	)
+
+	$msgChars = 0
+	$byRole = @{ system = 0; user = 0; assistant = 0; tool = 0; other = 0 }
+	$msgCount = 0
+	$chatMsgCount = 0
+	$toolPayloadChars = 0
+
+	foreach ($m in @($Messages)) {
+		if ($null -eq $m) { continue }
+		$msgCount++
+		$ch = Get-MBMessageCharCount -Message $m
+		$msgChars += $ch
+		$role = [string](Get-MBProp $m 'role')
+		if (-not $role) { $role = 'other' }
+		if ($byRole.ContainsKey($role)) { $byRole[$role] += $ch } else { $byRole['other'] += $ch }
+		# Status message count excludes system/sticky (empty chat = 0)
+		if ($role -ne 'system') { $chatMsgCount++ }
+		if ($role -eq 'tool') {
+			$tc = Get-MBProp $m 'content'
+			if ($tc) { $toolPayloadChars += ([string]$tc).Length }
+		}
+	}
+
+	$toolsChars = [int]$script:MB.ToolsOverheadChars
+	$toolsTok   = [int]$script:MB.ToolsOverheadTok
+	$totalChars = $msgChars + $toolsChars
+
+	if ($ForceRefresh) {
+		$script:MB.TokCacheKey = ''
+		$script:MB.TokCacheTokens = 0
+	}
+
+	$acc = Get-MBAccuratePromptTokens -Messages $Messages -MsgChars $msgChars -ToolPayloadChars $toolPayloadChars
+	$promptTokens = [int]$acc.Tokens
+	$tokSource = [string]$acc.Source
+
+	$window = [math]::Max(2048, [int]$script:MB.ContextWindow)
+	$reserve = Get-MBCompletionReserve
+	# Prompt budget = n_ctx minus completion reserve
+	$usable = Get-MBEffectivePromptBudget
+
+	$pct = if ($usable -gt 0) { [math]::Min(3.0, $promptTokens / [double]$usable) } else { 1.0 }
+
+	$level = 'ok'
+	if ($pct -ge [double]$script:MB.ContextHardPct) { $level = 'hard' }
+	elseif ($pct -ge [double]$script:MB.ContextSoftPct) { $level = 'soft' }
+
+	$script:MB.LastCtxChars  = $totalChars
+	$script:MB.LastCtxTokens = $promptTokens
+	$script:MB.LastCtxPct    = $pct
+	$script:MB.LastCtxLevel  = $level
+	$script:MB.TokenCountSource = $tokSource
+
+	return [pscustomobject]@{
+		MessageCount     = $msgCount
+		ChatMessageCount = $chatMsgCount
+		MessageChars     = $msgChars
+		ToolPayloadChars = $toolPayloadChars
+		ToolsChars       = $toolsChars
+		ToolsTokens      = $toolsTok
+		TotalChars       = $totalChars
+		PromptTokens     = $promptTokens
+		UsableTokens     = $usable
+		WindowTokens     = $window
+		ReserveTokens    = $reserve
+		Pct              = $pct
+		Level            = $level
+		ByRoleChars      = $byRole
+		TokenSource      = $tokSource
+	}
+}
+
+function Get-MBStickySystemContent {
+	$lines = New-Object System.Collections.ArrayList
+	[void]$lines.Add("$script:MB_STATE_MARKER - always trust this over older chat if conflict]")
+	[void]$lines.Add("Machine: $env:COMPUTERNAME  User: $env:USERNAME")
+	[void]$lines.Add("CWD: $($script:MB.WorkingDir)")
+	[void]$lines.Add("AutoApprove: $($script:MB.AutoApprove)")
+	# Omit live token stats from this system message
+	# live stats change every request and break prompt cache.
+
+	$findings = @($script:MB.StickyFindings)
+	if ($findings.Count -gt 0) {
+		[void]$lines.Add("Findings:")
+		foreach ($f in $findings) { [void]$lines.Add(" - $f") }
+	} else {
+		[void]$lines.Add("Findings: (none pinned)")
+	}
+
+	$notes = @($script:MB.StickyNotes)
+	if ($notes.Count -gt 0) {
+		[void]$lines.Add("Notes:")
+		foreach ($n in $notes) { [void]$lines.Add(" - $n") }
+	}
+
+	if ($script:MB.StickyExtra) {
+		[void]$lines.Add("Session summary:")
+		[void]$lines.Add([string]$script:MB.StickyExtra)
+	}
+
+	return ($lines -join "`n")
+}
+
+function Test-MBIsStateMessage {
+	param($Message)
+	$c = Get-MBProp $Message 'content'
+	$r = Get-MBProp $Message 'role'
+	if ($r -ne 'system') { return $false }
+	if ($null -eq $c) { return $false }
+	return ([string]$c).StartsWith($script:MB_STATE_MARKER)
+}
+
+function Test-MBIsBaseSystemMessage {
+	param($Message)
+	$r = Get-MBProp $Message 'role'
+	if ($r -ne 'system') { return $false }
+	if (Test-MBIsStateMessage $Message) { return $false }
+	$c = [string](Get-MBProp $Message 'content')
+	# Main system prompt starts with agent identity
+	return $c.StartsWith("You are $AgentName") -or $c.StartsWith("You are ")
+}
+
+function Sync-MBSystemMessages {
+	param([array]$Messages)
+
+	$baseContent = Get-MBSystemPrompt
+	$stateContent = Get-MBStickySystemContent
+
+	# Reuse system message objects when text unchanged (stable prefix for prompt cache)
+	$prevBase = $null
+	$prevState = $null
+	$rest = New-Object System.Collections.ArrayList
+	foreach ($m in @($Messages)) {
+		if ($null -eq $m) { continue }
+		if (Test-MBIsStateMessage $m) {
+			$prevState = $m
+			continue
+		}
+		if (Test-MBIsBaseSystemMessage $m) {
+			$prevBase = $m
+			continue
+		}
+		$c = [string](Get-MBProp $m 'content')
+		$r = Get-MBProp $m 'role'
+		if ($r -eq 'system' -and $c.StartsWith('[Context compacted:')) { continue }
+		[void]$rest.Add($m)
+	}
+
+	if ($prevBase -and ([string](Get-MBProp $prevBase 'content') -eq $baseContent)) {
+		$baseSystem = $prevBase
+	} else {
+		$baseSystem = @{ role = 'system'; content = $baseContent }
+	}
+	if ($prevState -and ([string](Get-MBProp $prevState 'content') -eq $stateContent)) {
+		$stateMsg = $prevState
+	} else {
+		$stateMsg = @{ role = 'system'; content = $stateContent }
+	}
+
+	$out = New-Object System.Collections.ArrayList
+	[void]$out.Add($baseSystem)
+	[void]$out.Add($stateMsg)
+	foreach ($m in $rest) { [void]$out.Add($m) }
+	return $out.ToArray()
+}
+
+function Add-MBStickyNote {
+	param([string]$Text, [ValidateSet('note','finding')]$Kind = 'note')
+	$Text = ($Text -replace '\s+', ' ').Trim()
+	if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+	if ($Text.Length -gt 400) { $Text = $Text.Substring(0, 397) + '...' }
+
+	$list = if ($Kind -eq 'finding') { $script:MB.StickyFindings } else { $script:MB.StickyNotes }
+	foreach ($x in @($list)) {
+		if ([string]$x -eq $Text) { return $false }
+	}
+	[void]$list.Add($Text)
+	while ($list.Count -gt 12) { $list.RemoveAt(0) }
+	return $true
+}
+
+function Clear-MBSticky {
+	$script:MB.StickyNotes.Clear()
+	$script:MB.StickyFindings.Clear()
+	$script:MB.StickyExtra = ''
+}
+
+function Shrink-MBToolPayloads {
+	param(
+		[array]$Messages,
+		[int]$RecentKeep = 6,
+		[int]$OldMaxChars = 2500,
+		[int]$RecentMaxChars = 12000
+	)
+	$out = New-Object System.Collections.ArrayList
+	$total = @($Messages).Count
+	$i = 0
+	foreach ($m in @($Messages)) {
+		$i++
+		$role = Get-MBProp $m 'role'
+		$content = Get-MBProp $m 'content'
+		$isRecent = ($i -gt ($total - $RecentKeep))
+		if ($role -eq 'tool' -and $content) {
+			$s = [string]$content
+			$cap = if ($isRecent) { $RecentMaxChars } else { $OldMaxChars }
+			if ($s.Length -gt $cap) {
+				[void]$out.Add(@{
+					role         = 'tool'
+					tool_call_id = [string](Get-MBProp $m 'tool_call_id')
+					content      = (Limit-MBResult $s $cap)
+				})
+				continue
+			}
+		}
+		[void]$out.Add($m)
+	}
+	return $out.ToArray()
+}
+
+function Enter-MBCompacting {
+	try {
+		$script:MB.CompactingDepth = [int]$script:MB.CompactingDepth + 1
+		$script:MB.IsCompacting = $true
+		if (Test-MBWpfActive) {
+			Update-MBWpfSticky -Status 'autocompacting'
+		}
+	} catch {}
+}
+
+function Exit-MBCompacting {
+	try {
+		$d = [int]$script:MB.CompactingDepth - 1
+		if ($d -lt 0) { $d = 0 }
+		$script:MB.CompactingDepth = $d
+		if ($d -le 0) {
+			$script:MB.IsCompacting = $false
+			if (Test-MBWpfActive) {
+				$st = if ($script:MB.IsThinking) { 'thinking...' } elseif ($script:MB.IsWorking) { 'working' } else { 'ready' }
+				Update-MBWpfSticky -Status $st
+				try { Update-MBWpfLiveChrome -Force } catch {}
+			}
+		}
+	} catch {}
+}
+
+function Compact-MBHistory {
+	param(
+		[array]$Messages,
+		[int]$KeepLast = 24,
+		[switch]$Aggressive,
+		[switch]$PreferModelDigest
+	)
+
+	# Compact: keep system/state; drop middle turns
+	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+
+	if ($Aggressive) { $KeepLast = [math]::Min($KeepLast, 12) }
+
+	$head = New-Object System.Collections.ArrayList
+	$rest = New-Object System.Collections.ArrayList
+	foreach ($m in @($Messages)) {
+		$r = Get-MBProp $m 'role'
+		if ($r -eq 'system' -and ($head.Count -lt 2)) {
+			[void]$head.Add($m)
+		} else {
+			[void]$rest.Add($m)
+		}
+	}
+
+	if ($rest.Count -le $KeepLast) {
+		$shrunk = @(Shrink-MBToolPayloads -Messages (@($head) + @($rest)) -RecentKeep 8 -OldMaxChars 2000)
+		return $shrunk
+	}
+
+	Enter-MBCompacting
+	try {
+	$dropped = $rest.Count - $KeepLast
+	$kept = @($rest | Select-Object -Last $KeepLast)
+
+	$summaryBits = New-Object System.Collections.ArrayList
+	$materialBits = New-Object System.Collections.ArrayList
+	$droppedArr = @($rest | Select-Object -First $dropped)
+	foreach ($m in $droppedArr) {
+		$r = Get-MBProp $m 'role'
+		$c = [string](Get-MBProp $m 'content')
+		if (-not $c) {
+			$tcs = Get-MBProp $m 'tool_calls'
+			if ($tcs) {
+				try {
+					$names = @($tcs | ForEach-Object { (Get-MBProp (Get-MBProp $_ 'function') 'name') }) -join ','
+					$c = "[tools: $names]"
+				} catch { $c = '' }
+			}
+		}
+		if ($r -eq 'user' -and $c) {
+			$line = $c -replace '\s+', ' '
+			$full = $line
+			if ($line.Length -gt 160) { $line = $line.Substring(0, 157) + '...' }
+			[void]$summaryBits.Add("User: $line")
+			if ($full.Length -gt 400) { $full = $full.Substring(0, 397) + '...' }
+			[void]$materialBits.Add("User: $full")
+		} elseif ($r -eq 'assistant' -and $c) {
+			$line = $c -replace '\s+', ' '
+			$full = $line
+			if ($line.Length -gt 160) { $line = $line.Substring(0, 157) + '...' }
+			if ($line.Trim().Length -gt 0) { [void]$summaryBits.Add("Agent: $line") }
+			if ($full.Trim().Length -gt 0) {
+				if ($full.Length -gt 400) { $full = $full.Substring(0, 397) + '...' }
+				[void]$materialBits.Add("Agent: $full")
+			}
+		} elseif ($r -eq 'tool' -and $c) {
+			$line = $c -replace '\s+', ' '
+			if ($line.Length -gt 220) { $line = $line.Substring(0, 217) + '...' }
+			[void]$materialBits.Add("Tool: $line")
+		}
+		if ($summaryBits.Count -ge 10) { break }
+	}
+	$extractive = if ($summaryBits.Count -gt 0) { ($summaryBits -join ' | ') } else { '(tool-heavy stretch)' }
+	if ($extractive.Length -gt 900) { $extractive = $extractive.Substring(0, 897) + '...' }
+
+	$digest = $extractive
+	$digestSource = 'extractive'
+	$canModel = $script:MB.ModelCompact -and $PreferModelDigest -and $materialBits.Count -gt 0 -and ([int]$script:MB.ApiFailures -lt 2)
+	if ($canModel) {
+		try {
+			$material = ($materialBits -join "`n")
+			$modelDigest = Invoke-MBModelSummary -Material $material -MaxTok 450
+			if ($modelDigest -and $modelDigest.Trim().Length -gt 40) {
+				$digest = $modelDigest.Trim()
+				$digestSource = 'model'
+				if ($digest.Length -gt 1100) { $digest = $digest.Substring(0, 1097) + '...' }
+			}
+		} catch {
+			$digest = $extractive
+			$digestSource = 'extractive'
+		}
+	}
+
+	$script:MB.StickyExtra = "Earlier conversation compressed ($dropped msgs, $digestSource): $digest"
+	if ($script:MB.StickyExtra.Length -gt 1400) {
+		$script:MB.StickyExtra = $script:MB.StickyExtra.Substring(0, 1397) + '...'
+	}
+
+	$notice = @{
+		role    = 'system'
+		content = "[Context compacted: dropped $dropped earlier messages ($digestSource digest). Sticky SESSION STATE has the digest. CWD=$($script:MB.WorkingDir)]"
+	}
+
+	# Refresh state message content after StickyExtra update
+	$out = New-Object System.Collections.ArrayList
+	[void]$out.Add(@{ role = 'system'; content = (Get-MBSystemPrompt) })
+	[void]$out.Add(@{ role = 'system'; content = (Get-MBStickySystemContent) })
+	[void]$out.Add($notice)
+	foreach ($m in $kept) {
+		if (Test-MBIsStateMessage $m) { continue }
+		if (Test-MBIsBaseSystemMessage $m) { continue }
+		[void]$out.Add($m)
+	}
+
+	$script:MB.CompactionCount++
+	$script:MB.LastCompactReason = "dropped $dropped msgs, keep last $KeepLast"
+
+	return @(Shrink-MBToolPayloads -Messages $out.ToArray() -RecentKeep 6 -OldMaxChars 1800 -RecentMaxChars 8000)
+	} finally {
+		Exit-MBCompacting
+	}
+}
+
+function Optimize-MBHistory {
+	param([array]$Messages)
+	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+
+	if ($Messages.Count -gt $MaxHistoryMessages) {
+		return Compact-MBHistory -Messages $Messages -KeepLast ([math]::Floor($MaxHistoryMessages * 0.55))
+	}
+
+	return @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 8 -OldMaxChars 4000 -RecentMaxChars $MaxToolResultChars)
+}
+
+function Ensure-MBPromptBudget {
+	param(
+		[array]$Messages,
+		[double]$TargetPct = 0.72,
+		[int]$MaxPasses = 6,
+		[switch]$Verbose
+	)
+
+	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+	$budget = Get-MBEffectivePromptBudget
+	$targetTok = [math]::Floor($budget * $TargetPct)
+	$beforeTok = (Get-MBContextEstimate -Messages $Messages).PromptTokens
+
+	$pass = 0
+	while ($pass -lt $MaxPasses) {
+		$pass++
+		$est = Get-MBContextEstimate -Messages $Messages
+		if ($est.PromptTokens -le $targetTok) { break }
+
+		if ($Verbose) {
+			Write-Host ("  ~ prompt ~{0:N0} tok > target ~{1:N0} - trim pass {2}..." -f `
+				$est.PromptTokens, $targetTok, $pass) -ForegroundColor DarkGray
+		}
+
+		if ($pass -eq 1) {
+			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 5 -OldMaxChars 1500 -RecentMaxChars 5000)
+		} elseif ($pass -eq 2) {
+			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 3 -OldMaxChars 800 -RecentMaxChars 3000)
+			$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 18)
+		} elseif ($pass -eq 3) {
+			$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 12 -Aggressive)
+			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 2 -OldMaxChars 500 -RecentMaxChars 2000)
+		} elseif ($pass -eq 4) {
+			$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 8 -Aggressive)
+			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 2 -OldMaxChars 400 -RecentMaxChars 1200)
+		} else {
+			# Retain system, state, and last few non-system messages
+			$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 6 -Aggressive)
+			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 1 -OldMaxChars 300 -RecentMaxChars 800)
+		}
+		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+	}
+
+	$final = Get-MBContextEstimate -Messages $Messages
+	if ($final.PromptTokens -lt $beforeTok) {
+		$script:MB.LastCompactReason = ("silent trim ~{0:N0}→{1:N0} tok" -f $beforeTok, $final.PromptTokens)
+	}
+	if ($final.PromptTokens -gt $budget) {
+		Write-MBWarn ("Context still ~{0:N0} tok over usable n_ctx room {1:N0} - consider /clear or /compact" -f $final.PromptTokens, $budget)
+	}
+	return $Messages
+}
+
+function Manage-MBContext {
+	param(
+		[array]$Messages,
+		[switch]$ForceCompact
+	)
+
+	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+	$est = Get-MBContextEstimate -Messages $Messages
+
+	if ($ForceCompact) {
+		$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 3 -OldMaxChars 800 -RecentMaxChars 2500)
+		$Messages = @(Compact-MBHistory -Messages $Messages -Aggressive -PreferModelDigest)
+		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+		$Messages = @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.65)
+		return $Messages
+	}
+
+	if (-not $script:MB.AutoCompact) {
+		if ($est.PromptTokens -gt (Get-MBEffectivePromptBudget)) {
+			return @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.70)
+		}
+		return $Messages
+	}
+
+	if ($est.Level -eq 'hard' -or $est.Pct -ge 0.92 -or $est.PromptTokens -gt (Get-MBEffectivePromptBudget)) {
+		return @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.68)
+	}
+
+	if ($est.Level -eq 'soft') {
+		$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 5 -OldMaxChars 1800 -RecentMaxChars ([math]::Min(8000, $MaxToolResultChars)))
+		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+		[void](Get-MBContextEstimate -Messages $Messages)
+		return $Messages
+	}
+
+	return $Messages
+}
+
+function Show-MBContextDetail {
+	param([array]$Messages)
+	$est = Get-MBContextEstimate -Messages $Messages
+	Write-Host ""
+	Write-MBRule -Label "context"
+	Write-Host ("  Level          : {0}" -f $est.Level.ToUpper()) -ForegroundColor $(
+		switch ($est.Level) { 'hard' { 'Red' } 'soft' { 'Yellow' } default { 'Green' } }
+	)
+	Write-Host ("  Budget used    : {0:P1}  (~{1:N0} / {2:N0} usable prompt tok)" -f $est.Pct, $est.PromptTokens, $est.UsableTokens) -ForegroundColor Gray
+	Write-Host ("  Model n_ctx    : {0:N0} tok (ContextWindowTokens)" -f $est.WindowTokens) -ForegroundColor Gray
+	Write-Host ("  Usable prompt  : {0:N0} tok (n_ctx minus completion reserve)" -f $est.UsableTokens) -ForegroundColor Gray
+	Write-Host ("  Reserved       : {0:N0} tok reserved for completion (MaxTokens)" -f $est.ReserveTokens) -ForegroundColor Gray
+	$srcLabel = switch ([string]$est.TokenSource) {
+		'server' { 'server /tokenize' }
+		'usage'  { 'last completion usage' }
+		default  { 'local estimate' }
+	}
+	Write-Host ("  Token source   : {0}" -f $srcLabel) -ForegroundColor $(if ($est.TokenSource -eq 'estimate') { 'Yellow' } else { 'Green' })
+	Write-Host ("  Messages       : {0}  ({1:N0} chars)" -f $est.MessageCount, $est.MessageChars) -ForegroundColor Gray
+	Write-Host ("  Tool payloads  : {0:N0} chars in role=tool bodies" -f $est.ToolPayloadChars) -ForegroundColor Gray
+	Write-Host ("  Tools schema   : ~{0:N0} chars / ~{1:N0} tok" -f $est.ToolsChars, $est.ToolsTokens) -ForegroundColor Gray
+	Write-Host ("  By role chars  : system={0:N0} user={1:N0} assistant={2:N0} tool={3:N0}" -f `
+		$est.ByRoleChars['system'], $est.ByRoleChars['user'], $est.ByRoleChars['assistant'], $est.ByRoleChars['tool']) -ForegroundColor DarkGray
+	Write-Host ("  Soft / Hard    : {0:P0} / {1:P0}  |  AutoCompact: {2}  |  Runs: {3}" -f `
+		$script:MB.ContextSoftPct, $script:MB.ContextHardPct, $script:MB.AutoCompact, $script:MB.CompactionCount) -ForegroundColor Gray
+	if ($script:MB.LastCompactReason) {
+		Write-Host "  Last compact   : $($script:MB.LastCompactReason)" -ForegroundColor DarkGray
+	}
+	Write-Host ""
+	Write-Host "  Sticky findings:" -ForegroundColor Cyan
+	$findings = @($script:MB.StickyFindings)
+	if ($findings.Count -eq 0) { Write-Host "    (none - /find <text> to pin)" -ForegroundColor DarkGray }
+	else { foreach ($f in $findings) { Write-Host "    - $f" -ForegroundColor Gray } }
+	Write-Host "  Sticky notes:" -ForegroundColor Cyan
+	$notes = @($script:MB.StickyNotes)
+	if ($notes.Count -eq 0) { Write-Host "    (none - /note <text> to pin)" -ForegroundColor DarkGray }
+	else { foreach ($n in $notes) { Write-Host "    - $n" -ForegroundColor Gray } }
+	if ($script:MB.StickyExtra) {
+		Write-Host "  Compressed digest:" -ForegroundColor Cyan
+		Write-Host "    $($script:MB.StickyExtra)" -ForegroundColor DarkGray
+	}
+	Write-Host ""
+	Write-Host "  Tip: tool results dominate context. Prefer GetBSODInfo over dumping .dmp bytes." -ForegroundColor DarkGray
+	Write-Host ""
+}
+
+function Test-MBSpeechUiOk {
+	if (Test-MBWpfActive) { return $true }
+	if ($script:MB.HostUi -eq 'wpf') { return $true }
+	return $false
+}
+
+function Test-MBSpeechPttDown {
+	try {
+		if ($script:HasNative -and ("MiniBot.Core.Native" -as [type])) {
+			return [bool][MiniBot.Core.Native]::IsSpeechPttDown()
+		}
+	} catch {}
+	return $false
+}
+
+function Initialize-MBSpeech {
+	if ($script:MB.SpeechReady -and $script:MB.SpeechSynth) {
+		return $true
+	}
+	$script:MB.SpeechInitError = ''
+	try {
+		Add-Type -AssemblyName System.Speech -ErrorAction Stop
+	} catch {
+		$script:MB.SpeechInitError = "System.Speech not available: $($_.Exception.Message)"
+		$script:MB.SpeechReady = $false
+		return $false
+	}
+
+	try {
+		if (-not $script:MB.SpeechSynth) {
+			$script:MB.SpeechSynth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+			try { $script:MB.SpeechSynth.SetOutputToDefaultAudioDevice() } catch {}
+			try { $script:MB.SpeechSynth.Rate = 1 } catch {}
+			try { $script:MB.SpeechSynth.Volume = 100 } catch {}
+		}
+	} catch {
+		$script:MB.SpeechInitError = "Speech synthesizer failed: $($_.Exception.Message)"
+		$script:MB.SpeechReady = $false
+		return $false
+	}
+
+	try {
+		if (-not $script:MB.SpeechEngine) {
+			$eng = $null
+			$cultures = @(
+				[System.Globalization.CultureInfo]::CurrentUICulture,
+				[System.Globalization.CultureInfo]::CurrentCulture,
+				[System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+			)
+			foreach ($c in $cultures) {
+				try {
+					$eng = New-Object System.Speech.Recognition.SpeechRecognitionEngine($c)
+					if ($eng) { break }
+				} catch { $eng = $null }
+			}
+			if (-not $eng) {
+				$eng = New-Object System.Speech.Recognition.SpeechRecognitionEngine
+			}
+			$eng.SetInputToDefaultAudioDevice()
+
+			$dict = New-Object System.Speech.Recognition.DictationGrammar
+			$dict.Enabled = $true
+			$eng.LoadGrammar($dict)
+			try {
+				$spell = New-Object System.Speech.Recognition.DictationGrammar 'grammar:dictation#spelling'
+				$spell.Enabled = $true
+				$eng.LoadGrammar($spell)
+			} catch {}
+
+			try { $eng.InitialSilenceTimeout = [TimeSpan]::FromSeconds(15) } catch {}
+			try { $eng.BabbleTimeout = [TimeSpan]::FromSeconds(0) } catch {}
+			try { $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.2) } catch {}
+			try { $eng.EndSilenceTimeoutAmbiguous = [TimeSpan]::FromSeconds(1.5) } catch {}
+			try { $eng.MaxAlternates = 3 } catch {}
+
+			$script:MB.SpeechEngine = $eng
+		}
+	} catch {
+		$script:MB.SpeechInitError = "Speech recognition failed (mic/language pack?): $($_.Exception.Message)"
+		$script:MB.SpeechEngine = $null
+	}
+
+	$script:MB.SpeechReady = [bool]$script:MB.SpeechSynth
+	return [bool]$script:MB.SpeechReady
+}
+
+function Stop-MBSpeech {
+	try {
+		if ($script:MB.SpeechSynth) {
+			try { $script:MB.SpeechSynth.SpeakAsyncCancelAll() } catch {}
+			try { $script:MB.SpeechSynth.Dispose() } catch {}
+		}
+	} catch {}
+	try {
+		if ($script:MB.SpeechEngine) {
+			try { $script:MB.SpeechEngine.RecognizeAsyncCancel() } catch {}
+			try { $script:MB.SpeechEngine.Dispose() } catch {}
+		}
+	} catch {}
+	try {
+		Get-EventSubscriber -ErrorAction SilentlyContinue |
+			Where-Object { $_.SourceIdentifier -like 'MB.Speech.*' } |
+			ForEach-Object { Unregister-Event -SourceIdentifier $_.SourceIdentifier -Force -ErrorAction SilentlyContinue }
+	} catch {}
+	$script:MB.SpeechSynth = $null
+	$script:MB.SpeechEngine = $null
+	$script:MB.SpeechReady = $false
+	$script:MB.SpeechListening = $false
+}
+
+function ConvertTo-MBSpeakableText {
+	param([string]$Text)
+	if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+	$t = [string]$Text
+	$t = [regex]::Replace($t, '(?s)```.*?```', ' (code block) ')
+	$t = [regex]::Replace($t, '`([^`]+)`', '$1')
+	$t = [regex]::Replace($t, '\[([^\]]+)\]\([^\)]+\)', '$1')
+	$t = $t -replace '[\*]{1,3}', '' -replace '_{1,3}', ''
+	$t = $t -replace '(?m)^\s{0,3}#+\s*', '' -replace '(?m)^\s*[-*+]\s+', ''
+	$t = $t -replace '\s+', ' '
+	$t = $t.Trim()
+	if ($t.Length -gt 1200) {
+		$t = $t.Substring(0, 1197) + '...'
+	}
+	return $t
+}
+
+function Invoke-MBSpeak {
+	param(
+		[string]$Text,
+		[int]$Rate = 1,
+		[bool]$Async = $true
+	)
+	if (-not (Initialize-MBSpeech)) {
+		return "ERROR: Speech TTS unavailable. $($script:MB.SpeechInitError)"
+	}
+	$speakable = ConvertTo-MBSpeakableText -Text $Text
+	if ([string]::IsNullOrWhiteSpace($speakable)) {
+		return "ERROR: Nothing speakable after cleanup."
+	}
+	try {
+		if ($null -ne $Rate -and $Rate -ge -10 -and $Rate -le 10) {
+			try { $script:MB.SpeechSynth.Rate = $Rate } catch {}
+		}
+		try { $script:MB.SpeechSynth.SpeakAsyncCancelAll() } catch {}
+		if ($Async) {
+			[void]$script:MB.SpeechSynth.SpeakAsync($speakable)
+			return "SUCCESS: Speaking ($($speakable.Length) chars, async)."
+		} else {
+			$script:MB.SpeechSynth.Speak($speakable)
+			return "SUCCESS: Spoke ($($speakable.Length) chars)."
+		}
+	} catch {
+		return "ERROR: TTS failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-MBSpeechListen {
+	param(
+		[int]$MaxSeconds = 90,
+		[scriptblock]$UpdatePrompt = $null
+	)
+	if (-not (Test-MBSpeechUiOk)) {
+		return @{ ok = $false; text = ''; error = 'speech_requires_wpf_host' }
+	}
+	if (-not (Initialize-MBSpeech)) {
+		return @{ ok = $false; text = ''; error = $script:MB.SpeechInitError }
+	}
+	if (-not $script:MB.SpeechEngine) {
+		return @{ ok = $false; text = ''; error = "Dictation engine not available. $($script:MB.SpeechInitError)" }
+	}
+
+	$eng = $script:MB.SpeechEngine
+	$script:MB.SpeechListening = $true
+
+	$global:MB_SpeechParts = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+	$global:MB_SpeechHypo = ''
+
+	$paint = {
+		param([string]$msg)
+		if ($UpdatePrompt) {
+			try { & $UpdatePrompt $msg } catch {}
+		}
+	}
+
+	try {
+		foreach ($sid in @('MB.Speech.Rec', 'MB.Speech.Hyp')) {
+			try { Unregister-Event -SourceIdentifier $sid -Force -ErrorAction SilentlyContinue } catch {}
+			try { Get-Event -SourceIdentifier $sid -ErrorAction SilentlyContinue | Remove-Event -ErrorAction SilentlyContinue } catch {}
+		}
+		try { $eng.RecognizeAsyncCancel() } catch {}
+
+		try {
+			while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
+		} catch {}
+
+		& $paint '● REC  hold Right-Ctrl… release to stop'
+
+		$null = Register-ObjectEvent -InputObject $eng -EventName SpeechRecognized -SourceIdentifier 'MB.Speech.Rec' -Action {
+			try {
+				$txt = [string]$Event.SourceEventArgs.Result.Text
+				if (-not [string]::IsNullOrWhiteSpace($txt)) {
+					[void]$global:MB_SpeechParts.Add($txt.Trim())
+					$global:MB_SpeechHypo = ''
+				}
+			} catch {}
+		}
+		$null = Register-ObjectEvent -InputObject $eng -EventName SpeechHypothesized -SourceIdentifier 'MB.Speech.Hyp' -Action {
+			try {
+				$global:MB_SpeechHypo = [string]$Event.SourceEventArgs.Result.Text
+			} catch {}
+		}
+
+		$eng.RecognizeAsync([System.Speech.Recognition.RecognizeMode]::Multiple)
+
+		$sw = [System.Diagnostics.Stopwatch]::StartNew()
+		$lastPaint = ''
+		$cancelled = $false
+		# Debounce PTT key-down so bounce does not start a zero-length take
+		$armed = $false
+		$armWait = [System.Diagnostics.Stopwatch]::StartNew()
+		while ($armWait.ElapsedMilliseconds -lt 400 -and -not $armed) {
+			if (Test-MBSpeechPttDown) { $armed = $true; break }
+			Start-Sleep -Milliseconds 15
+		}
+		if (-not $armed -and -not (Test-MBSpeechPttDown)) {
+			& $paint ''
+			return @{ ok = $false; text = ''; error = 'ptt_not_held' }
+		}
+
+		while ($sw.Elapsed.TotalSeconds -lt $MaxSeconds) {
+			if ((Test-MBInterrupt)) { $cancelled = $true; break }
+
+			try {
+				if ([Console]::KeyAvailable) {
+					$kk = [Console]::ReadKey($true)
+					if ($kk.Key -eq [ConsoleKey]::Escape) { $cancelled = $true; break }
+				}
+			} catch {}
+
+			if (-not (Test-MBSpeechPttDown) -and $sw.ElapsedMilliseconds -gt 150) {
+				break
+			}
+
+			$committed = (@($global:MB_SpeechParts) -join ' ').Trim()
+			$hyp = [string]$global:MB_SpeechHypo
+			$show = if ($committed -and $hyp) {
+				"● REC  $committed $hyp"
+			} elseif ($committed) {
+				"● REC  $committed"
+			} elseif ($hyp) {
+				"● REC  $hyp"
+			} else {
+				'● REC  hold Right-Ctrl… release to stop'
+			}
+			if ($show -ne $lastPaint) {
+				& $paint $show
+				$lastPaint = $show
+			}
+
+			Start-Sleep -Milliseconds 30
+		}
+
+		try { $eng.RecognizeAsyncStop() } catch {
+			try { $eng.RecognizeAsyncCancel() } catch {}
+		}
+		$flush = [System.Diagnostics.Stopwatch]::StartNew()
+		while ($flush.ElapsedMilliseconds -lt 450) {
+			Start-Sleep -Milliseconds 30
+		}
+
+		foreach ($sid in @('MB.Speech.Rec', 'MB.Speech.Hyp')) {
+			try { Unregister-Event -SourceIdentifier $sid -Force -ErrorAction SilentlyContinue } catch {}
+			try { Get-Event -SourceIdentifier $sid -ErrorAction SilentlyContinue | Remove-Event -ErrorAction SilentlyContinue } catch {}
+		}
+
+		$upWait = [System.Diagnostics.Stopwatch]::StartNew()
+		while ((Test-MBSpeechPttDown) -and $upWait.ElapsedMilliseconds -lt 2000) {
+			Start-Sleep -Milliseconds 20
+		}
+		try {
+			while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
+		} catch {}
+
+		if ($cancelled) {
+			& $paint ''
+			return @{ ok = $false; text = ''; error = 'cancelled' }
+		}
+
+		$joined = (@($global:MB_SpeechParts) -join ' ').Trim()
+		$hyp = [string]$global:MB_SpeechHypo
+		if ($hyp -and ($joined -notlike "*$hyp*")) {
+			if ($joined) { $joined = "$joined $hyp" } else { $joined = $hyp }
+			$joined = $joined.Trim()
+		}
+		$script:MB.SpeechLastHeard = $joined
+
+		if ($joined) {
+			& $paint $joined
+			return @{ ok = $true; text = $joined; error = '' }
+		}
+		& $paint ''
+		return @{ ok = $false; text = ''; error = 'no_speech' }
+	} catch {
+		try { & $paint '' } catch {}
+		return @{ ok = $false; text = ''; error = $_.Exception.Message }
+	} finally {
+		$script:MB.SpeechListening = $false
+		try { $eng.RecognizeAsyncCancel() } catch {}
+		foreach ($sid in @('MB.Speech.Rec', 'MB.Speech.Hyp')) {
+			try { Unregister-Event -SourceIdentifier $sid -Force -ErrorAction SilentlyContinue } catch {}
+		}
+		try {
+			while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
+		} catch {}
+	}
+}
+
+function Enable-MBSpeechMode {
+	param([bool]$On = $true)
+	if ($On -and -not (Test-MBSpeechUiOk)) {
+		$script:MB.SpeechEnabled = $false
+		return "Speech requires the WPF host."
+	}
+	if (-not $On) {
+		$script:MB.SpeechListening = $false
+		try {
+			if ($script:MB.SpeechEngine) { $script:MB.SpeechEngine.RecognizeAsyncCancel() }
+		} catch {}
+		try {
+			if ($script:MB.SpeechSynth) { $script:MB.SpeechSynth.SpeakAsyncCancelAll() }
+		} catch {}
+	}
+	$script:MB.SpeechEnabled = [bool]$On
+	if ($On) {
+		if (-not (Initialize-MBSpeech)) {
+			return "Speech mode ON but init failed: $($script:MB.SpeechInitError)"
+		}
+		try {
+			if (-not ($script:MB.ActiveToolGroups -contains 'speech')) {
+				[void]$script:MB.ActiveToolGroups.Add('speech')
+				try { Sync-MBPromptAfterToolGroups } catch { try { Initialize-MBToolsOverhead } catch {} }
+			}
+		} catch {}
+		$dict = if ($script:MB.SpeechEngine) { 'dictation OK' } else { 'dictation UNAVAILABLE (TTS only)' }
+		$auto = if ($script:MB.SpeechAutoReply) { 'ON' } else { 'off' }
+		return "Speech mode ON ($dict). Hold Right-Ctrl to talk, release to stop. Typing works when RCtrl is up. Auto-speak: $auto. Tool: SpeakText."
+	} else {
+		try {
+			if ($script:MB.ActiveToolGroups -contains 'speech') {
+				[void]$script:MB.ActiveToolGroups.Remove('speech')
+				try { Sync-MBPromptAfterToolGroups } catch { try { Initialize-MBToolsOverhead } catch {} }
+			}
+		} catch {}
+		return "Speech mode OFF."
+	}
+}
+
+function Invoke-SpeakText {
+	param(
+		[string]$text,
+		[int]$rate = 1,
+		[bool]$wait = $false
+	)
+	if ([string]::IsNullOrWhiteSpace($text)) { return "ERROR: text is required." }
+	return (Invoke-MBSpeak -Text $text -Rate $rate -Async (-not $wait))
+}
+
+function Add-MBInputHistory {
+	param([string]$Text)
+	if ([string]::IsNullOrWhiteSpace($Text)) { return }
+	if ($script:MB.InputHistory.Count -gt 0) {
+		$last = [string]$script:MB.InputHistory[$script:MB.InputHistory.Count - 1]
+		if ($last -eq $Text) { return }
+	}
+	[void]$script:MB.InputHistory.Add($Text)
+	while ($script:MB.InputHistory.Count -gt 80) {
+		$script:MB.InputHistory.RemoveAt(0)
+	}
+}
+
+function Read-MBUserInput {
+	if (-not (Test-MBWpfActive)) {
+		if ($script:MB.Wpf -and $script:MB.Wpf.ExitRequested) {
+			return ([string][char]0x1B + 'WPF_CLOSE')
+		}
+		return ""
+	}
+	if ($script:MB.Wpf.ExitRequested) { return ([string][char]0x1B + 'WPF_CLOSE') }
+	try { Refresh-MBWpfStickyFromSession } catch {}
+	$result = Read-MBWpfUserInput
+	if ($null -eq $result) { $result = "" }
+	Add-MBInputHistory -Text $result
+	return $result
+}
+
+function Save-MBSession {
+	param([array]$Messages, [string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) {
+		$desktop = [Environment]::GetFolderPath('Desktop')
+		$Path = Join-Path $desktop ("MiniBot-session-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
+	}
+	$Path = Resolve-MBPath $Path
+	$payload = @{
+		version  = $Version
+		savedAt  = (Get-Date).ToString("o")
+		model    = $Model
+		baseUrl  = $BaseUrl
+		cwd      = $script:MB.WorkingDir
+		messages = $Messages
+		context  = @{
+			windowTokens   = $script:MB.ContextWindow
+			lastPct        = $script:MB.LastCtxPct
+			lastTokens     = $script:MB.LastCtxTokens
+			compactions    = $script:MB.CompactionCount
+		}
+		sticky   = @{
+			notes    = @($script:MB.StickyNotes)
+			findings = @($script:MB.StickyFindings)
+			extra    = [string]$script:MB.StickyExtra
+		}
+	}
+	($payload | ConvertTo-Json -Depth 30) | Out-File -FilePath $Path -Encoding UTF8 -Force
+	return $Path
+}
+
+function Export-MBTranscript {
+	param([array]$Messages, [string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) {
+		$desktop = [Environment]::GetFolderPath('Desktop')
+		$Path = Join-Path $desktop ("MiniBot-transcript-{0:yyyyMMdd-HHmmss}.md" -f (Get-Date))
+	}
+	$Path = Resolve-MBPath $Path
+	$sb = New-Object System.Text.StringBuilder
+	[void]$sb.AppendLine("# MiniBot Transcript")
+	[void]$sb.AppendLine("Model: $Model")
+	[void]$sb.AppendLine("Saved: $((Get-Date).ToString('o'))")
+	[void]$sb.AppendLine("")
+	foreach ($m in $Messages) {
+		if ($m.role -eq 'system') { continue }
+		if ($m.role -eq 'user') {
+			[void]$sb.AppendLine("## You")
+			[void]$sb.AppendLine($m.content)
+		} elseif ($m.role -eq 'assistant') {
+			[void]$sb.AppendLine("## $AgentName")
+			if ($m.content) { [void]$sb.AppendLine([string]$m.content) }
+			if ($m.tool_calls) {
+				foreach ($tc in @($m.tool_calls)) {
+					[void]$sb.AppendLine("- tool: $($tc.function.name) ``$($tc.function.arguments)``")
+				}
+			}
+		} elseif ($m.role -eq 'tool') {
+			[void]$sb.AppendLine("### tool result")
+			$c = [string]$m.content
+			if ($c.Length -gt 2000) { $c = $c.Substring(0,2000) + "..." }
+			[void]$sb.AppendLine('```')
+			[void]$sb.AppendLine($c)
+			[void]$sb.AppendLine('```')
+		}
+		[void]$sb.AppendLine("")
+	}
+	$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+	[System.IO.File]::WriteAllText($Path, $sb.ToString(), $utf8NoBom)
+	return $Path
+}
+
+
+function Test-MBWpfDotNetReady {
+	try {
+		$frameworks = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP' -Recurse |
+			Get-ItemProperty -Name Version -EA 0 |
+			Where-Object { $_.PSChildName -Match '^(?!S)\p{L}' } |
+			Select-Object -ExpandProperty Version
+		if (-not $frameworks -or @($frameworks).Count -eq 0) {
+			return $true
+		}
+		$highestVersion = $frameworks | ForEach-Object { [version]$_ } | Measure-Object -Maximum | Select-Object -ExpandProperty Maximum
+		if ($highestVersion -lt [version]'3.0') { return $false }
+		return $true
+	} catch {
+		return $true
+	}
+}
+
+function Test-MBWpfAvailable {
+	try {
+		if ($PSVersionTable.PSEdition -eq 'Core' -and $IsLinux) { return $false }
+		if ($PSVersionTable.PSEdition -eq 'Core' -and $IsMacOS) { return $false }
+		if (-not (Test-MBWpfDotNetReady)) { return $false }
+		Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+		Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+		Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+		return $true
+	} catch { return $false }
+}
+
+function Resolve-MBHostUi {
+	$script:MB.HostUi = 'wpf'
+	return 'wpf'
+}
+
+function Test-MBWpfActive {
+	return ($script:MB.HostUi -eq 'wpf' -and $script:MB.Wpf -and $script:MB.Wpf.Ready)
+}
+
+function Show-MBWpfError {
+	param(
+		[string]$Title = 'MiniBot error',
+		[string]$Message,
+		[System.Exception]$Exception = $null
+	)
+	$detail = [string]$Message
+	if ($Exception) {
+		$detail = ($detail + "`n`n" + $Exception.GetType().FullName + ": " + $Exception.Message).Trim()
+		try {
+			if ($Exception.InnerException) {
+				$detail += "`nInner: " + $Exception.InnerException.Message
+			}
+		} catch {}
+	}
+	if ([string]::IsNullOrWhiteSpace($detail)) { $detail = '(no details)' }
+	try { Write-MBDebugLog -Step 'ERROR_POPUP' -Detail ("{0} | {1}" -f $Title, $detail) } catch {}
+
+	try {
+		Write-Host ""
+		Write-Host ("  ERROR: {0}" -f $Title) -ForegroundColor Red
+		foreach ($line in ($detail -split "`r?`n")) {
+			Write-Host ("    {0}" -f $line) -ForegroundColor DarkYellow
 		}
 		Write-Host ""
-		Write-Host "Press any key to exit..." -ForegroundColor DarkGray
-		[void][System.Console]::ReadKey($true)
+	} catch {}
+
+	if ((Test-MBWpfActive) -and $script:MB.Wpf -and $script:MB.Wpf.Dispatcher) {
+		$t = $Title
+		$m = $detail
+		$d = $script:MB.Wpf.Dispatcher
+		$show = {
+			try {
+				[System.Windows.MessageBox]::Show(
+					$m,
+					$t,
+					[System.Windows.MessageBoxButton]::OK,
+					[System.Windows.MessageBoxImage]::Error
+				) | Out-Null
+			} catch {}
+		}.GetNewClosure()
+		try {
+			if ($d.CheckAccess()) {
+				& $show
+			} else {
+				[void]$d.Invoke([Action]$show, [System.Windows.Threading.DispatcherPriority]::Send)
+			}
+		} catch {
+			try {
+				Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+				[System.Windows.Forms.MessageBox]::Show($detail, $Title) | Out-Null
+			} catch {}
+		}
+		return
+	}
+	try {
+		Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+		[System.Windows.MessageBox]::Show($detail, $Title, 'OK', 'Error') | Out-Null
+	} catch {
+		try {
+			$w = New-Object -ComObject Wscript.Shell
+			[void]$w.Popup($detail, 0, $Title, 16)
+		} catch {}
+	}
+}
+
+
+function ConvertTo-MBWpfSafeText {
+	param([AllowNull()][string]$Text)
+	if ($null -eq $Text -or $Text.Length -eq 0) { return '' }
+	$sb = New-Object System.Text.StringBuilder ($Text.Length + 4)
+	foreach ($ch in $Text.ToCharArray()) {
+		$code = [int][char]$ch
+		if ($code -eq 9 -or $code -eq 10 -or $code -eq 13) {
+			[void]$sb.Append($ch)
+			continue
+		}
+		# Drop other C0, DEL, C1 controls, BOM, replacement char
+		if ($code -lt 32) { continue }
+		if ($code -eq 0x7F) { continue }
+		if ($code -ge 0x80 -and $code -le 0x9F) { continue }
+		if ($code -eq 0xFEFF -or $code -eq 0xFFFD) { continue }
+		if ($code -eq 0x00AD -or $code -eq 0x2060 -or $code -eq 0x200B) { continue }
+		if ($code -eq 0x00A0) { [void]$sb.Append(' '); continue }
+		[void]$sb.Append($ch)
+	}
+	return $sb.ToString()
+}
+
+function Get-MBWpfCtxBarColor {
+	param([string]$Level = 'ok')
+	switch -Regex ([string]$Level) {
+		'hard' { return '#F7768E' }
+		'soft' { return '#E0AF68' }
+		default { return '#9ECE6A' }
+	}
+}
+
+function Invoke-MBWpf {
+	param(
+		[scriptblock]$Action,
+		[switch]$Async
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	$d = $script:MB.Wpf.Dispatcher
+	if (-not $d) { return }
+	if ($d.CheckAccess()) {
+		& $Action
+		return
+	}
+	$act = [Action]$Action
+	if ($Async) {
+		[void]$d.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, $act)
+	} else {
+		[void]$d.Invoke($act, [System.Windows.Threading.DispatcherPriority]::Background)
+	}
+}
+
+
+function Reset-MBMdStream {
+	if ([bool]$script:MB.MdFence -and (Test-MBWpfActive)) {
+		try { Write-MBMdCodeClose } catch {}
+	}
+	$script:MB.MdPending = ''
+	$script:MB.MdHold = ''
+	$script:MB.MdBold = $false
+	$script:MB.MdItalic = $false
+	$script:MB.MdStrike = $false
+	$script:MB.MdCode = $false
+	$script:MB.MdFence = $false
+	$script:MB.MdFenceLang = ''
+	$script:MB.MdFenceBuf = ''
+	$script:MB.MdLineBold = $false
+	$script:MB.MdLineItalic = $false
+	$script:MB.MdHeadLevel = 0
+	$script:MB.MdFontSize = 0
+	$script:MB.MdAtLineStart = $true
+	$script:MB.MdInTable = $false
+	$script:MB.MdTableLine = ''
+	$script:MB.MdTableRows = New-Object System.Collections.ArrayList
+	$script:MB.MdTableHasSep = $false
+}
+
+function Write-MBWpfStyled {
+	param(
+		[AllowNull()][string]$Text,
+		[switch]$Bold,
+		[switch]$Italic,
+		[switch]$Strike,
+		[switch]$Code,
+		[switch]$NoNewline,
+		[string]$Color = 'Gray',
+		[double]$FontSize = 0,
+		[int]$HeadLevel = 0
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	if ($null -eq $Text -or $Text.Length -eq 0) {
+		if ($NoNewline) { return }
+		$Text = ''
+	}
+	try { $Text = ConvertTo-MBWpfSafeText -Text $Text } catch {}
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$fs = [double]$FontSize
+	if ($fs -le 0 -and $HeadLevel -gt 0) {
+		switch ($HeadLevel) {
+			1 { $fs = 16 }
+			2 { $fs = 14.5 }
+			3 { $fs = 13.5 }
+			default { $fs = 13 }
+		}
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind       = 'text'
+		Text       = $Text
+		Color      = $Color
+		NoNewline  = [bool]$NoNewline
+		MdBold     = $(if ($Bold) { 1 } else { 0 })
+		MdItalic   = $(if ($Italic) { 1 } else { 0 })
+		MdStrike   = $(if ($Strike) { 1 } else { 0 })
+		MdCode     = $(if ($Code) { 1 } else { 0 })
+		MdFontSize = $fs
+		MdHead     = [int]$HeadLevel
+		MdNoLinks  = 0
+		Brand      = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Write-MBMdEmit {
+	param(
+		[string]$Text,
+		[switch]$NoNewline,
+		[string]$Color = ''
+	)
+	if ($null -eq $Text) { $Text = '' }
+	if ($Text.Length -eq 0 -and $NoNewline) { return }
+	$b = [bool]$script:MB.MdBold -or [bool]$script:MB.MdLineBold
+	$i = [bool]$script:MB.MdItalic -or [bool]$script:MB.MdLineItalic
+	$s = [bool]$script:MB.MdStrike
+	$c = [bool]$script:MB.MdCode
+	$hl = [int]$script:MB.MdHeadLevel
+	$fs = [double]$script:MB.MdFontSize
+	$col = $Color
+	if ([string]::IsNullOrEmpty($col)) {
+		if ($c) { $col = 'Cyan' }
+		elseif ($hl -gt 0) { $col = 'Cyan' }
+		elseif ($b) { $col = 'White' }
+		else { $col = 'Gray' }
+	}
+	Write-MBWpfStyled -Text $Text -NoNewline:$NoNewline `
+		-Bold:$b -Italic:$i -Strike:$s -Code:$c `
+		-Color $col -FontSize $fs -HeadLevel $hl
+}
+
+function Test-MBMdMarkerAt {
+	param([string]$S, [int]$I)
+	if ($I -lt 0 -or $I -ge $S.Length) { return $null }
+	$n = $S.Length - $I
+	$c0 = $S[$I]
+	if ($c0 -eq [char]'~') {
+		if ($n -ge 2 -and $S[$I + 1] -eq [char]'~') { return @{ Kind = 's'; Len = 2 } }
+		return $null
+	}
+	if ($c0 -eq [char]'`') { return @{ Kind = 'c'; Len = 1 } }
+	if ($c0 -eq [char]'*') {
+		if ($n -ge 3 -and $S[$I + 1] -eq [char]'*' -and $S[$I + 2] -eq [char]'*') {
+			return @{ Kind = 'bi'; Len = 3 }
+		}
+		if ($n -ge 2 -and $S[$I + 1] -eq [char]'*') { return @{ Kind = 'b'; Len = 2 } }
+		return @{ Kind = 'i'; Len = 1 }
+	}
+	if ($c0 -eq [char]'_') {
+		if ($n -ge 3 -and $S[$I + 1] -eq [char]'_' -and $S[$I + 2] -eq [char]'_') {
+			return @{ Kind = 'bi'; Len = 3 }
+		}
+		if ($n -ge 2 -and $S[$I + 1] -eq [char]'_') { return @{ Kind = 'b'; Len = 2 } }
+		return @{ Kind = 'i'; Len = 1 }
+	}
+	return $null
+}
+
+function Invoke-MBMdToggle {
+	param([string]$Kind)
+	switch ($Kind) {
+		'b'  { $script:MB.MdBold = -not [bool]$script:MB.MdBold }
+		'i'  { $script:MB.MdItalic = -not [bool]$script:MB.MdItalic }
+		'bi' {
+			$on = -not ([bool]$script:MB.MdBold -and [bool]$script:MB.MdItalic)
+			$script:MB.MdBold = $on
+			$script:MB.MdItalic = $on
+		}
+		's'  { $script:MB.MdStrike = -not [bool]$script:MB.MdStrike }
+		'c'  { $script:MB.MdCode = -not [bool]$script:MB.MdCode }
+	}
+}
+
+function Test-MBMdStyleOn {
+	param([string]$Kind)
+	switch ($Kind) {
+		'b'  { return [bool]$script:MB.MdBold }
+		'i'  { return [bool]$script:MB.MdItalic }
+		'bi' { return ([bool]$script:MB.MdBold -and [bool]$script:MB.MdItalic) }
+		's'  { return [bool]$script:MB.MdStrike }
+		'c'  { return [bool]$script:MB.MdCode }
+		default { return $false }
+	}
+}
+
+function Test-MBMdLinkHoldOpen {
+	# True while an incomplete markdown link is buffered across stream chunks.
+	param([string]$S)
+	if ([string]::IsNullOrEmpty($S)) { return $false }
+	$idx = 0
+	$len = $S.Length
+	while ($idx -lt $len) {
+		$open = $S.IndexOf([char]'[', $idx)
+		if ($open -lt 0) { break }
+		$close = $S.IndexOf([char]']', $open + 1)
+		if ($close -lt 0) { return $true }
+		if (($close + 1) -ge $len) { return $true }
+		if ($S[$close + 1] -ne [char]'(') {
+			$idx = $open + 1
+			continue
+		}
+		# Hold buffer only if URL looks like a link start
+		$urlStart = $close + 2
+		$paren = $S.IndexOf([char]')', $urlStart)
+		if ($paren -lt 0) {
+			$partial = ''
+			if ($urlStart -lt $len) { $partial = $S.Substring($urlStart) }
+			# Still typing URL, or empty after ](
+			if ($partial.Length -eq 0) { return $true }
+			if ($partial -match '^(?i)https?://' -or $partial -match '^(?i)www\.') { return $true }
+			# ](something that is clearly not a URL — do not hold forever
+			if ($partial -match '\s' -or $partial.Length -gt 12) {
+				$idx = $open + 1
+				continue
+			}
+			return $true
+		}
+		$idx = $paren + 1
+	}
+	return $false
+}
+
+function Test-MBMdHoldOpen {
+	param([string]$S)
+	if ([string]::IsNullOrEmpty($S)) { return $false }
+	if ($S.EndsWith('~') -and -not $S.EndsWith('~~')) { return $true }
+	if ($S -eq '*' -or $S -eq '_' -or $S -eq '~' -or $S -eq '`' ) { return $true }
+	if ($S -eq '**' -or $S -eq '__' -or $S -eq '~~' -or $S -eq '***' -or $S -eq '___') { return $true }
+	# Buffer incomplete markdown links so [label](https://...) is not split on spaces
+	if (Test-MBMdLinkHoldOpen -S $S) { return $true }
+
+	$bold = $false; $italic = $false; $strike = $false; $code = $false
+	$i = 0
+	$len = $S.Length
+	while ($i -lt $len) {
+		if ($code) {
+			if ($S[$i] -eq [char]'`') { $code = $false }
+			$i++
+			continue
+		}
+		$mk = Test-MBMdMarkerAt -S $S -I $i
+		if ($null -eq $mk) { $i++; continue }
+		$kind = [string]$mk.Kind
+		$mlen = [int]$mk.Len
+		$prevIsWord = ($i -gt 0 -and $S[$i - 1] -match '[A-Za-z0-9]')
+		$nextIsWord = (($i + $mlen) -lt $len -and $S[$i + $mlen] -match '[A-Za-z0-9]')
+		$styleOn = $false
+		switch ($kind) {
+			'b'  { $styleOn = $bold }
+			'i'  { $styleOn = $italic }
+			'bi' { $styleOn = ($bold -and $italic) }
+			's'  { $styleOn = $strike }
+			'c'  { $styleOn = $code }
+		}
+		$can = $true
+		if (-not $styleOn) { if ($prevIsWord) { $can = $false } }
+		else { if ($nextIsWord) { $can = $false } }
+		if ($can) {
+			switch ($kind) {
+				'b'  { $bold = -not $bold }
+				'i'  { $italic = -not $italic }
+				'bi' {
+					$on = -not ($bold -and $italic)
+					$bold = $on; $italic = $on
+				}
+				's'  { $strike = -not $strike }
+				'c'  { $code = -not $code }
+			}
+			$i += $mlen
+			continue
+		}
+		$i++
+	}
+	if ($bold -or $italic -or $strike -or $code) { return $true }
+	return $false
+}
+
+function Write-MBMdProcessInline {
+	param([string]$Text)
+	if ($null -eq $Text) { $Text = '' }
+	if ($Text.Length -eq 0) { return }
+	$work = $Text
+	$i = 0
+	$len = $work.Length
+	$buf = New-Object System.Text.StringBuilder
+	while ($i -lt $len) {
+		if ([bool]$script:MB.MdCode) {
+			if ($work[$i] -eq [char]'`') {
+				if ($buf.Length -gt 0) {
+					Write-MBMdEmit -Text $buf.ToString() -NoNewline
+					[void]$buf.Clear()
+				}
+				$script:MB.MdCode = $false
+				$i++
+				continue
+			}
+			[void]$buf.Append($work[$i])
+			$i++
+			continue
+		}
+		$mk = Test-MBMdMarkerAt -S $work -I $i
+		if ($null -ne $mk) {
+			$kind = [string]$mk.Kind
+			$mlen = [int]$mk.Len
+			$canToggle = $true
+			$prevIsWord = ($i -gt 0 -and $work[$i - 1] -match '[A-Za-z0-9]')
+			$nextIsWord = (($i + $mlen) -lt $len -and $work[$i + $mlen] -match '[A-Za-z0-9]')
+			$styleOn = Test-MBMdStyleOn -Kind $kind
+			if (-not $styleOn) {
+				if ($prevIsWord) { $canToggle = $false }
+			} else {
+				if ($nextIsWord) { $canToggle = $false }
+			}
+			if ($canToggle) {
+				if ($buf.Length -gt 0) {
+					Write-MBMdEmit -Text $buf.ToString() -NoNewline
+					[void]$buf.Clear()
+				}
+				Invoke-MBMdToggle -Kind $kind
+				$i += $mlen
+				continue
+			}
+		}
+		[void]$buf.Append($work[$i])
+		$i++
+	}
+	if ($buf.Length -gt 0) {
+		Write-MBMdEmit -Text $buf.ToString() -NoNewline
+	}
+}
+
+function Test-MBMdTableSeparator {
+	param([string]$Line)
+	$L = ([string]$Line).Trim() -replace [string][char]0x2502, '|' -replace [string][char]0x2503, '|'
+	return ($L -match '^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$')
+}
+
+function Get-MBMdTableCells {
+	param([string]$Line)
+	$raw = ([string]$Line).Trim()
+	if ($raw.Length -eq 0) { return [string[]]@() }
+	# Normalize box-drawing vertical bars to ASCII pipe
+	$raw = $raw -replace [string][char]0x2502, '|'
+	$raw = $raw -replace [string][char]0x2503, '|'
+	if ($raw.StartsWith('|')) { $raw = $raw.Substring(1) }
+	if ($raw.EndsWith('|') -and $raw.Length -gt 0) { $raw = $raw.Substring(0, $raw.Length - 1) }
+	$parts = $raw -split '\|'
+	$list = New-Object System.Collections.Generic.List[string]
+	foreach ($p in @($parts)) {
+		$list.Add((([string]$p).Trim()))
+	}
+	return ,([string[]]$list.ToArray())
+}
+
+function ConvertFrom-MBMdCellText {
+	param([string]$Text)
+	if ($null -eq $Text) { return '' }
+	$t = [string]$Text
+	$t = [regex]::Replace($t, '`([^`]*)`', '$1')
+	$t = [regex]::Replace($t, '\[([^\]]+)\]\(\s*https?://[^)\s]+\s*(?:\"[^\"]*\")?\s*\)', '$1')
+	$t = [regex]::Replace($t, '\*\*\*([^*]+)\*\*\*', '$1')
+	$t = [regex]::Replace($t, '\*\*([^*]+)\*\*', '$1')
+	$t = [regex]::Replace($t, '(?<!\*)\*([^*]+)\*(?!\*)', '$1')
+	$t = [regex]::Replace($t, '~~([^~]+)~~', '$1')
+	$t = [regex]::Replace($t, '__([^_]+)__', '$1')
+	$t = [regex]::Replace($t, '(?<!_)_([^_]+)_(?!_)', '$1')
+	return $t
+}
+
+function Complete-MBMdTableIfAny {
+	if ($null -eq $script:MB.MdTableRows) {
+		$script:MB.MdTableRows = New-Object System.Collections.ArrayList
+	}
+	if ([int]$script:MB.MdTableRows.Count -eq 0) {
+		$script:MB.MdInTable = $false
+		$script:MB.MdTableHasSep = $false
+		return
+	}
+	$rows = @($script:MB.MdTableRows.ToArray())
+	$script:MB.MdTableRows = New-Object System.Collections.ArrayList
+	$script:MB.MdInTable = $false
+	$script:MB.MdTableHasSep = $false
+	Write-MBMdEmitTable -Rows $rows
+}
+
+function Write-MBMdEmitTable {
+	param([object[]]$Rows)
+	if (-not (Test-MBWpfActive)) { return }
+	if ($null -eq $Rows -or @($Rows).Count -eq 0) { return }
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$sep = [string][char]0x1F  # unit separator — not used in normal cell text
+	$payload = New-Object System.Collections.ArrayList
+	foreach ($r in @($Rows)) {
+		if ($null -eq $r) { continue }
+		$cells = New-Object System.Collections.Generic.List[string]
+		$isHdr = $false
+		try {
+			try { $isHdr = [bool]$r.IsHeader } catch { $isHdr = $false }
+			$joined = $null
+			try { $joined = [string]$r.CellsJoined } catch { $joined = $null }
+			if (-not [string]::IsNullOrEmpty($joined)) {
+				foreach ($p in ($joined -split [char]0x1F)) { $cells.Add([string]$p) }
+			} else {
+				$cellSrc = $null
+				try { $cellSrc = $r.Cells } catch { $cellSrc = $null }
+				if ($null -ne $cellSrc) {
+					if ($cellSrc -is [string]) {
+						$cells.Add([string]$cellSrc)
+					} elseif ($cellSrc -is [System.Array]) {
+						for ($ci = 0; $ci -lt $cellSrc.Length; $ci++) {
+							$x = $cellSrc.GetValue($ci)
+							$cells.Add($(if ($null -eq $x) { '' } else { [string]$x }))
+						}
+					} elseif ($cellSrc -is [System.Collections.IList]) {
+						for ($ci = 0; $ci -lt $cellSrc.Count; $ci++) {
+							$x = $cellSrc[$ci]
+							$cells.Add($(if ($null -eq $x) { '' } else { [string]$x }))
+						}
+					} else {
+						$cells.Add([string]$cellSrc)
+					}
+				}
+			}
+		} catch {
+			$cells.Clear()
+			$cells.Add('')
+			$isHdr = $false
+		}
+		if ($cells.Count -eq 0) { $cells.Add('') }
+		$clean = New-Object System.Collections.Generic.List[string]
+		foreach ($c in $cells) {
+			$s = if ($null -eq $c) { '' } else { [string]$c }
+			try { $s = ConvertFrom-MBMdCellText -Text $s } catch {}
+			$clean.Add($s)
+		}
+		[void]$payload.Add([pscustomobject]@{
+			CellsJoined = [string]::Join($sep, $clean.ToArray())
+			ColCount    = [int]$clean.Count
+			IsHeader    = [bool]$isHdr
+		})
+	}
+	if ($payload.Count -eq 0) { return }
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind       = 'md-table'
+		Text       = ''
+		Color      = 'Gray'
+		NoNewline  = $true
+		Rows       = @($payload.ToArray())
+		MdBold     = 0
+		MdItalic   = 0
+		MdStrike   = 0
+		MdCode     = 0
+		MdFontSize = 0
+		MdHead     = 0
+		Brand      = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Write-MBMdFinishTableLine {
+	param([string]$Line)
+	if ($null -eq $script:MB.MdTableRows) {
+		$script:MB.MdTableRows = New-Object System.Collections.ArrayList
+	}
+	if (Test-MBMdTableSeparator -Line $Line) {
+		$script:MB.MdTableHasSep = $true
+		$script:MB.MdInTable = $true
+		for ($ri = 0; $ri -lt $script:MB.MdTableRows.Count; $ri++) {
+			try { $script:MB.MdTableRows[$ri].IsHeader = $true } catch {}
+		}
+		return
+	}
+	$cellArr = Get-MBMdTableCells -Line $Line
+	if ($null -eq $cellArr) { return }
+	$colN = 0
+	try { $colN = [int]$cellArr.Length } catch { try { $colN = @($cellArr).Count } catch { $colN = 0 } }
+	if ($colN -eq 0) { return }
+
+	$isHdr = ($script:MB.MdTableRows.Count -eq 0)
+	if ([bool]$script:MB.MdTableHasSep) { $isHdr = $false }
+
+	$sep = [string][char]0x1F
+	$joined = [string]::Join($sep, [string[]]$cellArr)
+	[void]$script:MB.MdTableRows.Add([pscustomobject]@{
+		Cells       = [string[]]$cellArr
+		CellsJoined = $joined
+		ColCount    = $colN
+		IsHeader    = $isHdr
+	})
+	$script:MB.MdInTable = $true
+}
+
+function Write-MBMdClearInline {
+	$script:MB.MdBold = $false
+	$script:MB.MdItalic = $false
+	$script:MB.MdStrike = $false
+	$script:MB.MdCode = $false
+}
+
+function Write-MBMdClearLineStyle {
+	$script:MB.MdLineBold = $false
+	$script:MB.MdLineItalic = $false
+	$script:MB.MdHeadLevel = 0
+	$script:MB.MdFontSize = 0
+}
+
+function Test-MBMdIsRuleChar {
+	param([int]$Code)
+	if ($Code -eq 0x2D -or $Code -eq 0x2A -or $Code -eq 0x5F) { return $true }
+	if ($Code -eq 0x2012 -or $Code -eq 0x2013 -or $Code -eq 0x2014 -or $Code -eq 0x2015) { return $true }
+	if ($Code -eq 0x2212 -or $Code -eq 0xFF0D) { return $true }
+	if ($Code -eq 0x2500 -or $Code -eq 0x2501 -or $Code -eq 0x254C -or $Code -eq 0x254D) { return $true }
+	if ($Code -eq 0x2550 -or $Code -eq 0x2574 -or $Code -eq 0x2576 -or $Code -eq 0x2578 -or $Code -eq 0x257A) { return $true }
+	if ($Code -eq 0x301C -or $Code -eq 0x3030) { return $true }
+	return $false
+}
+
+function Test-MBMdIsRuleText {
+	param([string]$S)
+	if ([string]::IsNullOrEmpty($S)) { return $false }
+	$t = $S.Trim()
+	if ($t.Length -lt 3) { return $false }
+	if ($t -match '^(-{3,}|\*{3,}|_{3,})$') { return $true }
+	foreach ($ch in $t.ToCharArray()) {
+		if (-not (Test-MBMdIsRuleChar -Code ([int][char]$ch))) { return $false }
+	}
+	return $true
+}
+
+function Write-MBMdEmitRule {
+	if (-not (Test-MBWpfActive)) { return }
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'md-rule'
+		Text      = ''
+		Color     = 'DarkGray'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 0
+		MdFontSize = 0
+		MdHead    = 0
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Write-MBWpfSectionBanner {
+	param(
+		[string]$Label = 'section',
+		[object]$Color = 'DarkGray'
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$lab = ([string]$Label).Trim()
+	if ([string]::IsNullOrWhiteSpace($lab)) { $lab = 'section' }
+	$cName = 'DarkGray'
+	try {
+		if ($Color -is [ConsoleColor]) { $cName = $Color.ToString() }
+		elseif ($Color) { $cName = [string]$Color }
+	} catch { $cName = 'DarkGray' }
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'section-banner'
+		Text      = $lab.ToLowerInvariant()
+		Color     = $cName
+		NoNewline = $true
+		MdBold    = 1
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 0
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Write-MBWpfApprovalBanner {
+	param([string]$Label = 'approval')
+	Write-MBWpfSectionBanner -Label $Label -Color Red
+}
+
+function Write-MBWpfApprovalButtons {
+	if (-not (Test-MBWpfActive)) { return }
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'approval-buttons'
+		Text      = ''
+		Color     = 'Yellow'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 0
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Disable-MBWpfActiveApprovalButtons {
+	if (-not (Test-MBWpfActive)) { return }
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
+	$act = {
+		try {
+			$hostPanel = $null
+			try { $hostPanel = $W.ActiveApprovalHost } catch { $hostPanel = $null }
+			if ($hostPanel) {
+				foreach ($c in @($hostPanel.Children)) {
+					try {
+						if ($c -is [System.Windows.Controls.Button]) {
+							$c.IsEnabled = $false
+							$c.Opacity = 0.55
+						}
+					} catch {}
+				}
+			}
+			try { $W.ActiveApprovalHost = $null } catch {}
+		} catch {}
+	}.GetNewClosure()
+	try {
+		$d = $W.Dispatcher
+		if ($d -and -not $d.CheckAccess()) {
+			[void]$d.BeginInvoke([Action]$act, [System.Windows.Threading.DispatcherPriority]::Normal)
+		} else {
+			& $act
+		}
+	} catch {
+		try { & $act } catch {}
+	}
+}
+
+function Write-MBWpfSynText {
+	param(
+		[AllowNull()][string]$Text,
+		[string]$Lang = 'ps'
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	if ($null -eq $Text -or $Text.Length -eq 0) { return }
+	try { $Text = ConvertTo-MBWpfSafeText -Text $Text } catch {}
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$lang = ([string]$Lang).Trim()
+	if ([string]::IsNullOrWhiteSpace($lang)) { $lang = 'ps' }
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'syn-inline'
+		Text      = $Text
+		Lang      = $lang
+		Color     = 'Cyan'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 1
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Write-MBMdCodeOpen {
+	param([string]$Lang = '')
+	if (-not (Test-MBWpfActive)) { return }
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$lang = ([string]$Lang).Trim()
+	if ($lang.StartsWith('```')) { $lang = $lang.TrimStart('`').Trim() }
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'md-code-open'
+		Text      = $lang
+		Color     = 'Cyan'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 1
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Write-MBMdCodeAppend {
+	param([AllowNull()][string]$Text)
+	if (-not (Test-MBWpfActive)) { return }
+	if ($null -eq $Text -or $Text.Length -eq 0) { return }
+	try { $Text = ConvertTo-MBWpfSafeText -Text $Text } catch {}
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'md-code-append'
+		Text      = $Text
+		Color     = 'Cyan'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 1
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Write-MBMdCodeClose {
+	if (-not (Test-MBWpfActive)) { return }
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'md-code-close'
+		Text      = ''
+		Color     = 'Cyan'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 0
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Write-MBMdFlushHold {
+	param([switch]$Force)
+	$hold = [string]$script:MB.MdHold
+	if ($hold.Length -eq 0) { return }
+	if (-not $Force -and (Test-MBMdHoldOpen -S $hold)) { return }
+
+	$work = $hold
+	$script:MB.MdHold = ''
+
+	if ([bool]$script:MB.MdAtLineStart -and ($null -ne $script:MB.MdTableRows) -and
+		([int]$script:MB.MdTableRows.Count -gt 0) -and ($work -notmatch '^\|')) {
+		Complete-MBMdTableIfAny
+	}
+
+	if (Test-MBMdIsRuleText -S $work) {
+		Complete-MBMdTableIfAny
+		Write-MBMdEmitRule
+		$script:MB.MdAtLineStart = $false
 		return
 	}
 
-	Clear-Host
-	Write-Host "================================================================================" -ForegroundColor DarkGray
-	Write-Host "|                                                                              |" -ForegroundColor DarkRed
-	Write-Host "|                               " -NoNewLine -ForegroundColor DarkRed; Write-Host "[" -NoNewLine -ForegroundColor DarkGray; Write-Host "$AgentName" -NoNewLine -ForegroundColor DarkRed; Write-Host "-" -NoNewLine -ForegroundColor DarkGray; Write-Host "Agent" -NoNewLine -ForegroundColor DarkRed; Write-Host "]" -NoNewLine -ForegroundColor DarkGray; Write-Host "                                |" -ForegroundColor DarkRed
-	Write-Host "|" -NoNewLine -ForegroundColor DarkRed; Write-Host "                                    v$Version                                    |" -ForegroundColor DarkRed
-	Write-Host "|                                                                              |" -ForegroundColor DarkRed
-	Write-Host "============================-...ESC to interrupt...-============================" -ForegroundColor DarkGray
-	Write-Host "`n Type your task, e.g: 'run quick diagnostics', 'check recent BSODs', or 'exit'." -ForegroundColor DarkGray -NoNewLine
-
-	$messages = @(@{ role = "system"; content = $SystemPrompt })
-
-	while ($true) {
-		$userInput = Read-Host "`n`n[You]"
-		if ($userInput -eq "exit" -or $userInput -eq "quit") {
-			Write-Host "`nGoodbye!`n" -ForegroundColor Gray
-			Sleep 2
-			break
+	if ([bool]$script:MB.MdAtLineStart) {
+		if ($work -match '^```(.*)$') {
+			Complete-MBMdTableIfAny
+			$script:MB.MdFence = $true
+			$script:MB.MdFenceLang = [string]$Matches[1]
+			$script:MB.MdFenceBuf = ''
+			$script:MB.MdAtLineStart = $false
+			if (Test-MBWpfActive) {
+				Write-MBMdCodeOpen -Lang $script:MB.MdFenceLang
+			}
+			return
 		}
+		if ($work -match '^(#{1,3})(\s+)(.*)$') {
+			$level = [int]$Matches[1].Length
+			$body = [string]$Matches[3]
+			$script:MB.MdHeadLevel = $level
+			$script:MB.MdLineBold = $true
+			$script:MB.MdFontSize = $(switch ($level) { 1 { 16 } 2 { 14.5 } default { 13.5 } })
+			$script:MB.MdAtLineStart = $false
+			if ($body.Length -gt 0) {
+				Write-MBMdProcessInline -Text $body
+				Write-MBMdClearInline
+			}
+			return
+		}
+		if ($work -match '^(#{1,3})$') {
+			$level = [int]$Matches[1].Length
+			$script:MB.MdHeadLevel = $level
+			$script:MB.MdLineBold = $true
+			$script:MB.MdFontSize = $(switch ($level) { 1 { 16 } 2 { 14.5 } default { 13.5 } })
+			$script:MB.MdAtLineStart = $false
+			return
+		}
+		if ($work -match '^[-*+]$') {
+			Write-MBWpfStyled -Text ([string][char]0x2022) -NoNewline -Color 'DarkGray'
+			$script:MB.MdAtLineStart = $false
+			return
+		}
+		if ($work -match '^[-*+](\s+)(.*)$') {
+			Write-MBWpfStyled -Text ([string][char]0x2022 + ' ') -NoNewline -Color 'DarkGray'
+			$script:MB.MdAtLineStart = $false
+			$body = [string]$Matches[2]
+			if ($body.Length -gt 0) {
+				Write-MBMdProcessInline -Text $body
+				Write-MBMdClearInline
+			}
+			return
+		}
+		if ($work -match '^(\d+)\.(\s+)(.*)$') {
+			Write-MBWpfStyled -Text ($Matches[1] + '. ') -NoNewline -Color 'DarkGray'
+			$script:MB.MdAtLineStart = $false
+			$body = [string]$Matches[3]
+			if ($body.Length -gt 0) {
+				Write-MBMdProcessInline -Text $body
+				Write-MBMdClearInline
+			}
+			return
+		}
+		if ($work -match '^(\d+)\.$') {
+			Write-MBWpfStyled -Text ($Matches[1] + '.') -NoNewline -Color 'DarkGray'
+			$script:MB.MdAtLineStart = $false
+			return
+		}
+		if ($work -eq '>') {
+			Write-MBWpfStyled -Text ([string][char]0x2502) -NoNewline -Color 'DarkGray'
+			$script:MB.MdLineItalic = $true
+			$script:MB.MdAtLineStart = $false
+			return
+		}
+		if ($work -match '^>(\s?)(.*)$') {
+			Write-MBWpfStyled -Text ([string][char]0x2502 + ' ') -NoNewline -Color 'DarkGray'
+			$script:MB.MdLineItalic = $true
+			$script:MB.MdAtLineStart = $false
+			$body = [string]$Matches[2]
+			if ($body.Length -gt 0) {
+				Write-MBMdProcessInline -Text $body
+				Write-MBMdClearInline
+			}
+			return
+		}
+	}
 
-		$trimmed = $userInput.Trim().ToLower()
-		if ($trimmed -eq '/autoapproveenable' -or $trimmed -eq 'autoapproveenable') {
-			$AutoApproveEnabled = $true
-			Write-Host "Auto-Approve ENABLED for this session. Modifying actions will NOT require approval from the user." -ForegroundColor Green
+	Write-MBMdProcessInline -Text $work
+	$script:MB.MdAtLineStart = $false
+	if (-not (Test-MBMdHoldOpen -S $work)) {
+		Write-MBMdClearInline
+	}
+}
+
+function Write-MBMdEmitWhitespace {
+	param([string]$Ws)
+	if ([string]::IsNullOrEmpty($Ws)) { return }
+	if ($Ws -match '[\n]') {
+		$script:MB.MdAtLineStart = $true
+		Write-MBMdClearLineStyle
+		if (($Ws -match '^[\r\n]+$') -and [bool]$script:MB.MdInTable -and
+			($null -ne $script:MB.MdTableRows) -and ([int]$script:MB.MdTableRows.Count -gt 0)) {
+			Complete-MBMdTableIfAny
+			return
+		}
+		if ($Ws -match '\n\s*\n') {
+			Complete-MBMdTableIfAny
+		}
+	}
+	Write-MBMdEmit -Text $Ws -NoNewline
+}
+
+function Write-MBMdStreamAppend {
+	param([AllowNull()][string]$Text)
+	if ($null -eq $Text -or $Text.Length -eq 0) { return }
+	if ($null -eq $script:MB.MdPending) { Reset-MBMdStream }
+
+	$chunk = ([string]$Text) -replace "`r`n", "`n" -replace "`r", "`n"
+	$script:MB.MdPending = [string]$script:MB.MdPending + $chunk
+	$s = [string]$script:MB.MdPending
+	$i = 0
+	$len = $s.Length
+
+	while ($i -lt $len) {
+		if ([bool]$script:MB.MdFence) {
+			$nIdx = $s.IndexOf([char]"`n", $i)
+			if ($nIdx -lt 0) {
+				$script:MB.MdPending = $s.Substring($i)
+				return
+			}
+			$line = $s.Substring($i, $nIdx - $i)
+			$i = $nIdx + 1
+			if ($line -match '^\s{0,3}```') {
+				$code = [string]$script:MB.MdFenceBuf
+				$script:MB.MdFence = $false
+				$script:MB.MdFenceBuf = ''
+				$script:MB.MdFenceLang = ''
+				if (Test-MBWpfActive) {
+					Write-MBMdCodeClose
+				} else {
+					if ($code.Length -gt 0) {
+						if ($code.EndsWith("`n")) { $code = $code.Substring(0, $code.Length - 1) }
+						Write-Host $code -ForegroundColor Cyan
+					}
+				}
+				$script:MB.MdAtLineStart = $true
+			} else {
+				$script:MB.MdFenceBuf = [string]$script:MB.MdFenceBuf + $line + "`n"
+				if (Test-MBWpfActive) {
+					Write-MBMdCodeAppend -Text ($line + "`n")
+				}
+			}
 			continue
 		}
-		if ($trimmed -eq '/autoapprovedisable' -or $trimmed -eq 'autoapprovedisable') {
-			$AutoApproveEnabled = $false
-			Write-Host "Auto-Approve DISABLED. All modifying actions will now require your approval." -ForegroundColor Cyan
+
+		$inTableLine = ([string]$script:MB.MdTableLine.Length -gt 0)
+		$startTable = (
+			(-not $inTableLine) -and
+			[bool]$script:MB.MdAtLineStart -and
+			([string]$script:MB.MdHold.Length -eq 0) -and
+			$i -lt $len -and $s[$i] -eq [char]'|'
+		)
+		if ($inTableLine -or $startTable) {
+			$nIdx = $s.IndexOf([char]"`n", $i)
+			if ($nIdx -lt 0) {
+				$script:MB.MdTableLine = [string]$script:MB.MdTableLine + $s.Substring($i)
+				$script:MB.MdPending = ''
+				return
+			}
+			$line = [string]$script:MB.MdTableLine + $s.Substring($i, $nIdx - $i)
+			$script:MB.MdTableLine = ''
+			$i = $nIdx + 1
+			Write-MBMdFinishTableLine -Line $line
+			$script:MB.MdAtLineStart = $true
+			Write-MBMdClearLineStyle
 			continue
 		}
 
-		if ([string]::IsNullOrWhiteSpace($userInput)) { continue }
+		if ([bool]$script:MB.MdAtLineStart -and ($null -ne $script:MB.MdTableRows) -and
+			([int]$script:MB.MdTableRows.Count -gt 0) -and
+			(-not [char]::IsWhiteSpace($s[$i])) -and ($s[$i] -ne [char]'|')) {
+			Complete-MBMdTableIfAny
+		}
 
-		$messages += @{ role = "user"; content = $userInput }
+		if ([char]::IsWhiteSpace($s[$i])) {
+			$j = $i
+			while ($j -lt $len -and [char]::IsWhiteSpace($s[$j])) { $j++ }
+			$ws = $s.Substring($i, $j - $i)
+			$i = $j
+			$hold = [string]$script:MB.MdHold
 
-		$turn = 0
-		while ($turn -lt $maxTurns) {
-			$turn++
-			$response = Invoke-ModelStreaming -Messages $messages
-
-			if ($script:interruptRequested) {
-				Reset-InterruptFlag
-				Write-Host "`n[INTERRUPT] Turn aborted by user. Partial response discarded." -ForegroundColor Yellow
-				break
+			if ($hold.Length -gt 0) {
+				if (-not (Test-MBMdHoldOpen -S $hold)) {
+					Write-MBMdFlushHold
+					Write-MBMdEmitWhitespace -Ws $ws
+				} elseif ($ws -match '[\n]') {
+					Write-MBMdFlushHold -Force
+					Write-MBMdEmitWhitespace -Ws $ws
+				} else {
+					$script:MB.MdHold = $hold + $ws
+				}
+			} else {
+				Write-MBMdEmitWhitespace -Ws $ws
 			}
+			continue
+		}
 
-			if (-not $response) {
-				break
+		$j = $i
+		while ($j -lt $len -and -not [char]::IsWhiteSpace($s[$j])) { $j++ }
+		if ($j -ge $len) {
+			$script:MB.MdPending = $s.Substring($i)
+			return
+		}
+		$token = $s.Substring($i, $j - $i)
+		$i = $j
+
+		$script:MB.MdHold = [string]$script:MB.MdHold + $token
+		if (-not (Test-MBMdHoldOpen -S ([string]$script:MB.MdHold))) {
+			Write-MBMdFlushHold
+		}
+	}
+
+	$script:MB.MdPending = ''
+}
+
+function Write-MBMdStreamFlush {
+	if ($null -eq $script:MB.MdPending) { $script:MB.MdPending = '' }
+	if ($null -eq $script:MB.MdHold) { $script:MB.MdHold = '' }
+	if ($null -eq $script:MB.MdTableLine) { $script:MB.MdTableLine = '' }
+
+	if ([string]$script:MB.MdPending.Length -gt 0) {
+		if ([bool]$script:MB.MdFence) {
+			$tail = [string]$script:MB.MdPending
+			$script:MB.MdFenceBuf = [string]$script:MB.MdFenceBuf + $tail
+			if (Test-MBWpfActive) { Write-MBMdCodeAppend -Text $tail }
+		} elseif ([string]$script:MB.MdTableLine.Length -gt 0 -or (
+				[bool]$script:MB.MdAtLineStart -and ([string]$script:MB.MdPending).StartsWith('|') -and
+				[string]$script:MB.MdHold.Length -eq 0
+			)) {
+			$script:MB.MdTableLine = [string]$script:MB.MdTableLine + [string]$script:MB.MdPending
+		} else {
+			$script:MB.MdHold = [string]$script:MB.MdHold + [string]$script:MB.MdPending
+		}
+		$script:MB.MdPending = ''
+	}
+
+	if ([bool]$script:MB.MdFence) {
+		if (Test-MBWpfActive) {
+			Write-MBMdCodeClose
+		} else {
+			$code = [string]$script:MB.MdFenceBuf
+			if ($code.Length -gt 0) {
+				if ($code.EndsWith("`n")) { $code = $code.Substring(0, $code.Length - 1) }
+				Write-Host $code -ForegroundColor Cyan
 			}
+		}
+		$script:MB.MdFence = $false
+		$script:MB.MdFenceBuf = ''
+		$script:MB.MdFenceLang = ''
+	}
+	if ([string]$script:MB.MdTableLine.Length -gt 0) {
+		Write-MBMdFinishTableLine -Line ([string]$script:MB.MdTableLine)
+		$script:MB.MdTableLine = ''
+	}
+	if ([string]$script:MB.MdHold.Length -gt 0) {
+		Write-MBMdFlushHold -Force
+	}
+	Complete-MBMdTableIfAny
 
-			$assistantMessage = $response.choices[0].message
-			$messages += $assistantMessage
+	Write-MBMdClearInline
+	Write-MBMdClearLineStyle
+	$script:MB.MdAtLineStart = $true
+	$script:MB.MdInTable = $false
+}
 
-			if ($assistantMessage.tool_calls) {
-				Write-Host "[" -NoNewLine -ForegroundColor DarkGray
-				Write-Host "$AgentName" -NoNewLine -ForegroundColor DarkYellow
-				Write-Host "-" -NoNewLine -ForegroundColor DarkGray
-				Write-Host "Agent" -NoNewLine -ForegroundColor DarkYellow
-				Write-Host "] " -NoNewLine -ForegroundColor DarkGray
-				Write-Host "is using tools... " -ForegroundColor DarkYellow
-				foreach ($tc in $assistantMessage.tool_calls) {
-					$fn = $tc.function.name
-					try { $args = $tc.function.arguments | ConvertFrom-Json } catch { $args = $tc.function.arguments }
-					Write-Host "  -> $fn" -NoNewline -ForegroundColor DarkGreen
-					if ($args) {
-						$summary = ""
-						if ($args.PSObject.Properties['command']) { $summary = " command: $($args.command)" }
-						elseif ($args.PSObject.Properties['path'])	 { $summary = " path: $($args.path)" }
-						elseif ($args.PSObject.Properties['name'])	 { $summary = " name: $($args.name)" }
-						elseif ($args.PSObject.Properties['tool'])	 { $summary = " tool: $($args.tool)" }
-						elseif ($args.PSObject.Properties['hours'])	 { $summary = " hours: $($args.hours)" }
-						elseif ($args.PSObject.Properties['action']) { $summary = " action: $($args.action)" }
-						elseif ($args.PSObject.Properties['savePath']) { $summary = " savePath: $($args.savePath)" }
-						if ($summary) { Write-Host $summary -ForegroundColor DarkGray } else { Write-Host "" }
-					} else { Write-Host "" }
-					$result = switch ($fn) {
-						"ReadFile"				 { Invoke-ReadFile $args.path }
-						"WriteFile"				 { Invoke-WriteFile $args.path $args.content }
-						"EditFile"				 { Invoke-EditFile $args.path $args.search $args.replace }
-						"RunCommand"			 {
-							if (Test-IsSafeCommand $args.command) {
-								Write-Host "Auto-Approve command (whitelisted) -> executing..." -ForegroundColor Green
-								Invoke-RunCommand $args.command $args.shell $true
+function Write-MBWpfRaw {
+	param(
+		[string]$Text,
+		[ConsoleColor]$Color = [ConsoleColor]::Gray,
+		[switch]$NoNewline,
+		[string]$Kind = 'text',
+		[switch]$Bold,
+		[switch]$Italic,
+		[switch]$Strike,
+		[switch]$Code,
+		[double]$FontSize = 0
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	if ($null -eq $Text) { $Text = '' }
+	if ($Kind -eq 'text') {
+		try { $Text = ConvertTo-MBWpfSafeText -Text $Text } catch {}
+	}
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$fs = 0.0
+	try { if ($FontSize -gt 0) { $fs = [double]$FontSize } } catch { $fs = 0.0 }
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind       = $Kind
+		Text       = $Text
+		Color      = $Color.ToString()
+		NoNewline  = [bool]$NoNewline
+		MdBold     = $(if ($Bold) { 1 } else { 0 })
+		MdItalic   = $(if ($Italic) { 1 } else { 0 })
+		MdStrike   = $(if ($Strike) { 1 } else { 0 })
+		MdCode     = $(if ($Code) { 1 } else { 0 })
+		MdFontSize = $fs
+		MdHead     = 0
+		MdNoLinks  = 1
+		Brand      = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+}
+
+function Update-MBWpfSticky {
+	param(
+		[string]$Line1,
+		[string]$Line2,
+		[string]$BrandName,
+		[string]$Line1Rest,
+		[string]$Left,
+		[string]$Center,
+		[string]$Right,
+		[string]$Hint,
+		[string]$Status,
+		[string]$PoweredBy,
+		[string]$AutoCompactLine,
+		[double]$CtxPct,
+		[string]$CtxColor,
+		[string]$CtxPctText,
+		[string]$CtxTokText
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	$cur = $script:MB.Wpf.PendingSticky
+	if (-not $cur) { $cur = @{} }
+	if ($PSBoundParameters.ContainsKey('Line1')) { $cur.Line1 = ConvertTo-MBWpfSafeText -Text $Line1 }
+	if ($PSBoundParameters.ContainsKey('BrandName')) { $cur.BrandName = ConvertTo-MBWpfSafeText -Text $BrandName }
+	if ($PSBoundParameters.ContainsKey('Line1Rest')) { $cur.Line1Rest = ConvertTo-MBWpfSafeText -Text $Line1Rest }
+	if ($PSBoundParameters.ContainsKey('Line2')) { $cur.Line2 = ConvertTo-MBWpfSafeText -Text $Line2 }
+	if ($PSBoundParameters.ContainsKey('Left')) { $cur.Left = ConvertTo-MBWpfSafeText -Text $Left }
+	if ($PSBoundParameters.ContainsKey('Center')) { $cur.Center = ConvertTo-MBWpfSafeText -Text $Center }
+	if ($PSBoundParameters.ContainsKey('Right')) { $cur.Right = ConvertTo-MBWpfSafeText -Text $Right }
+	if ($PSBoundParameters.ContainsKey('Hint')) { $cur.Hint = ConvertTo-MBWpfSafeText -Text $Hint }
+	if ($PSBoundParameters.ContainsKey('PoweredBy')) { $cur.PoweredBy = ConvertTo-MBWpfSafeText -Text $PoweredBy }
+	if ($PSBoundParameters.ContainsKey('AutoCompactLine')) { $cur.AutoCompactLine = ConvertTo-MBWpfSafeText -Text $AutoCompactLine }
+	if ($PSBoundParameters.ContainsKey('Status')) {
+		# Status mode for spinner; UI timer paints glyph
+		$raw = [string]$Status
+		$label = ($raw -replace '^[·*#o○●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]+', '').Trim()
+		if ([string]::IsNullOrWhiteSpace($label)) { $label = $raw.Trim() }
+		$mode = 'ready'
+		if ($label -match '(?i)autocompact|compact') {
+			$mode = 'compacting'
+			$label = 'autocompacting...'
+		} elseif ($label -match '(?i)think') {
+			$mode = 'thinking'
+			$label = 'thinking...'
+		} elseif ($label -match '(?i)work') {
+			$mode = 'working'
+			$label = 'working...'
+		} else {
+			$mode = 'ready'
+			$label = 'ready'
+		}
+		$cur.StatusMode = $mode
+		$cur.StatusLabel = $label
+		# Apply sticky status immediately; restart timer on busy transitions
+		try {
+			$prev = [string]$script:MB.Wpf.StatusMode
+			$script:MB.Wpf.StatusMode = $mode
+			$script:MB.Wpf.StatusLabel = $label
+			$busy = ($mode -eq 'thinking' -or $mode -eq 'working' -or $mode -eq 'compacting')
+			$wasBusy = ($prev -eq 'thinking' -or $prev -eq 'working' -or $prev -eq 'compacting')
+			if ($busy -and (-not $wasBusy -or $prev -ne $mode)) {
+				$script:MB.Wpf.StatusBusySince = [Environment]::TickCount
+			} elseif (-not $busy) {
+				$script:MB.Wpf.StatusBusySince = 0
+			}
+		} catch {}
+	}
+	if ($PSBoundParameters.ContainsKey('CtxPct')) { $cur.CtxPct = [double]$CtxPct }
+	if ($PSBoundParameters.ContainsKey('CtxColor')) { $cur.CtxColor = [string]$CtxColor }
+	if ($PSBoundParameters.ContainsKey('CtxPctText')) { $cur.CtxPctText = ConvertTo-MBWpfSafeText -Text $CtxPctText }
+	if ($PSBoundParameters.ContainsKey('CtxTokText')) { $cur.CtxTokText = ConvertTo-MBWpfSafeText -Text $CtxTokText }
+	$script:MB.Wpf.PendingSticky = $cur
+}
+
+function Get-MBWpfLowerRightText {
+	$dot = [string][char]0x00B7
+	$parts = New-Object System.Collections.ArrayList
+	$n = 0
+	try { $n = [int]$script:MB.CompactionCount } catch { $n = 0 }
+	if ($n -gt 0) {
+		[void]$parts.Add(("compact {0}x" -f $n))
+	}
+	$auto = if ($script:MB.AutoApprove) { 'auto-approve: ON' } else { 'auto-approve: OFF' }
+	[void]$parts.Add($auto)
+	[void]$parts.Add(("tools used {0}" -f [int]$script:MB.ToolCalls))
+	return ($parts -join ("  {0}  " -f $dot))
+}
+
+function Get-MBWpfAutoCompactLine {
+	if ($script:MB.AutoCompact) { return 'AutoCompact: ON' }
+	return 'AutoCompact: OFF'
+}
+
+function Update-MBWpfLiveChrome {
+	param(
+		[switch]$Force
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	try {
+		if ($script:MB.Wpf.NeedPathBudgetRefresh) {
+			$script:MB.Wpf.NeedPathBudgetRefresh = $false
+			try { Refresh-MBWpfStickyFromSession } catch {}
+		}
+		$now = [Environment]::TickCount
+		$last = 0
+		try { $last = [int]$script:MB.WpfLiveChromeTick } catch { $last = 0 }
+		$doCtx = $Force -or ($last -eq 0) -or ((($now - $last) -band 0x7fffffff) -ge 120)
+		$right = Get-MBWpfLowerRightText
+		$acLine = Get-MBWpfAutoCompactLine
+		if (-not $doCtx) {
+			Update-MBWpfSticky -Right $right -AutoCompactLine $acLine
+			return
+		}
+		$script:MB.WpfLiveChromeTick = $now
+		$est = Get-MBContextEstimate -Messages @($script:Messages)
+		$pctStr = ('{0,3:P0}' -f $est.Pct).Trim()
+		$tokStr = '{0:N0}/{1:N0}' -f $est.PromptTokens, $est.UsableTokens
+		$ctxHex = Get-MBWpfCtxBarColor -Level $est.Level
+		Update-MBWpfSticky -Right $right -AutoCompactLine $acLine `
+			-CtxPct ([double]$est.Pct) -CtxColor $ctxHex -CtxPctText $pctStr -CtxTokText $tokStr
+	} catch {}
+}
+
+function Refresh-MBWpfStickyFromSession {
+	param([string]$Hint = '')
+	if (-not (Test-MBWpfActive)) { return }
+	try {
+		$est = Get-MBContextEstimate -Messages @($script:Messages)
+		$dot = [string][char]0x00B7  # middot separator
+		$pctStr = ('{0,3:P0}' -f $est.Pct).Trim()
+		$tokStr = '{0:N0}/{1:N0}' -f $est.PromptTokens, $est.UsableTokens
+		$hasAlias = -not [string]::IsNullOrWhiteSpace([string]$ModelAlias)
+		$powered = if ($hasAlias) { "PoweredBy: {0}" -f ([string]$ModelAlias).Trim() } else { '' }
+		$brand = "[{0}-Agent]" -f [string]$AgentName
+		$maxPath = 48
+		try {
+			$winW = 0.0
+			if ($script:MB.Wpf.Window) { $winW = [double]$script:MB.Wpf.Window.ActualWidth }
+			if ($winW -gt 80) {
+				$chars = [int](($winW - 40) / 7.2)
+				$reserve = $brand.Length + 5  # brand + separators
+				if ($hasAlias) { $reserve += ($powered.Length + 6) }
+				$maxPath = [math]::Max(14, $chars - $reserve)
+			} elseif ($hasAlias) {
+				$maxPath = 36
+			}
+		} catch {}
+		$path = Get-MBShortPath -Path $script:MB.WorkingDir -MaxLen $maxPath
+		$line1Rest = "  {0}  {1}" -f $dot, $path
+		$line1 = "{0}{1}" -f $brand, $line1Rest
+		$acLine = Get-MBWpfAutoCompactLine
+		$right = Get-MBWpfLowerRightText
+		if (-not $Hint) {
+			$Hint = "Enter send  {0}  Ctrl+Enter newline  {0}  Esc interrupt  {0}  /help" -f $dot
+		}
+		$st = if ($script:MB.IsCompacting) { 'autocompacting' } `
+			elseif ($script:MB.IsThinking) { 'thinking...' } `
+			elseif ($script:MB.IsWorking) { 'working' } `
+			else { 'ready' }
+		$ctxHex = Get-MBWpfCtxBarColor -Level $est.Level
+		Update-MBWpfSticky -Line1 $line1 -BrandName ([string]$AgentName) -Line1Rest $line1Rest `
+			-Right $right -Hint $Hint -Status $st `
+			-PoweredBy $powered -AutoCompactLine $acLine `
+			-CtxPct ([double]$est.Pct) -CtxColor $ctxHex -CtxPctText $pctStr -CtxTokText $tokStr
+		try { Update-MBWpfToolGroupBar } catch {}
+		try { $script:MB.WpfLiveChromeTick = [Environment]::TickCount } catch {}
+	} catch {}
+}
+
+function Set-MBWpfPromptEnabled {
+	param(
+		[bool]$Enabled,
+		[switch]$Focus
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	$script:MB.Wpf.PromptArmed = [bool]$Enabled
+	$script:MB.Wpf.PendingPromptEnabled = [bool]$Enabled
+	if ($Enabled -and $Focus) {
+		try { $script:MB.Wpf.PendingPromptFocus = $true } catch {}
+	}
+}
+
+function Focus-MBWpfPrompt {
+	if (-not (Test-MBWpfActive)) { return }
+	$promptRef = $null
+	$winRef = $null
+	$d = $null
+	try { $promptRef = $script:MB.Wpf.Prompt } catch {}
+	try { $winRef = $script:MB.Wpf.Window } catch {}
+	try { $d = $script:MB.Wpf.Dispatcher } catch {}
+	if (-not $promptRef -or -not $d) { return }
+
+	try {
+		$script:MB.Wpf.PromptArmed = $true
+		$script:MB.Wpf.PendingPromptEnabled = $true
+		$script:MB.Wpf.PendingPromptFocus = $false
+	} catch {}
+
+	$sb = {
+		$p = $promptRef
+		$w = $winRef
+		if (-not $p) { return }
+		try {
+			try {
+				if ([bool]$script:MB.Wpf.AuthActive) { return }
+				if ($script:MB.Wpf.AuthOverlay -and $script:MB.Wpf.AuthOverlay.Visibility -eq [System.Windows.Visibility]::Visible) { return }
+				if ($script:MB.Wpf.ConfirmOverlay -and $script:MB.Wpf.ConfirmOverlay.Visibility -eq [System.Windows.Visibility]::Visible) { return }
+			} catch {}
+			$p.IsEnabled = $true
+			$p.Focusable = $true
+			$p.IsReadOnly = $false
+			try {
+				if ($script:MB.Wpf.SyncSendBtn) { & $script:MB.Wpf.SyncSendBtn $true }
+			} catch {}
+			try {
+				if ($w -and $w.WindowState -eq [System.Windows.WindowState]::Minimized) {
+					$w.WindowState = [System.Windows.WindowState]::Normal
+				}
+				if ($w) { [void]$w.Activate() }
+			} catch {}
+			try { [void]$p.Focus() } catch {}
+			try { [void][System.Windows.Input.Keyboard]::Focus($p) } catch {}
+			try {
+				if ($null -ne $p.Text) { $p.CaretIndex = $p.Text.Length }
+				else { $p.CaretIndex = 0 }
+			} catch {}
+		} catch {}
+	}.GetNewClosure()
+
+	try {
+		if ($d.CheckAccess()) { & $sb }
+		else { [void]$d.Invoke([Action]$sb, [System.Windows.Threading.DispatcherPriority]::Send) }
+	} catch {
+		try { Invoke-MBWpf -Action $sb } catch {}
+	}
+}
+
+function Read-MBWpfUserInput {
+	try {
+		Write-MBDebugLog -Step 'READ_WPF_INPUT_BEGIN'
+		if (-not (Test-MBWpfActive)) {
+			Write-MBDebugLog -Step 'READ_WPF_INPUT_NOT_ACTIVE'
+			return ""
+		}
+		try { Refresh-MBWpfStickyFromSession -Hint ("enter send  {0}  Ctrl+Enter newline  {0}  Esc interrupt  {0}  /help" -f ([char]0x00B7)) } catch {}
+		Set-MBWpfPromptEnabled -Enabled $true -Focus
+		try { Focus-MBWpfPrompt } catch {}
+		Write-MBDebugLog -Step 'READ_WPF_INPUT_ARMED'
+		$script:MB.Wpf.InputResult = $null
+		$script:MB.Wpf.InterruptFlag = $false
+		try { [void]$script:MB.Wpf.InputWait.Reset() } catch {}
+		$script:MB.Wpf.InputResult = $null
+		try {
+			while ($true) {
+				if ($script:MB.Wpf.ExitRequested) {
+					Write-MBDebugLog -Step 'READ_WPF_INPUT_EXIT_REQUESTED'
+					return [string][char]0x1B + 'WPF_CLOSE'
+				}
+				if ($script:MB.Wpf.InterruptFlag) {
+					$script:MB.Wpf.InterruptFlag = $false
+					$script:MB.Interrupt = $true
+					Write-MBDebugLog -Step 'READ_WPF_INPUT_INTERRUPT_FLAG'
+				}
+				$signaled = $false
+				try { $signaled = $script:MB.Wpf.InputWait.WaitOne(20) } catch { $signaled = $false }
+				if ($signaled) {
+					if ($script:MB.Wpf.ExitRequested) {
+						Write-MBDebugLog -Step 'READ_WPF_INPUT_EXIT_AFTER_SIGNAL'
+						return [string][char]0x1B + 'WPF_CLOSE'
+					}
+					$r = [string]$script:MB.Wpf.InputResult
+					$script:MB.Wpf.InputResult = $null
+					Write-MBDebugLog -Step 'READ_WPF_INPUT_RECEIVED' -Detail ("len={0}" -f $(if ($null -eq $r) { -1 } else { $r.Length }))
+					Set-MBWpfPromptEnabled -Enabled $false
+					try { Refresh-MBWpfStickyFromSession -Hint "… working …" } catch {}
+					Write-MBDebugLog -Step 'READ_WPF_INPUT_RETURN'
+					return $r
+				}
+			}
+		} finally {
+			try { Set-MBWpfPromptEnabled -Enabled $false } catch {}
+			Write-MBDebugLog -Step 'READ_WPF_INPUT_FINALLY'
+		}
+	} catch {
+		Write-MBDebugLog -Step 'READ_WPF_INPUT_ERROR' -Detail $_.Exception.Message
+		Show-MBWpfError -Title 'Prompt error' -Message 'Failed while waiting for input.' -Exception $_.Exception
+		return ""
+	}
+}
+
+function Restore-MBWpfStickyAfterApproval {
+	if (-not (Test-MBWpfActive)) { return }
+	$dot = [string][char]0x00B7
+	try {
+		if ($script:MB.IsCompacting) {
+			Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  autocompacting..." -f $dot)
+			Update-MBWpfSticky -Status 'compacting'
+		} elseif ($script:MB.IsThinking) {
+			Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  model thinking..." -f $dot)
+			Update-MBWpfSticky -Status 'thinking'
+		} elseif ($script:MB.IsWorking) {
+			Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  model working..." -f $dot)
+			Update-MBWpfSticky -Status 'working'
+		} else {
+			Refresh-MBWpfStickyFromSession
+			Update-MBWpfSticky -Status 'ready'
+		}
+	} catch {
+		try { Refresh-MBWpfStickyFromSession } catch {}
+	}
+}
+
+function Request-MBWpfConfirmation {
+	param(
+		[string]$Title,
+		[string]$Details = "",
+		[string]$Code = "",
+		[string]$CodeLang = "ps"
+	)
+	if (-not (Test-MBWpfActive)) { return $null }
+	Write-MBWpfRaw -Text "" -Color DarkGray
+	Write-MBWpfApprovalBanner -Label 'approval'
+	Write-MBWpfRaw -Text "" -Color DarkGray
+	if (-not [string]::IsNullOrWhiteSpace($Title)) {
+		Write-MBWpfRaw -Text ("  {0}" -f $Title) -Color White
+	}
+	if ($Details) {
+		foreach ($line in ($Details -split "`r?`n")) {
+			if ([string]::IsNullOrWhiteSpace($line)) {
+				Write-MBWpfRaw -Text "" -Color DarkGray
+			} else {
+				Write-MBWpfRaw -Text ("  {0}" -f $line) -Color DarkGray
+			}
+		}
+	}
+	if (-not [string]::IsNullOrWhiteSpace($Code)) {
+		$lang = ([string]$CodeLang).Trim()
+		if ([string]::IsNullOrWhiteSpace($lang)) { $lang = 'ps' }
+		$codeText = [string]$Code
+		$codeText = $codeText -replace "`r`n", "`n" -replace "`r", "`n"
+		Write-MBWpfSynText -Text $codeText -Lang $lang
+	}
+	Write-MBWpfRaw -Text "" -Color DarkGray
+	Write-MBWpfApprovalButtons
+	Write-MBWpfRaw -Text "" -Color DarkGray
+	Update-MBWpfSticky -Hint "approval: Y / N / A  (buttons or keyboard)"
+	Set-MBWpfPromptEnabled -Enabled $true -Focus
+	try { Focus-MBWpfPrompt } catch {}
+	$script:MB.Wpf.InputResult = $null
+	try {
+		while ($true) {
+			if ($script:MB.Wpf.ExitRequested) { return $false }
+			if ($script:MB.Wpf.InputWait.WaitOne(20)) {
+				$c = ([string]$script:MB.Wpf.InputResult).Trim().ToLowerInvariant()
+				$script:MB.Wpf.InputResult = $null
+				Set-MBWpfPromptEnabled -Enabled $false
+				try { Disable-MBWpfActiveApprovalButtons } catch {}
+				switch -Regex ($c) {
+					'^(y|yes)$' { $script:MB.ApprovalsGranted++; return $true }
+					'^(n|no)$'  { $script:MB.ApprovalsDenied++; return $false }
+					'^(a|all|yes to all|yestoall)$' {
+						$script:MB.AutoApprove = $true
+						$script:MB.ApprovalsGranted++
+						$script:MB.ModeSwitch = $true
+						Write-MBWpfRaw -Text "  Auto-Approve ENABLED for this session." -Color Green
+						return $true
+					}
+					default {
+						Write-MBWpfRaw -Text "  Enter Y, N, or A — or use the buttons." -Color Yellow
+						Write-MBWpfApprovalButtons
+						Set-MBWpfPromptEnabled -Enabled $true -Focus
+						try { Focus-MBWpfPrompt } catch {}
+					}
+				}
+			}
+		}
+	} finally {
+		try { Disable-MBWpfActiveApprovalButtons } catch {}
+		try { Set-MBWpfPromptEnabled -Enabled $false } catch {}
+		try { Restore-MBWpfStickyAfterApproval } catch {}
+	}
+}
+
+function Ensure-MBConNative {
+	try {
+		if (-not ('MiniBot.WpfNative.MBCon' -as [type])) {
+			Add-Type -MemberDefinition @"
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+[DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int dwProcessId);
+[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+"@ -Name 'MBCon' -Namespace 'MiniBot.WpfNative' -ErrorAction Stop
+		}
+	} catch {}
+}
+
+function Hide-MBNativeConsole {
+	# No-op when -HideConsole:$false (or default flipped at top of script)
+	try {
+		if ($null -ne $script:MB_HideConsole -and -not [bool]$script:MB_HideConsole) { return }
+	} catch {}
+	try {
+		Ensure-MBConNative
+		$hwnd = [MiniBot.WpfNative.MBCon]::GetConsoleWindow()
+		if ($hwnd -eq [IntPtr]::Zero) {
+			try { $hwnd = [IntPtr]$script:MB_HiddenConsoleHwnd } catch { $hwnd = [IntPtr]::Zero }
+		}
+		if ($hwnd -ne [IntPtr]::Zero) {
+			$script:MB_HiddenConsoleHwnd = $hwnd
+			[void][MiniBot.WpfNative.MBCon]::ShowWindow($hwnd, 0)  # SW_HIDE
+		}
+	} catch {}
+}
+
+function Invoke-MBWpfBringToFront {
+	param([switch]$StayTopmost)
+	if (-not (Test-MBWpfActive)) { return }
+	try { Ensure-MBConNative } catch {}
+	$keep = [bool]$StayTopmost
+	try {
+		if ($script:MB.Wpf) { $script:MB.Wpf.BootstrapTopmost = $keep }
+	} catch {}
+	$winRef = $null
+	try { $winRef = $script:MB.Wpf.Window } catch { $winRef = $null }
+	$d = $null
+	try { $d = $script:MB.Wpf.Dispatcher } catch { $d = $null }
+	if (-not $winRef -or -not $d) { return }
+
+	# Build closure before [Action] so captured locals stick
+	$sb = {
+		$w = $winRef
+		$keepTop = $keep
+		if (-not $w) { return }
+		try {
+			if ($w.WindowState -eq [System.Windows.WindowState]::Minimized) {
+				$w.WindowState = [System.Windows.WindowState]::Normal
+			}
+			try { [void]$w.Show() } catch {}
+			try {
+				$w.Topmost = $false
+				$w.Topmost = $true
+			} catch { try { $w.Topmost = $true } catch {} }
+			try { [void]$w.Activate() } catch {}
+			try { [void]$w.Focus() } catch {}
+			try {
+				if ('MiniBot.WpfNative.MBCon' -as [type]) {
+					$helper = New-Object System.Windows.Interop.WindowInteropHelper($w)
+					$hwnd = $helper.Handle
+					if ($hwnd -eq [IntPtr]::Zero) {
+						try { $hwnd = $helper.EnsureHandle() } catch {}
+					}
+					if ($hwnd -ne [IntPtr]::Zero) {
+						[void][MiniBot.WpfNative.MBCon]::ShowWindow($hwnd, 9)
+						[void][MiniBot.WpfNative.MBCon]::BringWindowToTop($hwnd)
+						try {
+							$fg = [MiniBot.WpfNative.MBCon]::GetForegroundWindow()
+							$dummy = [uint32]0
+							$fgTid = [MiniBot.WpfNative.MBCon]::GetWindowThreadProcessId($fg, [ref]$dummy)
+							$curTid = [MiniBot.WpfNative.MBCon]::GetCurrentThreadId()
+							if ($fgTid -ne 0 -and $fgTid -ne $curTid) {
+								[void][MiniBot.WpfNative.MBCon]::AttachThreadInput($curTid, $fgTid, $true)
+								[void][MiniBot.WpfNative.MBCon]::SetForegroundWindow($hwnd)
+								[void][MiniBot.WpfNative.MBCon]::AttachThreadInput($curTid, $fgTid, $false)
 							} else {
-								$cmdDetails = "The agent wants to run:`n`n`t$($args.command)`n`nThis command can modify files, settings, or system state.`nIt is not on the whitelist."
-								if (-not (Request-Confirmation -Title "RunCommand ACTION REQUIRES APPROVAL" -Details $cmdDetails)) {
-									Write-Host "Denied by user -> command blocked." -ForegroundColor Red
-									"BLOCKED BY USER: The user denied this command. Stop what you are doing and explain to the user why you need to do this."
-								} else {
-									if ($AutoApproveEnabled) {
-										if($script:modeSwitch){
-											$script:modeSwitch = $false
-										} else {
-											Write-Host "Auto-Approve enabled -> executing..." -ForegroundColor Green
-										}
-									} else {
-										Write-Host "Approved by user -> executing..." -ForegroundColor Green
-									}
-									Invoke-RunCommand $args.command $args.shell $true
+								[void][MiniBot.WpfNative.MBCon]::SetForegroundWindow($hwnd)
+							}
+						} catch {
+							try { [void][MiniBot.WpfNative.MBCon]::SetForegroundWindow($hwnd) } catch {}
+						}
+						try {
+							[void][MiniBot.WpfNative.MBCon]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, ([uint32](0x0001 -bor 0x0002 -bor 0x0040)))
+							if (-not $keepTop) {
+								[void][MiniBot.WpfNative.MBCon]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, ([uint32](0x0001 -bor 0x0002 -bor 0x0040)))
+							}
+						} catch {}
+					}
+				}
+			} catch {}
+			if (-not $keepTop) {
+				try {
+					$w.Topmost = $true
+					$w.Topmost = $false
+				} catch { try { $w.Topmost = $false } catch {} }
+				try { [void]$w.Activate() } catch {}
+			}
+		} catch {}
+	}.GetNewClosure()
+	$act = [Action]$sb
+
+	try {
+		if ($d.CheckAccess()) { & $sb }
+		else { [void]$d.Invoke($act, [System.Windows.Threading.DispatcherPriority]::Send) }
+	} catch {
+		try { Invoke-MBWpf -Action $sb } catch {}
+	}
+}
+
+function Clear-MBWpfBootstrapTopmost {
+	if (-not (Test-MBWpfActive)) { return }
+	try {
+		if ($script:MB.Wpf) { $script:MB.Wpf.BootstrapTopmost = $false }
+	} catch {}
+	try { Ensure-MBConNative } catch {}
+	$winRef = $null
+	try { $winRef = $script:MB.Wpf.Window } catch { $winRef = $null }
+	$d = $null
+	try { $d = $script:MB.Wpf.Dispatcher } catch { $d = $null }
+	if (-not $winRef -or -not $d) { return }
+
+	$sb = {
+		$w = $winRef
+		if (-not $w) { return }
+		try {
+			$w.Topmost = $true
+			$w.Topmost = $false
+			$w.Topmost = $false
+		} catch {
+			try { $w.Topmost = $false } catch {}
+		}
+		try {
+			if ('MiniBot.WpfNative.MBCon' -as [type]) {
+				$helper = New-Object System.Windows.Interop.WindowInteropHelper($w)
+				$hwnd = $helper.Handle
+				if ($hwnd -ne [IntPtr]::Zero) {
+					[void][MiniBot.WpfNative.MBCon]::SetWindowPos(
+						$hwnd, [IntPtr](-2), 0, 0, 0, 0,
+						([uint32](0x0001 -bor 0x0002 -bor 0x0040))
+					)
+				}
+			}
+		} catch {}
+	}.GetNewClosure()
+	$act = [Action]$sb
+
+	try {
+		if ($d.CheckAccess()) { & $sb }
+		else { [void]$d.Invoke($act, [System.Windows.Threading.DispatcherPriority]::Send) }
+	} catch {
+		try { Invoke-MBWpf -Action $sb } catch {}
+	}
+
+	try {
+		$sb2 = {
+			try {
+				$w2 = $winRef
+				if (-not $w2) { return }
+				if ($w2.Topmost) {
+					$w2.Topmost = $true
+					$w2.Topmost = $false
+				}
+				try {
+					if ('MiniBot.WpfNative.MBCon' -as [type]) {
+						$helper = New-Object System.Windows.Interop.WindowInteropHelper($w2)
+						$hwnd = $helper.Handle
+						if ($hwnd -ne [IntPtr]::Zero) {
+							[void][MiniBot.WpfNative.MBCon]::SetWindowPos(
+								$hwnd, [IntPtr](-2), 0, 0, 0, 0,
+								([uint32](0x0001 -bor 0x0002 -bor 0x0040))
+							)
+						}
+					}
+				} catch {}
+			} catch {}
+		}.GetNewClosure()
+		[void]$d.BeginInvoke([System.Windows.Threading.DispatcherPriority]::ApplicationIdle, [Action]$sb2)
+	} catch {}
+}
+
+
+function Start-MBWpfHost {
+	if ($script:MB.Wpf -and $script:MB.Wpf.Ready) { return $true }
+
+	if (-not (Test-MBWpfDotNetReady)) {
+		try {
+			$dotnetchecker = New-Object -ComObject Wscript.Shell
+			$dotnetchecker.Popup(
+				"dotNET 3.0 or higher is required for the MiniBot WPF host.",
+				0,
+				'MiniBot WPF',
+				0x0
+			) | Out-Null
+		} catch {}
+		Write-Warning "WPF requires .NET Framework 3.0+; not starting WPF host."
+		return $false
+	}
+
+	if (-not (Test-MBWpfAvailable)) { return $false }
+
+	# Shared state for UI and agent runspaces
+	$wpf = [hashtable]::Synchronized(@{
+		Ready         = $false
+		Failed        = $false
+		FailMsg       = ''
+		Dispatcher    = $null
+		Window        = $null
+		Log           = $null
+		Prompt        = $null
+		HdrLine1      = $null
+		HdrLine1Shadow = $null
+		HdrLine2      = $null
+		HdrLine2Shadow = $null
+		HdrToolGroups = $null
+		ToolGroupsFp  = ''
+		ToolGroupsBuilt = $false
+		ToolGroupsDirty = $true
+		ToolGroupsData  = $null
+		HdrPoweredBy  = $null
+		HdrPoweredByShadow = $null
+		HdrPoweredByHost = $null
+		HdrAutoCompact = $null
+		HdrAutoCompactShadow = $null
+		HdrLeft       = $null
+		HdrCenter     = $null
+		HdrRight      = $null
+		HintBar       = $null
+		StatusDot     = $null
+		LowerCenter   = $null
+		LowerRight    = $null
+		CtxBarFill    = $null
+		CtxPctText    = $null
+		CtxTokText    = $null
+		CtxBarMaxW    = 120
+		MonoFont      = $null
+		EmojiFont     = $null
+		LogMaxLineChars = 0
+		LogLineCharRun  = 0   # chars on the current (open) paragraph
+		LogWordWrap     = $true
+		WordWrapToggle  = $null
+		ReplyStartBlock = -1
+		ActiveCodeBox   = $null
+		ActiveCodeBorder = $null
+		StatusMode    = 'ready'     # ready | thinking | working | compacting
+		StatusLabel   = 'ready'
+		SpinIdx       = 0
+		SpinLastTick  = 0
+		StatusBusySince = 0         # Environment.TickCount when busy mode started
+		StatusTimer   = $null       # TextBlock for elapsed seconds
+		InputWait     = New-Object System.Threading.AutoResetEvent $false
+		InputResult   = $null
+		PromptArmed   = $false
+		ExitRequested = $false
+		# all exits hard-kill the process (single-instance lock)
+		SoftClose     = $false
+		CloseKind     = ''          # always treated as user_x on close
+		ForceProcessExit = $false
+		AuthActive    = $false      # true while login overlay is visible (blocks prompt focus)
+		AuthFocusTicks = 0          # re-apply username focus for a few timer frames
+		AuthNeedActivate = $false   # keep forcing OS foreground until window is active
+		BootstrapTopmost = $true    # Topmost until main screen loads; then cleared
+		History       = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+		HistIndex     = -1
+		ReadyWait     = New-Object System.Threading.ManualResetEvent $false
+		InterruptFlag = $false
+		SendBtn       = $null
+		SendMode      = 'send'      # send | stop
+		AgentName     = [string]$AgentName
+		Version       = [string]$Version
+		ModelAlias    = $(try { [string]$ModelAlias } catch { '' })
+		AutoCompactOn = $(try { [bool]$script:MB.AutoCompact } catch { $true })
+		Ps            = $null
+		Runspace      = $null
+		WriteQueue    = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+		PendingSticky = $null
+		PendingPromptEnabled = $null
+		PendingPromptFocus = $false   # true => focus PromptBox when arming
+		ActiveApprovalHost = $null    # inline Yes/No/All button strip in log
+		NeedPathBudgetRefresh = $false
+		LastPathBudgetTick = 0
+		BrushCache    = @{}
+		MdStretchElements = New-Object System.Collections.ArrayList
+		CredWait      = New-Object System.Threading.ManualResetEvent $false
+		CredResult    = $null
+		AuthOverlay   = $null
+		AuthUser      = $null
+		AuthPass      = $null
+		AuthError     = $null
+		AuthTitle     = $null
+		AuthSubtitle  = $null
+		AuthOk        = $null
+		AuthCancel    = $null
+		AuthSaveCreds = $null
+		ConfirmWait   = New-Object System.Threading.ManualResetEvent $false
+		ConfirmResult = $null
+		ConfirmOverlay = $null
+		ConfirmTitle  = $null
+		ConfirmPrompt = $null
+		ConfirmYes    = $null
+		ConfirmNo     = $null
+		ConfirmAccentBar = $null
+		InitStoreCreds = $false
+		DebugLogPath  = (Get-MBDebugLogPath)
+		DebugLogEnabled = [bool]$(try { [bool]$script:MB.DebugLogEnabled } catch { $false })
+	})
+	$script:MB.Wpf = $wpf
+	try { Write-MBDebugLog -Step 'WPF_HOST_STARTING' -Detail $wpf.DebugLogPath } catch {}
+
+	$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+	$rs.ApartmentState = [System.Threading.ApartmentState]::STA
+	$rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+	$rs.Open()
+	$ps = [PowerShell]::Create()
+	$ps.Runspace = $rs
+	$wpf.Runspace = $rs
+	$wpf.Ps = $ps
+
+	[void]$ps.AddScript({
+		param($W)
+		try {
+			Add-Type -AssemblyName PresentationFramework
+			Add-Type -AssemblyName PresentationCore
+			Add-Type -AssemblyName WindowsBase
+			Add-Type -AssemblyName System.Xaml
+
+			$xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MiniBot"
+        Width="980" Height="640"
+        MinWidth="640" MinHeight="400"
+        WindowStartupLocation="CenterScreen"
+        ShowActivated="True"
+        Topmost="True"
+        Background="#1A1A1E"
+        Foreground="#C8C8D0"
+        FontFamily="Consolas, Cascadia Mono, Courier New"
+        FontSize="13">
+  <Window.Resources>
+ <!-- Dark scrollbar (track + thumb) matching titlebar gray -->
+    <SolidColorBrush x:Key="MbScrollTrack" Color="#1A1A1E"/>
+    <SolidColorBrush x:Key="MbScrollThumb" Color="#3A3A42"/>
+    <SolidColorBrush x:Key="MbScrollThumbHover" Color="#52525C"/>
+    <SolidColorBrush x:Key="MbScrollThumbDrag" Color="#6A6A76"/>
+    <SolidColorBrush x:Key="MbScrollBtn" Color="#2A2A30"/>
+    <Style x:Key="MbScrollBarThumb" TargetType="Thumb">
+      <Setter Property="OverridesDefaultStyle" Value="True"/>
+      <Setter Property="IsTabStop" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Thumb">
+            <Border x:Name="Bd" Background="{StaticResource MbScrollThumb}" CornerRadius="3" Margin="1"/>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{StaticResource MbScrollThumbHover}"/>
+              </Trigger>
+              <Trigger Property="IsDragging" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{StaticResource MbScrollThumbDrag}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="MbScrollRepeat" TargetType="RepeatButton">
+      <Setter Property="OverridesDefaultStyle" Value="True"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="IsTabStop" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RepeatButton">
+            <Border Background="{StaticResource MbScrollTrack}"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="MbDarkCheckBox" TargetType="CheckBox">
+      <Setter Property="Foreground" Value="#C8C8D0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="CheckBox">
+            <StackPanel Orientation="Horizontal" Background="Transparent">
+              <Border x:Name="Box" Width="13" Height="13" Background="#121216"
+                      BorderBrush="#52525C" BorderThickness="1" CornerRadius="2"
+                      VerticalAlignment="Center" Margin="0,0,6,0">
+                <Path x:Name="CheckMark" Data="M1.5,6.5 L4.8,10 L11.5,2.5"
+                      Stroke="#9ECE6A" StrokeThickness="1.7" Visibility="Collapsed"
+                      Stretch="None" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Border>
+              <ContentPresenter VerticalAlignment="Center" RecognizesAccessKey="True"/>
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="Box" Property="BorderBrush" Value="#6A6A76"/>
+                <Setter TargetName="Box" Property="Background" Value="#1A1A1E"/>
+              </Trigger>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Box" Property="BorderBrush" Value="#8A8A96"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <!-- Login: primary (Sign in) — no system chrome, dark hover -->
+    <Style x:Key="MbAuthPrimaryBtn" TargetType="Button">
+      <Setter Property="Background" Value="#4A4A56"/>
+      <Setter Property="Foreground" Value="#E0E0E8"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                    CornerRadius="3" SnapsToDevicePixels="True">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#5C5C6A"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#3A3A48"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="Bd" Property="Opacity" Value="0.5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <!-- Login: secondary (Cancel) -->
+    <Style x:Key="MbAuthSecondaryBtn" TargetType="Button">
+      <Setter Property="Background" Value="#2A2A30"/>
+      <Setter Property="Foreground" Value="#C8C8D0"/>
+      <Setter Property="BorderBrush" Value="#3A3A42"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    CornerRadius="3" SnapsToDevicePixels="True">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#363640"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#5A5A66"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#222228"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#4A4A56"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ScrollBar">
+      <Setter Property="Background" Value="{StaticResource MbScrollTrack}"/>
+      <Setter Property="Foreground" Value="{StaticResource MbScrollThumb}"/>
+      <Setter Property="Width" Value="12"/>
+      <Setter Property="MinWidth" Value="12"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="{StaticResource MbScrollTrack}">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+              <Border Grid.Row="0" Height="12" Background="{StaticResource MbScrollBtn}"/>
+              <Track x:Name="PART_Track" Grid.Row="1" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="ScrollBar.PageUpCommand" Style="{StaticResource MbScrollRepeat}"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Style="{StaticResource MbScrollBarThumb}"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="ScrollBar.PageDownCommand" Style="{StaticResource MbScrollRepeat}"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+              <Border Grid.Row="2" Height="12" Background="{StaticResource MbScrollBtn}"/>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <Trigger Property="Orientation" Value="Horizontal">
+          <Setter Property="Width" Value="Auto"/>
+          <Setter Property="Height" Value="12"/>
+          <Setter Property="MinHeight" Value="12"/>
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="ScrollBar">
+                <Grid Background="{StaticResource MbScrollTrack}">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <Border Grid.Column="0" Width="12" Background="{StaticResource MbScrollBtn}"/>
+                  <Track x:Name="PART_Track" Grid.Column="1" IsDirectionReversed="False">
+                    <Track.DecreaseRepeatButton>
+                      <RepeatButton Command="ScrollBar.PageLeftCommand" Style="{StaticResource MbScrollRepeat}"/>
+                    </Track.DecreaseRepeatButton>
+                    <Track.Thumb>
+                      <Thumb Style="{StaticResource MbScrollBarThumb}"/>
+                    </Track.Thumb>
+                    <Track.IncreaseRepeatButton>
+                      <RepeatButton Command="ScrollBar.PageRightCommand" Style="{StaticResource MbScrollRepeat}"/>
+                    </Track.IncreaseRepeatButton>
+                  </Track>
+                  <Border Grid.Column="2" Width="12" Background="{StaticResource MbScrollBtn}"/>
+                </Grid>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+ <!-- Dark ScrollViewer: themes the H+V scrollbar corner (default is a white square) -->
+    <Style TargetType="ScrollViewer">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollViewer">
+            <Grid Background="{TemplateBinding Background}">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+              <ScrollContentPresenter Grid.Column="0" Grid.Row="0"
+                                      Margin="{TemplateBinding Padding}"
+                                      Content="{TemplateBinding Content}"
+                                      ContentTemplate="{TemplateBinding ContentTemplate}"
+                                      CanContentScroll="{TemplateBinding CanContentScroll}"/>
+              <ScrollBar x:Name="PART_VerticalScrollBar" Grid.Column="1" Grid.Row="0"
+                         Orientation="Vertical"
+                         ViewportSize="{TemplateBinding ViewportHeight}"
+                         Maximum="{TemplateBinding ScrollableHeight}"
+                         Value="{TemplateBinding VerticalOffset}"
+                         Visibility="{TemplateBinding ComputedVerticalScrollBarVisibility}"/>
+              <ScrollBar x:Name="PART_HorizontalScrollBar" Grid.Column="0" Grid.Row="1"
+                         Orientation="Horizontal"
+                         ViewportSize="{TemplateBinding ViewportWidth}"
+                         Maximum="{TemplateBinding ScrollableWidth}"
+                         Value="{TemplateBinding HorizontalOffset}"
+                         Visibility="{TemplateBinding ComputedHorizontalScrollBarVisibility}"/>
+ <!-- H+V intersection: dark fill (default WPF corner is white) -->
+              <Rectangle Grid.Column="1" Grid.Row="1" Fill="{StaticResource MbScrollTrack}"/>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Border BorderBrush="#2A2A30" BorderThickness="1" Background="#121216">
+    <Grid x:Name="RootGrid">
+ <!-- Main console chrome -->
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+ <!-- Top sticky: brand+path left (width-clamped) - PoweredBy/AutoCompact right (no overlap) -->
+        <Border Grid.Row="0" Panel.ZIndex="3" Background="#2A2A30" BorderBrush="#3A3A42"
+                BorderThickness="0,0,0,0" Padding="12,8,12,6">
+          <Grid>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="2"/>
+            </Grid.RowDefinitions>
+            <Grid Grid.Row="0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" MinWidth="80"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+ <!-- Grid (not StackPanel) so TextTrimming gets a finite width and never paints over PoweredBy -->
+              <Grid Grid.Column="0" Margin="0,0,20,0">
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+ <!-- Letter shadows: black copy offset behind glyphs -->
+                <Grid Grid.Row="0" Margin="0,0,0,3">
+                  <TextBlock x:Name="HdrLine1Shadow" Text="MiniBot" Foreground="#000000" FontSize="14"
+                             FontWeight="Bold" Opacity="0.65" Margin="1.5,1.5,0,0"
+                             TextTrimming="CharacterEllipsis" IsHitTestVisible="False"/>
+                  <TextBlock x:Name="HdrLine1" Text="MiniBot" Foreground="#C8C8D0" FontSize="14"
+                             TextTrimming="CharacterEllipsis"/>
+                </Grid>
+                <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Hidden"
+                              VerticalScrollBarVisibility="Disabled" Padding="0" Margin="0,1,0,0"
+                              Focusable="False">
+                  <StackPanel x:Name="HdrToolGroups" Orientation="Horizontal" VerticalAlignment="Center"/>
+                </ScrollViewer>
+              </Grid>
+              <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="4,1,0,0">
+                <!-- PoweredBy filled from -ModelAlias in code-behind; collapsed when empty -->
+                <Grid x:Name="HdrPoweredByHost" HorizontalAlignment="Right" MaxWidth="280"
+                      Visibility="Collapsed">
+                  <TextBlock x:Name="HdrPoweredByShadow" Text=""
+                             Foreground="#000000" FontSize="13" Opacity="0.65" Margin="1.5,1.5,0,0"
+                             HorizontalAlignment="Right" TextTrimming="CharacterEllipsis"
+                             IsHitTestVisible="False"/>
+                  <TextBlock x:Name="HdrPoweredBy" Text=""
+                             Foreground="#8A8A96" FontSize="13" HorizontalAlignment="Right"
+                             TextTrimming="CharacterEllipsis"/>
+                </Grid>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
+                  <CheckBox x:Name="WordWrapToggle" Style="{StaticResource MbDarkCheckBox}"
+                            VerticalAlignment="Center" Margin="0,0,14,0"
+                            IsChecked="True" ToolTip="Wrap long log lines">
+                    <CheckBox.Content>
+                      <TextBlock x:Name="WordWrapLabel" Text="wrap" Foreground="#C8C8D0" FontSize="12"
+                                 FontFamily="Consolas, Cascadia Mono, Courier New"
+                                 VerticalAlignment="Center" Margin="0,-2,0,0"/>
+                    </CheckBox.Content>
+                  </CheckBox>
+                  <Grid>
+                    <TextBlock x:Name="HdrAutoCompactShadow" Text="AutoCompact: ON"
+                               Foreground="#000000" FontSize="12" Opacity="0.65" Margin="1.5,1.5,0,0"
+                               HorizontalAlignment="Right" IsHitTestVisible="False"/>
+                    <TextBlock x:Name="HdrAutoCompact" Text="AutoCompact: ON"
+                               Foreground="#9ECE6A" FontSize="12" HorizontalAlignment="Right"/>
+                  </Grid>
+                </StackPanel>
+              </StackPanel>
+            </Grid>
+ <!-- Brand accent under sticky chrome -->
+            <Rectangle Grid.Row="1" Height="2" Margin="0,6,0,0" RadiusX="1" RadiusY="1">
+              <Rectangle.Fill>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                  <GradientStop Color="#B80F0A" Offset="0"/>
+                  <GradientStop Color="#7AA2F7" Offset="0.55"/>
+                  <GradientStop Color="#3A3A42" Offset="1"/>
+                </LinearGradientBrush>
+              </Rectangle.Fill>
+            </Rectangle>
+          </Grid>
+        </Border>
+        <Rectangle Grid.Row="1" Height="1" Fill="#3A3A42" Panel.ZIndex="2"/>
+
+ <!-- Scrollback; wrap toggled via header checkbox (left of AutoCompact) -->
+        <RichTextBox x:Name="LogBox" Grid.Row="2" IsReadOnly="True" IsDocumentEnabled="True"
+                     IsUndoEnabled="False"
+                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                     BorderThickness="0" Background="#121216" Foreground="#C8C8D0"
+                     Padding="12,6" AcceptsReturn="True" CaretBrush="#8A8A96"
+                     FontFamily="Consolas, Cascadia Mono, Segoe UI Emoji, Segoe UI Symbol, Courier New">
+          <RichTextBox.Resources>
+            <Style TargetType="Paragraph">
+              <Setter Property="Margin" Value="0"/>
+              <Setter Property="Padding" Value="0"/>
+              <Setter Property="LineHeight" Value="16"/>
+            </Style>
+          </RichTextBox.Resources>
+ <!-- PageWidth: viewport when wrap on; content width when wrap off -->
+          <FlowDocument PagePadding="0" LineHeight="16"
+                        FontFamily="Consolas, Cascadia Mono, Segoe UI Emoji, Segoe UI Symbol, Courier New"/>
+        </RichTextBox>
+
+ <!-- Lower status: status+timer (dynamic width by mode) | ctx | meta
+             ready → compact (ctx far left); thinking/working → same reserved band + timer;
+             autocompacting → label may grow and shift ctx once. -->
+        <Border Grid.Row="3" Background="#1E1E24" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="12,4">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel x:Name="StatusBand" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
+              <TextBlock x:Name="StatusDot" Text="· ready" Foreground="#9ECE6A"
+                         VerticalAlignment="Center" Margin="0,0,0,0" FontWeight="SemiBold"
+                         FontFamily="Consolas, Cascadia Mono, Segoe UI Symbol, Courier New"/>
+              <TextBlock x:Name="StatusTimer" Text="" Foreground="#6A6A76"
+                         VerticalAlignment="Center" HorizontalAlignment="Left"
+                         FontWeight="SemiBold"
+                         FontFamily="Consolas, Cascadia Mono, Courier New"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+              <TextBlock Text="ctx " Foreground="#6A6A76" VerticalAlignment="Center"/>
+              <Border Width="120" Height="12" Background="#2A2A30" CornerRadius="2"
+                      VerticalAlignment="Center" Margin="0,0,8,0" ClipToBounds="True">
+                <Rectangle x:Name="CtxBarFill" Width="0" Height="12" HorizontalAlignment="Left" Fill="#9ECE6A"/>
+              </Border>
+              <TextBlock x:Name="CtxPctText" Text="0%" Foreground="#9ECE6A"
+                         VerticalAlignment="Center" Margin="0,0,10,0" FontWeight="SemiBold"/>
+              <TextBlock x:Name="CtxTokText" Text="" Foreground="#6A6A76" VerticalAlignment="Center"/>
+            </StackPanel>
+            <TextBlock x:Name="LowerRight" Grid.Column="2" Text="" Foreground="#8A8A96"
+                       VerticalAlignment="Center" HorizontalAlignment="Right" TextTrimming="CharacterEllipsis"
+                       Margin="12,0,0,0"/>
+          </Grid>
+        </Border>
+
+ <!-- Prompt + Send/Stop -->
+        <Border Grid.Row="4" Background="#1A1A1E" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="10,8">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="> " Foreground="#8A8A96" FontSize="14" VerticalAlignment="Top" Margin="0,6,4,0"/>
+            <Border Grid.Column="1" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="4" Background="#121216" Padding="8,6" Margin="0,0,8,0">
+              <TextBox x:Name="PromptBox" AcceptsReturn="True" TextWrapping="Wrap"
+                       MinHeight="28" MaxHeight="140" VerticalScrollBarVisibility="Auto"
+                       BorderThickness="0" Background="Transparent" Foreground="#E0E0E8"
+                       CaretBrush="#C8C8D0" FontFamily="Consolas, Cascadia Mono, Courier New"
+                       FontSize="13" IsEnabled="True" IsReadOnly="True" Focusable="True"/>
+            </Border>
+            <Button x:Name="SendBtn" Grid.Column="2" Content="Send" Width="72" MinHeight="37"
+                    VerticalAlignment="Top" Cursor="Hand" FontWeight="SemiBold" FontSize="12"
+                    Background="#3A3A42" Foreground="#8A8A96" BorderBrush="#52525C" BorderThickness="1"
+                    Padding="8,6" Margin="0,2,0,0" IsEnabled="False"/>
+          </Grid>
+        </Border>
+
+ <!-- Hints below prompt -->
+        <Border Grid.Row="5" Background="#16161A" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="12,4">
+          <TextBlock x:Name="HintBar" Text="enter send  ·  Ctrl+Enter newline  ·  Esc / Stop interrupt  ·  /help"
+                     Foreground="#5A5A66" FontSize="11"/>
+        </Border>
+      </Grid>
+
+ <!-- Auth overlay (shown only when credentials required) -->
+      <Grid x:Name="AuthOverlay" Visibility="Collapsed" Panel.ZIndex="200">
+        <Border Background="#E6121216"/>
+        <!-- Fixed card height so checkbox + error never shove buttons out of frame -->
+        <Border Width="400" HorizontalAlignment="Center" VerticalAlignment="Center"
+                Background="#1E1E24" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="8" Padding="22,18,22,14">
+          <Grid>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="18"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <StackPanel Grid.Row="0">
+              <TextBlock x:Name="AuthTitle" Text="Authentication required" Foreground="#E0E0E8"
+                         FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+              <TextBlock x:Name="AuthSubtitle" Text="" Foreground="#8A8A96" TextWrapping="Wrap"
+                         FontSize="12" Margin="0,0,0,10" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
+              <TextBlock Text="Username" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+              <TextBox x:Name="AuthUser" Height="32" Padding="8,6" Margin="0,0,0,8"
+                       Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                       BorderBrush="#3A3A42" BorderThickness="1"
+                       FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"
+                       Focusable="True" IsTabStop="True" TabIndex="0"/>
+              <TextBlock Text="Password" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+              <PasswordBox x:Name="AuthPass" Height="32" Padding="8,6" Margin="0,0,0,6"
+                           Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                           BorderBrush="#3A3A42" BorderThickness="1"
+                           FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"
+                           Focusable="True" IsTabStop="True" TabIndex="1"/>
+              <CheckBox x:Name="AuthSaveCreds" Style="{StaticResource MbDarkCheckBox}"
+                        Margin="0,0,0,0" Cursor="Hand" Focusable="True" IsTabStop="True"
+                        TabIndex="2" IsChecked="False">
+                <CheckBox.Content>
+                  <TextBlock Text="Save credentials" Foreground="#A0A0AA" FontSize="12"
+                             Margin="0,-1,0,0"/>
+                </CheckBox.Content>
+              </CheckBox>
+            </StackPanel>
+            <!-- Reserved error slot right under checkbox (no stretch gap) -->
+            <TextBlock x:Name="AuthError" Grid.Row="1" Text="" Foreground="#F7768E" FontSize="11"
+                       TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
+              <Button x:Name="AuthOk" Style="{StaticResource MbAuthPrimaryBtn}"
+                      Content="Sign in" Width="96" Height="30" Margin="0,0,8,0"
+                      IsDefault="False" TabIndex="3"/>
+              <Button x:Name="AuthCancel" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="Cancel" Width="88" Height="30" TabIndex="4"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+      </Grid>
+ <!-- Confirm Yes/No overlay (above auth; credential retry / simple prompts) -->
+      <Grid x:Name="ConfirmOverlay" Visibility="Collapsed" Panel.ZIndex="300">
+        <Border Background="#E6121216"/>
+        <Border Width="400" HorizontalAlignment="Center" VerticalAlignment="Center"
+                Background="#1E1E24" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="8" Padding="22,18,22,16">
+          <Grid>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock x:Name="ConfirmTitle" Text="Invalid Entry" Foreground="#E0E0E8"
+                       FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+            <Rectangle x:Name="ConfirmAccentBar" Grid.Row="1" Height="3" Margin="0,0,0,14"
+                       RadiusX="1.5" RadiusY="1.5" Opacity="0.55">
+              <Rectangle.Fill>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                  <GradientStop Color="#7DCFFF" Offset="0"/>
+                  <GradientStop Color="#FFFFFF" Offset="0.5"/>
+                  <GradientStop Color="#7DCFFF" Offset="1"/>
+                </LinearGradientBrush>
+              </Rectangle.Fill>
+            </Rectangle>
+            <TextBlock x:Name="ConfirmPrompt" Grid.Row="2" Text="" Foreground="#C8C8D0"
+                       FontSize="13" TextWrapping="Wrap" Margin="0,0,0,18" LineHeight="20"/>
+            <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+              <Button x:Name="ConfirmYes" Style="{StaticResource MbAuthPrimaryBtn}"
+                      Content="Yes" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0"
+                      IsDefault="True" TabIndex="0"/>
+              <Button x:Name="ConfirmNo" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="No" MinWidth="88" Height="30" Padding="16,0"
+                      IsCancel="True" TabIndex="1"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+'@
+			$reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
+			$window = [Windows.Markup.XamlReader]::Load($reader)
+			$W.Window = $window
+			$W.Log = $window.FindName('LogBox')
+			$W.Prompt = $window.FindName('PromptBox')
+			$W.SendBtn = $window.FindName('SendBtn')
+			$W.HdrLine1 = $window.FindName('HdrLine1')
+			$W.HdrLine1Shadow = $window.FindName('HdrLine1Shadow')
+			$W.HdrLine2 = $null
+			$W.HdrLine2Shadow = $null
+			$W.HdrToolGroups = $window.FindName('HdrToolGroups')
+			$W.ToolGroupsFp = ''
+			$W.ToolGroupsBuilt = $false
+			$W.ToolGroupsDirty = $true
+			$W.ToolGroupsData = $null
+			$W.HdrPoweredBy = $window.FindName('HdrPoweredBy')
+			$W.HdrPoweredByShadow = $window.FindName('HdrPoweredByShadow')
+			$W.HdrPoweredByHost = $window.FindName('HdrPoweredByHost')
+			$W.HdrAutoCompact = $window.FindName('HdrAutoCompact')
+			$W.HdrAutoCompactShadow = $window.FindName('HdrAutoCompactShadow')
+			$W.HdrLeft = $W.HdrLine1
+			$W.HdrRight = $window.FindName('LowerRight')
+			$W.LowerRight = $window.FindName('LowerRight')
+			$W.WordWrapToggle = $window.FindName('WordWrapToggle')
+			$W.LogWordWrap = $true
+			try {
+				if ($W.WordWrapToggle) { $W.WordWrapToggle.IsChecked = $true }
+			} catch {}
+			$W.CtxBarFill = $window.FindName('CtxBarFill')
+			$W.CtxPctText = $window.FindName('CtxPctText')
+			$W.CtxTokText = $window.FindName('CtxTokText')
+			$W.CtxBarMaxW = 120
+			$W.HintBar = $window.FindName('HintBar')
+			$W.StatusDot = $window.FindName('StatusDot')
+			$W.StatusTimer = $window.FindName('StatusTimer')
+			$W.StatusBand = $window.FindName('StatusBand')
+			$W.StatusBusySince = 0
+			try {
+				$W.MonoFont = New-Object System.Windows.Media.FontFamily(
+					'Consolas, Cascadia Mono, Courier New, Segoe UI Emoji, Segoe UI Symbol, Segoe UI')
+				$W.EmojiFont = New-Object System.Windows.Media.FontFamily(
+					'Segoe UI Emoji, Segoe UI Symbol, Segoe UI')
+			} catch {}
+			$W.AuthOverlay = $window.FindName('AuthOverlay')
+			$W.AuthTitle = $window.FindName('AuthTitle')
+			$W.AuthSubtitle = $window.FindName('AuthSubtitle')
+			$W.AuthUser = $window.FindName('AuthUser')
+			$W.AuthPass = $window.FindName('AuthPass')
+			$W.AuthError = $window.FindName('AuthError')
+			$W.AuthOk = $window.FindName('AuthOk')
+			$W.AuthCancel = $window.FindName('AuthCancel')
+			$W.AuthSaveCreds = $window.FindName('AuthSaveCreds')
+			$W.ConfirmOverlay = $window.FindName('ConfirmOverlay')
+			$W.ConfirmTitle = $window.FindName('ConfirmTitle')
+			$W.ConfirmPrompt = $window.FindName('ConfirmPrompt')
+			$W.ConfirmYes = $window.FindName('ConfirmYes')
+			$W.ConfirmNo = $window.FindName('ConfirmNo')
+			$W.ConfirmAccentBar = $window.FindName('ConfirmAccentBar')
+			$W.Dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
+			$window.Title = ("MiniBot v{0}" -f $W.Version)
+			try {
+				$appId = 'MiniBot-Agent'
+				try { if ($W.AgentName) { $appId = ("{0}-Agent" -f $W.AgentName) } } catch {}
+				if (-not ('MiniBot.UI.IconExtractor' -as [type])) {
+					try {
+						Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+						Add-Type -AssemblyName PresentationCore -ErrorAction SilentlyContinue
+						Add-Type -AssemblyName WindowsBase -ErrorAction SilentlyContinue
+						$iconCode = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Interop;
+using System.Windows.Media.Imaging;
+using System.Windows;
+
+namespace MiniBot.UI
+{
+    public static class IconExtractor
+    {
+        [DllImport("Shell32.dll", EntryPoint = "ExtractIconExW", CharSet = CharSet.Unicode, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
+        private static extern int ExtractIconEx(string sFile, int iIndex, out IntPtr piLargeVersion, out IntPtr piSmallVersion, int amountIcons);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+        public static BitmapSource ExtractBitmapSource(string file, int number, bool largeIcon)
+        {
+            IntPtr large = IntPtr.Zero, small = IntPtr.Zero;
+            ExtractIconEx(file, number, out large, out small, 1);
+            IntPtr use = largeIcon ? large : small;
+            IntPtr other = largeIcon ? small : large;
+            try
+            {
+                if (use == IntPtr.Zero) return null;
+                BitmapSource bmp = Imaging.CreateBitmapSourceFromHIcon(use, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+                if (bmp != null && bmp.CanFreeze) bmp.Freeze();
+                return bmp;
+            }
+            catch { return null; }
+            finally
+            {
+                if (use != IntPtr.Zero) DestroyIcon(use);
+                if (other != IntPtr.Zero) DestroyIcon(other);
+            }
+        }
+    }
+}
+'@
+						$refs = @()
+						foreach ($name in @('PresentationCore', 'WindowsBase', 'PresentationFramework', 'System.Xaml')) {
+							try {
+								$a = [Reflection.Assembly]::LoadWithPartialName($name)
+								if ($a -and $a.Location) { $refs += $a.Location }
+							} catch {}
+						}
+						if ($refs.Count -gt 0) {
+							Add-Type -TypeDefinition $iconCode -ReferencedAssemblies $refs -ErrorAction Stop
+						} else {
+							Add-Type -TypeDefinition $iconCode -ErrorAction Stop
+						}
+					} catch {}
+				}
+				if ('MiniBot.UI.IconExtractor' -as [type]) {
+					$sys = $env:SystemRoot
+					if ([string]::IsNullOrWhiteSpace($sys)) { $sys = 'C:\Windows' }
+					$iconFile = Join-Path $sys 'System32\compstui.dll'
+					$bitmapSource = [MiniBot.UI.IconExtractor]::ExtractBitmapSource($iconFile, 11, $true)
+					if (-not $bitmapSource) {
+						$bitmapSource = [MiniBot.UI.IconExtractor]::ExtractBitmapSource($iconFile, 11, $false)
+					}
+					if ($bitmapSource) {
+						$window.Icon = $bitmapSource
+						try {
+							# TaskbarItemInfo.Overlay: show titlebar icon on the taskbar button
+							if (-not $window.TaskbarItemInfo) {
+								$window.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
+							}
+							$window.TaskbarItemInfo.Overlay = $bitmapSource
+							$window.TaskbarItemInfo.Description = $appId
+						} catch {}
+					}
+				}
+			} catch {}
+
+			try {
+				if ($W.HdrPoweredBy) {
+					$al = [string]$W.ModelAlias
+					if ([string]::IsNullOrWhiteSpace($al)) {
+						try { $W.HdrPoweredBy.Inlines.Clear() } catch {}
+						$W.HdrPoweredBy.Text = ''
+						$W.HdrPoweredBy.Visibility = [System.Windows.Visibility]::Collapsed
+						if ($W.HdrPoweredByShadow) {
+							$W.HdrPoweredByShadow.Text = ''
+							$W.HdrPoweredByShadow.Visibility = [System.Windows.Visibility]::Collapsed
+						}
+						if ($W.HdrPoweredByHost) {
+							$W.HdrPoweredByHost.Visibility = [System.Windows.Visibility]::Collapsed
+						}
+					} else {
+						$alias = $al.Trim()
+						$pb0 = ("PoweredBy: {0}" -f $alias)
+						try {
+							$bc0 = New-Object System.Windows.Media.BrushConverter
+							$muteBr = $bc0.ConvertFromString('#8A8A96')
+							$accBr = $bc0.ConvertFromString('#BB9AF7')
+							$W.HdrPoweredBy.Inlines.Clear()
+							$r1 = New-Object System.Windows.Documents.Run ('PoweredBy: ')
+							$r1.Foreground = $muteBr
+							$r2 = New-Object System.Windows.Documents.Run ($alias)
+							$r2.Foreground = $accBr
+							$r2.FontWeight = [System.Windows.FontWeights]::SemiBold
+							[void]$W.HdrPoweredBy.Inlines.Add($r1)
+							[void]$W.HdrPoweredBy.Inlines.Add($r2)
+						} catch {
+							$W.HdrPoweredBy.Text = $pb0
+						}
+						$W.HdrPoweredBy.Visibility = [System.Windows.Visibility]::Visible
+						if ($W.HdrPoweredByShadow) {
+							$W.HdrPoweredByShadow.Text = $pb0
+							$W.HdrPoweredByShadow.Visibility = [System.Windows.Visibility]::Visible
+						}
+						if ($W.HdrPoweredByHost) {
+							$W.HdrPoweredByHost.Visibility = [System.Windows.Visibility]::Visible
+						}
+					}
+				}
+				if ($W.HdrAutoCompact) {
+					$acOn = $true
+					try { $acOn = [bool]$W.AutoCompactOn } catch {}
+					$ac0 = $(if ($acOn) { 'AutoCompact: ON' } else { 'AutoCompact: OFF' })
+					$W.HdrAutoCompact.Text = $ac0
+					if ($W.HdrAutoCompactShadow) { $W.HdrAutoCompactShadow.Text = $ac0 }
+					try {
+						$bc = New-Object System.Windows.Media.BrushConverter
+						$W.HdrAutoCompact.Foreground = $bc.ConvertFromString($(if ($acOn) { '#9ECE6A' } else { '#F7768E' }))
+					} catch {}
+				}
+			} catch {}
+
+			$syncLogPageWidth = {
+				param($box, $bag)
+				try {
+					if (-not $box -or -not $box.Document) { return }
+					$viewW = [double]$box.ActualWidth
+					if ($viewW -lt 40 -or [double]::IsNaN($viewW)) { return }
+
+					$padL = 0.0; $padR = 0.0
+					try {
+						$padL = [double]$box.Padding.Left
+						$padR = [double]$box.Padding.Right
+					} catch {
+						$padL = 12.0; $padR = 12.0
+					}
+					$vBar = 0.0
+					try {
+						if ($box.ComputedVerticalScrollBarVisibility -eq [System.Windows.Visibility]::Visible) {
+							$vBar = 14.0
+						} else {
+							$vBar = 2.0
+						}
+					} catch { $vBar = 14.0 }
+
+					$columnW = $viewW - $padL - $padR - $vBar - 2.0
+					if ($columnW -lt 40) { $columnW = 40 }
+
+					$wrap = $false
+					try { $wrap = [bool]$bag.LogWordWrap } catch { $wrap = $false }
+					if ($wrap) {
+						$box.Document.PageWidth = $columnW
+						$box.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled
+						return
+					}
+
+					$charW = 7.2
+					$maxChars = 0
+					try { $maxChars = [int]$bag.LogMaxLineChars } catch { $maxChars = 0 }
+					$contentW = if ($maxChars -gt 0) { ($maxChars * $charW) + 8.0 } else { 0.0 }
+
+					$needsH = ($contentW -gt ($columnW + 1.0))
+					if ($needsH) {
+						$pageW = [math]::Min(60000.0, [math]::Max($columnW, $contentW))
+						$box.Document.PageWidth = $pageW
+						$box.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
+					} else {
+						$box.Document.PageWidth = $columnW
+						$box.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled
+					}
+				} catch {}
+			}.GetNewClosure()
+			$W.SyncLogPageWidth = $syncLogPageWidth
+			$syncMdStretch = {
+				param($box, $bag)
+				try {
+					if (-not $box -or -not $bag) { return }
+					$viewW = [double]$box.ActualWidth
+					if ($viewW -lt 40 -or [double]::IsNaN($viewW)) { return }
+					$padL = 12.0; $padR = 12.0
+					try {
+						$padL = [double]$box.Padding.Left
+						$padR = [double]$box.Padding.Right
+					} catch {}
+					$vBar = 16.0
+					try {
+						if ($box.ComputedVerticalScrollBarVisibility -eq [System.Windows.Visibility]::Visible) {
+							$vBar = 16.0
+						}
+					} catch {}
+					$w = $viewW - $padL - $padR - $vBar - 2.0
+					if ($w -lt 40) { $w = 40 }
+					$list = $null
+					try {
+						if ($bag -is [hashtable]) {
+							if (-not $bag.ContainsKey('MdStretchElements') -or $null -eq $bag['MdStretchElements']) {
+								$bag['MdStretchElements'] = New-Object System.Collections.ArrayList
+							}
+							$list = $bag['MdStretchElements']
+						} else {
+							try { $list = $bag.MdStretchElements } catch { $list = $null }
+							if ($null -eq $list) {
+								$list = New-Object System.Collections.ArrayList
+								try { $bag | Add-Member -NotePropertyName MdStretchElements -NotePropertyValue $list -Force } catch {
+									try { $bag.MdStretchElements = $list } catch {}
 								}
 							}
 						}
-						"ListDirectory"			 { Invoke-ListDirectory $args.path }
-						"GetSystemInfo"			 { Invoke-GetSystemInfo }
-						"GetProcessList"		 { Invoke-GetProcessList }
-						"Clipboard"				 { Invoke-Clipboard $args.action $args.text }
-						"GetBSODInfo"			 { Invoke-GetBSODInfo }
-						"GetEventLogs"			 { Invoke-GetEventLogs $args.hours }
-						"GetDiskHealth"			 { Invoke-GetDiskHealth }
-						"GetDiskSpace"			 { Invoke-GetDiskSpace $args.path }
-						"GetInstalledSoftware"	 { Invoke-GetInstalledSoftware }
-						"GetDriverInfo"			 { Invoke-GetDriverInfo }
-						"GetStartupItems"		 { Invoke-GetStartupItems }
-						"GetMemoryInfo"			 { Invoke-GetMemoryInfo }
-						"GetNetworkInfo"		 { Invoke-GetNetworkInfo }
-						"GetWindowsUpdateStatus" { Invoke-GetWindowsUpdateStatus }
-						"GetSystemUptime"		 { Invoke-GetSystemUptime }
-						"RunQuickDiagnostics"	 { Invoke-RunQuickDiagnostics }
-						"RunRepairTool"			 { Invoke-RunRepairTool $args.tool }
-						"GetServiceStatus"		 { Invoke-GetServiceStatus $args.name }
-						"ReadRegistry"			 { Invoke-ReadRegistry $args.path }
-						"GetPowerInfo"			 { Invoke-GetPowerInfo }
-						default					 { "Unknown tool: $fn" }
+					} catch { $list = $null }
+					if ($null -eq $list) { return }
+					$alive = New-Object System.Collections.ArrayList
+					foreach ($el in @($list)) {
+						if ($null -eq $el) { continue }
+						try {
+							if ($null -eq $el.Parent) { continue }
+							$el.Width = $w
+							try { $el.MaxWidth = $w } catch {}
+							try {
+								$meta = $el.Tag
+								if ($meta -is [hashtable] -and $meta['Kind'] -eq 'md-code' -and $null -ne $meta['Rtb']) {
+									$rtb = $meta['Rtb']
+									if ($null -ne $rtb.Document) {
+										$rtb.Document.PageWidth = [Math]::Max(80, $w - 8)
+									}
+								}
+							} catch {}
+							[void]$alive.Add($el)
+						} catch {}
 					}
-					$messages += @{ role = "tool"; tool_call_id = $tc.id; content = ($result | Out-String) }
-				}
-
-				if (($stepInterrupt) -or $script:interruptRequested) {
-					Reset-InterruptFlag
-					break
-				}
-				continue
+					if ($bag -is [hashtable]) { $bag['MdStretchElements'] = $alive }
+					else {
+						try { $bag.MdStretchElements = $alive } catch {}
+					}
+				} catch {}
+			}.GetNewClosure()
+			$W.SyncMdStretch = $syncMdStretch
+			if ($W.Log) {
+				try { $W.Log.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled } catch {}
+				$W.Log.add_SizeChanged({
+					param($s, $e)
+					try { & $syncLogPageWidth $W.Log $W } catch {}
+					try { & $syncMdStretch $W.Log $W } catch {}
+				}.GetNewClosure())
+				$W.Log.add_Loaded({
+					param($s, $e)
+					try { & $syncLogPageWidth $W.Log $W } catch {}
+					try { & $syncMdStretch $W.Log $W } catch {}
+				}.GetNewClosure())
+				try { & $syncLogPageWidth $W.Log $W } catch {}
 			}
-			break
+			if ($W.WordWrapToggle) {
+				$onWrapChanged = {
+					param($s, $e)
+					try {
+						$W.LogWordWrap = [bool]$W.WordWrapToggle.IsChecked
+						if ($W.SyncLogPageWidth -and $W.Log) { & $W.SyncLogPageWidth $W.Log $W }
+						try {
+							$tb = $window.FindName('WordWrapLabel')
+							if (-not $tb) { $tb = $W.WordWrapToggle.Content }
+							if ($tb -is [System.Windows.Controls.TextBlock]) {
+								$hex = if ($W.LogWordWrap) { '#C8C8D0' } else { '#6A6A76' }
+								$bc = New-Object System.Windows.Media.BrushConverter
+								$tb.Foreground = $bc.ConvertFromString($hex)
+							}
+						} catch {}
+					} catch {}
+				}.GetNewClosure()
+				$W.WordWrapToggle.add_Checked($onWrapChanged)
+				$W.WordWrapToggle.add_Unchecked($onWrapChanged)
+				try { & $onWrapChanged $null $null } catch {}
+			}
+
+			# Dark title bar (DWM immersive dark mode)
+			$applyDarkTitle = {
+				param($win)
+				try {
+					if (-not ("MB.Native.Dwm" -as [type])) {
+						Add-Type -Namespace MB.Native -Name Dwm -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+"@ -ErrorAction Stop
+					}
+					$helper = New-Object System.Windows.Interop.WindowInteropHelper($win)
+					$hwnd = $helper.Handle
+					if ($hwnd -eq [IntPtr]::Zero) { return }
+					$useDark = 1
+					# DWMWA_USE_IMMERSIVE_DARK_MODE: 20 (20H1+), 19 (older)
+					[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 20, [ref]$useDark, 4)
+					[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 19, [ref]$useDark, 4)
+					# DWMWA_CAPTION_COLOR (35); COLORREF 0x00BBGGRR = #2A2A30
+					try {
+						$caption = 0x00302A2A
+						[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 35, [ref]$caption, 4)
+					} catch {}
+				} catch {}
+			}.GetNewClosure()
+			$window.add_SourceInitialized({
+				param($s, $e)
+				try { & $applyDarkTitle $s } catch {}
+			}.GetNewClosure())
+			$window.add_Loaded({
+				param($s, $e)
+				try { & $applyDarkTitle $s } catch {}
+			}.GetNewClosure())
+			$window.add_SizeChanged({
+				param($s, $e)
+				try {
+					$now = [Environment]::TickCount
+					$last = 0
+					try { $last = [int]$W.LastPathBudgetTick } catch {}
+					if ($last -ne 0 -and ((($now - $last) -band 0x7fffffff) -lt 120)) {
+						try { if ($W.SyncMdStretch -and $W.Log) { & $W.SyncMdStretch $W.Log $W } } catch {}
+						return
+					}
+					$W.LastPathBudgetTick = $now
+					$W.NeedPathBudgetRefresh = $true
+					try { if ($W.SyncMdStretch -and $W.Log) { & $W.SyncMdStretch $W.Log $W } } catch {}
+				} catch {}
+			}.GetNewClosure())
+
+			$submitAuth = {
+				try {
+					$u = ''
+					$p = ''
+					try { $u = [string]$W.AuthUser.Text } catch {}
+					try { $p = [string]$W.AuthPass.Password } catch {}
+					if ([string]::IsNullOrWhiteSpace($u) -or [string]::IsNullOrWhiteSpace($p)) {
+						if ($W.AuthError) { $W.AuthError.Text = 'Username and password are required.' }
+						return
+					}
+					if ($W.AuthError) { $W.AuthError.Text = '' }
+					$wantSave = $false
+					try { if ($W.AuthSaveCreds -and $W.AuthSaveCreds.IsChecked) { $wantSave = $true } } catch {}
+					$W.CredResult = @{
+						User           = $u.Trim()
+						Pass           = $p
+						Cancelled      = $false
+						Store          = $wantSave
+						StoreSpecified = $true
+						ClearStored    = $false
+					}
+					if ($W.AuthOverlay) { $W.AuthOverlay.Visibility = [System.Windows.Visibility]::Collapsed }
+					if ($W.AuthOk) { $W.AuthOk.IsDefault = $false }
+					try { $W.AuthPass.Password = '' } catch {}
+					[void]$W.CredWait.Set()
+				} catch {
+					try {
+						[System.Windows.MessageBox]::Show(
+							$_.Exception.Message,
+							'Login error',
+							[System.Windows.MessageBoxButton]::OK,
+							[System.Windows.MessageBoxImage]::Error
+						) | Out-Null
+					} catch {}
+				}
+			}.GetNewClosure()
+
+			$W.AuthOk.add_Click({
+				param($s,$e)
+				try { & $submitAuth } catch {
+					try {
+						[System.Windows.MessageBox]::Show($_.Exception.Message, 'Login error') | Out-Null
+					} catch {}
+				}
+			}.GetNewClosure())
+			$W.AuthCancel.add_Click({
+				param($s,$e)
+				try {
+					$W.SoftClose = $false
+					$W.CloseKind = 'user_x'
+					$W.ForceProcessExit = $true
+					$W.ExitRequested = $true
+					$W.CredResult = @{
+						User = $null; Pass = $null; Cancelled = $true; SoftExit = $false; HardClose = $true
+						Store = $false; StoreSpecified = $true; ClearStored = $false
+					}
+					if ($W.AuthOverlay) { $W.AuthOverlay.Visibility = [System.Windows.Visibility]::Collapsed }
+					if ($W.AuthOk) { $W.AuthOk.IsDefault = $false }
+					try { $W.AuthPass.Password = '' } catch {}
+					[void]$W.CredWait.Set()
+				} catch {}
+			}.GetNewClosure())
+			$W.AuthPass.add_KeyDown({
+				param($s,$e)
+				try {
+					if ($e.Key -eq 'Return') { $e.Handled = $true; & $submitAuth }
+				} catch {}
+			}.GetNewClosure())
+			$W.AuthUser.add_KeyDown({
+				param($s,$e)
+				try {
+					if ($e.Key -eq 'Return') {
+						$e.Handled = $true
+						try { [void]$W.AuthPass.Focus() } catch {}
+					}
+				} catch {}
+			}.GetNewClosure())
+
+			if ($W.ConfirmYes) {
+				$W.ConfirmYes.add_Click({
+					param($s, $e)
+					try {
+						$W.ConfirmResult = $true
+						if ($W.ConfirmOverlay) {
+							$W.ConfirmOverlay.Visibility = [System.Windows.Visibility]::Collapsed
+						}
+						if ($W.ConfirmYes) { $W.ConfirmYes.IsDefault = $false }
+						[void]$W.ConfirmWait.Set()
+					} catch {}
+				}.GetNewClosure())
+			}
+			if ($W.ConfirmNo) {
+				$W.ConfirmNo.add_Click({
+					param($s, $e)
+					try {
+						$W.ConfirmResult = $false
+						if ($W.ConfirmOverlay) {
+							$W.ConfirmOverlay.Visibility = [System.Windows.Visibility]::Collapsed
+						}
+						if ($W.ConfirmYes) { $W.ConfirmYes.IsDefault = $false }
+						[void]$W.ConfirmWait.Set()
+					} catch {}
+				}.GetNewClosure())
+			}
+
+			$conv = New-Object System.Windows.Media.BrushConverter
+			$colorMap = @{
+				'Black'='#5C5C5C'; 'DarkBlue'='#7AA2F7'; 'DarkGreen'='#9ECE6A'; 'DarkCyan'='#7DCFFF'
+				'DarkRed'='#B80F0A'; 'DarkMagenta'='#BB9AF7'; 'DarkYellow'='#E0AF68'; 'Gray'='#A0A0AA'
+				'DarkGray'='#565F89'; 'Blue'='#7AA2F7'; 'Green'='#9ECE6A'; 'Cyan'='#7DCFFF'
+				'Red'='#B80F0A'; 'Magenta'='#BB9AF7'; 'Yellow'='#E0AF68'; 'White'='#C0CAF5'
+			}
+			$brailleFrames = @(
+				[string][char]0x280B,  # ⠋
+				[string][char]0x2819,  # ⠙
+				[string][char]0x2839,  # ⠹
+				[string][char]0x2838,  # ⠸
+				[string][char]0x283C,  # ⠼
+				[string][char]0x2834,  # ⠴
+				[string][char]0x2826,  # ⠦
+				[string][char]0x2827,  # ⠧
+				[string][char]0x2807,  # ⠇
+				[string][char]0x280F   # ⠏
+			)
+			$appendRuns = {
+				param($para, $chunk, $brush, $monoFont, $emojiFont)
+				if ([string]::IsNullOrEmpty($chunk) -or $null -eq $para) { return }
+				$sb = New-Object System.Text.StringBuilder
+				$mode = $null  # 't' text, 'e' emoji
+				$emit = {
+					param($targetPara, $m, $s, $br, $mf, $ef)
+					if ($null -eq $s -or $s.Length -eq 0) { return }
+					$run = New-Object System.Windows.Documents.Run ($s.ToString())
+					if ($m -eq 'e') {
+						if ($ef) { $run.FontFamily = $ef }
+						try { $run.ClearValue([System.Windows.Documents.TextElement]::ForegroundProperty) } catch {}
+					} else {
+						if ($mf) { $run.FontFamily = $mf }
+						$run.Foreground = $br
+					}
+					$targetPara.Inlines.Add($run)
+					[void]$s.Clear()
+				}
+				$i = 0
+				$len = $chunk.Length
+				while ($i -lt $len) {
+					$code = [int][char]$chunk[$i]
+					$cp = $code
+					$take = 1
+					# Surrogate pair: full codepoint
+					if ($code -ge 0xD800 -and $code -le 0xDBFF -and ($i + 1) -lt $len) {
+						$low = [int][char]$chunk[$i + 1]
+						if ($low -ge 0xDC00 -and $low -le 0xDFFF) {
+							$cp = 0x10000 + (($code - 0xD800) -shl 10) + ($low - 0xDC00)
+							$take = 2
+						}
+					}
+					$isEmoji = $false
+					if ($cp -ge 0x1F000 -and $cp -le 0x1FAFF) { $isEmoji = $true }
+					elseif ($cp -ge 0x1F1E6 -and $cp -le 0x1F1FF) { $isEmoji = $true }
+					elseif ($cp -ge 0x2600 -and $cp -le 0x27BF) { $isEmoji = $true }
+					elseif ($cp -ge 0x2300 -and $cp -le 0x23FF) { $isEmoji = $true }
+					elseif ($cp -ge 0x2B00 -and $cp -le 0x2BFF) { $isEmoji = $true }
+					elseif ($cp -ge 0xFE00 -and $cp -le 0xFE0F) { $isEmoji = $true }
+					elseif ($cp -eq 0x200D -or $cp -eq 0x20E3) { $isEmoji = $true }
+					elseif ($cp -ge 0x1F300 -and $cp -le 0x1F9FF) { $isEmoji = $true }
+					elseif ($cp -ge 0xE0020 -and $cp -le 0xE007F) { $isEmoji = $true }
+					$want = if ($isEmoji) { 'e' } else { 't' }
+					if ($null -eq $mode) { $mode = $want }
+					if ($want -ne $mode) {
+						& $emit $para $mode $sb $brush $monoFont $emojiFont
+						$mode = $want
+					}
+					[void]$sb.Append($chunk.Substring($i, $take))
+					$i += $take
+				}
+				& $emit $para $mode $sb $brush $monoFont $emojiFont
+			}.GetNewClosure()
+
+			# Code-block syntax highlighting (regex lexer → WPF Runs)
+			$synNormLang = {
+				param([string]$L)
+				$x = ([string]$L).Trim().ToLowerInvariant() -replace '^\.+', ''
+				switch -Regex ($x) {
+					'^(ps1|psm1|psd1|powershell|pwsh|ps)$' { return 'ps' }
+					'^(py|python|pyw)$' { return 'py' }
+					'^(js|javascript|jsx|mjs|cjs)$' { return 'js' }
+					'^(ts|typescript|tsx)$' { return 'ts' }
+					'^(json|jsonc)$' { return 'json' }
+					'^(sh|bash|zsh|shell|ksh)$' { return 'sh' }
+					'^(cs|csharp|c#)$' { return 'cs' }
+					'^(c|h)$' { return 'c' }
+					'^(cpp|cxx|cc|hpp|hh|hxx)$' { return 'cpp' }
+					'^(java)$' { return 'java' }
+					'^(kt|kotlin)$' { return 'java' }
+					'^(go|golang)$' { return 'go' }
+					'^(rs|rust)$' { return 'rust' }
+					'^(rb|ruby)$' { return 'rb' }
+					'^(php)$' { return 'php' }
+					'^(sql|mysql|pgsql|postgres|tsql|plsql)$' { return 'sql' }
+					'^(html|htm|xml|svg|xaml|xsl|xsd)$' { return 'xml' }
+					'^(css|scss|less|sass)$' { return 'css' }
+					'^(yml|yaml)$' { return 'yaml' }
+					'^(md|markdown)$' { return 'md' }
+					'^(diff|patch)$' { return 'diff' }
+					'^(ini|toml|conf|cfg|env)$' { return 'ini' }
+					'^(dockerfile|docker)$' { return 'docker' }
+					'^(bat|cmd)$' { return 'bat' }
+					'^(r)$' { return 'r' }
+					'^(lua)$' { return 'lua' }
+					'^(swift)$' { return 'swift' }
+					'^(vb|vbs|vba)$' { return 'vb' }
+					default { return 'generic' }
+				}
+			}.GetNewClosure()
+
+			$synBuildRules = {
+				param([string]$Norm)
+				$o = New-Object System.Collections.ArrayList
+				$add = {
+					param($list, $name, $pat)
+					try {
+						$rx = New-Object System.Text.RegularExpressions.Regex (
+							$pat,
+							[System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+						)
+						[void]$list.Add(@{ N = $name; Rx = $rx })
+					} catch {}
+				}
+				$strDQ = '"(?:\\.|[^"\\])*"'
+				$strSQ = "'(?:\\.|[^'\\])*'"
+				$strBT = '`(?:\\.|[^`\\])*`'
+				$num   = '\b(?:0[xX][0-9A-Fa-f]+|\d+\.\d+(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+|\d+)\b'
+				$cLine = '//[^\r\n]*'
+				$cBlock = '/\*[\s\S]*?\*/'
+				$hashLine = '#[^\r\n]*'
+				$kwC = 'if|else|elif|for|while|do|switch|case|break|continue|return|goto|class|struct|enum|union|typedef|sizeof|const|static|extern|volatile|register|inline|void|int|char|short|long|float|double|signed|unsigned|bool|true|false|NULL|nullptr|new|delete|this|public|private|protected|namespace|using|template|typename|try|catch|throw|default|auto'
+				switch ($Norm) {
+					'ps' {
+						& $add $o 'string'  ('@"[\s\S]*?"@|@''[\s\S]*?''@|"[^"\r\n`]*"|''[^''\r\n]*''')
+						& $add $o 'comment' $hashLine
+						& $add $o 'variable' '\$\w+|\$\{[^}]+\}|\$\?'
+						& $add $o 'keyword'  '\b(?:function|filter|workflow|configuration|class|enum|param|begin|process|end|dynamicparam|if|elseif|else|foreach|for|while|do|switch|break|continue|return|exit|throw|try|catch|finally|trap|data|in|and|or|not|xor|bor|band|bnot|as|is|isnot|contains|notcontains|like|notlike|match|notmatch|replace|split|join|eq|ne|gt|ge|lt|le|shl|shr|inlinescript|parallel|sequence|from|where|hidden|static|var|ValidateSet|ValidateRange|ValidateNotNull|ValidateNotNullOrEmpty|CmdletBinding|Parameter|Alias|OutputType|SupportsShouldProcess)\b'
+						& $add $o 'builtin'  '\b(?:Get|Set|New|Remove|Add|Clear|Copy|Move|Rename|Test|Invoke|Start|Stop|Restart|Wait|Write|Read|Out|Import|Export|ConvertTo|ConvertFrom|Select|Where|ForEach|Sort|Group|Measure|Compare|Format|Update|Register|Unregister|Enable|Disable|Install|Uninstall|Push|Pop|Enter|Exit|Connect|Disconnect|Send|Receive|Join|Split|Expand|Compress|Mount|Dismount|Resolve|Find|Search|Show|Hide|Lock|Unlock|Grant|Revoke|Approve|Deny|Publish|Unpublish|Protect|Unprotect|Backup|Restore|Checkpoint|Complete|Suspend|Resume|Limit|Skip|Use|Trace|Debug|Assert|Confirm|Request)-[A-Za-z][\w.]*\b'
+						& $add $o 'operator' '(?:-eq|-ne|-gt|-ge|-lt|-le|-like|-notlike|-match|-notmatch|-replace|-contains|-notcontains|-in|-notin|-and|-or|-not|-xor|-band|-bor|-bxor|-bnot|-shl|-shr|\|=|[\+\-\*/%]=|==|!=|<=|>=|=>|=|\||&|;|\.\.|\.\.|::)'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\bfunction\s+([A-Za-z_][\w-]*)'
+						& $add $o 'type'     '\[(?:string|int|long|double|float|bool|char|byte|decimal|datetime|timespan|guid|xml|hashtable|psobject|pscustomobject|array|void|object|switch|scriptblock|regex|uri|version|ipaddress|[\w.]+)\]'
+					}
+					'py' {
+						& $add $o 'string'  ('"""[\s\S]*?"""|''''[\s\S]*?''''|f?"(?:\\.|[^"\\])*"|f?''(?:\\.|[^''\\])*''')
+						& $add $o 'comment' $hashLine
+						& $add $o 'keyword'  '\b(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|match|case)\b'
+						& $add $o 'builtin'  '\b(?:abs|all|any|bin|bool|bytearray|bytes|callable|chr|classmethod|compile|complex|dict|dir|divmod|enumerate|eval|exec|filter|float|format|frozenset|getattr|globals|hasattr|hash|help|hex|id|input|int|isinstance|issubclass|iter|len|list|locals|map|max|memoryview|min|next|object|oct|open|ord|pow|print|property|range|repr|reversed|round|set|setattr|slice|sorted|staticmethod|str|sum|super|tuple|type|vars|zip)\b'
+						& $add $o 'function' '\bdef\s+([A-Za-z_]\w*)|\bclass\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*(?=\()'
+						& $add $o 'number'   $num
+						& $add $o 'decorator' '@[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*'
+						& $add $o 'operator' '==|!=|<=|>=|//|\*\*|:=|[-+*/%@&|^~<>]=?|='
+					}
+					'js' {
+						& $add $o 'comment' ("$cBlock|$cLine")
+						& $add $o 'string'  ("$strDQ|$strSQ|$strBT")
+						& $add $o 'keyword'  '\b(?:async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|from|function|if|import|in|instanceof|let|new|of|return|static|super|switch|this|throw|try|typeof|var|void|while|with|yield|enum|implements|interface|package|private|protected|public|abstract|boolean|byte|char|double|final|float|goto|int|long|native|short|synchronized|throws|transient|volatile|as|type|keyof|readonly|infer|never|unknown|any|string|number|bigint|symbol|object|undefined|null|true|false)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\b(?:function\s+)?([A-Za-z_$][\w$]*)\s*(?=\()|\b([A-Za-z_$][\w$]*)\s*(?==>\s*)'
+						& $add $o 'operator' '===|!==|=>|\?\?|\?\.|&&|\|\||\*\*|[-+*/%&|^~<>!=]=?|\?\?='
+					}
+					'ts' {
+						& $add $o 'comment' ("$cBlock|$cLine")
+						& $add $o 'string'  ("$strDQ|$strSQ|$strBT")
+						& $add $o 'keyword'  '\b(?:async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|from|function|if|import|in|instanceof|let|new|of|return|static|super|switch|this|throw|try|typeof|var|void|while|with|yield|enum|implements|interface|package|private|protected|public|abstract|readonly|type|namespace|module|declare|keyof|infer|is|as|satisfies|override|true|false|null|undefined|any|unknown|never|string|number|boolean|bigint|symbol|object)\b'
+						& $add $o 'type'     '\b(?:string|number|boolean|bigint|symbol|object|undefined|null|void|never|unknown|any|Record|Partial|Required|Readonly|Pick|Omit|Exclude|Extract|NonNullable|ReturnType|InstanceType|Promise|Array|Map|Set|Date|Error|RegExp)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\b(?:function\s+)?([A-Za-z_$][\w$]*)\s*(?=\()'
+						& $add $o 'operator' '===|!==|=>|\?\?|\?\.|&&|\|\||[-+*/%&|^~<>!=]=?'
+					}
+					'json' {
+						& $add $o 'string'  $strDQ
+						& $add $o 'number'  $num
+						& $add $o 'keyword' '\b(?:true|false|null)\b'
+						& $add $o 'punctuation' '[{}\[\],:]'
+					}
+					'sh' {
+						& $add $o 'comment' $hashLine
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'variable' '\$\{[^}]+\}|\$\w+|\$\d+|\$[@*#?$!-]'
+						& $add $o 'keyword'  '\b(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|function|select|in|time|coproc|true|false|test)\b'
+						& $add $o 'builtin'  '\b(?:echo|printf|read|cd|pwd|export|unset|alias|unalias|set|shift|return|exit|source|eval|exec|trap|wait|kill|jobs|bg|fg|ulimit|umask|getopts|hash|type|command|builtin|enable|help|let|local|declare|typeset|readonly|mapfile|readarray)\b'
+						& $add $o 'number'   $num
+						& $add $o 'operator' '&&|\|\||>>|<<|2>&1|&>|[-+*/%=<>!]=?|[|;&(){}]'
+					}
+					'cs' {
+						& $add $o 'comment' ("$cBlock|$cLine")
+						& $add $o 'string'  ('@"(?:""|[^"])*"|"(?:\\.|[^"\\])*"|''(?:\\.|[^''\\])''')
+						& $add $o 'keyword'  '\b(?:abstract|as|base|bool|break|byte|case|catch|char|checked|class|const|continue|decimal|default|delegate|do|double|else|enum|event|explicit|extern|false|finally|fixed|float|for|foreach|goto|if|implicit|in|int|interface|internal|is|lock|long|namespace|new|null|object|operator|out|override|params|private|protected|public|readonly|ref|return|sbyte|sealed|short|sizeof|stackalloc|static|string|struct|switch|this|throw|true|try|typeof|uint|ulong|unchecked|unsafe|ushort|using|virtual|void|volatile|while|async|await|var|dynamic|nameof|when|yield|record|init|with|required|nint|nuint|file|scoped)\b'
+						& $add $o 'type'     '\b(?:string|int|long|bool|byte|char|decimal|double|float|object|void|var|dynamic|Task|List|Dictionary|IEnumerable|Action|Func|DateTime|Guid|Exception)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\b([A-Za-z_]\w*)\s*(?=\()'
+						& $add $o 'operator' '=>|\?\?|\?\.|&&|\|\||[-+*/%&|^~<>!=]=?'
+					}
+					{ $_ -in @('c','cpp') } {
+						& $add $o 'comment' ("$cBlock|$cLine")
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'keyword'  ("\b(?:$kwC|class|public|private|protected|virtual|override|friend|operator|try|catch|throw|using|namespace|template|typename|constexpr|nullptr|true|false|include|define|ifdef|ifndef|endif|pragma|bool)\b")
+						& $add $o 'meta'    '^\s*#\s*\w+[^\r\n]*'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\b([A-Za-z_]\w*)\s*(?=\()'
+						& $add $o 'type'     '\b(?:int|char|void|float|double|long|short|unsigned|signed|bool|size_t|uint\d+_t|int\d+_t|string|vector|map|set|auto)\b'
+					}
+					'java' {
+						& $add $o 'comment' ("$cBlock|$cLine")
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'keyword'  '\b(?:abstract|assert|boolean|break|byte|case|catch|char|class|const|continue|default|do|double|else|enum|extends|final|finally|float|for|goto|if|implements|import|instanceof|int|interface|long|native|new|package|private|protected|public|return|short|static|strictfp|super|switch|synchronized|this|throw|throws|transient|try|void|volatile|while|true|false|null|var|record|sealed|permits|yield|when)\b'
+						& $add $o 'type'     '\b(?:String|Integer|Boolean|Double|Float|Long|Object|List|Map|Set|Optional|Stream|Exception|Override|Deprecated)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\b([A-Za-z_]\w*)\s*(?=\()'
+					}
+					'go' {
+						& $add $o 'comment' ("$cBlock|$cLine")
+						& $add $o 'string'  ($strDQ + '|' + $strSQ + '|`[^`]*`')
+						& $add $o 'keyword'  '\b(?:break|case|chan|const|continue|default|defer|else|fallthrough|for|func|go|goto|if|import|interface|map|package|range|return|select|struct|switch|type|var|true|false|nil|iota)\b'
+						& $add $o 'type'     '\b(?:bool|byte|complex64|complex128|error|float32|float64|int|int8|int16|int32|int64|rune|string|uint|uint8|uint16|uint32|uint64|uintptr|any|comparable)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\bfunc\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*(?=\()'
+					}
+					'rust' {
+						& $add $o 'comment' ("$cBlock|$cLine")
+						& $add $o 'string'  ($strDQ + '|' + $strSQ + '|r#*"[^"]*"#*')
+						& $add $o 'keyword'  '\b(?:as|async|await|break|const|continue|crate|dyn|else|enum|extern|false|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|true|type|unsafe|use|where|while|abstract|become|box|do|final|macro|override|priv|typeof|unsized|virtual|yield)\b'
+						& $add $o 'type'     '\b(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|f32|f64|bool|char|str|String|Vec|Option|Result|Box|Rc|Arc|Cell|RefCell)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\bfn\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*(?=\()'
+						& $add $o 'meta'    '#\[[^\]]*\]'
+					}
+					'rb' {
+						& $add $o 'comment' $hashLine
+						& $add $o 'string'  ('%[qQwW]?\{[^}]*\}|' + $strDQ + '|' + $strSQ + '|:[A-Za-z_]\w*[!?]?')
+						& $add $o 'keyword'  '\b(?:BEGIN|END|alias|and|begin|break|case|class|def|defined|do|else|elsif|end|ensure|false|for|if|in|module|next|nil|not|or|redo|rescue|retry|return|self|super|then|true|undef|unless|until|when|while|yield)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\bdef\s+([A-Za-z_]\w*[!?=]?)|\b([A-Za-z_]\w*[!?]?)\s*(?=\()'
+						& $add $o 'variable' '@{1,2}[A-Za-z_]\w*|[A-Za-z_]\w*:'
+					}
+					'php' {
+						& $add $o 'comment' ("$cBlock|$cLine|#[^\r\n]*")
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'variable' '\$[A-Za-z_]\w*'
+						& $add $o 'keyword'  '\b(?:abstract|and|array|as|break|callable|case|catch|class|clone|const|continue|declare|default|do|echo|else|elseif|empty|enddeclare|endfor|endforeach|endif|endswitch|endwhile|eval|exit|extends|final|finally|fn|for|foreach|function|global|goto|if|implements|include|include_once|instanceof|insteadof|interface|isset|list|match|namespace|new|or|print|private|protected|public|readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|var|while|xor|yield|true|false|null)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\bfunction\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*(?=\()'
+					}
+					'sql' {
+						& $add $o 'comment' ("$cBlock|--[^\r\n]*")
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'keyword'  '(?i)\b(?:select|from|where|and|or|not|in|is|null|as|join|inner|left|right|full|outer|on|group|by|order|having|limit|offset|insert|into|values|update|set|delete|create|alter|drop|table|index|view|database|schema|primary|key|foreign|references|unique|check|default|constraint|cascade|restrict|union|all|distinct|case|when|then|else|end|exists|between|like|ilike|with|recursive|over|partition|window|rank|count|sum|avg|min|max|cast|coalesce|nullif|true|false|asc|desc|inner|cross|natural|using|returning|conflict|do|nothing|begin|commit|rollback|transaction|grant|revoke|truncate|replace|merge|upsert|explain|analyze|vacuum)\b'
+						& $add $o 'number'   $num
+						& $add $o 'type'     '(?i)\b(?:int|integer|bigint|smallint|tinyint|decimal|numeric|float|real|double|money|char|varchar|nvarchar|text|ntext|date|datetime|timestamp|time|bool|boolean|blob|clob|json|uuid|serial|bigserial)\b'
+					}
+					'xml' {
+						& $add $o 'comment' '<!--[\s\S]*?-->'
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'tag'     '</?[A-Za-z_][\w:.-]*|/?>'
+						& $add $o 'attribute' '\b[A-Za-z_][\w:.-]*(?=\s*=)'
+						& $add $o 'meta'    '<\?[\s\S]*?\?>|<!\[CDATA\[[\s\S]*?\]\]>'
+					}
+					'css' {
+						& $add $o 'comment' $cBlock
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'keyword'  '@[A-Za-z-]+|\b(?:important|from|to)\b'
+						& $add $o 'property' '(?m)^\s*([A-Za-z-]+)\s*(?=:)|(?<=[;{]\s*)([A-Za-z-]+)\s*(?=:)'
+						& $add $o 'number'   ($num + '(?:px|em|rem|%|vh|vw|s|ms|deg|fr)?')
+						& $add $o 'function' '\b([A-Za-z-]+)\s*(?=\()'
+						& $add $o 'selector' '[.#][A-Za-z_][\w-]*'
+					}
+					'yaml' {
+						& $add $o 'comment' $hashLine
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'keyword'  '\b(?:true|false|null|yes|no|on|off)\b'
+						& $add $o 'number'   $num
+						& $add $o 'property' '(?m)^(?:\s*-\s*)?([A-Za-z_][\w.-]*)\s*(?=:)'
+						& $add $o 'meta'    '(?m)^---$|^\.\.\.$|&\w+|\*\w+|<<\s*:'
+					}
+					'md' {
+						& $add $o 'header'  '(?m)^#{1,6}\s+[^\r\n]+'
+						& $add $o 'string'  ($strDQ + '|' + $strBT + '|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_')
+						& $add $o 'meta'    '(?m)^(?:\s*[-*+]|\s*\d+\.)\s+|^\s*>\s+|\[([^\]]+)\]\([^)]+\)'
+						& $add $o 'comment' ('(?m)^' + '```' + '[\w]*$|^~~~[\w]*$')
+					}
+					'diff' {
+						& $add $o 'meta'    '(?m)^(?:diff |index |--- |\+\+\+ |@@ ).*$'
+						& $add $o 'keyword' '(?m)^\+.*$'
+						& $add $o 'tag'     '(?m)^-.*$'
+						& $add $o 'comment' '(?m)^(?:\s|\\).*\$'
+					}
+					'ini' {
+						& $add $o 'comment' ('[;#][^\r\n]*')
+						& $add $o 'header'  '(?m)^\[[^\]]+\]'
+						& $add $o 'property' '(?m)^([A-Za-z_][\w.-]*)\s*(?==)'
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'number'  $num
+						& $add $o 'keyword' '\b(?:true|false|on|off|yes|no)\b'
+					}
+					'docker' {
+						& $add $o 'comment' $hashLine
+						& $add $o 'keyword'  '(?i)\b(?:FROM|RUN|CMD|LABEL|MAINTAINER|EXPOSE|ENV|ADD|COPY|ENTRYPOINT|VOLUME|USER|WORKDIR|ARG|ONBUILD|STOPSIGNAL|HEALTHCHECK|SHELL|AS)\b'
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'number'  $num
+						& $add $o 'variable' '\$\{[^}]+\}|\$\w+'
+					}
+					'bat' {
+						& $add $o 'comment' '(?i)(?:^|\s)(?:REM\b|::)[^\r\n]*'
+						& $add $o 'keyword'  '(?i)\b(?:if|else|for|in|do|goto|call|exit|set|setlocal|endlocal|enabledelayedexpansion|echo|pause|shift|start|pushd|popd|cd|dir|copy|move|del|type|exist|defined|errorlevel|equ|neq|lss|leq|gtr|geq|not)\b'
+						& $add $o 'variable' '%[^%]+%|!\w+!'
+						& $add $o 'string'  $strDQ
+						& $add $o 'number'  $num
+					}
+					'r' {
+						& $add $o 'comment' $hashLine
+						& $add $o 'string'  ("$strDQ|$strSQ")
+						& $add $o 'keyword'  '\b(?:if|else|repeat|while|function|for|in|next|break|TRUE|FALSE|NULL|Inf|NaN|NA|NA_integer_|NA_real_|NA_complex_|NA_character_|library|require|source|return)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\b([A-Za-z.][\w.]*)\s*(?=\()'
+						& $add $o 'operator' '<-|<<-|->|->>|%[^%]+%|==|!=|<=|>=|&&|\|\|'
+					}
+					'lua' {
+						& $add $o 'comment' ('--\[\[[\s\S]*?\]\]|--[^\r\n]*')
+						& $add $o 'string'  ("$strDQ|$strSQ|\[\[[\s\S]*?\]\]")
+						& $add $o 'keyword'  '\b(?:and|break|do|else|elseif|end|false|for|function|goto|if|in|local|nil|not|or|repeat|return|then|true|until|while)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\bfunction\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)|\b([A-Za-z_]\w*)\s*(?=\()'
+					}
+					'swift' {
+						& $add $o 'comment' ("$cBlock|$cLine")
+						& $add $o 'string'  ('"""[\s\S]*?"""|"(?:\\.|[^"\\])*"')
+						& $add $o 'keyword'  '\b(?:associatedtype|class|deinit|enum|extension|fileprivate|func|import|init|inout|internal|let|open|operator|private|protocol|public|rethrows|static|struct|subscript|typealias|var|break|case|continue|default|defer|do|else|fallthrough|for|guard|if|in|repeat|return|switch|where|while|as|Any|catch|false|is|nil|super|self|Self|throw|throws|true|try|async|await|actor|some|opaque)\b'
+						& $add $o 'type'     '\b(?:Int|String|Bool|Double|Float|Array|Dictionary|Set|Optional|Result|Error|Void)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\bfunc\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*(?=\()'
+					}
+					'vb' {
+						& $add $o 'comment' ("'[^\r\n]*|(?i)\bREM\b[^\r\n]*")
+						& $add $o 'string'  $strDQ
+						& $add $o 'keyword'  '(?i)\b(?:AddHandler|AddressOf|Alias|And|AndAlso|As|Boolean|ByRef|Byte|ByVal|Call|Case|Catch|CBool|CByte|CChar|CDate|CDbl|CDec|Char|CInt|Class|CLng|CObj|Const|Continue|CSByte|CShort|CSng|CStr|CType|CUInt|CULng|CUShort|Date|Decimal|Declare|Default|Delegate|Dim|DirectCast|Do|Double|Each|Else|ElseIf|End|Enum|Erase|Error|Event|Exit|False|Finally|For|Friend|Function|Get|GetType|GetXMLNamespace|Global|GoTo|Handles|If|Implements|Imports|In|Inherits|Integer|Interface|Is|IsNot|Let|Lib|Like|Long|Loop|Me|Mod|Module|MustInherit|MustOverride|MyBase|MyClass|Namespace|Narrowing|New|Next|Not|Nothing|NotInheritable|NotOverridable|Object|Of|On|Operator|Option|Optional|Or|OrElse|Overloads|Overridable|Overrides|ParamArray|Partial|Private|Property|Protected|Public|RaiseEvent|ReadOnly|ReDim|REM|RemoveHandler|Resume|Return|SByte|Select|Set|Shadows|Shared|Short|Single|Static|Step|Stop|String|Structure|Sub|SyncLock|Then|Throw|To|True|Try|TryCast|TypeOf|UInteger|ULong|UShort|Using|When|While|Widening|With|WithEvents|WriteOnly|Xor|Async|Await|Iterator|Yield)\b'
+						& $add $o 'number'   $num
+					}
+					default {
+						& $add $o 'comment' ("$cBlock|$cLine|$hashLine")
+						& $add $o 'string'  ("$strDQ|$strSQ|$strBT")
+						& $add $o 'keyword'  '\b(?:if|else|elif|elseif|for|while|do|switch|case|break|continue|return|function|func|def|class|struct|enum|import|from|export|const|let|var|new|try|catch|finally|throw|true|false|null|nil|None|True|False|and|or|not|in|of|as|is|public|private|protected|static|void|int|string|bool|float|double)\b'
+						& $add $o 'number'   $num
+						& $add $o 'function' '\b([A-Za-z_]\w*)\s*(?=\()'
+						& $add $o 'operator' '==|!=|<=|>=|&&|\|\||=>|[-+*/%&|^~<>!=]=?'
+					}
+				}
+				return $o
+			}.GetNewClosure()
+
+			$synTokenize = {
+				param([string]$Text, [string]$Norm)
+				$spans = New-Object System.Collections.ArrayList
+				if ([string]::IsNullOrEmpty($Text)) { return $spans }
+				$cache = $null
+				try {
+					if ($W -is [hashtable]) {
+						if (-not $W.ContainsKey('SynRuleCache') -or $null -eq $W['SynRuleCache']) {
+							$W['SynRuleCache'] = @{}
+						}
+						$cache = $W['SynRuleCache']
+					}
+				} catch { $cache = $null }
+				$rules = $null
+				if ($null -ne $cache -and $cache.ContainsKey($Norm)) {
+					$rules = $cache[$Norm]
+				} else {
+					$rules = & $synBuildRules $Norm
+					if ($null -ne $cache) { $cache[$Norm] = $rules }
+				}
+				if ($null -eq $rules -or $rules.Count -eq 0) {
+					[void]$spans.Add(@{ T = $Text; K = 'plain' })
+					return $spans
+				}
+				$pos = 0
+				$len = $Text.Length
+				$maxScan = [Math]::Min($len, 120000)
+				while ($pos -lt $maxScan) {
+					$bestIdx = [int]::MaxValue
+					$bestLen = 0
+					$bestName = 'plain'
+					$bestVal = $null
+					foreach ($r in $rules) {
+						try {
+							$m = $r.Rx.Match($Text, $pos)
+							if ($m.Success -and $m.Index -ge $pos -and $m.Length -gt 0) {
+								if ($m.Index -lt $bestIdx -or ($m.Index -eq $bestIdx -and $m.Length -gt $bestLen)) {
+									$bestIdx = $m.Index
+									$bestLen = $m.Length
+									$bestName = [string]$r.N
+									$bestVal = $m.Value
+								}
+							}
+						} catch {}
+					}
+					if ($null -eq $bestVal) {
+						[void]$spans.Add(@{ T = $Text.Substring($pos, $maxScan - $pos); K = 'plain' })
+						$pos = $maxScan
+						break
+					}
+					if ($bestIdx -gt $pos) {
+						[void]$spans.Add(@{ T = $Text.Substring($pos, $bestIdx - $pos); K = 'plain' })
+					}
+					$k = $bestName
+					if ($k -eq 'decorator') { $k = 'meta' }
+					[void]$spans.Add(@{ T = $bestVal; K = $k })
+					$pos = $bestIdx + $bestLen
+				}
+				if ($pos -lt $len) {
+					[void]$spans.Add(@{ T = $Text.Substring($pos); K = 'plain' })
+				}
+				$merged = New-Object System.Collections.ArrayList
+				foreach ($s in $spans) {
+					if ($merged.Count -gt 0) {
+						$prev = $merged[$merged.Count - 1]
+						if ([string]$prev.K -eq [string]$s.K) {
+							$prev.T = [string]$prev.T + [string]$s.T
+							continue
+						}
+					}
+					[void]$merged.Add(@{ T = [string]$s.T; K = [string]$s.K })
+				}
+				return $merged
+			}.GetNewClosure()
+
+			$synColorMap = @{
+				plain       = '#C8C8D0'
+				comment     = '#6A6A76'
+				string      = '#9ECE6A'
+				keyword     = '#BB9AF7'
+				number      = '#FF9E64'
+				function    = '#7AA2F7'
+				type        = '#7DCFFF'
+				variable    = '#E0AF68'
+				operator    = '#89DDFF'
+				punctuation = '#8A8A96'
+				tag         = '#F7768E'
+				attribute   = '#E0AF68'
+				builtin     = '#7AA2F7'
+				property    = '#7DCFFF'
+				meta        = '#BB9AF7'
+				header      = '#7AA2F7'
+			}
+
+			$paintCodeHighlight = {
+				param($rtb, [string]$plain, [string]$lang, $conv, $brushCache, $monoFont)
+				if ($null -eq $rtb) { return }
+				try {
+					$norm = & $synNormLang $lang
+					$tokens = & $synTokenize $plain $norm
+					$doc = New-Object System.Windows.Documents.FlowDocument
+					$doc.PagePadding = New-Object System.Windows.Thickness(0)
+					try { $doc.TextAlignment = [System.Windows.TextAlignment]::Left } catch {}
+					$para = New-Object System.Windows.Documents.Paragraph
+					$para.Margin = New-Object System.Windows.Thickness(0)
+					$para.Padding = New-Object System.Windows.Thickness(0)
+					try { $para.LineHeight = 18 } catch {}
+					if ($null -eq $tokens -or $tokens.Count -eq 0) {
+						$run = New-Object System.Windows.Documents.Run ($(if ($null -eq $plain) { '' } else { $plain }))
+						$hx0 = '#C8C8D0'
+						if (-not $brushCache.ContainsKey($hx0)) { $brushCache[$hx0] = $conv.ConvertFromString($hx0) }
+						$run.Foreground = $brushCache[$hx0]
+						if ($monoFont) { $run.FontFamily = $monoFont }
+						[void]$para.Inlines.Add($run)
+					} else {
+						foreach ($tok in $tokens) {
+							$k = [string]$tok.K
+							if (-not $synColorMap.ContainsKey($k)) { $k = 'plain' }
+							$hx = [string]$synColorMap[$k]
+							if (-not $brushCache.ContainsKey($hx)) {
+								$brushCache[$hx] = $conv.ConvertFromString($hx)
+							}
+							$run = New-Object System.Windows.Documents.Run ([string]$tok.T)
+							$run.Foreground = $brushCache[$hx]
+							if ($monoFont) { $run.FontFamily = $monoFont }
+							[void]$para.Inlines.Add($run)
+						}
+					}
+					[void]$doc.Blocks.Add($para)
+					try {
+						$pw = [double]$rtb.ActualWidth
+						if ([double]::IsNaN($pw) -or $pw -lt 40) {
+							try {
+								$par = $rtb.Parent
+								while ($null -ne $par -and -not ($par -is [System.Windows.FrameworkElement])) { $par = $par.Parent }
+								if ($par -is [System.Windows.FrameworkElement] -and $par.ActualWidth -gt 40) {
+									$pw = [double]$par.ActualWidth - 8
+								}
+							} catch {}
+						}
+						if ([double]::IsNaN($pw) -or $pw -lt 40) { $pw = 480 }
+						$doc.PageWidth = [Math]::Max(80, $pw - 6)
+					} catch {}
+					$rtb.Document = $doc
+				} catch {
+					try {
+						$doc2 = New-Object System.Windows.Documents.FlowDocument
+						$p2 = New-Object System.Windows.Documents.Paragraph
+						$r2 = New-Object System.Windows.Documents.Run ($(if ($null -eq $plain) { '' } else { $plain }))
+						if ($monoFont) { $r2.FontFamily = $monoFont }
+						[void]$p2.Inlines.Add($r2)
+						[void]$doc2.Blocks.Add($p2)
+						$rtb.Document = $doc2
+					} catch {}
+				}
+			}.GetNewClosure()
+
+			$getCodePlainText = {
+				param($box)
+				if ($null -eq $box) { return '' }
+				try {
+					if ($box.Tag -is [hashtable] -and $null -ne $box.Tag['Plain']) {
+						return [string]$box.Tag['Plain']
+					}
+				} catch {}
+				try {
+					if ($box -is [System.Windows.Controls.TextBox]) { return [string]$box.Text }
+				} catch {}
+				try {
+					$tr = New-Object System.Windows.Documents.TextRange($box.Document.ContentStart, $box.Document.ContentEnd)
+					$t = [string]$tr.Text
+					return $t.TrimEnd([char]13, [char]10)
+				} catch {}
+				return ''
+			}.GetNewClosure()
+
+			$openHttpLink = {
+				param($sender, $e)
+				try {
+					$u = $null
+					try { if ($e -and $e.Uri) { $u = [string]$e.Uri.AbsoluteUri } } catch {}
+					if ([string]::IsNullOrWhiteSpace($u)) {
+						try { if ($sender -and $sender.NavigateUri) { $u = [string]$sender.NavigateUri.AbsoluteUri } } catch {}
+					}
+					if ($u -match '^(?i)https?://') {
+						$psi = New-Object System.Diagnostics.ProcessStartInfo
+						$psi.FileName = $u
+						$psi.UseShellExecute = $true
+						[void][System.Diagnostics.Process]::Start($psi)
+					}
+				} catch {}
+				try { if ($e) { $e.Handled = $true } } catch {}
+			}.GetNewClosure()
+
+			$splitLinkSegments = {
+				param([string]$s)
+				$out = New-Object System.Collections.ArrayList
+				if ([string]::IsNullOrEmpty($s)) { return $out }
+				# [label](https://url) first, then bare https:// and www.
+				$rx = New-Object System.Text.RegularExpressions.Regex (
+					'(?i)\[([^\]]+)\]\(\s*(https?://[^)\s]+)\s*(?:\"[^\"]*\")?\s*\)|(https?://[^\s<>\[\]]+)|(www\.[^\s<>\[\]]+)'
+				)
+				$pos = 0
+				foreach ($m in $rx.Matches($s)) {
+					if ($m.Index -gt $pos) {
+						[void]$out.Add(@{ Kind = 't'; Text = $s.Substring($pos, $m.Index - $pos) })
+					}
+					$display = $null
+					$url = $null
+					$bare = $false
+					if ($m.Groups[1].Success -and $m.Groups[2].Success) {
+						# Markdown: display label only; full URL on hover
+						$display = ([string]$m.Groups[1].Value).Trim()
+						$url = ([string]$m.Groups[2].Value).Trim()
+					} elseif ($m.Groups[3].Success) {
+						$url = [string]$m.Groups[3].Value
+						$display = $url
+						$bare = $true
+					} elseif ($m.Groups[4].Success) {
+						$display = [string]$m.Groups[4].Value
+						$url = 'https://' + $display
+						$bare = $true
+					}
+					if ($null -ne $url) {
+						$trail = ''
+						if ($bare) {
+							while ($url.Length -gt 0) {
+								$ch = $url.Substring($url.Length - 1, 1)
+								if ($ch -match '^[.,;:!?)\]]$') {
+									$trail = $ch + $trail
+									$url = $url.Substring(0, $url.Length - 1)
+								} else { break }
+							}
+							if ($trail.Length -gt 0 -and $display.Length -ge $trail.Length -and $display.EndsWith($trail)) {
+								$display = $display.Substring(0, $display.Length - $trail.Length)
+							}
+						}
+						if (($url -match '^(?i)https?://\S+$') -and $display.Length -gt 0) {
+							[void]$out.Add(@{ Kind = 'a'; Text = $display; Url = $url })
+							if ($trail.Length -gt 0) {
+								[void]$out.Add(@{ Kind = 't'; Text = $trail })
+							}
+						} else {
+							[void]$out.Add(@{ Kind = 't'; Text = [string]$m.Value })
+						}
+					} else {
+						[void]$out.Add(@{ Kind = 't'; Text = [string]$m.Value })
+					}
+					$pos = $m.Index + $m.Length
+				}
+				if ($pos -lt $s.Length) {
+					[void]$out.Add(@{ Kind = 't'; Text = $s.Substring($pos) })
+				}
+				if ($out.Count -eq 0) {
+					[void]$out.Add(@{ Kind = 't'; Text = $s })
+				}
+				return $out
+			}.GetNewClosure()
+
+			$addHyperlink = {
+				param($targetPara, $display, $url, $brush, $monoFont)
+				if ($null -eq $targetPara -or [string]::IsNullOrEmpty($display)) { return }
+				if ($url -notmatch '^(?i)https?://') { return }
+				try {
+					$uri = New-Object System.Uri ($url)
+					$hl = New-Object System.Windows.Documents.Hyperlink
+					$hl.NavigateUri = $uri
+					$hl.Cursor = [System.Windows.Input.Cursors]::Hand
+					try { $hl.ToolTip = [string]$url } catch {}
+					$run = New-Object System.Windows.Documents.Run ($display)
+					if ($monoFont) { $run.FontFamily = $monoFont }
+					$linkHex = '#7AA2F7'
+					if (-not $W.BrushCache.ContainsKey($linkHex)) {
+						$W.BrushCache[$linkHex] = $conv.ConvertFromString($linkHex)
+					}
+					$run.Foreground = $W.BrushCache[$linkHex]
+					try { $hl.Foreground = $W.BrushCache[$linkHex] } catch {}
+					try { $hl.TextDecorations = [System.Windows.TextDecorations]::Underline } catch {}
+					$hl.Inlines.Add($run)
+					$hl.add_RequestNavigate($openHttpLink)
+					$targetPara.Inlines.Add($hl)
+				} catch {
+					try {
+						$run = New-Object System.Windows.Documents.Run ($display)
+						$run.Foreground = $brush
+						if ($monoFont) { $run.FontFamily = $monoFont }
+						$targetPara.Inlines.Add($run)
+					} catch {}
+				}
+			}.GetNewClosure()
+
+			$appendRunsWithLinks = {
+				param($para, $chunk, $brush, $monoFont, $emojiFont)
+				if ([string]::IsNullOrEmpty($chunk) -or $null -eq $para) { return }
+				$segs = @( & $splitLinkSegments $chunk )
+				foreach ($seg in $segs) {
+					if ($null -eq $seg) { continue }
+					if ([string]$seg.Kind -eq 'a') {
+						& $addHyperlink $para ([string]$seg.Text) ([string]$seg.Url) $brush $monoFont
+					} else {
+						$tx = [string]$seg.Text
+						if ($tx.Length -gt 0) {
+							& $appendRuns $para $tx $brush $monoFont $emojiFont
+						}
+					}
+				}
+			}.GetNewClosure()
+
+			$timer = New-Object System.Windows.Threading.DispatcherTimer
+			$timer.Interval = [TimeSpan]::FromMilliseconds(16)
+			$timer.add_Tick({
+				try {
+					$rtb = $W.Log
+					$q = $W.WriteQueue
+					if (-not $rtb -or -not $q) { return }
+					$doc = $rtb.Document
+					if (-not $doc) { return }
+					try {
+						if ($W -is [hashtable]) {
+							if (-not $W.ContainsKey('BrushCache') -or $null -eq $W['BrushCache']) {
+								$W['BrushCache'] = @{}
+							}
+						} elseif ($null -eq $W.BrushCache) {
+							$W.BrushCache = @{}
+						}
+					} catch {
+						try { $W['BrushCache'] = @{} } catch {}
+					}
+					$n = 0
+					$item = $null
+					while ($n -lt 120 -and $q.TryDequeue([ref]$item)) {
+					  try {
+						$n++
+						if ($null -eq $item) { continue }
+						$kind = 'text'
+						try { if ($item.Kind) { $kind = [string]$item.Kind } } catch {}
+
+						$newPara = {
+							$p = New-Object System.Windows.Documents.Paragraph
+							$p.Margin = New-Object System.Windows.Thickness 0
+							$p.Padding = New-Object System.Windows.Thickness 0
+							$p.LineHeight = 16
+							return $p
+						}
+						$trimTrailingEmptyParas = {
+							try {
+								while ($doc.Blocks.Count -gt 0) {
+									$last = $doc.Blocks.LastBlock
+									if (-not ($last -is [System.Windows.Documents.Paragraph])) { break }
+									$isEmpty = $false
+									try {
+										if ($last.Inlines.Count -eq 0) { $isEmpty = $true }
+										elseif ($last.Inlines.Count -eq 1) {
+											$fi = $last.Inlines.FirstInline
+											if ($fi -is [System.Windows.Documents.Run]) {
+												if ([string]::IsNullOrWhiteSpace([string]$fi.Text)) { $isEmpty = $true }
+											}
+										}
+									} catch { $isEmpty = $false }
+									if (-not $isEmpty) { break }
+									[void]$doc.Blocks.Remove($last)
+								}
+							} catch {}
+						}
+
+						$stretchW = 280.0
+						try {
+							$aw = [double]$rtb.ActualWidth
+							if ($aw -gt 48 -and -not [double]::IsNaN($aw)) {
+								$padL = 12.0; $padR = 12.0
+								try { $padL = [double]$rtb.Padding.Left; $padR = [double]$rtb.Padding.Right } catch {}
+								$vBar = 16.0
+								try {
+									if ($rtb.ComputedVerticalScrollBarVisibility -eq [System.Windows.Visibility]::Visible) {
+										$vBar = 16.0
+									}
+								} catch {}
+								$stretchW = [Math]::Max(40.0, $aw - $padL - $padR - $vBar - 2.0)
+							}
+						} catch {}
+
+						# Chat turn header: brand + right-anchored timestamp
+						if ($kind -eq 'chat-turn') {
+							try {
+								& $trimTrailingEmptyParas
+								$role = 'agent'
+								try { if ($item.Role) { $role = ([string]$item.Role).ToLowerInvariant() } } catch {}
+								$nm = ''
+								try { $nm = [string]$item.Name } catch {}
+								if ([string]::IsNullOrWhiteSpace($nm)) {
+									$nm = if ($role -eq 'user') { 'You' } else { 'MiniBot' }
+								}
+								$bodyTxt = ''
+								try { if ($null -ne $item.Body) { $bodyTxt = [string]$item.Body } } catch {}
+								$timeTxt = ''
+								try { if ($item.Time) { $timeTxt = [string]$item.Time } } catch {}
+								$doHl = $false
+								try { $doHl = ([int]$item.Highlight -ne 0) } catch { $doHl = ($role -eq 'user') }
+
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								foreach ($hx in @('#26808080', '#6A6A76', '#A0A0AA', '#B80F0A', '#7DCFFF', '#C8C8D0', '#8A8A96')) {
+									if (-not $brushCache.ContainsKey($hx)) {
+										$brushCache[$hx] = $conv.ConvertFromString($hx)
+									}
+								}
+
+								$tsRightInset = 18.0
+								$outer = New-Object System.Windows.Controls.Border
+								$outer.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+								$outer.SnapsToDevicePixels = $true
+								$outer.Width = $stretchW
+								$outer.Tag = 'chat-turn'
+								if ($doHl) {
+									$outer.Background = $brushCache['#26808080']
+									$outer.CornerRadius = New-Object System.Windows.CornerRadius(5)
+									$outer.Padding = New-Object System.Windows.Thickness(10, 7, $tsRightInset, 8)
+									$outer.Margin = New-Object System.Windows.Thickness(0, 8, 0, 6)
+								} else {
+									$outer.Background = [System.Windows.Media.Brushes]::Transparent
+									$outer.Padding = New-Object System.Windows.Thickness(0, 6, $tsRightInset, 2)
+									$outer.Margin = New-Object System.Windows.Thickness(0, 10, 0, 2)
+								}
+
+								$grid = New-Object System.Windows.Controls.Grid
+								$col0 = New-Object System.Windows.Controls.ColumnDefinition
+								$col0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+								$col1 = New-Object System.Windows.Controls.ColumnDefinition
+								$col1.Width = [System.Windows.GridLength]::Auto
+								[void]$grid.ColumnDefinitions.Add($col0)
+								[void]$grid.ColumnDefinitions.Add($col1)
+								$row0 = New-Object System.Windows.Controls.RowDefinition
+								$row0.Height = [System.Windows.GridLength]::Auto
+								[void]$grid.RowDefinitions.Add($row0)
+								if ($doHl -and $bodyTxt.Length -gt 0) {
+									$row1 = New-Object System.Windows.Controls.RowDefinition
+									$row1.Height = [System.Windows.GridLength]::Auto
+									[void]$grid.RowDefinitions.Add($row1)
+								}
+
+								$left = New-Object System.Windows.Controls.TextBlock
+								$left.FontFamily = $W.MonoFont
+								$left.FontSize = 13
+								$left.TextWrapping = [System.Windows.TextWrapping]::Wrap
+								$left.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$mkRun = {
+									param($t, $br, $bold)
+									$r = New-Object System.Windows.Documents.Run ($t)
+									$r.Foreground = $br
+									if ($bold) { $r.FontWeight = [System.Windows.FontWeights]::Bold }
+									return $r
+								}
+								if ($role -eq 'user') {
+									[void]$left.Inlines.Add((& $mkRun '[' $brushCache['#A0A0AA'] $false))
+									[void]$left.Inlines.Add((& $mkRun $nm $brushCache['#7DCFFF'] $true))
+									[void]$left.Inlines.Add((& $mkRun ']' $brushCache['#A0A0AA'] $false))
+								} else {
+									[void]$left.Inlines.Add((& $mkRun '[' $brushCache['#A0A0AA'] $false))
+									[void]$left.Inlines.Add((& $mkRun $nm $brushCache['#B80F0A'] $true))
+									[void]$left.Inlines.Add((& $mkRun '-' $brushCache['#A0A0AA'] $false))
+									[void]$left.Inlines.Add((& $mkRun 'Agent' $brushCache['#B80F0A'] $true))
+									[void]$left.Inlines.Add((& $mkRun ']' $brushCache['#A0A0AA'] $false))
+								}
+								[System.Windows.Controls.Grid]::SetRow($left, 0)
+								[System.Windows.Controls.Grid]::SetColumn($left, 0)
+								[void]$grid.Children.Add($left)
+
+								$right = New-Object System.Windows.Controls.TextBlock
+								$right.Text = $timeTxt
+								$right.Foreground = $brushCache['#6A6A76']
+								$right.FontFamily = $W.MonoFont
+								$right.FontSize = 11
+								$right.Margin = New-Object System.Windows.Thickness(16, 0, 0, 0)
+								$right.Padding = New-Object System.Windows.Thickness(0)
+								$right.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$right.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+								$right.TextAlignment = [System.Windows.TextAlignment]::Right
+								try { $right.MinWidth = 52 } catch {}
+								[System.Windows.Controls.Grid]::SetRow($right, 0)
+								[System.Windows.Controls.Grid]::SetColumn($right, 1)
+								[void]$grid.Children.Add($right)
+
+								if ($doHl -and $bodyTxt.Length -gt 0) {
+									$bodyTb = New-Object System.Windows.Controls.TextBlock
+									$bodyTb.Text = $bodyTxt
+									$bodyTb.Foreground = $brushCache['#C8C8D0']
+									$bodyTb.FontFamily = $W.MonoFont
+									$bodyTb.FontSize = 13
+									$bodyTb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+									$bodyTb.Margin = New-Object System.Windows.Thickness(0, 5, 0, 0)
+									[System.Windows.Controls.Grid]::SetRow($bodyTb, 1)
+									[System.Windows.Controls.Grid]::SetColumn($bodyTb, 0)
+									[System.Windows.Controls.Grid]::SetColumnSpan($bodyTb, 2)
+									[void]$grid.Children.Add($bodyTb)
+								}
+
+								$outer.Child = $grid
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($outer)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+								try {
+									if ($W -is [hashtable]) {
+										if (-not $W.ContainsKey('MdStretchElements') -or $null -eq $W['MdStretchElements']) {
+											$W['MdStretchElements'] = New-Object System.Collections.ArrayList
+										}
+										[void]$W['MdStretchElements'].Add($outer)
+									} else {
+										$sl = $null
+										try { $sl = $W.MdStretchElements } catch { $sl = $null }
+										if ($null -eq $sl) {
+											$sl = New-Object System.Collections.ArrayList
+											try { $W | Add-Member -NotePropertyName MdStretchElements -NotePropertyValue $sl -Force } catch {}
+										}
+										[void]$sl.Add($outer)
+									}
+								} catch {}
+								$doc.Blocks.Add((& $newPara))
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'md-code-open') {
+							try {
+								& $trimTrailingEmptyParas
+								$lang = ''
+								try { $lang = [string]$item.Text } catch {}
+								if ([string]::IsNullOrWhiteSpace($lang)) { $lang = 'code' }
+
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								foreach ($hx in @('#1A1A1E', '#252530', '#3A3A42', '#7DCFFF', '#8A8A96', '#C8C8D0', '#2A2A30', '#7AA2F7', '#BB9AF7', '#9ECE6A', '#FF9E64', '#E0AF68', '#89DDFF', '#F7768E', '#6A6A76')) {
+									if (-not $brushCache.ContainsKey($hx)) {
+										$brushCache[$hx] = $conv.ConvertFromString($hx)
+									}
+								}
+
+								$outer = New-Object System.Windows.Controls.Border
+								$outer.Background = $brushCache['#1A1A1E']
+								$outer.BorderBrush = $brushCache['#3A3A42']
+								$outer.BorderThickness = New-Object System.Windows.Thickness(1)
+								$outer.CornerRadius = New-Object System.Windows.CornerRadius(6)
+								$outer.Padding = New-Object System.Windows.Thickness(0)
+								$outer.Margin = New-Object System.Windows.Thickness(0, 8, 0, 10)
+								$outer.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+								$outer.SnapsToDevicePixels = $true
+								$outer.Width = $stretchW
+
+								$root = New-Object System.Windows.Controls.Grid
+								$rowHdr = New-Object System.Windows.Controls.RowDefinition
+								$rowHdr.Height = [System.Windows.GridLength]::Auto
+								$rowBody = New-Object System.Windows.Controls.RowDefinition
+								$rowBody.Height = [System.Windows.GridLength]::Auto
+								[void]$root.RowDefinitions.Add($rowHdr)
+								[void]$root.RowDefinitions.Add($rowBody)
+
+								$hdr = New-Object System.Windows.Controls.Border
+								$hdr.Background = $brushCache['#252530']
+								$hdr.Padding = New-Object System.Windows.Thickness(10, 5, 8, 5)
+								$hdr.CornerRadius = New-Object System.Windows.CornerRadius(6, 6, 0, 0)
+								$hdrGrid = New-Object System.Windows.Controls.Grid
+								$hc0 = New-Object System.Windows.Controls.ColumnDefinition
+								$hc0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+								$hc1 = New-Object System.Windows.Controls.ColumnDefinition
+								$hc1.Width = [System.Windows.GridLength]::Auto
+								[void]$hdrGrid.ColumnDefinitions.Add($hc0)
+								[void]$hdrGrid.ColumnDefinitions.Add($hc1)
+
+								$langTb = New-Object System.Windows.Controls.TextBlock
+								$langTb.Text = $lang
+								$langTb.Foreground = $brushCache['#8A8A96']
+								$langTb.FontFamily = $W.MonoFont
+								$langTb.FontSize = 11
+								$langTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								[System.Windows.Controls.Grid]::SetColumn($langTb, 0)
+								[void]$hdrGrid.Children.Add($langTb)
+
+								$codeBox = New-Object System.Windows.Controls.RichTextBox
+								$codeBox.IsReadOnly = $true
+								try { $codeBox.IsReadOnlyCaretVisible = $true } catch {}
+								try { $codeBox.IsUndoEnabled = $false } catch {}
+								$codeBox.BorderThickness = New-Object System.Windows.Thickness(0)
+								$codeBox.Background = [System.Windows.Media.Brushes]::Transparent
+								$codeBox.Foreground = $brushCache['#C8C8D0']
+								try { $codeBox.CaretBrush = $brushCache['#C8C8D0'] } catch {}
+								$codeBox.FontFamily = $W.MonoFont
+								$codeBox.FontSize = 12.5
+								$codeBox.Padding = New-Object System.Windows.Thickness(10, 8, 10, 10)
+								$codeBox.MinHeight = 28
+								$codeBox.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled
+								$codeBox.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled
+								try {
+									$codeBox.Document.PagePadding = New-Object System.Windows.Thickness(0)
+									$codeBox.Document.PageWidth = [Math]::Max(80, $stretchW - 8)
+								} catch {}
+								$codeMeta = @{
+									Kind     = 'md-code'
+									Lang     = $lang
+									Plain    = ''
+									Rtb      = $codeBox
+									LiveHl   = $true
+								}
+								$codeBox.Tag = $codeMeta
+								$outer.Tag = $codeMeta
+
+								$copyBtn = New-Object System.Windows.Controls.Button
+								$copyBtn.Content = 'Copy'
+								$copyBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+								$copyBtn.Padding = New-Object System.Windows.Thickness(10, 2, 10, 2)
+								$copyBtn.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+								$copyBtn.FontSize = 11
+								$copyBtn.FontFamily = $W.MonoFont
+								$copyBtn.Foreground = $brushCache['#C8C8D0']
+								$copyBtn.Background = $brushCache['#2A2A30']
+								$copyBtn.BorderBrush = $brushCache['#3A3A42']
+								$copyBtn.BorderThickness = New-Object System.Windows.Thickness(1)
+								$copyBtn.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$copyBtn.Tag = @{
+									Box        = $codeBox
+									CopiedOnce = $false
+									ResetTimer = $null
+								}
+								$copyBtn.Add_Click({
+									param($sender, $e)
+									try {
+										$st = $null
+										try { $st = $sender.Tag } catch {}
+										$tb = $null
+										if ($st -is [hashtable]) {
+											try { $tb = $st['Box'] } catch {}
+										} else {
+											$tb = $st
+										}
+										$txt = ''
+										if ($null -ne $tb) {
+											try {
+												if ($tb.Tag -is [hashtable] -and $null -ne $tb.Tag['Plain']) {
+													$txt = [string]$tb.Tag['Plain']
+												} else {
+													$tr = New-Object System.Windows.Documents.TextRange($tb.Document.ContentStart, $tb.Document.ContentEnd)
+													$txt = ([string]$tr.Text).TrimEnd([char]13, [char]10)
+												}
+											} catch {
+												try { $txt = [string]$tb.Text } catch { $txt = '' }
+											}
+										}
+										if ($null -eq $txt) { $txt = '' }
+										[System.Windows.Clipboard]::SetText($txt)
+										$sender.Content = 'Copied'
+										if ($st -is [hashtable]) {
+											$st['CopiedOnce'] = $true
+											try {
+												if ($null -ne $st['ResetTimer']) {
+													$st['ResetTimer'].Stop()
+													$st['ResetTimer'] = $null
+												}
+											} catch {}
+											$timer = New-Object System.Windows.Threading.DispatcherTimer
+											$timer.Interval = [TimeSpan]::FromSeconds(3)
+											$timer.Tag = $sender
+											$timer.Add_Tick({
+												param($tSender, $te)
+												try {
+													$tSender.Stop()
+													$btn = $null
+													try { $btn = $tSender.Tag } catch {}
+													if ($null -eq $btn) { return }
+													$bst = $null
+													try { $bst = $btn.Tag } catch {}
+													$chk = [string][char]0x2713  # ✓
+													if ($bst -is [hashtable] -and [bool]$bst['CopiedOnce']) {
+														$btn.Content = ('{0} Copy' -f $chk)
+													} else {
+														$btn.Content = 'Copy'
+													}
+													if ($bst -is [hashtable]) { $bst['ResetTimer'] = $null }
+												} catch {}
+											})
+											$st['ResetTimer'] = $timer
+											$timer.Start()
+										}
+									} catch {
+										try { $sender.Content = 'Failed' } catch {}
+									}
+								})
+								[System.Windows.Controls.Grid]::SetColumn($copyBtn, 1)
+								[void]$hdrGrid.Children.Add($copyBtn)
+								$hdr.Child = $hdrGrid
+								[System.Windows.Controls.Grid]::SetRow($hdr, 0)
+								[void]$root.Children.Add($hdr)
+
+								[System.Windows.Controls.Grid]::SetRow($codeBox, 1)
+								[void]$root.Children.Add($codeBox)
+								$outer.Child = $root
+
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($outer)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+
+								try {
+									if ($W -is [hashtable]) {
+										$W['ActiveCodeBox'] = $codeBox
+										$W['ActiveCodeBorder'] = $outer
+										if (-not $W.ContainsKey('MdStretchElements') -or $null -eq $W['MdStretchElements']) {
+											$W['MdStretchElements'] = New-Object System.Collections.ArrayList
+										}
+										[void]$W['MdStretchElements'].Add($outer)
+									} else {
+										try { $W.ActiveCodeBox = $codeBox } catch {}
+										try { $W.ActiveCodeBorder = $outer } catch {}
+										$sl = $null
+										try { $sl = $W.MdStretchElements } catch { $sl = $null }
+										if ($null -eq $sl) {
+											$sl = New-Object System.Collections.ArrayList
+											try { $W | Add-Member -NotePropertyName MdStretchElements -NotePropertyValue $sl -Force } catch {}
+										}
+										[void]$sl.Add($outer)
+									}
+								} catch {}
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'md-code-append') {
+							try {
+								$piece = ''
+								try { $piece = [string]$item.Text } catch {}
+								if ($piece.Length -gt 0) {
+									$box = $null
+									try {
+										if ($W -is [hashtable]) { $box = $W['ActiveCodeBox'] }
+										else { $box = $W.ActiveCodeBox }
+									} catch {}
+									if ($null -ne $box) {
+										$meta = $null
+										try { $meta = $box.Tag } catch {}
+										if ($meta -is [hashtable]) {
+											$meta['Plain'] = [string]$meta['Plain'] + $piece
+											$plainNow = [string]$meta['Plain']
+											if ($plainNow.Length -le 24000) {
+												$bc = $null
+												try { $bc = $W['BrushCache'] } catch { try { $bc = $W.BrushCache } catch {} }
+												if ($null -eq $bc) { $bc = @{}; try { $W['BrushCache'] = $bc } catch {} }
+												& $paintCodeHighlight $box $plainNow ([string]$meta['Lang']) $conv $bc $W.MonoFont
+											} else {
+												try { $box.AppendText($piece) } catch {}
+												$meta['LiveHl'] = $false
+											}
+										} else {
+											try { $box.AppendText($piece) } catch {}
+										}
+										try { $box.ScrollToEnd() } catch {}
+									} else {
+										if ($doc.Blocks.Count -eq 0) { $doc.Blocks.Add((& $newPara)) }
+										$para = $doc.Blocks | Select-Object -Last 1
+										if (-not ($para -is [System.Windows.Documents.Paragraph])) {
+											$para = & $newPara
+											$doc.Blocks.Add($para)
+										}
+										$hex = '#7DCFFF'
+										if (-not $W.BrushCache.ContainsKey($hex)) {
+											$W.BrushCache[$hex] = $conv.ConvertFromString($hex)
+										}
+										& $appendRuns $para $piece $W.BrushCache[$hex] $W.MonoFont $W.EmojiFont
+									}
+								}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'md-code-close') {
+							try {
+								$box = $null
+								try {
+									if ($W -is [hashtable]) { $box = $W['ActiveCodeBox'] }
+									else { $box = $W.ActiveCodeBox }
+								} catch {}
+								if ($null -ne $box) {
+									$meta = $null
+									try { $meta = $box.Tag } catch {}
+									if ($meta -is [hashtable]) {
+										$bc = $null
+										try { $bc = $W['BrushCache'] } catch { try { $bc = $W.BrushCache } catch {} }
+										if ($null -eq $bc) { $bc = @{}; try { $W['BrushCache'] = $bc } catch {} }
+										& $paintCodeHighlight $box ([string]$meta['Plain']) ([string]$meta['Lang']) $conv $bc $W.MonoFont
+									}
+								}
+								if ($W -is [hashtable]) {
+									$W['ActiveCodeBox'] = $null
+									$W['ActiveCodeBorder'] = $null
+								} else {
+									try { $W.ActiveCodeBox = $null } catch {}
+									try { $W.ActiveCodeBorder = $null } catch {}
+								}
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'chat-timing') {
+							try {
+								$tline = ''
+								try { $tline = [string]$item.Text } catch {}
+								if (-not [string]::IsNullOrWhiteSpace($tline)) {
+									& $trimTrailingEmptyParas
+									$brushCache = $null
+									try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+									if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+									$hx = '#6A6A76'
+									if (-not $brushCache.ContainsKey($hx)) {
+										$brushCache[$hx] = $conv.ConvertFromString($hx)
+									}
+									# Spacer paragraph = blank line above stamp
+									$doc.Blocks.Add((& $newPara))
+									$tb = New-Object System.Windows.Controls.TextBlock
+									$tb.Text = $tline
+									$tb.Foreground = $brushCache[$hx]
+									$tb.FontFamily = $W.MonoFont
+									$tb.FontSize = 10
+									$tb.FontStyle = [System.Windows.FontStyles]::Italic
+									$tb.Margin = New-Object System.Windows.Thickness(5, 0, 0, 10)
+									$tb.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+									$tb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+									$buc = New-Object System.Windows.Documents.BlockUIContainer ($tb)
+									$buc.Margin = New-Object System.Windows.Thickness 0
+									$doc.Blocks.Add($buc)
+									$doc.Blocks.Add((& $newPara))
+									try { $W.LogLineCharRun = 0 } catch {}
+								}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'md-rule') {
+							try {
+								& $trimTrailingEmptyParas
+								$ruleHex = '#3D4158'
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								if (-not $brushCache.ContainsKey($ruleHex)) {
+									$brushCache[$ruleHex] = $conv.ConvertFromString($ruleHex)
+								}
+								$border = New-Object System.Windows.Controls.Border
+								$border.Height = 1
+								$border.Background = $brushCache[$ruleHex]
+								$border.Margin = New-Object System.Windows.Thickness(0, 2, 0, 2)
+								$border.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+								$border.SnapsToDevicePixels = $true
+								$border.Width = $stretchW
+								$border.Tag = 'md-rule'
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($border)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+								try {
+									if ($W -is [hashtable]) {
+										if (-not $W.ContainsKey('MdStretchElements') -or $null -eq $W['MdStretchElements']) {
+											$W['MdStretchElements'] = New-Object System.Collections.ArrayList
+										}
+										[void]$W['MdStretchElements'].Add($border)
+									} else {
+										$sl = $null
+										try { $sl = $W.MdStretchElements } catch { $sl = $null }
+										if ($null -eq $sl) {
+											$sl = New-Object System.Collections.ArrayList
+											try { $W | Add-Member -NotePropertyName MdStretchElements -NotePropertyValue $sl -Force } catch {}
+										}
+										[void]$sl.Add($border)
+									}
+								} catch {}
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'approval-banner' -or $kind -eq 'section-banner') {
+							try {
+								& $trimTrailingEmptyParas
+								$lab = 'section'
+								try { if ($item.Text) { $lab = [string]$item.Text } } catch {}
+								if ([string]::IsNullOrWhiteSpace($lab)) { $lab = 'section' }
+								$cName = 'DarkGray'
+								try { if ($item.Color) { $cName = [string]$item.Color } } catch {}
+								# Map console color names to theme hex
+								$ruleHex = switch -Regex ($cName) {
+									'^(?i)red|darkred$' { '#F7768E' }
+									'^(?i)yellow|darkyellow$' { '#E0AF68' }
+									'^(?i)green|darkgreen$' { '#9ECE6A' }
+									'^(?i)cyan|darkcyan|blue|darkblue$' { '#7DCFFF' }
+									'^(?i)magenta|darkmagenta|purple$' { '#BB9AF7' }
+									'^(?i)white$' { '#E8E8F0' }
+									default { '#BB9AF7' }
+								}
+								if ($kind -eq 'approval-banner') { $ruleHex = '#F7768E' }
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								if (-not $brushCache.ContainsKey($ruleHex)) {
+									$brushCache[$ruleHex] = $conv.ConvertFromString($ruleHex)
+								}
+								$grid = New-Object System.Windows.Controls.Grid
+								$grid.Margin = New-Object System.Windows.Thickness(0, 8, 0, 6)
+								$grid.Width = $stretchW
+								$grid.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+								$grid.SnapsToDevicePixels = $true
+								$c0 = New-Object System.Windows.Controls.ColumnDefinition
+								$c0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+								$c1 = New-Object System.Windows.Controls.ColumnDefinition
+								$c1.Width = [System.Windows.GridLength]::Auto
+								$c2 = New-Object System.Windows.Controls.ColumnDefinition
+								$c2.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+								[void]$grid.ColumnDefinitions.Add($c0)
+								[void]$grid.ColumnDefinitions.Add($c1)
+								[void]$grid.ColumnDefinitions.Add($c2)
+								$lineL = New-Object System.Windows.Controls.Border
+								$lineL.Height = 1
+								$lineL.Background = $brushCache[$ruleHex]
+								$lineL.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$lineL.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+								$lineL.SnapsToDevicePixels = $true
+								[System.Windows.Controls.Grid]::SetColumn($lineL, 0)
+								[void]$grid.Children.Add($lineL)
+								$tb = New-Object System.Windows.Controls.TextBlock
+								$tb.Text = $lab
+								$tb.Foreground = $brushCache[$ruleHex]
+								$tb.FontWeight = [System.Windows.FontWeights]::Bold
+								$tb.FontSize = 12
+								if ($W.MonoFont) { $tb.FontFamily = $W.MonoFont }
+								$tb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$tb.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+								[System.Windows.Controls.Grid]::SetColumn($tb, 1)
+								[void]$grid.Children.Add($tb)
+								$lineR = New-Object System.Windows.Controls.Border
+								$lineR.Height = 1
+								$lineR.Background = $brushCache[$ruleHex]
+								$lineR.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$lineR.Margin = New-Object System.Windows.Thickness(10, 0, 0, 0)
+								$lineR.SnapsToDevicePixels = $true
+								[System.Windows.Controls.Grid]::SetColumn($lineR, 2)
+								[void]$grid.Children.Add($lineR)
+								$grid.Tag = $(if ($kind -eq 'approval-banner') { 'approval-banner' } else { 'section-banner' })
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($grid)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+								try {
+									if ($W -is [hashtable]) {
+										if (-not $W.ContainsKey('MdStretchElements') -or $null -eq $W['MdStretchElements']) {
+											$W['MdStretchElements'] = New-Object System.Collections.ArrayList
+										}
+										[void]$W['MdStretchElements'].Add($grid)
+									} else {
+										$sl = $null
+										try { $sl = $W.MdStretchElements } catch { $sl = $null }
+										if ($null -eq $sl) {
+											$sl = New-Object System.Collections.ArrayList
+											try { $W | Add-Member -NotePropertyName MdStretchElements -NotePropertyValue $sl -Force } catch {}
+										}
+										[void]$sl.Add($grid)
+									}
+								} catch {}
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'approval-buttons') {
+							try {
+								& $trimTrailingEmptyParas
+								$yesHex = '#9ECE6A'
+								$noHex = '#F7768E'
+								$allHex = '#E0AF68'
+								$chipBgHex = '#2A2A30'
+								$borderHex = '#3A3A42'
+								$labelHex = '#C8C8D0'
+								foreach ($hx in @($yesHex, $noHex, $allHex, $chipBgHex, $borderHex, $labelHex)) {
+									if (-not $W.BrushCache.ContainsKey($hx)) {
+										try { $W.BrushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+									}
+								}
+								$sp = New-Object System.Windows.Controls.StackPanel
+								$sp.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+								$sp.Margin = New-Object System.Windows.Thickness(8, 13, 8, 0)
+								$sp.Tag = 'approval-buttons'
+								$lab = New-Object System.Windows.Controls.TextBlock
+								$lab.Text = 'Proceed?'
+								$lab.Foreground = $W.BrushCache[$labelHex]
+								$lab.FontSize = 12
+								$lab.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$lab.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+								if ($W.MonoFont) { try { $lab.FontFamily = $W.MonoFont } catch {} }
+								[void]$sp.Children.Add($lab)
+
+								$mkBtn = {
+									param($caption, $fgHex, $answer)
+									$btn = New-Object System.Windows.Controls.Button
+									$btn.Content = $caption
+									$btn.Foreground = $W.BrushCache[$fgHex]
+									$btn.Background = $W.BrushCache[$chipBgHex]
+									$btn.BorderBrush = $W.BrushCache[$fgHex]
+									$btn.BorderThickness = New-Object System.Windows.Thickness(1)
+									$btn.Padding = New-Object System.Windows.Thickness(12, 4, 12, 4)
+									$btn.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+									$btn.Cursor = [System.Windows.Input.Cursors]::Hand
+									$btn.FontSize = 12
+									$btn.FontWeight = [System.Windows.FontWeights]::SemiBold
+									$btn.MinWidth = 72
+									$btn.Tag = $answer
+									if ($W.MonoFont) { try { $btn.FontFamily = $W.MonoFont } catch {} }
+									try {
+										$xamlBtn = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+  <Border x:Name="Bd" Background="{TemplateBinding Background}"
+          BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}"
+          CornerRadius="4" SnapsToDevicePixels="True"
+          Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="Bd" Property="Opacity" Value="0.92"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="Bd" Property="Opacity" Value="0.8"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+										$tpl = [Windows.Markup.XamlReader]::Parse($xamlBtn)
+										if ($null -ne $tpl) { $btn.Template = $tpl }
+									} catch {}
+									$null = $btn.Add_Click({
+										param($sender, $e)
+										try {
+											$a = ''
+											try { $a = [string]$sender.Tag } catch { $a = '' }
+											if ([string]::IsNullOrWhiteSpace($a)) { return }
+											try {
+												foreach ($c in @($sp.Children)) {
+													if ($c -is [System.Windows.Controls.Button]) {
+														$c.IsEnabled = $false
+													}
+												}
+											} catch {}
+											try { $W.ActiveApprovalHost = $null } catch {}
+											$W.InputResult = $a
+											[void]$W.InputWait.Set()
+											try {
+												$W.PromptArmed = $false
+												if ($W.Prompt) { $W.Prompt.IsReadOnly = $true }
+											} catch {}
+											try { if ($W.SyncSendBtn) { & $W.SyncSendBtn $false } } catch {}
+											try { if ($W.Prompt) { $W.Prompt.Clear() } } catch {}
+										} catch {}
+									}.GetNewClosure())
+									return $btn
+								}.GetNewClosure()
+
+								[void]$sp.Children.Add((& $mkBtn 'Yes' $yesHex 'y'))
+								[void]$sp.Children.Add((& $mkBtn 'No' $noHex 'n'))
+								[void]$sp.Children.Add((& $mkBtn 'Yes to All' $allHex 'a'))
+
+								$hint = New-Object System.Windows.Controls.TextBlock
+								$hint.Text = '  or type Y / N / A'
+								$hint.Foreground = $W.BrushCache[$labelHex]
+								$hint.Opacity = 0.55
+								$hint.FontSize = 11
+								$hint.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$hint.Margin = New-Object System.Windows.Thickness(4, 0, 0, 0)
+								if ($W.MonoFont) { try { $hint.FontFamily = $W.MonoFont } catch {} }
+								[void]$sp.Children.Add($hint)
+
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($sp)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+								try { $W.ActiveApprovalHost = $sp } catch {}
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'syn-inline') {
+							try {
+								& $trimTrailingEmptyParas
+								$plain = ''
+								try { if ($null -ne $item.Text) { $plain = [string]$item.Text } } catch {}
+								$lang = 'ps'
+								try { if ($item.Lang) { $lang = [string]$item.Lang } } catch {}
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								$norm = & $synNormLang $lang
+								# One paragraph per line so multi-line commands stay readable
+								$lines = @($plain -split "`n", -1)
+								if ($lines.Count -eq 0) { $lines = @('') }
+								foreach ($ln in $lines) {
+									$lineText = [string]$ln
+									$para = New-Object System.Windows.Documents.Paragraph
+									$para.Margin = New-Object System.Windows.Thickness(0)
+									$para.Padding = New-Object System.Windows.Thickness(0)
+									try { $para.LineHeight = 18 } catch {}
+									$pad = New-Object System.Windows.Documents.Run ('  ')
+									if ($W.MonoFont) { $pad.FontFamily = $W.MonoFont }
+									[void]$para.Inlines.Add($pad)
+									$tokens = & $synTokenize $lineText $norm
+									if ($null -eq $tokens -or $tokens.Count -eq 0) {
+										$run = New-Object System.Windows.Documents.Run ($lineText)
+										$hx0 = '#C8C8D0'
+										if (-not $brushCache.ContainsKey($hx0)) { $brushCache[$hx0] = $conv.ConvertFromString($hx0) }
+										$run.Foreground = $brushCache[$hx0]
+										if ($W.MonoFont) { $run.FontFamily = $W.MonoFont }
+										[void]$para.Inlines.Add($run)
+									} else {
+										foreach ($tok in $tokens) {
+											$k = [string]$tok.K
+											if (-not $synColorMap.ContainsKey($k)) { $k = 'plain' }
+											$hx = [string]$synColorMap[$k]
+											if (-not $brushCache.ContainsKey($hx)) {
+												$brushCache[$hx] = $conv.ConvertFromString($hx)
+											}
+											$run = New-Object System.Windows.Documents.Run ([string]$tok.T)
+											$run.Foreground = $brushCache[$hx]
+											if ($W.MonoFont) { $run.FontFamily = $W.MonoFont }
+											[void]$para.Inlines.Add($run)
+										}
+									}
+									$doc.Blocks.Add($para)
+								}
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {
+								try {
+									$fb = New-Object System.Windows.Documents.Paragraph
+									$fb.Margin = New-Object System.Windows.Thickness 0
+									$fr = New-Object System.Windows.Documents.Run ('  ' + [string]$item.Text)
+									if ($W.MonoFont) { $fr.FontFamily = $W.MonoFont }
+									[void]$fb.Inlines.Add($fr)
+									$doc.Blocks.Add($fb)
+								} catch {}
+							}
+							continue
+						}
+
+						if ($kind -eq 'md-table') {
+							try {
+								$rowsIn = $null
+								try { $rowsIn = $item.Rows } catch { $rowsIn = $null }
+								$rowList = New-Object System.Collections.ArrayList
+								$us = [char]0x1F
+								if ($null -ne $rowsIn) {
+									foreach ($rr in @($rowsIn)) {
+										if ($null -eq $rr) { continue }
+										$cellList = New-Object System.Collections.Generic.List[string]
+										$isHdr = $false
+										try { $isHdr = [bool]$rr.IsHeader } catch { $isHdr = ($rowList.Count -eq 0) }
+										$joined = $null
+										try { $joined = [string]$rr.CellsJoined } catch { $joined = $null }
+										if (-not [string]::IsNullOrEmpty($joined)) {
+											foreach ($p in ($joined.Split($us))) {
+												$cellList.Add([string]$p)
+											}
+										} else {
+											try {
+												$cs = $rr.Cells
+												if ($cs -is [System.Array]) {
+													for ($ci = 0; $ci -lt $cs.Length; $ci++) {
+														$x = $cs.GetValue($ci)
+														$cellList.Add($(if ($null -eq $x) { '' } else { [string]$x }))
+													}
+												} elseif ($cs -is [string]) {
+													$cellList.Add([string]$cs)
+												}
+											} catch {}
+										}
+										if ($cellList.Count -eq 0) { $cellList.Add('') }
+										try {
+											$decl = [int]$rr.ColCount
+											while ($cellList.Count -lt $decl) { $cellList.Add('') }
+										} catch {}
+										[void]$rowList.Add([pscustomobject]@{
+											Cells    = $cellList
+											IsHeader = $isHdr
+										})
+									}
+								}
+								if ($rowList.Count -eq 0) { continue }
+								$colCount = 1
+								foreach ($rr in $rowList) {
+									try {
+										$cc = [int]$rr.Cells.Count
+										if ($cc -gt $colCount) { $colCount = $cc }
+									} catch {}
+								}
+								if ($colCount -lt 1) { $colCount = 1 }
+
+								# --- brushes (hashtable-safe) ---
+								$edgeHex = '#3D4158'
+								$hdrBg = '#1F1F28'
+								$rowBg = '#16161C'
+								$rowBgAlt = '#1A1A22'
+								$fgHex = '#C0CAF5'
+								$hdrFg = '#E8E8F0'
+								try {
+									if ($null -eq $W['BrushCache']) { $W['BrushCache'] = @{} }
+								} catch {
+									try { if ($null -eq $W.BrushCache) { $W.BrushCache = @{} } } catch {}
+								}
+								$bc = $null
+								try { $bc = $W['BrushCache'] } catch { try { $bc = $W.BrushCache } catch { $bc = @{} } }
+								if ($null -eq $bc) { $bc = @{} }
+								foreach ($hx in @($edgeHex, $hdrBg, $rowBg, $rowBgAlt, $fgHex, $hdrFg)) {
+									if (-not $bc.ContainsKey($hx)) {
+										try { $bc[$hx] = $conv.ConvertFromString($hx) } catch {}
+									}
+								}
+
+								# Measure: char widths only (no FormattedText)
+								$fontSize = 12.5
+								$charW = $fontSize * 0.62
+								$padX = 16.0
+								$borderX = 1.0
+								$minCol = 28.0
+								$maxCol = [Math]::Max(120.0, $stretchW * 0.55)
+								$colMax = New-Object 'System.Double[]' $colCount
+								for ($c = 0; $c -lt $colCount; $c++) { $colMax[$c] = 0.0 }
+								foreach ($rr in $rowList) {
+									$cells = $rr.Cells
+									for ($c = 0; $c -lt $colCount; $c++) {
+										$t = ''
+										try {
+											if ($c -lt $cells.Count -and $null -ne $cells[$c]) { $t = [string]$cells[$c] }
+										} catch {}
+										$mw = [double]$t.Length * $charW
+										if ($mw -gt $colMax[$c]) { $colMax[$c] = $mw }
+									}
+								}
+								$colWidths = New-Object 'System.Double[]' $colCount
+								$tableW = 0.0
+								for ($c = 0; $c -lt $colCount; $c++) {
+									$w = $colMax[$c] + $padX + $borderX
+									if ($w -lt $minCol) { $w = $minCol }
+									if ($w -gt $maxCol) { $w = $maxCol }
+									$colWidths[$c] = $w
+									$tableW += $w
+								}
+								if ($tableW -lt 40) { $tableW = 40 }
+
+								& $trimTrailingEmptyParas
+								$grid = New-Object System.Windows.Controls.Grid
+								$grid.Tag = 'md-table'
+								$grid.Width = $tableW
+								$grid.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+								$grid.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+								for ($c = 0; $c -lt $colCount; $c++) {
+									$cd = New-Object System.Windows.Controls.ColumnDefinition
+									$cd.Width = New-Object System.Windows.GridLength -ArgumentList @([double]$colWidths[$c], [System.Windows.GridUnitType]::Pixel)
+									[void]$grid.ColumnDefinitions.Add($cd)
+								}
+								$mono = $null
+								try { $mono = $W['MonoFont'] } catch { try { $mono = $W.MonoFont } catch { $mono = $null } }
+
+								for ($r = 0; $r -lt $rowList.Count; $r++) {
+									$rd = New-Object System.Windows.Controls.RowDefinition
+									$rd.Height = [System.Windows.GridLength]::Auto
+									[void]$grid.RowDefinitions.Add($rd)
+									$rowObj = $rowList[$r]
+									if ($null -eq $rowObj) { continue }
+									$cells = $rowObj.Cells
+									$isHdr = ($r -eq 0)
+									try { $isHdr = [bool]$rowObj.IsHeader } catch {}
+									$bgHex = if ($isHdr) { $hdrBg } elseif (($r % 2) -eq 0) { $rowBg } else { $rowBgAlt }
+									for ($c = 0; $c -lt $colCount; $c++) {
+										$cellText = ''
+										try {
+											if ($null -ne $cells -and $c -lt $cells.Count -and $null -ne $cells[$c]) {
+												$cellText = [string]$cells[$c]
+											}
+										} catch {}
+										$cellBorder = New-Object System.Windows.Controls.Border
+										try { $cellBorder.BorderBrush = $bc[$edgeHex] } catch {}
+										$cellBorder.BorderThickness = New-Object System.Windows.Thickness(1)
+										try { $cellBorder.Background = $bc[$bgHex] } catch {}
+										$cellBorder.Padding = New-Object System.Windows.Thickness(8, 4, 8, 4)
+										$tb = New-Object System.Windows.Controls.TextBlock
+										$tb.Text = $cellText
+										$est = [double]$cellText.Length * $charW
+										if (($est + $padX + $borderX) -gt $maxCol) {
+											$tb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+										} else {
+											$tb.TextWrapping = [System.Windows.TextWrapping]::NoWrap
+										}
+										try {
+											$tb.Foreground = $bc[$(if ($isHdr) { $hdrFg } else { $fgHex })]
+										} catch {}
+										if ($isHdr) {
+											$tb.FontWeight = [System.Windows.FontWeights]::SemiBold
+										}
+										if ($null -ne $mono) {
+											try { $tb.FontFamily = $mono } catch {}
+										}
+										$tb.FontSize = $fontSize
+										$cellBorder.Child = $tb
+										[System.Windows.Controls.Grid]::SetRow($cellBorder, [int]$r)
+										[System.Windows.Controls.Grid]::SetColumn($cellBorder, [int]$c)
+										[void]$grid.Children.Add($cellBorder)
+									}
+								}
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($grid)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+								try {
+									$sp = New-Object System.Windows.Controls.Border
+									$sp.Height = 22
+									$sp.Width = 1
+									$sp.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+									$sp.Background = [System.Windows.Media.Brushes]::Transparent
+									$spBuc = New-Object System.Windows.Documents.BlockUIContainer ($sp)
+									$spBuc.Margin = New-Object System.Windows.Thickness 0
+									$doc.Blocks.Add($spBuc)
+								} catch {}
+								try {
+									$approxChars = [int][Math]::Ceiling($tableW / 7.2)
+									$curMax = 0
+									try { $curMax = [int]$W['LogMaxLineChars'] } catch {
+										try { $curMax = [int]$W.LogMaxLineChars } catch { $curMax = 0 }
+									}
+									if ($approxChars -gt $curMax) {
+										try { $W['LogMaxLineChars'] = $approxChars } catch {
+											try { $W.LogMaxLineChars = $approxChars } catch {}
+										}
+									}
+								} catch {}
+								try { $W['LogLineCharRun'] = 0 } catch {
+									try { $W.LogLineCharRun = 0 } catch {}
+								}
+							} catch {
+							}
+							continue
+						}
+
+						if ($kind -eq 'dl-progress') {
+							try {
+								$phase = 'update'
+								try { if ($item.Phase) { $phase = [string]$item.Phase } } catch {}
+								$label = 'Downloading'
+								try { if ($item.Text) { $label = [string]$item.Text } } catch {}
+								$pct = -1
+								try { if ($null -ne $item.Percent) { $pct = [int]$item.Percent } } catch {}
+								$bytes = [int64]0
+								$totalB = [int64]0
+								try { $bytes = [int64]$item.Bytes } catch {}
+								try { $totalB = [int64]$item.TotalBytes } catch {}
+								$detail = ''
+								try { if ($item.Detail) { $detail = [string]$item.Detail } } catch {}
+
+								$fmtSz = {
+									param([int64]$b)
+									if ($b -lt 1024) { return ("{0} B" -f $b) }
+									if ($b -lt 1048576) { return ("{0:N1} KB" -f ($b / 1024.0)) }
+									if ($b -lt 1073741824) { return ("{0:N1} MB" -f ($b / 1048576.0)) }
+									return ("{0:N2} GB" -f ($b / 1073741824.0))
+								}
+								$sizeTxt = if ($totalB -gt 0) {
+									"{0} / {1}" -f (& $fmtSz $bytes), (& $fmtSz $totalB)
+								} else {
+									& $fmtSz $bytes
+								}
+								$lineTxt = if ($phase -eq 'fail') {
+									$d = if ($detail) { " - $detail" } else { '' }
+									"  $label  FAIL$d"
+								} elseif ($phase -eq 'done') {
+									"  $label  OK  $sizeTxt"
+								} elseif ($pct -ge 0) {
+									"  $label  $pct%  $sizeTxt"
+								} else {
+									"  $label  $sizeTxt"
+								}
+
+								$fgHex = if ($phase -eq 'fail') { '#F7768E' } elseif ($phase -eq 'done') { '#9ECE6A' } else { '#EEEEEE' }
+								$barHex = '#9ECE6A'
+								$trackHex = '#333333'
+								try {
+									if ($null -eq $W['BrushCache']) { $W['BrushCache'] = @{} }
+								} catch {
+									try { if ($null -eq $W.BrushCache) { $W.BrushCache = @{} } } catch {}
+								}
+								$bc = $null
+								try { $bc = $W['BrushCache'] } catch { try { $bc = $W.BrushCache } catch { $bc = @{} } }
+								if ($null -eq $bc) { $bc = @{} }
+								foreach ($hx in @($fgHex, $barHex, $trackHex, '#C0CAF5', '#9ECE6A', '#F7768E', '#EEEEEE')) {
+									if (-not $bc.ContainsKey($hx)) {
+										try { $bc[$hx] = $conv.ConvertFromString($hx) } catch {}
+									}
+								}
+
+								$ui = $null
+								try { $ui = $W['DlProgressUi'] } catch { try { $ui = $W.DlProgressUi } catch { $ui = $null } }
+								if ($phase -eq 'start') {
+									try { $W['DlProgressUi'] = $null } catch { try { $W.DlProgressUi = $null } catch {} }
+									$ui = $null
+								}
+								$needNew = ($null -eq $ui) -or ($null -eq $ui.Label) -or ($null -eq $ui.Bar)
+								if (-not $needNew) {
+									try {
+										$stillInDoc = $false
+										if ($ui.Container -and $doc.Blocks.Contains($ui.Container)) { $stillInDoc = $true }
+										if (-not $stillInDoc) { $needNew = $true }
+									} catch { $needNew = $true }
+								}
+
+								if ($needNew) {
+									$sp = New-Object System.Windows.Controls.StackPanel
+									$sp.Orientation = [System.Windows.Controls.Orientation]::Vertical
+									$sp.Margin = New-Object System.Windows.Thickness(0, 4, 0, 6)
+									$tb = New-Object System.Windows.Controls.TextBlock
+									$tb.Text = $lineTxt
+									$tb.FontSize = 12.5
+									try { if ($W.MonoFont) { $tb.FontFamily = $W.MonoFont } } catch {}
+									try { $tb.Foreground = $bc[$fgHex] } catch {}
+									$tb.TextWrapping = [System.Windows.TextWrapping]::NoWrap
+									$pb = New-Object System.Windows.Controls.ProgressBar
+									$pb.Height = 3
+									$pb.Minimum = 0
+									$pb.Maximum = 100
+									$pb.BorderThickness = New-Object System.Windows.Thickness(0)
+									$barW = [Math]::Min(280.0, [Math]::Max(120.0, $stretchW - 16.0))
+									$pb.Width = $barW
+									$pb.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+									$pb.Margin = New-Object System.Windows.Thickness(8, 4, 0, 0)
+									try { $pb.Foreground = $bc[$barHex] } catch {}
+									try { $pb.Background = $bc[$trackHex] } catch {}
+									if ($pct -ge 0) {
+										$pb.IsIndeterminate = $false
+										$pb.Value = [Math]::Max(0, [Math]::Min(100, $pct))
+									} else {
+										$pb.IsIndeterminate = $true
+										$pb.Value = 0
+									}
+									[void]$sp.Children.Add($tb)
+									[void]$sp.Children.Add($pb)
+									$buc = New-Object System.Windows.Documents.BlockUIContainer ($sp)
+									$buc.Margin = New-Object System.Windows.Thickness 0
+									try { $buc.Tag = 'dl-progress' } catch {}
+									$doc.Blocks.Add($buc)
+									$ui = @{ Container = $buc; Panel = $sp; Label = $tb; Bar = $pb }
+									try { $W['DlProgressUi'] = $ui } catch { try { $W.DlProgressUi = $ui } catch {} }
+								} else {
+									try { $ui.Label.Text = $lineTxt } catch {}
+									try { $ui.Label.Foreground = $bc[$fgHex] } catch {}
+									if ($pct -ge 0) {
+										try {
+											$ui.Bar.IsIndeterminate = $false
+											$ui.Bar.Value = [Math]::Max(0, [Math]::Min(100, $pct))
+										} catch {}
+									} elseif ($phase -eq 'update') {
+										try { $ui.Bar.IsIndeterminate = $true } catch {}
+									}
+									if ($phase -eq 'done') {
+										try {
+											$ui.Bar.IsIndeterminate = $false
+											$ui.Bar.Value = 100
+										} catch {}
+									}
+								}
+								if ($phase -eq 'done' -or $phase -eq 'fail') {
+									try { $W['DlProgressUi'] = $null } catch { try { $W.DlProgressUi = $null } catch {} }
+								}
+							} catch {}
+							continue
+						}
+
+						$text = [string]$item.Text
+						$cName = [string]$item.Color
+						$noNl = [bool]$item.NoNewline
+						$isBold = $false; $isItalic = $false; $isStrike = $false; $isCode = $false
+						$mdFontSize = 0.0
+						$mdHead = 0
+						try {
+							if ($null -ne $item.MdBold) { $isBold = ([int]$item.MdBold -ne 0) }
+							elseif ($null -ne $item.Bold) { $isBold = [bool]$item.Bold }
+						} catch {}
+						try {
+							if ($null -ne $item.MdItalic) { $isItalic = ([int]$item.MdItalic -ne 0) }
+							elseif ($null -ne $item.Italic) { $isItalic = [bool]$item.Italic }
+						} catch {}
+						try {
+							if ($null -ne $item.MdStrike) { $isStrike = ([int]$item.MdStrike -ne 0) }
+							elseif ($null -ne $item.Strike) { $isStrike = [bool]$item.Strike }
+						} catch {}
+						try {
+							if ($null -ne $item.MdCode) { $isCode = ([int]$item.MdCode -ne 0) }
+							elseif ($null -ne $item.Code) { $isCode = [bool]$item.Code }
+						} catch {}
+						try { if ($null -ne $item.MdFontSize) { $mdFontSize = [double]$item.MdFontSize } } catch {}
+						try { if ($null -ne $item.MdHead) { $mdHead = [int]$item.MdHead } } catch {}
+						$noLinks = 0
+						try { if ($null -ne $item.MdNoLinks) { $noLinks = [int]$item.MdNoLinks } } catch {}
+						$hex = $colorMap[$cName]
+						if (-not $hex) { $hex = '#A9B1D6' }
+						if ($isCode) { $hex = '#7DCFFF' }
+						elseif ($mdHead -gt 0) {
+							if ($mdHead -eq 1) { $hex = '#7AA2F7' }
+							elseif ($mdHead -eq 2) { $hex = '#7DCFFF' }
+							else { $hex = '#BB9AF7' }
+						}
+						elseif ($isBold) { $hex = '#E8E8F0' }
+						if (-not $W.BrushCache.ContainsKey($hex)) {
+							$W.BrushCache[$hex] = $conv.ConvertFromString($hex)
+						}
+						if (-not $W.BrushCache.ContainsKey('#1A1A1E')) {
+							$W.BrushCache['#1A1A1E'] = $conv.ConvertFromString('#1A1A1E')
+						}
+						$brush = $W.BrushCache[$hex]
+						if ($doc.Blocks.Count -eq 0) {
+							$doc.Blocks.Add((& $newPara))
+						}
+						$para = $doc.Blocks | Select-Object -Last 1
+						if (-not ($para -is [System.Windows.Documents.Paragraph])) {
+							$para = & $newPara
+							$doc.Blocks.Add($para)
+						}
+						if ($mdHead -gt 0) {
+							try {
+								if ($mdHead -eq 1) { $para.LineHeight = 22 }
+								elseif ($mdHead -eq 2) { $para.LineHeight = 20 }
+								else { $para.LineHeight = 18 }
+							} catch {}
+						}
+						$parts = $text -split "(`n)", -1
+						for ($i = 0; $i -lt $parts.Count; $i++) {
+							$chunk = $parts[$i]
+							if ($chunk -eq "`n") {
+								try {
+									$runLen = [int]$W.LogLineCharRun
+									if ($runLen -gt [int]$W.LogMaxLineChars) { $W.LogMaxLineChars = $runLen }
+									$W.LogLineCharRun = 0
+								} catch {}
+								$para = & $newPara
+								$doc.Blocks.Add($para)
+								continue
+							}
+							if ($chunk.Length -eq 0) { continue }
+							try { $W.LogLineCharRun = [int]$W.LogLineCharRun + $chunk.Length } catch {}
+							$needsStyle = $isBold -or $isItalic -or $isStrike -or $isCode -or ($mdFontSize -gt 0) -or ($mdHead -gt 0)
+							if (-not $needsStyle) {
+								if ($noLinks -ne 0) {
+									& $appendRuns $para $chunk $brush $W.MonoFont $W.EmojiFont
+								} else {
+									& $appendRunsWithLinks $para $chunk $brush $W.MonoFont $W.EmojiFont
+								}
+								continue
+							}
+							if ($isCode) {
+							} elseif (($noLinks -eq 0) -and ($chunk -match '(?i)https?://|www\.|\[[^\]]+\]\(https?://')) {
+								$segs = @( & $splitLinkSegments $chunk )
+								foreach ($seg in $segs) {
+									if ($null -eq $seg) { continue }
+									if ([string]$seg.Kind -eq 'a') {
+										& $addHyperlink $para ([string]$seg.Text) ([string]$seg.Url) $brush $W.MonoFont
+									} else {
+										$sub = [string]$seg.Text
+										if ($sub.Length -eq 0) { continue }
+										$run = New-Object System.Windows.Documents.Run ($sub)
+										$run.Foreground = $brush
+										if ($W.MonoFont) { $run.FontFamily = $W.MonoFont }
+										if ($isBold -or $mdHead -gt 0) { $run.FontWeight = [System.Windows.FontWeights]::Bold }
+										if ($isItalic) { $run.FontStyle = [System.Windows.FontStyles]::Italic }
+										if ($isStrike) {
+											try { $run.TextDecorations = [System.Windows.TextDecorations]::Strikethrough } catch {}
+										}
+										if ($mdFontSize -gt 0) { try { $run.FontSize = $mdFontSize } catch {} }
+										$para.Inlines.Add($run)
+									}
+								}
+								continue
+							}
+							if ($needsStyle) {
+								if ($mdHead -gt 0 -and $chunk -match '^[\?\uFFFD\uFFFE\uFEFF]+$') {
+									continue
+								}
+								$codeBg = $null
+								if ($isCode) {
+									try {
+										$bc0 = $null
+										try { $bc0 = $W['BrushCache'] } catch { $bc0 = $W.BrushCache }
+										if ($null -ne $bc0) {
+											if (-not $bc0.ContainsKey('#1A1A1E')) {
+												$bc0['#1A1A1E'] = $conv.ConvertFromString('#1A1A1E')
+											}
+											$codeBg = $bc0['#1A1A1E']
+										}
+									} catch {}
+								}
+								$headStack = $null
+								try {
+									$headStack = New-Object System.Windows.Media.FontFamily(
+										'Segoe UI Emoji, Segoe UI Symbol, Consolas, Cascadia Mono, Courier New, Segoe UI')
+								} catch { $headStack = $W.EmojiFont }
+								$applyStyledRun = {
+									param($targetPara, $txt, $isEmojiSeg)
+									if ([string]::IsNullOrEmpty($txt) -or $null -eq $targetPara) { return }
+									if ($txt -match '^[\?\uFFFD]+$') { return }
+									$run = New-Object System.Windows.Documents.Run ($txt)
+									if ($isEmojiSeg) {
+										if ($W.EmojiFont) { $run.FontFamily = $W.EmojiFont }
+										elseif ($headStack) { $run.FontFamily = $headStack }
+										try { $run.ClearValue([System.Windows.Documents.TextElement]::ForegroundProperty) } catch {
+											$run.Foreground = $brush
+										}
+									} else {
+										$run.Foreground = $brush
+										# heading font stack includes emoji fallbacks
+										if ($mdHead -gt 0 -and $null -ne $headStack) {
+											$run.FontFamily = $headStack
+										} elseif ($W.MonoFont) {
+											$run.FontFamily = $W.MonoFont
+										}
+									}
+									if ($isBold -or $mdHead -gt 0) {
+										$run.FontWeight = [System.Windows.FontWeights]::Bold
+									}
+									if ($isItalic) { $run.FontStyle = [System.Windows.FontStyles]::Italic }
+									if ($isStrike) {
+										try { $run.TextDecorations = [System.Windows.TextDecorations]::Strikethrough } catch {}
+									}
+									if ($null -ne $codeBg) {
+										try { $run.Background = $codeBg } catch {}
+									}
+									if ($mdFontSize -gt 0) {
+										try { $run.FontSize = $mdFontSize } catch {}
+									}
+									$targetPara.Inlines.Add($run)
+								}
+								$sbT = New-Object System.Text.StringBuilder
+								$modeSeg = $null  # 'e' emoji, 't' text
+								$flushSeg = {
+									param($m)
+									if ($sbT.Length -eq 0) { return }
+									& $applyStyledRun $para $sbT.ToString() ($m -eq 'e')
+									[void]$sbT.Clear()
+								}
+								$si = 0
+								$slen = $chunk.Length
+								while ($si -lt $slen) {
+									$code = [int][char]$chunk[$si]
+									$cp = $code
+									$take = 1
+									if ($code -ge 0xD800 -and $code -le 0xDBFF -and ($si + 1) -lt $slen) {
+										$low = [int][char]$chunk[$si + 1]
+										if ($low -ge 0xDC00 -and $low -le 0xDFFF) {
+											$cp = 0x10000 + (($code - 0xD800) -shl 10) + ($low - 0xDC00)
+											$take = 2
+										}
+									}
+									$isEmoji = $false
+									# unpaired high surrogate: use emoji font path
+									if ($code -ge 0xD800 -and $code -le 0xDBFF -and $take -eq 1) { $isEmoji = $true }
+									elseif ($cp -ge 0x1F000 -and $cp -le 0x1FAFF) { $isEmoji = $true }
+									elseif ($cp -ge 0x1F1E6 -and $cp -le 0x1F1FF) { $isEmoji = $true }
+									elseif ($cp -ge 0x1F300 -and $cp -le 0x1F9FF) { $isEmoji = $true }
+									elseif ($cp -ge 0x2190 -and $cp -le 0x21FF) { $isEmoji = $true }
+									elseif ($cp -ge 0x2300 -and $cp -le 0x23FF) { $isEmoji = $true }
+									elseif ($cp -ge 0x2460 -and $cp -le 0x24FF) { $isEmoji = $true }
+									elseif ($cp -ge 0x25A0 -and $cp -le 0x25FF) { $isEmoji = $true }
+									elseif ($cp -ge 0x2600 -and $cp -le 0x27BF) { $isEmoji = $true }
+									elseif ($cp -ge 0x2B00 -and $cp -le 0x2BFF) { $isEmoji = $true }
+									elseif ($cp -ge 0xFE00 -and $cp -le 0xFE0F) { $isEmoji = $true }
+									elseif ($cp -eq 0x200D -or $cp -eq 0x20E3 -or $cp -eq 0xFE0F) { $isEmoji = $true }
+									elseif ($cp -ge 0xE0020 -and $cp -le 0xE007F) { $isEmoji = $true }
+									$want = if ($isEmoji) { 'e' } else { 't' }
+									if ($null -eq $modeSeg) { $modeSeg = $want }
+									if ($want -ne $modeSeg) {
+										& $flushSeg $modeSeg
+										$modeSeg = $want
+									}
+									[void]$sbT.Append($chunk.Substring($si, $take))
+									$si += $take
+								}
+								if ($null -ne $modeSeg) { & $flushSeg $modeSeg }
+							} else {
+								if ($noLinks -ne 0) {
+									& $appendRuns $para $chunk $brush $W.MonoFont $W.EmojiFont
+								} else {
+									& $appendRunsWithLinks $para $chunk $brush $W.MonoFont $W.EmojiFont
+								}
+							}
+						}
+						if (-not $noNl -and $null -ne $text -and -not $text.EndsWith("`n")) {
+							try {
+								$runLen = [int]$W.LogLineCharRun
+								if ($runLen -gt [int]$W.LogMaxLineChars) { $W.LogMaxLineChars = $runLen }
+								$W.LogLineCharRun = 0
+							} catch {}
+							$para = & $newPara
+							$doc.Blocks.Add($para)
+						} else {
+							try {
+								$runLen = [int]$W.LogLineCharRun
+								if ($runLen -gt [int]$W.LogMaxLineChars) { $W.LogMaxLineChars = $runLen }
+							} catch {}
+						}
+					  } catch {}
+					}
+					if ($n -gt 0) {
+						try { $rtb.ScrollToEnd() } catch {}
+						try {
+							while ($doc.Blocks.Count -gt 4000 -and $null -ne $doc.Blocks.FirstBlock) {
+								$doc.Blocks.Remove($doc.Blocks.FirstBlock)
+							}
+						} catch {}
+						try {
+							if ($W.SyncLogPageWidth) { & $W.SyncLogPageWidth $rtb $W }
+						} catch {}
+						try {
+							if ($W.SyncMdStretch) { & $W.SyncMdStretch $rtb $W }
+						} catch {}
+					}
+					$pend = $W.PendingSticky
+					if ($pend) {
+						$W.PendingSticky = $null
+						if ($W.HdrLine1) {
+							$shadowPlain = $null
+							if ($null -ne $pend.BrandName) {
+								try {
+									$grayHex = '#A0A0AA'   # light gray brackets / dash
+									$redHex  = '#B80F0A'   # brand red for name / Agent
+									$pathHex = '#C8C8D0'
+									foreach ($hx in @($grayHex, $redHex, $pathHex)) {
+										if (-not $W.BrushCache.ContainsKey($hx)) {
+											$W.BrushCache[$hx] = $conv.ConvertFromString($hx)
+										}
+									}
+									$grayB = $W.BrushCache[$grayHex]
+									$redB  = $W.BrushCache[$redHex]
+									$pathB = $W.BrushCache[$pathHex]
+									$W.HdrLine1.Inlines.Clear()
+									$nm = [string]$pend.BrandName
+									$rest = if ($null -ne $pend.Line1Rest) { [string]$pend.Line1Rest } else { '' }
+									$mk = {
+										param($t, $br, $bold)
+										$r = New-Object System.Windows.Documents.Run ($t)
+										$r.Foreground = $br
+										if ($bold) {
+											$r.FontWeight = [System.Windows.FontWeights]::Bold
+										}
+										return $r
+									}
+									[void]$W.HdrLine1.Inlines.Add((& $mk '[' $grayB $false))
+									[void]$W.HdrLine1.Inlines.Add((& $mk $nm $redB $true))
+									[void]$W.HdrLine1.Inlines.Add((& $mk '-' $grayB $false))
+									[void]$W.HdrLine1.Inlines.Add((& $mk 'Agent' $redB $true))
+									[void]$W.HdrLine1.Inlines.Add((& $mk ']' $grayB $false))
+									if ($rest.Length -gt 0) {
+										[void]$W.HdrLine1.Inlines.Add((& $mk $rest $pathB $false))
+									}
+									$shadowPlain = ("[{0}-Agent]{1}" -f $nm, $rest)
+								} catch {
+									if ($null -ne $pend.Line1) {
+										$W.HdrLine1.Text = [string]$pend.Line1
+										$shadowPlain = [string]$pend.Line1
+									}
+								}
+							} elseif ($null -ne $pend.Line1) {
+								$W.HdrLine1.Text = [string]$pend.Line1
+								$shadowPlain = [string]$pend.Line1
+							} elseif ($null -ne $pend.Left) {
+								$W.HdrLine1.Text = [string]$pend.Left
+								$shadowPlain = [string]$pend.Left
+							}
+							if ($null -ne $shadowPlain -and $W.HdrLine1Shadow) {
+								try { $W.HdrLine1Shadow.Text = $shadowPlain } catch {}
+							}
+						}
+						if ($null -ne $pend.PoweredBy -and $W.HdrPoweredBy) {
+							$pb = [string]$pend.PoweredBy
+							if ([string]::IsNullOrWhiteSpace($pb)) {
+								try { $W.HdrPoweredBy.Inlines.Clear() } catch {}
+								$W.HdrPoweredBy.Text = ''
+								$W.HdrPoweredBy.Visibility = [System.Windows.Visibility]::Collapsed
+								if ($W.HdrPoweredByShadow) {
+									$W.HdrPoweredByShadow.Text = ''
+									$W.HdrPoweredByShadow.Visibility = [System.Windows.Visibility]::Collapsed
+								}
+								if ($W.HdrPoweredByHost) {
+									$W.HdrPoweredByHost.Visibility = [System.Windows.Visibility]::Collapsed
+								}
+							} else {
+								# PoweredBy sticky: muted prefix + ModelAlias
+								$painted = $false
+								try {
+									$m = [regex]::Match($pb, '^(PoweredBy:\s*)(.+)$')
+									if ($m.Success) {
+										$muteHex = '#8A8A96'
+										$accHex  = '#BB9AF7'
+										foreach ($hx in @($muteHex, $accHex)) {
+											if (-not $W.BrushCache.ContainsKey($hx)) {
+												$W.BrushCache[$hx] = $conv.ConvertFromString($hx)
+											}
+										}
+										$W.HdrPoweredBy.Inlines.Clear()
+										$r1 = New-Object System.Windows.Documents.Run ($m.Groups[1].Value)
+										$r1.Foreground = $W.BrushCache[$muteHex]
+										$r2 = New-Object System.Windows.Documents.Run ($m.Groups[2].Value)
+										$r2.Foreground = $W.BrushCache[$accHex]
+										$r2.FontWeight = [System.Windows.FontWeights]::SemiBold
+										[void]$W.HdrPoweredBy.Inlines.Add($r1)
+										[void]$W.HdrPoweredBy.Inlines.Add($r2)
+										$painted = $true
+									}
+								} catch { $painted = $false }
+								if (-not $painted) { $W.HdrPoweredBy.Text = $pb }
+								$W.HdrPoweredBy.Visibility = [System.Windows.Visibility]::Visible
+								if ($W.HdrPoweredByShadow) {
+									$W.HdrPoweredByShadow.Text = $pb
+									$W.HdrPoweredByShadow.Visibility = [System.Windows.Visibility]::Visible
+								}
+								if ($W.HdrPoweredByHost) {
+									$W.HdrPoweredByHost.Visibility = [System.Windows.Visibility]::Visible
+								}
+							}
+						}
+						if ($null -ne $pend.AutoCompactLine -and $W.HdrAutoCompact) {
+							$ac = [string]$pend.AutoCompactLine
+							$W.HdrAutoCompact.Text = $ac
+							if ($W.HdrAutoCompactShadow) { try { $W.HdrAutoCompactShadow.Text = $ac } catch {} }
+							try {
+								$acOn = ($ac -match '(?i)\bON\b')
+								$hex = if ($acOn) { '#9ECE6A' } else { '#F7768E' }
+								if (-not $W.BrushCache.ContainsKey($hex)) {
+									$W.BrushCache[$hex] = $conv.ConvertFromString($hex)
+								}
+								$W.HdrAutoCompact.Foreground = $W.BrushCache[$hex]
+							} catch {}
+						}
+						# Lower status: meta and context bar
+						# auto-approve: ON = orange, OFF = green (all caps); rest muted grey
+						if ($null -ne $pend.Right -and ($W.LowerRight -or $W.HdrRight)) {
+							$lr = if ($W.LowerRight) { $W.LowerRight } else { $W.HdrRight }
+							$txt = [string]$pend.Right
+							try {
+								$lr.Inlines.Clear()
+								$grayHex = '#8A8A96'
+								$onHex = '#FF9E64'   # orange when auto-approve ON
+								$offHex = '#9ECE6A'  # green when OFF
+								foreach ($hx in @($grayHex, $onHex, $offHex)) {
+									if (-not $W.BrushCache.ContainsKey($hx)) {
+										$W.BrushCache[$hx] = $conv.ConvertFromString($hx)
+									}
+								}
+								$addRun = {
+									param([string]$t, [string]$hex)
+									if ([string]::IsNullOrEmpty($t)) { return }
+									$run = New-Object System.Windows.Documents.Run ($t)
+									$run.Foreground = $W.BrushCache[$hex]
+									[void]$lr.Inlines.Add($run)
+								}
+								if ($txt -match '(?s)^(.*)(auto-approve:\s*)(ON|OFF)(.*)$') {
+									& $addRun $Matches[1] $grayHex
+									& $addRun $Matches[2] $grayHex
+									$valHex = if ($Matches[3] -eq 'ON') { $onHex } else { $offHex }
+									& $addRun $Matches[3] $valHex
+									& $addRun $Matches[4] $grayHex
+								} else {
+									& $addRun $txt $grayHex
+								}
+							} catch {
+								try { $lr.Text = $txt } catch {}
+							}
+						}
+						if ($null -ne $pend.Hint -and $W.HintBar) { $W.HintBar.Text = [string]$pend.Hint }
+						if ($null -ne $pend.StatusMode) {
+							$newMode = [string]$pend.StatusMode
+							$oldMode = [string]$W.StatusMode
+							$W.StatusMode = $newMode
+							$nb = ($newMode -eq 'thinking' -or $newMode -eq 'working' -or $newMode -eq 'compacting')
+							$ob = ($oldMode -eq 'thinking' -or $oldMode -eq 'working' -or $oldMode -eq 'compacting')
+							if ($nb -and (-not $ob -or $oldMode -ne $newMode)) {
+								$W.StatusBusySince = [Environment]::TickCount
+							} elseif (-not $nb) {
+								$W.StatusBusySince = 0
+							}
+						}
+						if ($null -ne $pend.StatusLabel) { $W.StatusLabel = [string]$pend.StatusLabel }
+						if ($null -ne $pend.CtxPct -and $W.CtxBarFill) {
+							$pct = [double]$pend.CtxPct
+							if ($pct -lt 0) { $pct = 0 }
+							if ($pct -gt 1) { $pct = 1 }
+							$maxW = 120
+							try { if ($W.CtxBarMaxW) { $maxW = [double]$W.CtxBarMaxW } } catch {}
+							$W.CtxBarFill.Width = [math]::Max(0, [math]::Round($pct * $maxW))
+							if ($pend.CtxColor) {
+								try {
+									$bh = [string]$pend.CtxColor
+									if (-not $W.BrushCache.ContainsKey($bh)) {
+										$W.BrushCache[$bh] = $conv.ConvertFromString($bh)
+									}
+									$W.CtxBarFill.Fill = $W.BrushCache[$bh]
+								} catch {}
+							}
+						}
+						if ($null -ne $pend.CtxPctText -and $W.CtxPctText) {
+							$W.CtxPctText.Text = [string]$pend.CtxPctText
+							if ($pend.CtxColor) {
+								try {
+									$bh = [string]$pend.CtxColor
+									if (-not $W.BrushCache.ContainsKey($bh)) {
+										$W.BrushCache[$bh] = $conv.ConvertFromString($bh)
+									}
+									$W.CtxPctText.Foreground = $W.BrushCache[$bh]
+								} catch {}
+							}
+						}
+						if ($null -ne $pend.CtxTokText -and $W.CtxTokText) {
+							$W.CtxTokText.Text = [string]$pend.CtxTokText
+						}
+					}
+					# Tool-group chips: grey inactive / lime active; click opens tool list
+					try {
+						if ($W.ToolGroupsDirty -and $W.HdrToolGroups -and $W.ToolGroupsData) {
+							$W.ToolGroupsDirty = $false
+							$td = $W.ToolGroupsData
+							$panel = $W.HdrToolGroups
+							try { $panel.Children.Clear() } catch {}
+							$order = @()
+							$activeArr = @()
+							$toolsMap = @{}
+							$fpIn = ''
+							try { $order = @($td.order) } catch {}
+							try { $activeArr = @($td.active) } catch {}
+							try { $toolsMap = $td.tools } catch {}
+							try { $fpIn = [string]$td.fp } catch {}
+							$installerPkgs = @()
+							try { $installerPkgs = @($td.installerPackages) } catch { $installerPkgs = @() }
+							$limeHex = '#9ECE6A'
+							$grayHex = '#8A8A96'
+							$chipBgHex = '#3A3A42'
+							$menuBgHex = '#1E1E24'
+							$menuFgHex = '#C8C8D0'
+							$sepHex = '#3A3A42'
+							foreach ($hx in @($limeHex, $grayHex, $chipBgHex, $menuBgHex, $menuFgHex, $sepHex)) {
+								if (-not $W.BrushCache.ContainsKey($hx)) {
+									try { $W.BrushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+								}
+							}
+							$limeB = $W.BrushCache[$limeHex]
+							$grayB = $W.BrushCache[$grayHex]
+							$chipBg = $W.BrushCache[$chipBgHex]
+							$menuBg = $W.BrushCache[$menuBgHex]
+							$menuFg = $W.BrushCache[$menuFgHex]
+							$sepB = $W.BrushCache[$sepHex]
+							$dot = [string][char]0x00B7
+							$first = $true
+							$mono = $null
+							try { $mono = $W.MonoFont } catch {}
+							foreach ($g in $order) {
+								if ([string]::IsNullOrWhiteSpace([string]$g)) { continue }
+								if (-not $first) {
+									$sep = New-Object System.Windows.Controls.TextBlock
+									$sep.Text = $dot
+									$sep.Foreground = $grayB
+									$sep.FontSize = 10
+									$sep.Margin = New-Object System.Windows.Thickness(2, 0, 2, 0)
+									$sep.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+									$sep.Opacity = 0.8
+									if ($mono) { try { $sep.FontFamily = $mono } catch {} }
+									[void]$panel.Children.Add($sep)
+								}
+								$first = $false
+								$on = $false
+								try { $on = ($activeArr -contains [string]$g) } catch { $on = $false }
+								$border = New-Object System.Windows.Controls.Border
+								$border.Background = $chipBg
+								$border.CornerRadius = New-Object System.Windows.CornerRadius(3)
+								$border.Padding = New-Object System.Windows.Thickness(5, 1, 5, 1)
+								$border.Margin = New-Object System.Windows.Thickness(0)
+								$border.Cursor = [System.Windows.Input.Cursors]::Hand
+								$border.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$border.SnapsToDevicePixels = $true
+								$tb = New-Object System.Windows.Controls.TextBlock
+								$tb.Text = [string]$g
+								$tb.FontSize = 11
+								$tb.Foreground = $(if ($on) { $limeB } else { $grayB })
+								$tb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								if ($mono) { try { $tb.FontFamily = $mono } catch {} }
+								if ($on) {
+									try { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+								}
+								$border.Child = $tb
+								$tools = @()
+								try {
+									if ($toolsMap -is [hashtable] -and $toolsMap.ContainsKey([string]$g)) {
+										$tools = @($toolsMap[[string]$g])
+									} elseif ($toolsMap.Contains([string]$g)) {
+										$tools = @($toolsMap[[string]$g])
+									}
+								} catch { $tools = @() }
+								$cm = New-Object System.Windows.Controls.ContextMenu
+								try {
+									$cm.Background = $menuBg
+									$cm.Foreground = $menuFg
+									$cm.BorderBrush = $chipBg
+									$cm.BorderThickness = New-Object System.Windows.Thickness(1)
+									$cm.Padding = New-Object System.Windows.Thickness(2)
+									# Override system menu brushes (kills default white chrome)
+									if ($null -eq $cm.Resources) {
+										$cm.Resources = New-Object System.Windows.ResourceDictionary
+									}
+									try { $cm.Resources[[System.Windows.SystemColors]::MenuBrushKey] = $menuBg } catch {}
+									try { $cm.Resources[[System.Windows.SystemColors]::MenuBarBrushKey] = $menuBg } catch {}
+									try { $cm.Resources[[System.Windows.SystemColors]::ControlBrushKey] = $menuBg } catch {}
+									try { $cm.Resources[[System.Windows.SystemColors]::MenuTextBrushKey] = $menuFg } catch {}
+									try { $cm.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = $chipBg } catch {}
+									try { $cm.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = $menuFg } catch {}
+									# Flat menu shell (no left icon/check gutter column)
+									try {
+										$cmTplXaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ContextMenu">
+  <Border Background="{TemplateBinding Background}"
+          BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}"
+          CornerRadius="4" Padding="{TemplateBinding Padding}"
+          SnapsToDevicePixels="True">
+    <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+  </Border>
+</ControlTemplate>
+'@
+										$cmTpl = [Windows.Markup.XamlReader]::Parse($cmTplXaml)
+										if ($null -ne $cmTpl) { $cm.Template = $cmTpl }
+									} catch {}
+									# MenuItem without icon column (that white bar)
+									try {
+										$miStyle = New-Object System.Windows.Style ([System.Windows.Controls.MenuItem])
+										$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::BackgroundProperty, $menuBg)))
+										$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::BorderThicknessProperty, (New-Object System.Windows.Thickness(0)))))
+										$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::PaddingProperty, (New-Object System.Windows.Thickness(10, 5, 14, 5)))))
+										# Menu items stay enabled so WPF does not force disabled grey
+										$miTplXaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="MenuItem">
+  <Border x:Name="Bd" Background="{TemplateBinding Background}"
+          BorderThickness="0" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True"
+          TextElement.Foreground="{TemplateBinding Foreground}">
+    <ContentPresenter ContentSource="Header" RecognizesAccessKey="True"
+                      VerticalAlignment="Center" HorizontalAlignment="Left"
+                      TextElement.Foreground="{TemplateBinding Foreground}"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsHighlighted" Value="True">
+      <Setter TargetName="Bd" Property="Background" Value="#3A3A42"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+										$miTpl = [Windows.Markup.XamlReader]::Parse($miTplXaml)
+										if ($null -ne $miTpl) {
+											$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::TemplateProperty, $miTpl)))
+										}
+										$cm.Resources[[System.Windows.Controls.MenuItem]] = $miStyle
+									} catch {}
+								} catch {}
+								# Dropdown text color matches chip active/inactive state
+								$itemFg = $(if ($on) { $limeB } else { $grayB })
+								$addToolItem = {
+									param([string]$header, $fgBrush, $bgBrush, [string]$tip = '')
+									$mi = New-Object System.Windows.Controls.MenuItem
+									$mi.Header = $header
+									# Enabled + IsHitTestVisible=false so color is not system-disabled grey
+									$mi.IsEnabled = $true
+									$mi.IsHitTestVisible = $false
+									$mi.Focusable = $false
+									try { $mi.Foreground = $fgBrush } catch {}
+									try { $mi.Background = $bgBrush } catch {}
+									try { $mi.SetValue([System.Windows.Documents.TextElement]::ForegroundProperty, $fgBrush) } catch {}
+									if (-not [string]::IsNullOrWhiteSpace($tip)) {
+										try { $mi.ToolTip = $tip } catch {}
+									}
+									return $mi
+								}.GetNewClosure()
+								if ($tools.Count -eq 0) {
+									[void]$cm.Items.Add((& $addToolItem '(no tools)' $itemFg $menuBg ''))
+								} else {
+									foreach ($tn in $tools) {
+										[void]$cm.Items.Add((& $addToolItem ([string]$tn) $itemFg $menuBg ''))
+									}
+								}
+								# Installers menu: dark divider then catalog package names
+								if ([string]$g -eq 'installers' -and $installerPkgs.Count -gt 0) {
+									# Custom dark divider (default Separator is too light on dark theme)
+									try {
+										$divMi = New-Object System.Windows.Controls.MenuItem
+										$divMi.IsEnabled = $true
+										$divMi.IsHitTestVisible = $false
+										$divMi.Focusable = $false
+										$divMi.Background = $menuBg
+										$lineBd = New-Object System.Windows.Controls.Border
+										$lineBd.Height = 1
+										$lineBd.Background = $sepB
+										$lineBd.Margin = New-Object System.Windows.Thickness(4, 0, 4, 0)
+										$lineBd.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+										$lineBd.SnapsToDevicePixels = $true
+										$divMi.Header = $lineBd
+										try {
+											$divTplXaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="MenuItem">
+  <Border Background="{TemplateBinding Background}" Padding="6,6,6,6" SnapsToDevicePixels="True">
+    <ContentPresenter ContentSource="Header" HorizontalAlignment="Stretch" VerticalAlignment="Center"/>
+  </Border>
+</ControlTemplate>
+'@
+											$divTpl = [Windows.Markup.XamlReader]::Parse($divTplXaml)
+											if ($null -ne $divTpl) { $divMi.Template = $divTpl }
+										} catch {}
+										[void]$cm.Items.Add($divMi)
+									} catch {}
+									foreach ($pkg in $installerPkgs) {
+										if ($null -eq $pkg) { continue }
+										$pid = ''
+										$pnm = ''
+										try { $pid = [string]$pkg.id } catch {}
+										try { $pnm = [string]$pkg.name } catch {}
+										if ([string]::IsNullOrWhiteSpace($pnm)) { $pnm = $pid }
+										if ([string]::IsNullOrWhiteSpace($pnm)) { continue }
+										[void]$cm.Items.Add((& $addToolItem $pnm $itemFg $menuBg $pid))
+									}
+								}
+								try {
+									$cm.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+									$cm.PlacementTarget = $border
+									$cm.HorizontalOffset = 0
+									$cm.VerticalOffset = 2
+								} catch {}
+								$border.ContextMenu = $cm
+								# Explicit open/closed flag (WPF closes menu before click handlers)
+								$chipState = [pscustomobject]@{ Group = [string]$g; Open = $false }
+								$border.Tag = $chipState
+								$border.ToolTip = $(if ($on) { "Active · $g" } else { "Inactive · $g" })
+								$null = $cm.Add_Closed({
+									try { $chipState.Open = $false } catch {}
+									try {
+										# Skip reopen on the same click that dismissed the menu
+										$W.ToolMenuToggleSkipChip = $border
+										$W.ToolMenuToggleSkipTick = [Environment]::TickCount
+									} catch {}
+								}.GetNewClosure())
+								$null = $border.Add_PreviewMouseLeftButtonDown({
+									param($sender, $e)
+									try {
+										if (-not $sender -or -not $sender.ContextMenu) { return }
+										$m = $sender.ContextMenu
+										$st = $null
+										try { $st = $sender.Tag } catch { $st = $null }
+
+										# Same click that closed the menu: stay closed
+										try {
+											$skipChip = $null
+											$skipTick = 0
+											try { $skipChip = $W.ToolMenuToggleSkipChip } catch {}
+											try { $skipTick = [int]$W.ToolMenuToggleSkipTick } catch {}
+											if ($skipChip -eq $sender -and $skipTick -ne 0) {
+												$dt = ([Environment]::TickCount - $skipTick) -band 0x7fffffff
+												if ($dt -lt 400) {
+													$W.ToolMenuToggleSkipChip = $null
+													$W.ToolMenuToggleSkipTick = 0
+													if ($st) { $st.Open = $false }
+													$m.IsOpen = $false
+													$e.Handled = $true
+													return
+												}
+											}
+										} catch {}
+
+										# Switch: open <-> closed
+										$nowOpen = $false
+										try { if ($st -and [bool]$st.Open) { $nowOpen = $true } } catch {}
+										try { if ([bool]$m.IsOpen) { $nowOpen = $true } } catch {}
+
+										if ($nowOpen) {
+											if ($st) { $st.Open = $false }
+											$m.IsOpen = $false
+											$e.Handled = $true
+											return
+										}
+
+										# Close other group menus
+										try {
+											$parent = $sender.Parent
+											if ($parent -and $parent.Children) {
+												foreach ($sib in @($parent.Children)) {
+													try {
+														if ($sib -eq $sender) { continue }
+														if ($sib.ContextMenu -and [bool]$sib.ContextMenu.IsOpen) {
+															$sib.ContextMenu.IsOpen = $false
+														}
+														$sst = $sib.Tag
+														if ($sst -and ($sst -is [pscustomobject])) {
+															try { $sst.Open = $false } catch {}
+														}
+													} catch {}
+												}
+											}
+										} catch {}
+
+										$m.PlacementTarget = $sender
+										$m.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+										$m.HorizontalOffset = 0
+										$m.VerticalOffset = 2
+										if ($st) { $st.Open = $true }
+										$m.IsOpen = $true
+										try {
+											$W.ToolMenuToggleSkipChip = $null
+											$W.ToolMenuToggleSkipTick = 0
+										} catch {}
+										$e.Handled = $true
+									} catch {}
+								}.GetNewClosure())
+								[void]$panel.Children.Add($border)
+							}
+							try {
+								$W.ToolGroupsFp = $fpIn
+								$W.ToolGroupsBuilt = $true
+							} catch {}
+						}
+					} catch {}
+					if ($null -ne $W.PendingPromptEnabled) {
+						$en = [bool]$W.PendingPromptEnabled
+						$W.PendingPromptEnabled = $null
+						$wantFocus = $false
+						try {
+							$wantFocus = [bool]$W.PendingPromptFocus
+							$W.PendingPromptFocus = $false
+						} catch { $wantFocus = $false }
+						$authUp = $false
+						try {
+							if ([bool]$W.AuthActive) { $authUp = $true }
+							elseif ($W.AuthOverlay -and $W.AuthOverlay.Visibility -eq [System.Windows.Visibility]::Visible) {
+								$authUp = $true
+							}
+							elseif ($W.ConfirmOverlay -and $W.ConfirmOverlay.Visibility -eq [System.Windows.Visibility]::Visible) {
+								$authUp = $true
+							}
+						} catch {}
+						if ($authUp) {
+							if ($en) {
+								$W.PendingPromptEnabled = $true
+								if ($wantFocus) { $W.PendingPromptFocus = $true }
+							}
+							$W.PromptArmed = $false
+							if ($W.Prompt) {
+								$W.Prompt.IsEnabled = $true
+								$W.Prompt.Focusable = $true
+								$W.Prompt.IsReadOnly = $true
+							}
+							try { if ($W.SyncSendBtn) { & $W.SyncSendBtn $false } } catch {}
+						} else {
+							$W.PromptArmed = $en
+							if ($W.Prompt) {
+								$W.Prompt.IsEnabled = $true
+								$W.Prompt.Focusable = $true
+								$W.Prompt.IsReadOnly = -not $en
+							}
+							try { if ($W.SyncSendBtn) { & $W.SyncSendBtn $en } } catch {}
+							if ($en -and $wantFocus -and $W.Prompt) {
+								try {
+									if ($W.Window) { [void]$W.Window.Activate() }
+								} catch {}
+								try { [void]$W.Prompt.Focus() } catch {}
+								try { [void][System.Windows.Input.Keyboard]::Focus($W.Prompt) } catch {}
+								try {
+									if ($null -ne $W.Prompt.Text) { $W.Prompt.CaretIndex = $W.Prompt.Text.Length }
+								} catch {}
+							}
+						}
+					}
+					# status spinner + elapsed timer
+					if ($W.StatusDot) {
+						$mode = [string]$W.StatusMode
+						if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'ready' }
+						$label = [string]$W.StatusLabel
+						if ([string]::IsNullOrWhiteSpace($label)) {
+							$label = switch ($mode) {
+								'thinking'    { 'thinking...' }
+								'working'     { 'working...' }
+								'compacting'  { 'autocompacting...' }
+								default       { 'ready' }
+							}
+						} else {
+							if ($mode -eq 'thinking' -and $label -notmatch '\.\.\.$') { $label = 'thinking...' }
+							elseif ($mode -eq 'working' -and $label -notmatch '\.\.\.$') { $label = 'working...' }
+							elseif ($mode -eq 'compacting' -and $label -notmatch '\.\.\.$') { $label = 'autocompacting...' }
+						}
+						$busy = ($mode -eq 'thinking' -or $mode -eq 'working' -or $mode -eq 'compacting')
+						$now = [Environment]::TickCount
+						# status band layout by mode (ready / busy / compacting)
+						$labelMinW = 0.0
+						$timerW = 0.0
+						$dotRight = 0.0
+						$bandRight = 10.0
+						if ($mode -eq 'thinking' -or $mode -eq 'working') {
+							$labelMinW = 98.0    # thinking/working label width
+							$timerW = 32.0       # "0.0s"…"9999s"
+							$dotRight = 0.0      # no gap between label and timer
+							$bandRight = 5.0     # +3px after counter before ctx
+						} elseif ($mode -eq 'compacting') {
+							$labelMinW = 0.0
+							$timerW = 32.0
+							$dotRight = 0.0
+							$bandRight = 5.0     # same +3px after counter
+						} else {
+							$labelMinW = 0.0
+							$timerW = 0.0
+							$dotRight = 0.0
+							$bandRight = 14.0    # ready: slight offset before ctx
+						}
+						try {
+							if ($W.StatusDot) {
+								$W.StatusDot.MinWidth = $labelMinW
+								$W.StatusDot.ClearValue([System.Windows.FrameworkElement]::WidthProperty)
+								$W.StatusDot.Margin = New-Object System.Windows.Thickness(0, 0, $dotRight, 0)
+							}
+						} catch {}
+						try {
+							if ($W.StatusBand) {
+								$W.StatusBand.Margin = New-Object System.Windows.Thickness(0, 0, $bandRight, 0)
+							}
+						} catch {}
+						try {
+							if ($W.StatusTimer) {
+								if ($timerW -gt 0) {
+									$W.StatusTimer.Width = $timerW
+									$W.StatusTimer.MinWidth = $timerW
+									$W.StatusTimer.Margin = New-Object System.Windows.Thickness(0)
+									$W.StatusTimer.Visibility = [System.Windows.Visibility]::Visible
+								} else {
+									$W.StatusTimer.Width = 0
+									$W.StatusTimer.MinWidth = 0
+									$W.StatusTimer.Text = ''
+									$W.StatusTimer.Visibility = [System.Windows.Visibility]::Collapsed
+								}
+							}
+						} catch {}
+						if ($busy) {
+							$since = 0
+							try { $since = [int]$W.StatusBusySince } catch { $since = 0 }
+							if ($since -eq 0) {
+								$W.StatusBusySince = $now
+								$since = $now
+							}
+							$last = 0
+							try { $last = [int]$W.SpinLastTick } catch { $last = 0 }
+							if (($now - $last) -ge 80 -or $last -eq 0) {
+								$W.SpinLastTick = $now
+								$idx = 0
+								try { $idx = [int]$W.SpinIdx } catch { $idx = 0 }
+								$W.SpinIdx = ($idx + 1) % $brailleFrames.Count
+							}
+							$fi = 0
+							try { $fi = [int]$W.SpinIdx } catch { $fi = 0 }
+							if ($fi -lt 0 -or $fi -ge $brailleFrames.Count) { $fi = 0 }
+							$spin = [string]$brailleFrames[$fi]
+							$W.StatusDot.Text = "$spin $label"
+							try {
+								$elapsedMs = ($now - $since) -band 0x7fffffff
+								if ($elapsedMs -lt 0) { $elapsedMs = 0 }
+								$secs = $elapsedMs / 1000.0
+								$timerText = ''
+								if ($secs -lt 10.0) {
+									$timerText = ('{0:0.0}s' -f $secs)
+								} else {
+									$timerText = (([int][Math]::Floor($secs)).ToString() + 's')
+								}
+								if ($W.StatusTimer) {
+									$W.StatusTimer.Text = $timerText
+									$busyHexT = if ($mode -eq 'compacting') { '#E0AF68' } else { '#7DCFFF' }
+									$bcT = $null
+									try { $bcT = $W['BrushCache'] } catch { try { $bcT = $W.BrushCache } catch {} }
+									if ($null -eq $bcT) { $bcT = @{}; try { $W['BrushCache'] = $bcT } catch {} }
+									if (-not $bcT.ContainsKey($busyHexT)) {
+										$bcT[$busyHexT] = $conv.ConvertFromString($busyHexT)
+									}
+									$W.StatusTimer.Foreground = $bcT[$busyHexT]
+								}
+							} catch {}
+							try {
+								$busyHex = if ($mode -eq 'compacting') { '#E0AF68' } else { '#7DCFFF' }
+								$bcSpin = $null
+								try { $bcSpin = $W['BrushCache'] } catch { try { $bcSpin = $W.BrushCache } catch {} }
+								if ($null -eq $bcSpin) { $bcSpin = @{}; try { $W['BrushCache'] = $bcSpin } catch {} }
+								if (-not $bcSpin.ContainsKey($busyHex)) {
+									$bcSpin[$busyHex] = $conv.ConvertFromString($busyHex)
+								}
+								$W.StatusDot.Foreground = $bcSpin[$busyHex]
+							} catch {}
+						} else {
+							$W.SpinIdx = 0
+							$W.StatusBusySince = 0
+							$W.StatusDot.Text = ([string][char]0x00B7) + ' ready'
+							if ($W.StatusTimer) {
+								$W.StatusTimer.Text = ''
+							}
+							try {
+								$okHex = '#9ECE6A'
+								$bcSpin = $null
+								try { $bcSpin = $W['BrushCache'] } catch { try { $bcSpin = $W.BrushCache } catch {} }
+								if ($null -eq $bcSpin) { $bcSpin = @{}; try { $W['BrushCache'] = $bcSpin } catch {} }
+								if (-not $bcSpin.ContainsKey($okHex)) {
+									$bcSpin[$okHex] = $conv.ConvertFromString($okHex)
+								}
+								$W.StatusDot.Foreground = $bcSpin[$okHex]
+							} catch {}
+						}
+					}
+				} catch {
+					try {
+						$msg = [string]$_.Exception.Message
+						if ($W -is [hashtable]) {
+							$W['LastPaintError'] = $msg
+						} else {
+							$W.LastPaintError = $msg
+						}
+					} catch {}
+				}
+			}.GetNewClosure())
+			$timer.Start()
+			$W.PumpTimer = $timer
+
+			# Prompt stays focusable; submit gated by PromptArmed
+			if ($W.Prompt) {
+				$W.Prompt.IsEnabled = $true
+				$W.Prompt.IsReadOnly = $true
+				$W.Prompt.Focusable = $true
+			}
+
+			$syncSendBtn = {
+				param([bool]$armed)
+				try {
+					$btn = $W.SendBtn
+					if (-not $btn) { return }
+					$bc = New-Object System.Windows.Media.BrushConverter
+					if ($armed) {
+						$W.SendMode = 'send'
+						$btn.Content = 'Send'
+						$btn.IsEnabled = $true
+						$btn.Background = $bc.ConvertFromString('#4A4A56')
+						$btn.Foreground = $bc.ConvertFromString('#E0E0E8')
+						$btn.BorderBrush = $bc.ConvertFromString('#6A6A76')
+					} else {
+						$W.SendMode = 'stop'
+						$btn.Content = 'Stop'
+						$btn.IsEnabled = $true
+						$btn.Background = $bc.ConvertFromString('#3D2A2A')
+						$btn.Foreground = $bc.ConvertFromString('#F7768E')
+						$btn.BorderBrush = $bc.ConvertFromString('#F7768E')
+					}
+				} catch {}
+			}.GetNewClosure()
+			$W.SyncSendBtn = $syncSendBtn
+			try { & $syncSendBtn $false } catch {}
+
+			$submitPrompt = {
+				try {
+					if (-not $W.PromptArmed -or -not $W.Prompt -or $W.Prompt.IsReadOnly) { return $false }
+					$text = [string]$W.Prompt.Text
+					$W.Prompt.Clear()
+					if (-not [string]::IsNullOrWhiteSpace($text)) {
+						try {
+							[void]$W.History.Add($text)
+							while ($W.History.Count -gt 80) { $W.History.RemoveAt(0) }
+						} catch {}
+					}
+					$W.HistIndex = -1
+					$W.InputResult = $text
+					[void]$W.InputWait.Set()
+					try { & $syncSendBtn $false } catch {}
+					$W.PromptArmed = $false
+					try { $W.Prompt.IsReadOnly = $true } catch {}
+					return $true
+				} catch { return $false }
+			}.GetNewClosure()
+
+			$interruptWork = {
+				try {
+					$W.InterruptFlag = $true
+					if ($W.PromptArmed -and $W.Prompt -and -not $W.Prompt.IsReadOnly) {
+						try { $W.Prompt.Clear() } catch {}
+					}
+				} catch {}
+			}.GetNewClosure()
+
+			if ($W.SendBtn) {
+				$W.SendBtn.add_Click({
+					param($s, $e)
+					try {
+						if ([string]$W.SendMode -eq 'stop' -or -not [bool]$W.PromptArmed) {
+							& $interruptWork
+						} else {
+							[void](& $submitPrompt)
+						}
+					} catch {}
+				}.GetNewClosure())
+			}
+
+			# UI-thread debug lines (same gate as -DebugLog / debug=1)
+			$uiLog = {
+				param($step, $detail)
+				$on = $false
+				try { $on = [bool]$W.DebugLogEnabled } catch { $on = $false }
+				if (-not $on) { return }
+				try {
+					$p = [string]$W.DebugLogPath
+					if (-not $p) { $p = Join-Path $env:USERPROFILE 'Desktop\MiniBot-debug.log' }
+					$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+					$tid = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+					$line = "[{0}] UI tid={1} | {2}" -f $ts, $tid, $step
+					if ($detail) {
+						$d2 = ([string]$detail -replace '[\r\n]+', ' ')
+						if ($d2.Length -gt 400) { $d2 = $d2.Substring(0, 397) + '...' }
+						$line += ' :: ' + $d2
+					}
+					$line += [Environment]::NewLine
+					[System.IO.File]::AppendAllText($p, $line)
+				} catch {}
+			}.GetNewClosure()
+
+			$W.Prompt.add_PreviewKeyDown({
+				param($sender, $e)
+				try {
+					if ($e.Key -eq 'Return') {
+						$e.Handled = $true
+						if (-not $W.PromptArmed -or $sender.IsReadOnly) {
+							try { & $uiLog 'ENTER_IGNORED' ("armed={0} readOnly={1}" -f $W.PromptArmed, $sender.IsReadOnly) } catch {}
+							return
+						}
+						$mods = [System.Windows.Input.Keyboard]::Modifiers
+						$ctrl = ($mods -band [System.Windows.Input.ModifierKeys]::Control) -ne 0
+						$shift = ($mods -band [System.Windows.Input.ModifierKeys]::Shift) -ne 0
+						if ($ctrl -or $shift) {
+							$caret = $sender.CaretIndex
+							$sender.Text = $sender.Text.Insert($caret, "`r`n")
+							$sender.CaretIndex = $caret + 2
+							try { & $uiLog 'ENTER_NEWLINE' '' } catch {}
+							return
+						}
+						try { & $uiLog 'ENTER_PRESSED' ("len={0}" -f ([string]$sender.Text).Length) } catch {}
+						[void](& $submitPrompt)
+						try { & $uiLog 'ENTER_SIGNALED' 'InputWait.Set() done' } catch {}
+						return
+					}
+					if ($sender.IsReadOnly) {
+						if ($e.Key -ne 'Escape') { $e.Handled = $true }
+					}
+					if ($e.Key -eq 'Up') {
+						if (-not $W.PromptArmed -or $sender.IsReadOnly) { return }
+						if ($W.History.Count -eq 0) { return }
+						$e.Handled = $true
+						if ($W.HistIndex -lt 0) { $W.HistIndex = $W.History.Count - 1 }
+						elseif ($W.HistIndex -gt 0) { $W.HistIndex-- }
+						$sender.Text = [string]$W.History[$W.HistIndex]
+						$sender.CaretIndex = $sender.Text.Length
+						return
+					}
+					if ($e.Key -eq 'Down') {
+						if (-not $W.PromptArmed -or $sender.IsReadOnly) { return }
+						if ($W.HistIndex -lt 0) { return }
+						$e.Handled = $true
+						if ($W.HistIndex -lt ($W.History.Count - 1)) {
+							$W.HistIndex++
+							$sender.Text = [string]$W.History[$W.HistIndex]
+						} else {
+							$W.HistIndex = -1
+							$sender.Clear()
+						}
+						$sender.CaretIndex = $sender.Text.Length
+						return
+					}
+					if ($e.Key -eq 'Escape') {
+						$e.Handled = $true
+						& $interruptWork
+					}
+				} catch {
+					try { & $uiLog 'ENTER_HANDLER_ERROR' $_.Exception.Message } catch {}
+					try {
+						[System.Windows.MessageBox]::Show(
+							$_.Exception.Message,
+							'MiniBot input error',
+							[System.Windows.MessageBoxButton]::OK,
+							[System.Windows.MessageBoxImage]::Error
+						) | Out-Null
+					} catch {}
+				}
+			}.GetNewClosure())
+
+			$window.add_Closing({
+				param($s, $ev)
+				try { & $uiLog 'WINDOW_CLOSING' ("soft={0}" -f $W.SoftClose) } catch {}
+				$W.ExitRequested = $true
+				$W.InterruptFlag = $true
+				# Hard-exit; release single-instance lock
+				$W.CloseKind = 'user_x'
+				$W.ForceProcessExit = $true
+				$W.SoftClose = $false
+				try { [void]$W.InputWait.Set() } catch {}
+				try { [void]$W.CredWait.Set() } catch {}
+				try { [void]$W.ConfirmWait.Set() } catch {}
+				try {
+					$W.Dispatcher.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
+				} catch {}
+			}.GetNewClosure())
+
+			$W.Ready = $true
+			[void]$W.ReadyWait.Set()
+			try { & $uiLog 'WPF_WINDOW_SHOWN' $window.Title } catch {}
+			try {
+				$window.Topmost = $true
+				$W.BootstrapTopmost = $true
+			} catch {}
+			[void]$window.Show()
+			try {
+				[void]$window.Activate()
+				try { [void]$window.Focus() } catch {}
+			} catch {}
+			try {
+				$safety = New-Object System.Windows.Threading.DispatcherTimer
+				$safety.Interval = [TimeSpan]::FromSeconds(6)
+				$safety.Tag = $window
+				$safety.Add_Tick({
+					param($s, $e)
+					try { $s.Stop() } catch {}
+					try {
+						$W.BootstrapTopmost = $false
+						$win = $s.Tag
+						if ($win) {
+							$win.Topmost = $false
+							$win.Topmost = $true
+							$win.Topmost = $false
+						}
+					} catch {}
+				}.GetNewClosure())
+				$safety.Start()
+			} catch {}
+			[System.Windows.Threading.Dispatcher]::Run()
+			try { & $uiLog 'WPF_DISPATCHER_EXIT' '' } catch {}
+		} catch {
+			$W.Failed = $true
+			$W.FailMsg = $_.Exception.Message
+			$W.Ready = $false
+			try {
+				$p = [string]$W.DebugLogPath
+				if ($p) {
+					[System.IO.File]::AppendAllText($p, ("[{0}] WPF_HOST_FAIL :: {1}`r`n" -f (Get-Date -Format o), $_.Exception.Message))
+				}
+			} catch {}
+			try { [void]$W.ReadyWait.Set() } catch {}
+		}
+	}).AddArgument($wpf)
+
+	[void]$ps.BeginInvoke()
+	[void]$wpf.ReadyWait.WaitOne(15000)
+
+	if ($wpf.Failed -or -not $wpf.Ready) {
+		$msg = if ($wpf.FailMsg) { $wpf.FailMsg } else { 'timeout starting WPF host' }
+		Write-Warning "WPF host failed: $msg"
+		try { Write-MBDebugLog -Step 'WPF_HOST_FAIL' -Detail $msg } catch {}
+		$script:MB.HostUi = 'wpf'
+		# shut down STA host
+		try {
+			if ($wpf) {
+				$wpf.ExitRequested = $true
+				$wpf.ForceProcessExit = $true
+				try { [void]$wpf.InputWait.Set() } catch {}
+				try { [void]$wpf.CredWait.Set() } catch {}
+				try { [void]$wpf.ConfirmWait.Set() } catch {}
+				try { [void]$wpf.ReadyWait.Set() } catch {}
+				try {
+					if ($wpf.Dispatcher) {
+						$wpf.Dispatcher.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
+					}
+				} catch {}
+			}
+		} catch {}
+		try { $ps.Stop() } catch {}
+		try { $ps.Dispose() } catch {}
+		try { $rs.Close(); $rs.Dispose() } catch {}
+		try { $script:MB.Wpf = $null } catch {}
+		return $false
+	}
+
+	Hide-MBNativeConsole
+	$script:MB.HostUi = 'wpf'
+	try { Ensure-MBConNative } catch {}
+	try { Invoke-MBWpfBringToFront -StayTopmost } catch {}
+	return $true
+}
+
+function Stop-MBWpfHost {
+	param(
+		[switch]$Soft
+	)
+	Write-MBDebugLog -Step 'WPF_STOP_BEGIN'
+	if (-not $script:MB.Wpf) { return }
+	try {
+		# hard-exit; release single-instance lock
+		$script:MB.Wpf.SoftClose = $false
+		$script:MB.Wpf.CloseKind = 'user_x'
+		$script:MB.Wpf.ForceProcessExit = $true
+		$script:MB.Wpf.ExitRequested = $true
+		try { [void]$script:MB.Wpf.InputWait.Set() } catch {}
+		try { [void]$script:MB.Wpf.CredWait.Set() } catch {}
+		try { [void]$script:MB.Wpf.ConfirmWait.Set() } catch {}
+		Invoke-MBWpf -Action {
+			if ($script:MB.Wpf.Window) { $script:MB.Wpf.Window.Close() }
+		}
+	} catch {
+		Write-MBDebugLog -Step 'WPF_STOP_CLOSE_ERR' -Detail $_.Exception.Message
+	}
+	try {
+		if ($script:MB.Wpf.Ps) { $script:MB.Wpf.Ps.Dispose() }
+		if ($script:MB.Wpf.Runspace) { $script:MB.Wpf.Runspace.Close(); $script:MB.Wpf.Runspace.Dispose() }
+	} catch {}
+	$script:MB.Wpf.Ready = $false
+	Write-MBDebugLog -Step 'WPF_STOP_DONE'
+}
+
+function Write-Host {
+	[CmdletBinding(DefaultParameterSetName = 'object')]
+	param(
+		[Parameter(Position = 0, ValueFromPipeline = $true)]
+		[AllowNull()]
+		[object]$Object,
+		[switch]$NoNewline,
+		[ConsoleColor]$ForegroundColor,
+		[ConsoleColor]$BackgroundColor,
+		[object]$Separator
+	)
+	begin { $buf = New-Object System.Collections.ArrayList }
+	process {
+		try {
+			if ($null -ne $Object) { [void]$buf.Add($Object) }
+		} catch {}
+	}
+	end {
+		try {
+			$text = if ($buf.Count -gt 0) {
+				if ($PSBoundParameters.ContainsKey('Separator') -and $null -ne $Separator) {
+					($buf | ForEach-Object { "$_" }) -join [string]$Separator
+				} else {
+					($buf | ForEach-Object { "$_" }) -join ' '
+				}
+			} else { '' }
+
+			if (Test-MBWpfActive) {
+				$c = if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $ForegroundColor } else { [ConsoleColor]::Gray }
+				Write-MBWpfRaw -Text $text -Color $c -NoNewline:$NoNewline
+				return
+			}
+			$splat = @{}
+			if ($PSBoundParameters.ContainsKey('Object') -or $buf.Count -gt 0) { $splat['Object'] = $text }
+			if ($NoNewline) { $splat['NoNewline'] = $true }
+			if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $splat['ForegroundColor'] = $ForegroundColor }
+			if ($PSBoundParameters.ContainsKey('BackgroundColor')) { $splat['BackgroundColor'] = $BackgroundColor }
+			Microsoft.PowerShell.Utility\Write-Host @splat
+		} catch {
+			try { Microsoft.PowerShell.Utility\Write-Host "[log error] $($_.Exception.Message)" -ForegroundColor Red } catch {}
 		}
 	}
 }
 
-Start-LocalAgent
+function Start-LocalAgent {
+	Write-MBDebugLog -Step 'AGENT_START'
+	$resolvedHost = Resolve-MBHostUi
+	Write-MBDebugLog -Step 'AGENT_HOST_RESOLVED' -Detail $resolvedHost
+	$script:MB.PreferWpfLogin = $true
+
+	Write-MBDebugLog -Step 'AGENT_AUTH_BEGIN'
+	$auth = Connect-MBModelEndpoint -TimeoutSeconds 8
+	$connTest = $auth.ConnTest
+	Write-MBDebugLog -Step 'AGENT_AUTH_DONE' -Detail ("ok={0} exit={1}" -f $auth.Success, $auth.Exit)
+
+	if ($auth.Exit -or -not $auth.Success) {
+		$msg = $null
+		if ($auth.Message) { $msg = [string]$auth.Message }
+		elseif ($connTest -and $connTest.Message) { $msg = [string]$connTest.Message }
+		else { $msg = 'Unable to connect.' }
+
+		if ($msg -match '(?i)login UI|requires WPF') {
+			try {
+				Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+				[void][System.Windows.MessageBox]::Show(
+					$msg,
+					'MiniBot',
+					[System.Windows.MessageBoxButton]::OK,
+					[System.Windows.MessageBoxImage]::Error
+				)
+			} catch {}
+			Complete-MBSessionExit -Message $msg
+			return
+		}
+
+		$isCancel = $false
+		try {
+			if ($auth.SoftExit -or $auth.HardClose) { $isCancel = $true }
+			elseif ($msg -match '(?i)cancel') { $isCancel = $true }
+		} catch {}
+		if ($isCancel) {
+			Complete-MBSessionExit -Message 'login cancelled, session ended.'
+			return
+		}
+		try {
+			Write-Host ""
+			Write-MBRule -Color DarkRed -Label "connection failed"
+			Write-Host "  $msg" -ForegroundColor Yellow
+			if ($connTest -and $connTest.StatusCode -and $connTest.StatusCode -notin 401, 403) {
+				Write-Host "  Model server unreachable or misconfigured." -ForegroundColor DarkYellow
+			}
+			Write-Host ""
+		} catch {}
+		Complete-MBSessionExit -Message 'connection failed, session ended.'
+		return
+	}
+
+	if (-not (Start-MBWpfHost)) {
+		Write-MBDebugLog -Step 'AGENT_WPF_FAILED'
+		try {
+			Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+			[void][System.Windows.MessageBox]::Show(
+				'MiniBot requires the WPF host and it failed to start. Check MiniBot-debug.log if present.',
+				'MiniBot',
+				[System.Windows.MessageBoxButton]::OK,
+				[System.Windows.MessageBoxImage]::Error
+			)
+		} catch {}
+		Complete-MBSessionExit -Message 'WPF host failed, session ended.'
+		return
+	}
+	Write-MBDebugLog -Step 'AGENT_WPF_READY' -Detail (Get-MBDebugLogPath)
+	$script:MB.PreferWpfLogin = $false
+
+	# Hard-exit on post-host failure (STA / instance lock)
+	try {
+	Initialize-MBToolGroups
+	try { Update-MBWpfToolGroupBar -Force } catch {}
+	Initialize-MBTokenCounting
+	Initialize-MBToolsOverhead
+	if ($script:MB.SpeechEnabled) {
+		if (Test-MBSpeechUiOk) {
+			try { $null = Enable-MBSpeechMode -On $true } catch {}
+		} else {
+			$script:MB.SpeechEnabled = $false
+			Write-MBWarn "Speech disabled: WPF host not active."
+		}
+	}
+
+	Show-MBBanner
+	Write-MBOk "Connected ($($connTest.AuthType), $($connTest.ElapsedMs) ms)"
+	if ($script:HasNative) {
+		Write-MBInfo "Native helpers loaded (process timeout + HTML extract)"
+	}
+	if ($script:MB.SpeechEnabled -and (Test-MBSpeechUiOk)) {
+		$dict = if ($script:MB.SpeechEngine) { 'PTT+TTS' } elseif ($script:MB.SpeechReady) { 'TTS only' } else { 'init failed' }
+		Write-MBInfo ("Speech: ON ({0}) - hold Right-Ctrl to talk" -f $dict)
+		if ($script:MB.SpeechInitError) { Write-MBWarn $script:MB.SpeechInitError }
+	}
+
+	$script:Messages = @(Sync-MBSystemMessages -Messages @())
+	$script:LastUserMessage = $null
+	[void](Get-MBContextEstimate -Messages $script:Messages -ForceRefresh)
+	try { Refresh-MBWpfStickyFromSession } catch {}
+	try {
+		Set-MBWpfPromptEnabled -Enabled $true -Focus
+		Focus-MBWpfPrompt
+	} catch {}
+	try { Clear-MBWpfBootstrapTopmost } catch {}
+	try {
+		Start-Sleep -Milliseconds 30
+		Clear-MBWpfBootstrapTopmost
+		Focus-MBWpfPrompt
+	} catch {}
+
+	Write-MBDebugLog -Step 'AGENT_MAIN_LOOP'
+	while ($true) {
+		try {
+			Write-MBDebugLog -Step 'LOOP_WAIT_INPUT'
+			$userInput = Read-MBUserInput
+			Write-MBDebugLog -Step 'LOOP_GOT_INPUT' -Detail ("len={0}" -f $(if ($null -eq $userInput) { -1 } else { ([string]$userInput).Length }))
+		} catch {
+			Write-MBDebugLog -Step 'LOOP_INPUT_ERROR' -Detail $_.Exception.Message
+			try {
+				Show-MBWpfError -Title 'Input UI error' -Message 'Failed to read the next prompt.' -Exception $_.Exception
+			} catch {
+				Write-MBErr "Input UI error: $($_.Exception.Message)"
+			}
+			Write-MBWarn "WPF input error - retrying prompt. (Close window to exit.)"
+			$userInput = ""
+			Start-Sleep -Milliseconds 200
+		}
+		if ($null -eq $userInput) { $userInput = "" }
+		try {
+			$trimmed = $userInput.Trim()
+			$lower = $trimmed.ToLower()
+		} catch {
+			$trimmed = ""
+			$lower = ""
+		}
+
+		$wpfCloseSentinel = ([string][char]0x1B + 'WPF_CLOSE')
+		$wpfClosed = ($userInput -eq $wpfCloseSentinel)
+		$exitReq = $false
+		try {
+			if ((Test-MBWpfActive) -and $null -ne $script:MB.Wpf) {
+				$exitReq = [bool]$script:MB.Wpf['ExitRequested']
+			}
+		} catch { $exitReq = $false }
+		# Ignore stale ExitRequested after a real prompt
+		if ($wpfClosed -eq $false -and $exitReq -and [string]::IsNullOrWhiteSpace($trimmed)) {
+			$wpfClosed = $true
+		}
+
+		$typedExit = ($lower -in @('exit', 'quit', '/exit', '/quit'))
+		if ($wpfClosed -or $typedExit) {
+			Write-MBDebugLog -Step 'LOOP_SESSION_END' -Detail ("wpfClosed={0} exitReq={1} lower={2}" -f $wpfClosed, $exitReq, $lower)
+			Complete-MBSessionExit -Message 'session ended.'
+			break
+		}
+		if ([string]::IsNullOrWhiteSpace($trimmed)) {
+			try { Refresh-MBWpfStickyFromSession } catch {}
+			continue
+		}
+
+		if ($trimmed.StartsWith('/') -or $lower -in @('autoapproveenable','autoapprovedisable')) {
+			$parts = $trimmed -split '\s+', 2
+			$cmd = $parts[0].ToLower()
+			$arg = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+
+			switch -Regex ($cmd) {
+				'^/help$|^/h$|^/\?$' { Show-MBHelp; continue }
+				'^/status$|^/stat$'  { Show-MBStatus; continue }
+				'^/context$|^/ctx$' {
+					Show-MBContextDetail -Messages $script:Messages
+					continue
+				}
+				'^/model$' {
+					Write-MBInfo "Model: $(Get-MBDisplayModel)"
+					if (-not [string]::IsNullOrWhiteSpace([string]$ModelAlias) -and [string]$ModelAlias -ne [string]$Model) {
+						Write-MBInfo "Model id: $Model"
+					}
+					Write-MBInfo "Endpoint: $BaseUrl"
+					Write-MBInfo ("ContextWindowTokens: {0}" -f $script:MB.ContextWindow)
+					continue
+				}
+				'^/tools$' {
+					Write-Host ""
+					if ($arg -match '^(?i)list|groups?$') {
+						Write-Host (Get-MBToolGroupsStatus) -ForegroundColor Gray
+						Write-Host ""
+						continue
+					}
+					if ($arg) {
+						$g = $arg.Trim().ToLowerInvariant()
+						if ($g -in @('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech','full','all')) {
+							$msg = Enable-MBToolGroup -Group $g
+							Write-MBOk $msg
+						} else {
+							Write-MBWarn "Usage: /tools [core|vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full|list]"
+						}
+						Write-Host ""
+						continue
+					}
+					Write-Host ("  Profile: {0}  |  Active groups: {1}" -f $script:MB.ToolProfile, ((@($script:MB.ActiveToolGroups) -join ', '))) -ForegroundColor DarkGray
+					Write-Host ""
+					foreach ($gKey in @($script:MBToolCatalog.Keys)) {
+						$meta = if ($script:MBToolGroupMeta -and $script:MBToolGroupMeta.Contains($gKey)) { $script:MBToolGroupMeta[$gKey] } else { $null }
+						$isOn = @($script:MB.ActiveToolGroups) -contains $gKey
+						$flag = if ($isOn) { 'ON ' } else { 'off' }
+						$flagColor = if ($isOn) { 'Green' } else { 'DarkGray' }
+						$label = if ($meta) { $meta.Label } else { $gKey }
+						Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+						Write-Host $flag -NoNewline -ForegroundColor $flagColor
+						Write-Host "] " -NoNewline -ForegroundColor DarkGray
+						Write-Host $gKey -NoNewline -ForegroundColor Cyan
+						Write-Host (" - {0}" -f $label) -ForegroundColor White
+						if ($meta -and $meta.Description) {
+							Write-Host ("       {0}" -f $meta.Description) -ForegroundColor DarkGray
+						}
+						foreach ($tn in @($script:MBToolCatalog[$gKey])) {
+							if (Test-MBToolNameActive -Name $tn) {
+								Write-Host ("       - {0}" -f $tn) -ForegroundColor Cyan
+							} else {
+								Write-Host ("       - {0}" -f $tn) -ForegroundColor DarkGray
+							}
+						}
+					}
+					Write-Host ""
+					Write-Host "  /tools <group> enable  |  /tools full  |  /tools core  |  /tools list" -ForegroundColor DarkGray
+					Write-Host ""
+					continue
+				}
+				'^/sandbox$|^/sb$' {
+					$sa = if ($arg) { $arg.Trim().ToLowerInvariant() } else { '' }
+					if ($sa -match '^(clear|reset|wipe)\s+(all|global|machine|\*)$' -or $sa -match '^(clearall|clear-all|wipeall|purge)$') {
+						Write-MBOk (Clear-MBSandboxAll)
+					} elseif ($sa -match '^(clear|reset|wipe)$') {
+						Write-MBOk (Clear-MBSandboxRoot)
+					} else {
+						Write-Host (Get-MBSandboxInfo) -ForegroundColor Gray
+					}
+					Write-Host ""
+					continue
+				}
+				'^/speech$|^/voice$|^/tts$|^/ptt$' {
+					if (-not (Test-MBSpeechUiOk)) {
+						Write-MBWarn "Speech requires the WPF host."
+						continue
+					}
+					$sa = if ($arg) { $arg.Trim() } else { '' }
+					$saLow = $sa.ToLowerInvariant()
+					if ($saLow -match '^(on|1|true|enable|start)$') {
+						Write-MBOk (Enable-MBSpeechMode -On $true)
+					} elseif ($saLow -match '^(off|0|false|disable|stop)$') {
+						Write-MBOk (Enable-MBSpeechMode -On $false)
+					} elseif ($saLow -match '^(auto|autoreply)$') {
+						$script:MB.SpeechAutoReply = -not [bool]$script:MB.SpeechAutoReply
+						Write-MBOk ("Speech auto-reply TTS: {0}" -f $(if ($script:MB.SpeechAutoReply) { 'ON' } else { 'off' }))
+					} elseif ($saLow -match '^(autoon|auto-on)$') {
+						$script:MB.SpeechAutoReply = $true
+						Write-MBOk "Speech auto-reply TTS: ON"
+					} elseif ($saLow -match '^(autooff|auto-off)$') {
+						$script:MB.SpeechAutoReply = $false
+						Write-MBOk "Speech auto-reply TTS: off"
+					} elseif ($saLow -match '^(test|say)(\s|$)') {
+						$say = 'MiniBot speech is working.'
+						if ($sa -match '(?i)^(test|say)\s+(.+)$') { $say = $Matches[2] }
+						Write-Host (Invoke-MBSpeak -Text $say -Async $false) -ForegroundColor Gray
+					} elseif ($saLow -match '^(listen|mic)$') {
+						$res = Invoke-MBSpeechListen -UpdatePrompt {
+							param([string]$msg)
+							if ($msg) {
+								Write-Host ("  {0}" -f $msg) -ForegroundColor Magenta
+							}
+						}
+						if ($res.ok) {
+							Write-MBOk ("Heard: {0}" -f $res.text)
+						} else {
+							Write-MBWarn ("Listen failed: {0}" -f $(if ($res.error) { $res.error } else { 'no speech' }))
+						}
+					} else {
+						$st = if ($script:MB.SpeechEnabled) { 'ON' } else { 'off' }
+						$auto = if ($script:MB.SpeechAutoReply) { 'ON' } else { 'off' }
+						$ready = if ($script:MB.SpeechReady) { 'ready' } else { 'not init' }
+						Write-Host ""
+						Write-Host ("  Speech mode : {0}  ({1})" -f $st, $ready) -ForegroundColor $(if ($script:MB.SpeechEnabled) { 'Green' } else { 'DarkGray' })
+						Write-Host ("  Auto-reply  : {0}  (TTS final model answers)" -f $auto) -ForegroundColor Gray
+						Write-Host "  Record      : hold Right-Ctrl to talk, release to stop (PTT)" -ForegroundColor Gray
+						Write-Host "  Typing      : works anytime Right-Ctrl is not held (Left-Ctrl+Enter still multi-line)" -ForegroundColor DarkGray
+						Write-Host "  Status shows on the input line (● REC …). Esc cancels mid-PTT." -ForegroundColor Gray
+						Write-Host "  Model tool  : SpeakText (group speech; enabled with /speech on)" -ForegroundColor Gray
+						if ($script:MB.SpeechInitError) {
+							Write-Host ("  Last error  : {0}" -f $script:MB.SpeechInitError) -ForegroundColor DarkYellow
+						}
+						if ($script:MB.SpeechLastHeard) {
+							Write-Host ("  Last heard  : {0}" -f $script:MB.SpeechLastHeard) -ForegroundColor DarkGray
+						}
+						Write-Host ""
+						Write-Host "  /speech on|off | auto | test | listen | say <text>" -ForegroundColor DarkGray
+						Write-Host "  Launch: -SpeechEnabled:`$true  or  `$env:speech=1" -ForegroundColor DarkGray
+						Write-Host ""
+					}
+					continue
+				}
+				'^/wd$' {
+					Write-MBInfo $script:MB.WorkingDir
+					continue
+				}
+				'^/cd$' {
+					if (-not $arg) { Write-MBWarn "Usage: /cd <path>"; continue }
+					$r = Invoke-SetWorkingDirectory -path $arg
+					$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+					Write-MBInfo $r
+					continue
+				}
+				'^/note$' {
+					if (-not $arg) { Write-MBWarn "Usage: /note <text to remember>"; continue }
+					if (Add-MBStickyNote -Text $arg -Kind note) {
+						$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+						Write-MBOk "Pinned note."
+					} else {
+						Write-MBInfo "Note unchanged (empty or duplicate)."
+					}
+					continue
+				}
+				'^/find$|^/finding$|^/findings$' {
+					if (-not $arg) { Write-MBWarn "Usage: /find <finding to pin>"; continue }
+					if (Add-MBStickyNote -Text $arg -Kind finding) {
+						$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+						Write-MBOk "Pinned finding."
+					} else {
+						Write-MBInfo "Finding unchanged (empty or duplicate)."
+					}
+					continue
+				}
+				'^/forget$' {
+					Clear-MBSticky
+					$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+					Write-MBOk "Sticky notes, findings, and digest cleared."
+					continue
+				}
+				'^/clear$|^/reset$' {
+					$script:Messages = @(Sync-MBSystemMessages -Messages @())
+					$script:MB.StickyExtra = ''
+					Write-MBOk "Conversation cleared (sticky notes kept - /forget to wipe those)."
+					try { Refresh-MBWpfStickyFromSession } catch {}
+					continue
+				}
+				'^/compact$' {
+					$before = Get-MBContextEstimate -Messages $script:Messages
+					$script:Messages = @(Manage-MBContext -Messages $script:Messages -ForceCompact)
+					$script:Messages = @(Ensure-MBPromptBudget -Messages $script:Messages -TargetPct 0.65 -Verbose)
+					$after = Get-MBContextEstimate -Messages $script:Messages
+					Write-MBOk ("Compacted: {0:P0} -> {1:P0}  (~{2:N0} -> ~{3:N0} tok)  msgs {4}" -f `
+						$before.Pct, $after.Pct, $before.PromptTokens, $after.PromptTokens, $script:Messages.Count)
+					try { Refresh-MBWpfStickyFromSession } catch {}
+					continue
+				}
+				'^/autocompact$' {
+					if ($arg -match '^(off|0|false|disable)') {
+						$script:MB.AutoCompact = $false
+						Write-MBOk "AutoCompact OFF"
+					} elseif ($arg -match '^(on|1|true|enable)') {
+						$script:MB.AutoCompact = $true
+						Write-MBOk "AutoCompact ON"
+					} else {
+						$script:MB.AutoCompact = -not $script:MB.AutoCompact
+						Write-MBOk ("AutoCompact {0}" -f $(if ($script:MB.AutoCompact) { 'ON' } else { 'OFF' }))
+					}
+					try {
+						if ($script:MB.Wpf) { $script:MB.Wpf.AutoCompactOn = [bool]$script:MB.AutoCompact }
+						Refresh-MBWpfStickyFromSession
+					} catch {}
+					continue
+				}
+				'^/auto$|^/autoapproveenable$|^/autoapprovedisable$|^autoapproveenable$|^autoapprovedisable$' {
+					if ($cmd -match 'disable' -or $arg -match '^(off|0|false|disable)') {
+						$script:MB.AutoApprove = $false
+						Write-MBOk "auto-approve OFF"
+					} elseif ($cmd -match 'enable' -or $arg -match '^(on|1|true|enable)') {
+						$script:MB.AutoApprove = $true
+						Write-MBWarn "auto-approve ON - modifying actions will not prompt."
+					} else {
+						$script:MB.AutoApprove = -not $script:MB.AutoApprove
+						if ($script:MB.AutoApprove) {
+							Write-MBWarn "auto-approve ON"
+						} else {
+							Write-MBOk "auto-approve OFF"
+						}
+					}
+					$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+					try { Refresh-MBWpfStickyFromSession } catch {}
+					continue
+				}
+				'^/save$' {
+					try {
+						$p = Save-MBSession -Messages $script:Messages -Path $arg
+						Write-MBOk "Saved: $p"
+					} catch { Write-MBErr $_.Exception.Message }
+					continue
+				}
+				'^/load$' {
+					if (-not $arg) { Write-MBWarn "Usage: /load <path>"; continue }
+					try {
+						$lp = Resolve-MBPath $arg
+						$obj = Get-Content -LiteralPath $lp -Raw | ConvertFrom-Json
+						if ($obj.sticky) {
+							Clear-MBSticky
+							foreach ($n in @($obj.sticky.notes)) {
+								if ($n) { [void]$script:MB.StickyNotes.Add([string]$n) }
+							}
+							foreach ($f in @($obj.sticky.findings)) {
+								if ($f) { [void]$script:MB.StickyFindings.Add([string]$f) }
+							}
+							if ($obj.sticky.extra) { $script:MB.StickyExtra = [string]$obj.sticky.extra }
+						}
+						$script:Messages = @(Repair-MBMessagesEncoding -Messages @(Sync-MBSystemMessages -Messages @($obj.messages)))
+						if ($obj.cwd) {
+							try { Invoke-SetWorkingDirectory -path $obj.cwd | Out-Null } catch {}
+						}
+						Write-MBOk "Loaded + re-synced system/state ($($script:Messages.Count) messages) from $lp"
+						try { Refresh-MBWpfStickyFromSession } catch {}
+					} catch { Write-MBErr $_.Exception.Message }
+					continue
+				}
+				'^/export$' {
+					try {
+						$p = Export-MBTranscript -Messages $script:Messages -Path $arg
+						Write-MBOk "Exported: $p"
+					} catch { Write-MBErr $_.Exception.Message }
+					continue
+				}
+				'^/retry$' {
+					if (-not $script:LastUserMessage) {
+						Write-MBWarn "No previous user message to retry."
+						continue
+					}
+					$userInput = $script:LastUserMessage
+					$trimmed = $userInput
+				}
+				default {
+					if ($cmd.StartsWith('/')) {
+						Write-MBWarn "Unknown command: $cmd  (try /help)"
+						continue
+					}
+				}
+			}
+			if ($cmd -eq '/retry') {
+			} elseif ($trimmed.StartsWith('/') -or $lower -in @('autoapproveenable','autoapprovedisable')) {
+				continue
+			}
+		}
+
+		try {
+		Write-MBDebugLog -Step 'TURN_BEGIN' -Detail ("preview={0}" -f $trimmed)
+		$script:LastUserMessage = $userInput
+		$script:MB.UserTurns++
+		try {
+			Write-MBDebugLog -Step 'TURN_ADD_USER_MSG'
+			$script:Messages += @{ role = 'user'; content = (Sanitize-MBText -Text ([string]$userInput)) }
+		} catch {
+			Write-MBDebugLog -Step 'TURN_ADD_USER_MSG_ERR' -Detail $_.Exception.Message
+			Show-MBWpfError -Title 'Message error' -Message 'Could not add your message to history.' -Exception $_.Exception
+			continue
+		}
+
+		try { Reset-MBToolLoopGuard } catch {}
+		Write-MBDebugLog -Step 'TURN_CONTEXT_MANAGE'
+		try {
+			$script:Messages = @(Manage-MBContext -Messages $script:Messages)
+		} catch {
+			Write-MBWarn "Context manage failed: $($_.Exception.Message)"
+			try { $script:Messages = @(Optimize-MBHistory -Messages $script:Messages) } catch {}
+		}
+		try { Update-MBWpfLiveChrome -Force } catch {}
+		Write-MBDebugLog -Step 'TURN_CONTEXT_OK' -Detail ("msgs={0}" -f @($script:Messages).Count)
+
+		# Paint user turn and working state
+		try {
+			Write-MBDebugLog -Step 'TURN_PAINT_USER'
+			Write-Host ""
+			Write-MBUserMessage -Text $userInput
+			Show-MBWorkingHint
+			Write-MBDebugLog -Step 'TURN_PAINT_USER_OK'
+		} catch {
+			Write-MBDebugLog -Step 'TURN_PAINT_USER_ERR' -Detail $_.Exception.Message
+			try { Write-MBUserMessage -Text $userInput } catch {}
+			try { Hide-MBPromptForWork } catch {}
+		}
+
+		Reset-MBInterrupt
+		$turn = 0
+		try {
+			while ($turn -lt $MaxTurns) {
+				$turn++
+				$script:MB.AgentTurns++
+				Write-MBDebugLog -Step 'TURN_MODEL_ITER' -Detail ("turn={0}" -f $turn)
+
+				# Re-sync sticky state + budget check before every model call
+				try {
+					$script:Messages = @(Manage-MBContext -Messages $script:Messages)
+				} catch {
+					$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+				}
+
+				$response = $null
+				try {
+					Write-MBDebugLog -Step 'TURN_CALL_STREAM'
+					$response = Invoke-ModelStreaming -Messages $script:Messages
+					Write-MBDebugLog -Step 'TURN_CALL_STREAM_DONE' -Detail ("null={0}" -f ($null -eq $response))
+				} catch {
+					Write-MBDebugLog -Step 'TURN_CALL_STREAM_THROW' -Detail $_.Exception.Message
+					Write-MBErr "Model call threw: $($_.Exception.Message)"
+					break
+				}
+
+				if ($script:MB.Interrupt -or ($response -and $response.interrupted)) {
+					Reset-MBInterrupt
+					Write-Host "  [turn aborted - stream cancelled]" -ForegroundColor Red
+					break
+				}
+				if (-not $response) {
+					Write-MBWarn "No model response after retries - returning to prompt."
+					Write-Host "  Use /retry when the server is healthy again (500/502 are often transient)." -ForegroundColor DarkGray
+					break
+				}
+
+				$assistantMessage = $null
+				try {
+					if ($response.choices -and @($response.choices).Count -gt 0) {
+						$assistantMessage = $response.choices[0].message
+					}
+				} catch {
+					Write-MBErr "Bad response shape: $($_.Exception.Message)"
+					break
+				}
+				if (-not $assistantMessage) {
+					Write-MBWarn "Empty assistant message - returning to prompt."
+					break
+				}
+
+				$script:Messages += $assistantMessage
+				try { Update-MBWpfLiveChrome } catch {}
+
+				$tcList = @()
+				try {
+					$rawTc = Get-MBProp $assistantMessage 'tool_calls'
+					if ($rawTc) { $tcList = @($rawTc) }
+				} catch { $tcList = @() }
+
+				if ($tcList.Count -eq 0) {
+					$finalText = Get-MBProp $assistantMessage 'content'
+					if ([string]::IsNullOrWhiteSpace([string]$finalText)) {
+						Write-MBWarn "Model returned no text and no tools (context may be too noisy). Try GetBSODInfo or a narrower question."
+						break
+					}
+
+					$fr = ''
+					try { $fr = [string](Get-MBProp $response 'finish_reason') } catch { $fr = '' }
+					$ct = 0
+					try { $ct = [int](Get-MBProp $response 'completion_tokens') } catch {
+						$ct = [int]$script:MB.LastServerCompletionTokens
+					}
+					$needCont = $false
+					try { if ($response.truncated) { $needCont = $true } } catch {}
+					$haveUsageCont = $false
+					try {
+						if ($fr -match '^(?i)length|max_tokens|limit$') { $haveUsageCont = $true }
+						elseif ($ct -gt 0 -and $response.truncated) { $haveUsageCont = $true }
+					} catch {}
+					if (-not $needCont) {
+						$needCont = Test-MBReplyIncomplete -Text ([string]$finalText) -FinishReason $fr -HasToolCalls $false -CompletionTokens $ct -HaveUsage $haveUsageCont
+					}
+					$maxCont = [math]::Max(0, [int]$MaxReplyContinues)
+					$cont = 0
+					while ($cont -lt $maxCont) {
+						if (-not $needCont) {
+							$needCont = Test-MBReplyIncomplete -Text ([string]$finalText) -FinishReason $fr -HasToolCalls $false -CompletionTokens $ct -HaveUsage $haveUsageCont
+						}
+						if (-not $needCont) { break }
+						$needCont = $false
+						$cont++
+						Write-MBReplyStatus -Title 'continuing truncated reply' -Meta @(
+							('{0}/{1}' -f $cont, $maxCont)
+							('max_tokens {0}' -f $(try { [int]$script:MB.LastRequestMaxTokens } catch { [int]$MaxTokens }))
+						) -Muted -DebugOnly
+						$script:Messages += @{
+							role    = 'user'
+							content = (Sanitize-MBText -Text (Get-MBContinuePrompt))
+						}
+						try {
+							$script:Messages = @(Manage-MBContext -Messages $script:Messages)
+						} catch {
+							$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+						}
+
+						$contResponse = $null
+						try {
+							$contResponse = Invoke-ModelStreaming -Messages $script:Messages
+						} catch {
+							Write-MBWarn "Continue call failed: $($_.Exception.Message)"
+							break
+						}
+						if ($script:MB.Interrupt -or ($contResponse -and $contResponse.interrupted)) {
+							Reset-MBInterrupt
+							Write-MBReplyStatus -Title 'continue aborted' -Error
+							break
+						}
+						if (-not $contResponse) {
+							Write-MBWarn "Continue returned no response."
+							break
+						}
+
+						$contMsg = $null
+						try {
+							if ($contResponse.choices -and @($contResponse.choices).Count -gt 0) {
+								$contMsg = $contResponse.choices[0].message
+							}
+						} catch {}
+						if (-not $contMsg) {
+							Write-MBWarn "Continue returned empty message."
+							break
+						}
+
+						$script:Messages += $contMsg
+						$contTools = @()
+						try {
+							$rawCt = Get-MBProp $contMsg 'tool_calls'
+							if ($rawCt) { $contTools = @($rawCt) }
+						} catch { $contTools = @() }
+
+						if ($contTools.Count -gt 0) {
+							$assistantMessage = $contMsg
+							$tcList = $contTools
+							break
+						}
+
+						$finalText = Get-MBProp $contMsg 'content'
+						try { $fr = [string](Get-MBProp $contResponse 'finish_reason') } catch { $fr = '' }
+						try { $ct = [int](Get-MBProp $contResponse 'completion_tokens') } catch {
+							$ct = [int]$script:MB.LastServerCompletionTokens
+						}
+						try {
+							if ($contResponse.truncated) { $needCont = $true; $haveUsageCont = $true }
+						} catch {}
+						if ($fr -match '^(?i)length|max_tokens|limit|max_completion_tokens$') {
+							$needCont = $true
+							$haveUsageCont = $true
+						}
+						$response = $contResponse
+					}
+
+					if ($tcList.Count -eq 0) {
+						if ($cont -gt 0 -and (Test-MBReplyIncomplete -Text ([string]$finalText) -FinishReason $fr -HasToolCalls $false -CompletionTokens $ct -HaveUsage $haveUsageCont)) {
+							Write-MBReplyStatus -Title 'still incomplete' -Meta @(
+								('after {0} continue(s)' -f $cont)
+							) -Hint 'say continue, or launch with -MaxTokens / -MaxReplyContinues higher' -DebugOnly -Muted
+						}
+						if ($script:MB.SpeechEnabled -and $script:MB.SpeechAutoReply -and -not [string]::IsNullOrWhiteSpace([string]$finalText)) {
+							try {
+								$null = Invoke-MBSpeak -Text ([string]$finalText) -Async $true
+							} catch {}
+						}
+						break
+					}
+				}
+
+				foreach ($tc in $tcList) {
+					if ((Test-MBInterrupt)) { break }
+
+					$fn = $null
+					$argString = $null
+					try {
+						$fn = (Get-MBProp (Get-MBProp $tc 'function') 'name')
+						$argString = (Get-MBProp (Get-MBProp $tc 'function') 'arguments')
+					} catch {}
+					if (-not $fn) { $fn = 'unknown' }
+
+					$argsObj = Convert-MBToolArguments -ArgString $argString
+					$parseFailed = $false
+					if ($argsObj -and (Get-MBProp $argsObj '_parse_error')) {
+						$parseFailed = $true
+						Write-Host "  ~ JSON parse issue for $fn - args salvage failed" -ForegroundColor DarkYellow
+					}
+					if (-not $argsObj) { $argsObj = [pscustomobject]@{} }
+
+					Write-Host "  -> " -NoNewline -ForegroundColor DarkGreen
+					Write-Host $fn -NoNewline -ForegroundColor Green
+					$hint = ""
+					if (Test-MBHasProp $argsObj 'path') { $hint = "  $(Get-MBProp $argsObj 'path')" }
+					elseif (Test-MBHasProp $argsObj 'name') { $hint = "  $(Get-MBProp $argsObj 'name')" }
+					elseif (Test-MBHasProp $argsObj 'piece') { $hint = "  piece=$(Get-MBProp $argsObj 'piece')" }
+					elseif (Test-MBHasProp $argsObj 'command') {
+						$c = [string](Get-MBProp $argsObj 'command')
+						if ($c.Length -gt 70) { $c = $c.Substring(0, 67) + "..." }
+						$hint = "  $c"
+					}
+					elseif (Test-MBHasProp $argsObj 'code') {
+						$c = [string](Get-MBProp $argsObj 'code')
+						if ($c.Length -gt 50) { $c = $c.Substring(0, 47) + "..." }
+						$hint = "  code=$c"
+					}
+					elseif (Test-MBHasProp $argsObj 'url') { $hint = "  $(Get-MBProp $argsObj 'url')" }
+					elseif (Test-MBHasProp $argsObj 'github_url') { $hint = "  $(Get-MBProp $argsObj 'github_url')" }
+					Write-Host $hint -ForegroundColor DarkGray
+
+					$toolResult = ""
+					try {
+						if ($parseFailed -and $fn -match '^(?i)SandBox') {
+							$prev = [string](Get-MBProp $argsObj '_raw_preview')
+							$toolResult = @"
+ERROR: Could not parse tool arguments JSON for $fn.
+The model must pass a single JSON object. For code, escape newlines as \n inside the JSON string (or keep code short).
+Preview: $prev
+Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert like `$Result.Value -eq 4 after printing JSON.
+"@
+						} else {
+							$toolResult = Invoke-MBTool -Name $fn -ArgsObj $argsObj
+						}
+					} catch {
+						$toolResult = "ERROR: tool $fn threw: $($_.Exception.Message)"
+						Write-MBErr $toolResult
+					}
+					if ($null -eq $toolResult) { $toolResult = "" }
+					$tr = [string]$toolResult
+					if ($tr.TrimStart().StartsWith('{') -or $tr.TrimStart().StartsWith('[')) {
+						try {
+							$toolResult = [regex]::Replace($tr, '[\x00-\x08\x0B\x0C\x0E-\x1F]', ' ')
+						} catch { $toolResult = $tr }
+					} else {
+						$toolResult = Sanitize-MBText -Text $tr
+					}
+
+					Write-Host "    ($($script:MB.LastToolMs) ms, $($toolResult.Length) chars)" -ForegroundColor DarkGray
+					try {
+						$toolSec = [double]([math]::Max(0, [int]$script:MB.LastToolMs) / 1000.0)
+						Write-MBWorkedStamp -Seconds $toolSec
+					} catch {}
+
+					$tcId = Get-MBProp $tc 'id'
+					if (-not $tcId) { $tcId = "call_$([guid]::NewGuid().ToString('N').Substring(0,8))" }
+
+					$script:Messages += @{
+						role         = 'tool'
+						tool_call_id = [string]$tcId
+						content      = [string]$toolResult
+					}
+					try { Update-MBWpfLiveChrome } catch {}
+				}
+
+				if ($script:MB.Interrupt) {
+					Reset-MBInterrupt
+					Write-Host "  [tool loop aborted]" -ForegroundColor Yellow
+					break
+				}
+
+				try {
+					$script:Messages = @(Manage-MBContext -Messages $script:Messages)
+				} catch {
+					Write-MBWarn "History optimize failed: $($_.Exception.Message)"
+					try { $script:Messages = @(Optimize-MBHistory -Messages $script:Messages) } catch {}
+				}
+				try { Update-MBWpfLiveChrome -Force } catch {}
+
+				Write-Host "  ... feeding tool results back to model ..." -ForegroundColor DarkGray
+			}
+		} catch {
+			$errMsg = $_.Exception.Message
+			Write-MBDebugLog -Step 'AGENT_LOOP_CATCH' -Detail $errMsg
+			$pos = ''
+			try {
+				if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+					$pos = [string]$_.InvocationInfo.PositionMessage
+				}
+			} catch {}
+			try {
+				Show-MBWpfError -Title 'Agent loop error' -Message ($errMsg + $(if ($pos) { "`n$pos" } else { '' })) -Exception $_.Exception
+			} catch {
+				Write-MBErr "Agent loop error: $errMsg"
+				if ($pos) { Write-Host $pos -ForegroundColor DarkGray }
+			}
+		}
+
+		if ($turn -ge $MaxTurns) {
+			Write-MBWarn "Hit max tool-loop turns ($MaxTurns). Summarizing context for next message."
+		}
+
+		try {
+			$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+		} catch {}
+
+		try { Clear-MBWorkingState } catch {}
+		Write-MBDebugLog -Step 'TURN_END'
+		} catch {
+			# Per-turn catch; session stays open
+			Write-MBDebugLog -Step 'TURN_CATCH' -Detail $_.Exception.Message
+			try {
+				Show-MBWpfError -Title 'Turn error' -Message 'Something failed while handling your message. You can try again.' -Exception $_.Exception
+			} catch {
+				Write-MBErr "Turn error: $($_.Exception.Message)"
+			}
+			try { Clear-MBWorkingState } catch {}
+		}
+	}
+	Write-MBDebugLog -Step 'AGENT_LOOP_EXIT'
+	} catch {
+		Write-MBDebugLog -Step 'AGENT_SESSION_CATCH' -Detail $_.Exception.Message
+		try {
+			Show-MBWpfError -Title 'Session error' -Message 'A fatal error occurred in the agent session.' -Exception $_.Exception
+		} catch {
+			try {
+				Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+				[void][System.Windows.MessageBox]::Show(
+					$_.Exception.Message,
+					'MiniBot session error',
+					[System.Windows.MessageBoxButton]::OK,
+					[System.Windows.MessageBoxImage]::Error
+				)
+			} catch {}
+		}
+		$script:MB.SessionEnding = $true
+	} finally {
+		Write-MBDebugLog -Step 'AGENT_FINALLY' -Detail ("SessionEnding={0}" -f $script:MB.SessionEnding)
+		try { Dispose-MBSharedHttpClient } catch {}
+		try { Complete-MBSessionExit } catch {
+			try { Stop-MBWpfHost } catch {}
+			try {
+				if ($script:SingleInstanceEvent) {
+					$script:SingleInstanceEvent.Close()
+					$script:SingleInstanceEvent.Dispose()
+					$script:SingleInstanceEvent = $null
+				}
+			} catch {}
+			try { [Environment]::Exit(0) } catch { Exit 0 }
+		}
+	}
+}
+
+try {
+	Write-MBDebugLog -Step 'ENTRY_BEGIN'
+	Start-LocalAgent
+	Write-MBDebugLog -Step 'ENTRY_AGENT_RETURNED'
+} catch {
+	Write-MBDebugLog -Step 'ENTRY_CATCH' -Detail $_.Exception.Message
+	try {
+		Show-MBWpfError -Title 'MiniBot failed to start' -Message $_.Exception.Message -Exception $_.Exception
+	} catch {
+		try {
+			Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+			[void][System.Windows.MessageBox]::Show(
+				$_.Exception.Message,
+				'MiniBot failed to start',
+				[System.Windows.MessageBoxButton]::OK,
+				[System.Windows.MessageBoxImage]::Error
+			)
+		} catch {
+			try { Microsoft.PowerShell.Utility\Write-Host "MiniBot failed: $($_.Exception.Message)" -ForegroundColor Red } catch {}
+		}
+	}
+} finally {
+	Write-MBDebugLog -Step 'ENTRY_FINALLY' -Detail ("SessionEnding={0}" -f $script:MB.SessionEnding)
+	try { Dispose-MBSharedHttpClient } catch {}
+	try { $null = Invoke-MBTempCleanup -All } catch {}
+	# tear down host and single-instance lock
+	try { Complete-MBSessionExit } catch {
+		try { $null = Invoke-MBTempCleanup -All } catch {}
+		try { Stop-MBWpfHost } catch {}
+		try {
+			if ($script:SingleInstanceEvent) {
+				$script:SingleInstanceEvent.Close()
+				$script:SingleInstanceEvent.Dispose()
+				$script:SingleInstanceEvent = $null
+			}
+		} catch {}
+		try { [Environment]::Exit(0) } catch { Exit 0 }
+	}
+}
