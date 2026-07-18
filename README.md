@@ -1,6 +1,8 @@
 # MiniBot
 OpenAI-compatible PowerShell agent client for local models (Windows PowerShell 5.1 + WPF UI).
 
+<p align="center"><img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png"></p>
+
 ## Setup
 1. Edit the defaults at the top of `MiniBot.ps1` (`BaseUrl`, `Model`, `ApiKey`, etc).
 2. Run it.
