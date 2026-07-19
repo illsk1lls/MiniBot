@@ -4046,7 +4046,7 @@ function Test-IsSafeCommand {
 	if ($trimmed -match '[\r\n]') { return $false }
 	if ($trimmed -match '`') { return $false }
 	if ($trimmed -match '\$\(') { return $false }
-	if ($trimmed -match "@['\`]|@\{") { return $false }
+	if ($trimmed -match '@[''"]|@\{') { return $false }
 	if ($trimmed -match ';') { return $false }
 	if ($trimmed -match '&&|\|\|') { return $false }
 	if ($trimmed -match '(?<![|&])&(?![&=])') { return $false }
