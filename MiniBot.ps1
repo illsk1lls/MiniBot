@@ -21,7 +21,7 @@ param(
 	# This is NOT the real model alias entry. Enter your server name here for `PoweredBy: YourServerName` on the top right of the window, this `Alias` is for MiniBot display only
 	[string]$ModelAlias = "YourServerName",
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.11.0",
+	[string]$Version = "2.10.0",
 	[string]$ApiKey = "none",
 	# Max completion tokens per model request (also reserved out of n_ctx for the prompt budget)
 	[int]$MaxTokens = 32768,
@@ -1217,10 +1217,10 @@ namespace MiniBot.Core {
 		public long ElapsedMs;
 	}
 
-	/// <summary>
+	/// 
 	/// Directory size via FindFirstFileExW + FIND_FIRST_EX_LARGE_FETCH,
 	/// FindExInfoBasic (no short names), skip reparse points, parallel top-level walks.
-	/// </summary>
+	/// 
 	public static class DiskWalk {
 		public static volatile bool CancelRequested = false;
 
@@ -1283,7 +1283,7 @@ namespace MiniBot.Core {
 			return false;
 		}
 
-		/// <summary>Sum file bytes under path. deep=false: immediate children files only.</summary>
+		/// Sum file bytes under path. deep=false: immediate children files only.
 		public static FolderSizeInfo Measure(string path, bool deep, int timeoutMs) {
 			CancelRequested = false;
 			var sw = Stopwatch.StartNew();
@@ -1313,9 +1313,9 @@ namespace MiniBot.Core {
 			return info;
 		}
 
-		/// <summary>
+		/// 
 		/// Size each top-level subdirectory under root (parallel), return largest first.
-		/// </summary>
+		/// 
 		public static FolderSizeInfo[] TopFolders(string root, int maxResults, bool deep, int timeoutMs, int maxChildren) {
 			CancelRequested = false;
 			var sw = Stopwatch.StartNew();
@@ -4133,6 +4133,7 @@ function Request-Confirmation {
 		[string]$Code = "",
 		[string]$CodeLang = "ps"
 	)
+	try { Sync-MBAutoApproveFromWpf } catch {}
 	if ($script:MB.AutoApprove) {
 		$script:MB.ApprovalsGranted++
 		return $true
@@ -4953,7 +4954,7 @@ $script:MBGroupQuickMap = [ordered]@{
 	vision    = 'pdf/image/screenshot: ReadImage, ReadPdf, ViewScreen'
 	system    = 'OS inventory: processes, ports, services, disk, BSOD, events, software'
 	repair    = 'RunQuickDiagnostics; RunRepairTool sfc|dism|chkdsk'
-	setup     = 'tune PC + NewMachineSetup (settings; can install catalog apps)'
+	setup     = 'tune PC + user/domain(join|leave)/drive/printer/share + NewMachineSetup'
 	installers = 'silent download/install catalog: 7zip, chrome, adobe, adwcleaner, vlc'
 	sandbox   = 'multi-step PS lab (SandBoxWrite/SandBox pieces)'
 	files     = 'DownloadFile; zip ExpandArchive/CompressArchive'
@@ -4969,13 +4970,13 @@ You are $AgentName v$Version - local Windows agent (local model). Tool-first co-
 Rules: evidence-only (never invent results/paths/status); concise (findings + next steps); PS 5.1 only; paths relative to CWD unless absolute; large files use head/tail/offset+length - never dump multi-MB/binary/.dmp.
 Mutate only after read when possible; operator may deny - stop that action, never bypass. Identical tool+args in a row is blocked - change args/tool or synthesize.
 Harness: if a tool parse/return looks wrong (error text, empty/garbled/malformed payload) - or the same failure hits 2+ times - tell the operator immediately (what broke + short evidence + a fix idea if obvious). Trust the tool output; do not re-run or thrash in silence.
-TOOL GROUPS: Only tools in active groups appear in your tool list. core is always on. Need something else? Call EnableToolGroup group=<name> once, then call the real tool in the same turn - no ask, no ListToolGroups, no narration. Prefer specialized tools over RunCommand.
+TOOL GROUPS: Only tools in active groups appear in your tool list. core is always on. On every new user task, re-check which groups you need (task may differ from what is already enabled) and EnableToolGroup any missing ones before you work — one call can unlock several (group=setup,system or groups=[setup,system]). Need something else mid-task? EnableToolGroup once (multi ok), then call the real tools in the same turn - no ask, no ListToolGroups, no narration. Prefer specialized tools over RunCommand.
 MAP (group = when to enable):
 vision = pdf/image/screenshot (ReadImage, ReadPdf page=1 first, ViewScreen)
-system = processes/ports/services/disk/BSOD/events/software inventory
+system = processes/ports/services/disk/BSOD/events/software inventory; ScanNetwork; ProbeShares
 repair = RunQuickDiagnostics, sfc/dism/chkdsk
-setup = volume/brightness/explorer/power/F8 boot/UAC/restore/uninstall; NewMachineSetup
-installers = silent app installs: ListInstallers / InstallPackage (7zip, chrome, adobe, adwcleaner, vlc)
+setup = volume/brightness/explorer/power/F8 boot/UAC/restore/uninstall; AddLocalUser; JoinDomain; LeaveDomain; MapNetworkDrive; AddNetworkPrinter; CreateShare; NewMachineSetup residential|business
+installers = silent app installs: ListInstallers / InstallPackage (7zip, chrome, adobe, adwcleaner, vlc, gotoassist)
 sandbox = multi-step PowerShell lab pieces
 files = DownloadFile, zip expand/compress
 packages = PowerShell Gallery modules
@@ -4983,6 +4984,11 @@ registry = registry read/write
 clipboard = clipboard read/write
 web = HTTP API, BrowsePage, GitHub files
 speech = SpeakText TTS
+SHARE PLAYBOOK (mandatory tools — do not invent shell loops):
+- User asks to find/locate/discover a network share (or "who has temp share") → EnableToolGroup groups=[system,setup] then call ProbeShares (same turn). Do not answer from guesswork; do not RunCommand net view / Get-SmbShare / New-CimSession / foreach Test-Path \\host\...
+- Know the machine IP/name → ProbeShares computer=IP share_name=NAME (and username/password if operator gave them). Do not know which PC → ProbeShares with hosts omitted (auto LAN search) + share_name if given.
+- Optional ScanNetwork first only if you also need MAC/hostname/vendor inventory; for "find the share" ProbeShares alone is enough.
+- Found (found_uncs / hosts_with_match) → MapNetworkDrive path=\\IP\share letter=Z username=... password=... (setup group). Creating a share on THIS PC → CreateShare (not ProbeShares).
 User-facing text = results and next steps only - never announce enabling tools.
 "@
 
@@ -4996,7 +5002,13 @@ RunCommand: runs command text in-process via -EncodedCommand (no outer expansion
 VISION: ReadImage path= (vision next turn). ReadPdf: default page=1 only - multipage render is expensive; do not page through a PDF unless the user asks for later pages, full doc, or a page the first pass cannot answer. Text extract when clean; auto page-render vision if empty/garbled/CID (still page 1 unless page=N). render=true forces vision. ViewScreen no approval - look only, or save=true/path= (report exact path). Trust vision over garbled PDF text. Do not spam captures or multi-page ReadPdf loops.
 "@
 	system = @"
-SYSTEM: inventory via GetSystemInfo, GetProcessList/Tree, GetMemoryInfo, GetNetworkInfo, GetNetConnections, GetDiskSpace/Health, GetServiceStatus, ControlService (prompt), GetPowerInfo, GetStartupItems, GetInstalledSoftware, GetDriverInfo, GetWindowsUpdateStatus, GetScheduledTasks, GetBSODInfo, GetEventLogs, GetSystemUptime. Prefer these over ad-hoc shell.
+SYSTEM: inventory via GetSystemInfo, GetProcessList/Tree, GetMemoryInfo, GetNetworkInfo, GetLocalShares (this PC shares + who has access), GetMappedDrives (letter->UNC maps), ScanNetwork, ProbeShares, GetNetConnections, GetDiskSpace/Health, GetServiceStatus, ControlService (prompt), GetPowerInfo, GetStartupItems, GetInstalledSoftware, GetDriverInfo, GetWindowsUpdateStatus, GetScheduledTasks, GetBSODInfo, GetEventLogs, GetSystemUptime.
+LAN / SHARES — use tools, not shell:
+- Find/locate a share on the network → call ProbeShares immediately (after EnableToolGroup system if needed). NEVER RunCommand for share discovery (net view, Get-SmbShare, New-CimSession, Test-Path \\host\... loops hang or lie).
+- Known IP/hostname → ProbeShares computer=<ip> share_name=<name> [username= password=]. Unknown host → ProbeShares share_name=<name> with hosts omitted (auto search). Multiple known IPs → hosts=[...].
+- ScanNetwork = peer inventory (IP/MAC/hostname/vendor) when useful; not a substitute for ProbeShares when the ask is "find the share".
+- After ProbeShares hits (found_uncs / hosts_with_match) → EnableToolGroup setup if needed → MapNetworkDrive (do not invent mapping via net use in RunCommand unless MapNetworkDrive failed).
+Prefer specialized tools over ad-hoc shell. Never RunCommand Get-ComputerInfo (slow, huge, truncates) - use GetSystemInfo or targeted Get-CimInstance Win32_*.
 "@
 	repair = @"
 REPAIR: RunQuickDiagnostics for a quick bundle. RunRepairTool sfc|dism|chkdsk always prompts. BSOD: GetBSODInfo+GetEventLogs first; list dump names/sizes only - never ReadAllBytes on .dmp.
@@ -5004,7 +5016,10 @@ REPAIR: RunQuickDiagnostics for a quick bundle. RunRepairTool sfc|dism|chkdsk al
 	setup = @"
 SETUP (Windows tune / new-machine settings):
 - AudioVolume / DisplayBrightness / SetWindowsOption / SystemRestore / UninstallSoftware for one-off tweaks (always prompt on mutate).
-- NewMachineSetup: one approval for SETTINGS + SOFTWARE. Settings: restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off. Software from catalog: 7zip, Chrome, Adobe, ADWCleaner, VLC. skip_software=true for settings-only. dry_run=true previews.
+- AddLocalUser (local account; optional admin group). JoinDomain (domain + credentials; optional OU/reboot). LeaveDomain (workgroup leave; ALWAYS verifies a local admin password first via dropdown — if none/can't auth, offers create; refuse create = decline leave to prevent lockout).
+- SHARES: GetLocalShares = list shares on THIS PC + access (who has share/NTFS rights). GetMappedDrives = list letter->UNC maps on THIS PC. CreateShare = publish a folder here. MapNetworkDrive = connect to \\server\share (letter + path; pass username/password when known). Finding a remote share first is ProbeShares (system group), then MapNetworkDrive here - do not RunCommand net use unless the tool fails.
+- AddNetworkPrinter (\\server\share; optional default). CreateShare path= folder + name=: local user share; pass share_password when operator already gave it (no re-prompt); omit only if none given. SMBv1 check/ask if off. Always prompt on mutate.
+- NewMachineSetup profile=residential|business: one approval for SETTINGS + profile SOFTWARE. Shared settings (restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off). If the machine is portable, recommend re-enabling encryption after setup (especially business). Software: both 7zip/Chrome/Adobe/ADWCleaner; residential +VLC; business +GoToAssist + Avast portal. skip_software=true for settings-only. dry_run=true previews.
 "@
 	installers = @"
 INSTALLERS (silent download+install, temp files cleaned after each package):
@@ -5070,7 +5085,7 @@ function Get-MBSystemPrompt {
 
 	[void]$parts.Add(("ON: {0}." -f (($onList | ForEach-Object { $_ }) -join ', ')))
 	if ($offBits.Count -gt 0) {
-		[void]$parts.Add(("OFF - EnableToolGroup group=<name> then use the tool (silent): {0}." -f ($offBits -join '; ')))
+		[void]$parts.Add(("OFF - EnableToolGroup group=<name or comma-list / groups=[...]> then use tools (silent): {0}." -f ($offBits -join '; ')))
 	}
 	return (($parts | Where-Object { $_ -and "$_".Trim() }) -join "`n")
 }
@@ -5090,7 +5105,7 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "SetWorkingDirectory"; description = "Set agent working directory for relative paths and commands."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "GetEnvironment"; description = "Selected environment variables and PATH summary."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Optional single variable name" } } } } },
 	@{ type = "function"; function = @{ name = "SetEnvironment"; description = "Set an environment variable. Process scope is immediate (no prompt). User/Machine scopes ALWAYS prompt. Use target=Process|User|Machine."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; value = @{ type = "string" }; target = @{ type = "string"; description = "Process (default) | User | Machine" } }; required = @("name","value") } } },
-	@{ type = "function"; function = @{ name = "GetSystemInfo"; description = "Basic system information as JSON."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetSystemInfo"; description = "Basic system information as JSON (OS/CPU/RAM/IPs). Prefer over Get-ComputerInfo or broad inventory shells."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetProcessList"; description = "Top processes by CPU as JSON."; parameters = @{ type = "object"; properties = @{ limit = @{ type = "integer" } } } } },
 	@{ type = "function"; function = @{ name = "GetProcessTree"; description = "Process parent/child tree (pid, ppid, name, depth). Optional root_pid to start from one process."; parameters = @{ type = "object"; properties = @{ root_pid = @{ type = "integer"; description = "Start from this PID (0 = all roots)" }; max_depth = @{ type = "integer"; description = "Max tree depth (default 6)" }; max_nodes = @{ type = "integer"; description = "Cap nodes returned (default 200)" } } } } },
 	@{ type = "function"; function = @{ name = "GetNetConnections"; description = "TCP connections/listeners (local/remote address:port, state, pid, process). Like netstat."; parameters = @{ type = "object"; properties = @{ state = @{ type = "string"; description = "Filter e.g. Listen, Established" }; port = @{ type = "integer"; description = "Filter by local or remote port" }; max = @{ type = "integer"; description = "Max rows (default 100)" } } } } },
@@ -5108,7 +5123,10 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetMemoryInfo"; description = "RAM usage + top consumers."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetNetworkInfo"; description = "Adapters + connectivity test."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "GetWindowsUpdateStatus"; description = "Pending Windows updates (needs PSWindowsUpdate)."; parameters = @{ type = "object"; properties = @{} } } },
+@{ type = "function"; function = @{ name = "GetLocalShares"; description = "List SMB shares published on THIS PC (not remote discovery). Read-only. Returns share name, path, and who has access: share_access / access_summary (share ACL via Get-SmbShareAccess) plus optional ntfs_access on the folder. Special shares (C$, ADMIN$, IPC$) omitted unless include_special=true. include_ntfs=false for share ACL only. For remote shares use ProbeShares; to create use CreateShare."; parameters = @{ type = "object"; properties = @{ include_special = @{ type = "boolean"; description = "Include admin/special shares ending in $ (default false)" }; include_ntfs = @{ type = "boolean"; description = "Include NTFS ACL on share path (default true)" }; max = @{ type = "integer"; description = "Max shares (default 80)" } } } } },
+@{ type = "function"; function = @{ name = "GetMappedDrives"; description = "List network drive mappings on THIS PC (letter -> UNC, status). Read-only. Combines Get-SmbMapping, PSDrive, net use. include_disconnected=false to hide Unavailable. Not for finding remote shares (ProbeShares) or mapping (MapNetworkDrive)."; parameters = @{ type = "object"; properties = @{ include_disconnected = @{ type = "boolean"; description = "Include Unavailable/Disconnected maps (default true)" } } } } },
+	@{ type = "function"; function = @{ name = "ScanNetwork"; description = "Scan the local LAN for machines and identify them (IP, MAC, hostname, MAC vendor). Harness-native (illsk1lls/IPScanner, no GUI). Discovery: active=true (default) uses fast flood-ping — Test-Connection -Count 1 -AsJob for the whole subnet at once then Wait-Job (same speed path as IPScanner). Then ARP/neighbors + SendARP MAC discovery (required for vendor OUI), reverse DNS, macvendorlookup. active=false = ARP only (quieter). Default auto primary private /24. Returns sorted hosts."; parameters = @{ type = "object"; properties = @{ subnet = @{ type = "string"; description = "Optional CIDR or prefix e.g. 192.168.1.0/24 or 192.168.1. (default auto)" }; active = @{ type = "boolean"; description = "Flood-ping subnet then ARP/MAC resolve (default true). false = neighbors only" }; resolve_mac = @{ type = "boolean"; description = "SendARP MAC discovery for IPs missing MAC (default true; required for vendors)" }; resolve_hostnames = @{ type = "boolean"; description = "Reverse DNS (default true)" }; resolve_vendors = @{ type = "boolean"; description = "MAC OUI vendor lookup (default true; needs internet + MAC)" }; timeout_ms = @{ type = "integer"; description = "Wait-Job timeout budget ms for flood (default 4000 effective floor)" }; max_hosts = @{ type = "integer"; description = "Max addresses to flood-ping (default 254, max 1022)" } }; required = @() } } },
+@{ type = "function"; function = @{ name = "ProbeShares"; description = "REQUIRED tool when the user asks to find/locate/discover a network share (or which PC has a named share). Do not use RunCommand. TARGETED: computer=IP or hosts=['IP'] only those machines. SEARCH: omit hosts = auto LAN flood then probe. Then TCP 445/139 + timed net use guess (share_name=temp or common names). Optional username/password; access-denied still means share exists. Returns found_uncs/hosts_with_match — next call MapNetworkDrive (setup group). Not for creating shares (use CreateShare)."; parameters = @{ type = "object"; properties = @{ hosts = @{ type = "array"; items = @{ type = "string" }; description = "Known host IPs (targeted). Omit for auto LAN search." }; computer = @{ type = "string"; description = "Single known host (targeted)" }; share_name = @{ type = "string"; description = "Share name to try first e.g. temp" }; share_names = @{ type = "array"; items = @{ type = "string" }; description = "Extra share names to try" }; username = @{ type = "string"; description = "Optional HOST\\share for probe" }; password = @{ type = "string"; description = "Optional password for probe" }; port_timeout_ms = @{ type = "integer"; description = "TCP timeout ms (default 300)" }; probe_timeout_sec = @{ type = "integer"; description = "net use timeout sec per guess (default 3)" }; stop_on_first_match = @{ type = "boolean"; description = "Stop after first hit (default false)" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetSystemUptime"; description = "Uptime and last boot."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle: BSOD, events, disk health/space, memory."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "RunRepairTool"; description = "sfc, dism, or chkdsk. ALWAYS prompts for approval."; parameters = @{ type = "object"; properties = @{ tool = @{ type = "string"; enum = @("sfc","dism","chkdsk") }; driveLetter = @{ type = "string" }; arguments = @{ type = "string" } }; required = @("tool") } } },
@@ -5142,10 +5160,15 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "ListWindowsOptions"; description = "List SetWindowsOption catalog keys, allowed values, and short descriptions (read-only)."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "SystemRestore"; description = "System Restore: action=status|enable|disable|create|list. enable/create/disable ALWAYS prompt. create optional description=."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "status|enable|disable|create|list" }; description = @{ type = "string"; description = "Restore point description when action=create" }; drive = @{ type = "string"; description = "Drive letter (default C:)" } }; required = @("action") } } },
 	@{ type = "function"; function = @{ name = "UninstallSoftware"; description = "Uninstall an installed program by display name match (Uninstall registry). Prefer exact-ish name from GetInstalledSoftware first. ALWAYS prompts. No silent force beyond QuietUninstall/msiexec when available."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Display name substring to match" }; product_code = @{ type = "string"; description = "Optional MSI product code {GUID}" } }; required = @("name") } } },
-	@{ type = "function"; function = @{ name = "NewMachineSetup"; description = "Full new-machine setup. ALWAYS prompts once listing SETTINGS + SOFTWARE. Settings: restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off. Software from catalog: 7zip, Chrome, Adobe, ADWCleaner, VLC. ADWCleaner will run a scan. skip_software=true for settings only. dry_run=true previews."; parameters = @{ type = "object"; properties = @{ dry_run = @{ type = "boolean" }; timezone = @{ type = "string" }; skip_restore_point = @{ type = "boolean" }; skip_software = @{ type = "boolean" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "AddLocalUser"; description = "Create a local Windows user. ALWAYS prompts. Optional full_name, description, admin=true (Administrators group). Password never logged in full."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; password = @{ type = "string" }; full_name = @{ type = "string" }; description = @{ type = "string" }; admin = @{ type = "boolean"; description = "Add to local Administrators (default false)" } }; required = @("username","password") } } },
+	@{ type = "function"; function = @{ name = "JoinDomain"; description = "Join this PC to an Active Directory domain. ALWAYS prompts. Requires domain + domain join credentials. Optional ou= distinguished name, new_name= rename before join, reboot=true to restart after success."; parameters = @{ type = "object"; properties = @{ domain = @{ type = "string"; description = "Domain FQDN e.g. corp.example.com" }; username = @{ type = "string"; description = "Domain account authorized to join (DOMAIN\\user or user@domain)" }; password = @{ type = "string" }; ou = @{ type = "string"; description = "Optional target OU DN" }; new_name = @{ type = "string"; description = "Optional new computer name before join" }; reboot = @{ type = "boolean"; description = "Restart after successful join (default false)" } }; required = @("domain","username","password") } } },
+	@{ type = "function"; function = @{ name = "LeaveDomain"; description = "Leave the Active Directory domain (join workgroup). ALWAYS prompts. Lockout-safe: operator must verify a local admin password (dropdown of local admins) before disjoin. If no local admin or auth fails, offers to create one; if create is refused, LeaveDomain is blocked. Optional local_username/local_password skip UI only when valid. workgroup= default WORKGROUP; reboot=true optional."; parameters = @{ type = "object"; properties = @{ workgroup = @{ type = "string"; description = "Target workgroup name (default WORKGROUP)" }; reboot = @{ type = "boolean"; description = "Restart after successful leave (default false)" }; local_username = @{ type = "string"; description = "Optional local admin to verify (still must pass password check)" }; local_password = @{ type = "string"; description = "Optional local admin password" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional — if omitted or busy, auto-picks free letter D-Z (RescueMaker-style: skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. password= as given. Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M — omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
+@{ type = "function"; function = @{ name = "AddNetworkPrinter"; description = "Connect a network/shared printer (\\\\server\\printer). ALWAYS prompts. Optional name= friendly name, set_default=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Printer share UNC \\\\server\\printer" }; name = @{ type = "string"; description = "Optional local display name" }; set_default = @{ type = "boolean"; description = "Set as default printer (default false)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "CreateShare"; description = "Share any local folder over SMB (existing path OK; create only if missing and ensure_folder=true). ALWAYS approval once. Fixed local user share (non-admin). IMPORTANT: if the operator already stated a password, pass it as share_password and do not make them type it again; only omit share_password when no password was given, then the UI prompts once (cancel = abort). Checks SMBv1: if off, asks whether older devices need it and enables only if Yes. Password-protected sharing ON. ACL: Everyone Full + explicit Full for user share. Enables File/Printer Sharing + discovery + LanmanServer. Returns UNC and how-to. path= folder; name= share name."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Any local folder to share (existing or to create)" }; name = @{ type = "string"; description = "Share name (UNC tail)" }; share_password = @{ type = "string"; description = "Password for local user share. REQUIRED in the call when the operator already provided one; omit only if none was given (then operator is prompted)." }; description = @{ type = "string"; description = "Optional share comment" }; everyone_full = @{ type = "boolean"; description = "Grant Everyone Full on share+NTFS (default true)" }; ensure_network = @{ type = "boolean"; description = "Enable File and Printer Sharing (default true)" }; ensure_discovery = @{ type = "boolean"; description = "Enable Network Discovery (default true)" }; ensure_folder = @{ type = "boolean"; description = "Create path if missing (default true)" }; force = @{ type = "boolean"; description = "Replace existing share of same name (default false)" } }; required = @("path","name") } } },
 	@{ type = "function"; function = @{ name = "ListInstallers"; description = "List silent installer catalog (id, name, notes). Read-only."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "InstallPackage"; description = "Silent download+install from the installers catalog. package=id or packages=[ids]. Follows redirects (dynamic URLs). ALWAYS prompts. Temp downloads cleaned after each package. Ids: 7zip, chrome, adobe_reader, adwcleaner (will run a scan), vlc."; parameters = @{ type = "object"; properties = @{ package = @{ type = "string"; description = "Single package id" }; packages = @{ type = "array"; items = @{ type = "string" }; description = "Multiple package ids" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently unlock tools. group= vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full (aliases: tune/newmachine->setup, install/chrome/vlc->installers, http->web, ...). Then call the real tool. Never announce."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string"; description = "Group name or alias from MAP" } }; required = @("group") } } },
+	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently unlock one or more tool groups in a single call. Prefer multi when the task needs several: group=setup,system or groups=[setup,system]. Names: vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full (aliases: tune/newmachine->setup, install/chrome/vlc->installers, http->web, ...). Then call the real tools. Never announce."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string"; description = "One group, or comma/space-separated list e.g. setup,system,files" }; groups = @{ type = "array"; items = @{ type = "string" }; description = "Multiple groups (preferred when >1); same names as group=" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "ListToolGroups"; description = "Dump group/tool catalog. Prefer EnableToolGroup using the MAP in the system prompt - usually no need to list first."; parameters = @{ type = "object"; properties = @{} } } }
 )
 
@@ -5160,7 +5183,7 @@ $script:MBToolCatalog = [ordered]@{
 		'ReadImage','ReadPdf','ViewScreen'
 	)
 	system = @(
-		'GetSystemInfo','GetProcessList','GetProcessTree','GetMemoryInfo','GetNetworkInfo','GetNetConnections',
+		'GetSystemInfo','GetProcessList','GetProcessTree','GetMemoryInfo','GetNetworkInfo','GetLocalShares','GetMappedDrives','ScanNetwork','ProbeShares','GetNetConnections',
 		'GetDiskSpace','GetDiskHealth','GetBSODInfo','GetEventLogs','GetSystemUptime',
 		'GetServiceStatus','ControlService','GetPowerInfo','GetStartupItems',
 		'GetInstalledSoftware','GetDriverInfo','GetWindowsUpdateStatus','GetScheduledTasks'
@@ -5168,7 +5191,9 @@ $script:MBToolCatalog = [ordered]@{
 	repair    = @('RunQuickDiagnostics','RunRepairTool')
 	setup     = @(
 		'AudioVolume','DisplayBrightness','SetWindowsOption','ListWindowsOptions',
-		'SystemRestore','UninstallSoftware','NewMachineSetup'
+		'SystemRestore','UninstallSoftware',
+		'AddLocalUser','JoinDomain','LeaveDomain','MapNetworkDrive','AddNetworkPrinter','CreateShare',
+		'NewMachineSetup'
 	)
 	installers = @(
 		'ListInstallers','InstallPackage'
@@ -5193,7 +5218,7 @@ $script:MBToolGroupMeta = [ordered]@{
 	}
 	system = @{
 		Label       = 'System'
-		Description = 'System info, process tree, ports, services'
+		Description = 'System info, process tree, ports, services, local shares/maps, ScanNetwork, ProbeShares'
 	}
 	repair = @{
 		Label       = 'Repair'
@@ -5201,7 +5226,7 @@ $script:MBToolGroupMeta = [ordered]@{
 	}
 	setup = @{
 		Label       = 'Setup / Tune'
-		Description = 'Volume, brightness, Windows options, restore, uninstall, NewMachineSetup'
+		Description = 'Volume, brightness, Windows options, restore, uninstall, local user, domain join/leave, map drive, network printer, create share, NewMachineSetup'
 	}
 	installers = @{
 		Label       = 'Installers'
@@ -5363,12 +5388,19 @@ function Resolve-MBToolGroupName {
 		'service' = 'system'; 'services' = 'system'; 'disk' = 'system'; 'network' = 'system'
 		'port' = 'system'; 'ports' = 'system'; 'bsod' = 'system'; 'event' = 'system'
 		'events' = 'system'; 'software' = 'system'; 'driver' = 'system'; 'uptime' = 'system'
+		'lan' = 'system'; 'scannetwork' = 'system'; 'ipscan' = 'system'; 'arpscan' = 'system'
+		'probeshares' = 'system'; 'findshares' = 'system'; 'smbscan' = 'system'
+		'findshare' = 'system'; 'find_share' = 'system'; 'locateshare' = 'system'
 		'fix' = 'repair'; 'diagnostics' = 'repair'; 'diagnostic' = 'repair'
 		'dism' = 'repair'; 'sfc' = 'repair'; 'chkdsk' = 'repair'
 		'tune' = 'setup'; 'tuning' = 'setup'; 'newmachine' = 'setup'; 'newpc' = 'setup'
 		'desktop' = 'setup'; 'brightness' = 'setup'; 'volume' = 'setup'; 'audio' = 'setup'
 		'power' = 'setup'; 'uac' = 'setup'; 'restore' = 'setup'; 'uninstall' = 'setup'
 		'boot' = 'setup'; 'f8' = 'setup'; 'explorer' = 'setup'
+		'domain' = 'setup'; 'joindomain' = 'setup'; 'leavedomain' = 'setup'; 'disjoin' = 'setup'; 'unjoin' = 'setup'
+		'adduser' = 'setup'; 'localuser' = 'setup'
+		'mapdrive' = 'setup'; 'netdrive' = 'setup'; 'printer' = 'setup'; 'netprinter' = 'setup'
+		'share' = 'setup'; 'createshare' = 'setup'; 'smb' = 'setup'; 'netshare' = 'setup'
 		'install' = 'installers'; 'installer' = 'installers'; 'apps' = 'installers'
 		'chrome' = 'installers'; 'vlc' = 'installers'; '7zip' = 'installers'; 'adobe' = 'installers'
 		'lab' = 'sandbox'; 'sandboxes' = 'sandbox'
@@ -5418,10 +5450,26 @@ function Resolve-MBToolName {
 		'process' = 'GetProcessList'; 'processes' = 'GetProcessList'; 'ps' = 'GetProcessList'
 		'service' = 'GetServiceStatus'; 'services' = 'GetServiceStatus'
 		'netstat' = 'GetNetConnections'; 'ports' = 'GetNetConnections'
+		'scan_network' = 'ScanNetwork'; 'lan_scan' = 'ScanNetwork'; 'ip_scan' = 'ScanNetwork'
+		'arp_scan' = 'ScanNetwork'; 'network_scan' = 'ScanNetwork'
+		'probe_shares' = 'ProbeShares'; 'find_shares' = 'ProbeShares'
+		'smb_probe' = 'ProbeShares'; 'find_share' = 'ProbeShares'
+		'list_shares' = 'GetLocalShares'; 'local_shares' = 'GetLocalShares'; 'get_local_shares' = 'GetLocalShares'
+		'smb_shares' = 'GetLocalShares'; 'who_has_share_access' = 'GetLocalShares'
+		'mapped_drives' = 'GetMappedDrives'; 'map_list' = 'GetMappedDrives'; 'net_use' = 'GetMappedDrives'
+		'list_maps' = 'GetMappedDrives'; 'get_mapped_drives' = 'GetMappedDrives'
 		'enable_tools' = 'EnableToolGroup'; 'enable_group' = 'EnableToolGroup'
 		'tools' = 'ListToolGroups'; 'list_tools' = 'ListToolGroups'
 		'volume' = 'AudioVolume'; 'mute' = 'AudioVolume'; 'brightness' = 'DisplayBrightness'
 		'uninstall' = 'UninstallSoftware'; 'setup_machine' = 'NewMachineSetup'; 'new_machine' = 'NewMachineSetup'
+		'add_user' = 'AddLocalUser'; 'local_user' = 'AddLocalUser'; 'create_user' = 'AddLocalUser'
+		'join_domain' = 'JoinDomain'; 'domain_join' = 'JoinDomain'
+		'leave_domain' = 'LeaveDomain'; 'disjoin' = 'LeaveDomain'; 'disjoin_domain' = 'LeaveDomain'
+		'unjoin' = 'LeaveDomain'; 'unjoin_domain' = 'LeaveDomain'; 'remove_domain' = 'LeaveDomain'
+		'map_drive' = 'MapNetworkDrive'; 'map_network_drive' = 'MapNetworkDrive'
+		'add_printer' = 'AddNetworkPrinter'; 'network_printer' = 'AddNetworkPrinter'
+		'create_share' = 'CreateShare'; 'make_share' = 'CreateShare'; 'network_share' = 'CreateShare'
+		'smb_share' = 'CreateShare'; 'share_folder' = 'CreateShare'
 		'system_restore' = 'SystemRestore'; 'restore_point' = 'SystemRestore'
 		'list_installers' = 'ListInstallers'; 'install_package' = 'InstallPackage'; 'install_app' = 'InstallPackage'
 	}
@@ -5510,30 +5558,112 @@ function Get-MBActiveTools {
 	return $active
 }
 
-function Enable-MBToolGroup {
-	param([string]$Group)
-	if ([string]::IsNullOrWhiteSpace($Group)) {
-		$map = ($script:MBGroupQuickMap.Keys | ForEach-Object { "$_=$($script:MBGroupQuickMap[$_])" }) -join '; '
-		return "ERROR: group required. Use: vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full. MAP: $map"
-	}
-	$resolved = Resolve-MBToolGroupName -Group $Group
-	if (-not $resolved) {
-		$asTool = Resolve-MBToolName -Name $Group
-		if ($asTool) {
-			$tg = Get-MBToolGroupForName -Name $asTool
-			if ($tg -and $tg -ne 'core') {
-				$resolved = $tg
-			} elseif ($tg -eq 'core') {
-				return "OK: '$Group' maps to core tool $asTool (already available). Call $asTool directly - do not narrate."
+function Get-MBEnableToolGroupTokens {
+	# Shared token split for EnableToolGroup args (group CSV + groups array).
+	param(
+		[string]$Group = '',
+		[object]$groups = $null
+	)
+	$rawTokens = New-Object System.Collections.ArrayList
+	if ($null -ne $groups) {
+		if ($groups -is [System.Collections.IEnumerable] -and -not ($groups -is [string])) {
+			foreach ($item in @($groups)) {
+				$s = [string]$item
+				if (-not [string]::IsNullOrWhiteSpace($s)) { [void]$rawTokens.Add($s.Trim()) }
 			}
+		} else {
+			$s = [string]$groups
+			if (-not [string]::IsNullOrWhiteSpace($s)) { [void]$rawTokens.Add($s.Trim()) }
 		}
 	}
-	if (-not $resolved) {
-		$known = @($script:MBToolCatalog.Keys) -join ', '
-		return "ERROR: Unknown group '$Group'. Known: $known, full. Or pass a tool name (e.g. ReadPdf -> vision)."
+	if (-not [string]::IsNullOrWhiteSpace($Group)) {
+		[void]$rawTokens.Add(([string]$Group).Trim())
 	}
-	$g = $resolved
-	if ($g -in @('all', 'full')) {
+	$tokens = New-Object System.Collections.ArrayList
+	$seen = @{}
+	foreach ($tok in @($rawTokens)) {
+		foreach ($part in ([string]$tok -split '[,;|\s]+')) {
+			$p = $part.Trim()
+			if ([string]::IsNullOrWhiteSpace($p)) { continue }
+			$key = $p.ToLowerInvariant()
+			if ($seen.ContainsKey($key)) { continue }
+			$seen[$key] = $true
+			[void]$tokens.Add($p)
+		}
+	}
+	return @($tokens)
+}
+
+function Get-MBToolConsoleLabel {
+	# Console-only display name (model still calls EnableToolGroup).
+	param(
+		[string]$Name,
+		$ArgsObj = $null
+	)
+	if ($Name -ne 'EnableToolGroup') { return $Name }
+	$g = ''
+	$gs = $null
+	if ($ArgsObj) {
+		if (Test-MBHasProp $ArgsObj 'group') { $g = [string](Get-MBProp $ArgsObj 'group') }
+		if (Test-MBHasProp $ArgsObj 'groups') { $gs = (Get-MBProp $ArgsObj 'groups') }
+	}
+	$toks = @(Get-MBEnableToolGroupTokens -Group $g -groups $gs)
+	if ($toks.Count -gt 1) { return 'EnableToolGroups' }
+	return 'EnableToolGroup'
+}
+
+function Enable-MBToolGroup {
+	param(
+		[string]$Group = '',
+		[object]$groups = $null
+	)
+	$tokens = @(Get-MBEnableToolGroupTokens -Group $Group -groups $groups)
+	if ($tokens.Count -eq 0) {
+		$map = ($script:MBGroupQuickMap.Keys | ForEach-Object { "$_=$($script:MBGroupQuickMap[$_])" }) -join '; '
+		return "ERROR: group or groups required. One or many: group=setup,system or groups=[setup,system]. Known: vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full. MAP: $map"
+	}
+
+	# Resolve each token -> group name (or tool-name alias)
+	$resolvedList = New-Object System.Collections.ArrayList
+	$unknown = New-Object System.Collections.ArrayList
+	$coreToolHints = New-Object System.Collections.ArrayList
+	foreach ($tok in @($tokens)) {
+		$resolved = Resolve-MBToolGroupName -Group $tok
+		if (-not $resolved) {
+			$asTool = Resolve-MBToolName -Name $tok
+			if ($asTool) {
+				$tg = Get-MBToolGroupForName -Name $asTool
+				if ($tg -and $tg -ne 'core') {
+					$resolved = $tg
+				} elseif ($tg -eq 'core') {
+					[void]$coreToolHints.Add("$tok->$asTool")
+					continue
+				}
+			}
+		}
+		if (-not $resolved) {
+			[void]$unknown.Add($tok)
+			continue
+		}
+		if (-not ($resolvedList -contains $resolved)) {
+			[void]$resolvedList.Add($resolved)
+		}
+	}
+	if ($resolvedList.Count -eq 0) {
+		if ($coreToolHints.Count -gt 0 -and $unknown.Count -eq 0) {
+			return "OK: $($coreToolHints -join ', ') map to core (already available). Call them directly - do not narrate."
+		}
+		$known = @($script:MBToolCatalog.Keys) -join ', '
+		$bad = if ($unknown.Count -gt 0) { $unknown -join ', ' } else { ($tokens -join ', ') }
+		return "ERROR: Unknown group(s) '$bad'. Known: $known, full. Or pass a tool name (e.g. ReadPdf -> vision)."
+	}
+
+	# full/all wins
+	$wantFull = $false
+	foreach ($g in @($resolvedList)) {
+		if ($g -in @('all', 'full')) { $wantFull = $true; break }
+	}
+	if ($wantFull) {
 		foreach ($name in @('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')) {
 			if (-not ($script:MB.ActiveToolGroups -contains $name)) {
 				[void]$script:MB.ActiveToolGroups.Add($name)
@@ -5543,32 +5673,62 @@ function Enable-MBToolGroup {
 		$nNow = @((Get-MBActiveToolNames)).Count
 		return "OK full ($nNow tools). Continue the task with the needed tools now - do not narrate this enable to the user."
 	}
-	if ($g -eq 'core') {
+
+	# core alone = reset to core only; core mixed with others = ignore reset, enable the others
+	$onlyCore = ($resolvedList.Count -eq 1 -and $resolvedList[0] -eq 'core')
+	if ($onlyCore) {
 		$script:MB.ActiveToolGroups.Clear()
 		[void]$script:MB.ActiveToolGroups.Add('core')
 		Sync-MBPromptAfterToolGroups
 		$nNow = @((Get-MBActiveToolNames)).Count
 		return "OK core only ($nNow tools)."
 	}
-	if (-not $script:MBToolCatalog.Contains($g)) {
-		$known = ($script:MBToolCatalog.Keys -join ', ')
-		return "ERROR: Unknown group '$Group'. Known: $known, full"
-	}
+
 	if (-not ($script:MB.ActiveToolGroups -contains 'core')) {
 		[void]$script:MB.ActiveToolGroups.Add('core')
 	}
-	$already = $script:MB.ActiveToolGroups -contains $g
-	if (-not $already) {
-		[void]$script:MB.ActiveToolGroups.Add($g)
+
+	$enabled = New-Object System.Collections.ArrayList
+	$already = New-Object System.Collections.ArrayList
+	$badKnown = New-Object System.Collections.ArrayList
+	foreach ($g in @($resolvedList)) {
+		if ($g -eq 'core') { continue }
+		if (-not $script:MBToolCatalog.Contains($g)) {
+			[void]$badKnown.Add($g)
+			continue
+		}
+		if ($script:MB.ActiveToolGroups -contains $g) {
+			[void]$already.Add($g)
+		} else {
+			[void]$script:MB.ActiveToolGroups.Add($g)
+			[void]$enabled.Add($g)
+		}
 	}
+	if ($enabled.Count -eq 0 -and $already.Count -eq 0) {
+		$known = ($script:MBToolCatalog.Keys -join ', ')
+		return "ERROR: No valid groups to enable. Unknown: $($badKnown -join ', '). Known: $known, full"
+	}
+
 	Sync-MBPromptAfterToolGroups
-	$toolsIn = @($script:MBToolCatalog[$g])
 	$nNow = @((Get-MBActiveToolNames)).Count
-	$what = if ($script:MBGroupQuickMap -and $script:MBGroupQuickMap.Contains($g)) { [string]$script:MBGroupQuickMap[$g] } else { '' }
-	if ($already) {
-		return "OK group=$g already on ($what). tools=$($toolsIn -join ','). totalSchemas=$nNow. Call the tool you need now - do not narrate."
+	$bits = New-Object System.Collections.ArrayList
+	if ($enabled.Count -gt 0) {
+		$detail = foreach ($g in @($enabled)) {
+			$what = if ($script:MBGroupQuickMap -and $script:MBGroupQuickMap.Contains($g)) { [string]$script:MBGroupQuickMap[$g] } else { '' }
+			if ($what) { "$g ($what)" } else { $g }
+		}
+		[void]$bits.Add(("enabled={0}" -f ($detail -join '; ')))
 	}
-	return "OK enabled group=$g ($what). tools=$($toolsIn -join ','). totalSchemas=$nNow. Call the tool you need NOW in this turn - do not narrate to the user."
+	if ($already.Count -gt 0) {
+		[void]$bits.Add(("already_on={0}" -f ($already -join ',')))
+	}
+	if ($unknown.Count -gt 0) {
+		[void]$bits.Add(("unknown_ignored={0}" -f ($unknown -join ',')))
+	}
+	if ($coreToolHints.Count -gt 0) {
+		[void]$bits.Add(("core_tools={0}" -f ($coreToolHints -join ',')))
+	}
+	return "OK $($bits -join '. '). totalSchemas=$nNow. Call the tool(s) you need NOW in this turn - do not narrate to the user."
 }
 
 function Get-MBToolGroupsStatus {
@@ -5594,7 +5754,7 @@ function Get-MBToolGroupsStatus {
 		activeToolCount = $nActive
 		activeTools   = @((Get-MBActiveToolNames | Sort-Object))
 		groups        = $groups
-		hint          = "EnableToolGroup group=vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full - smallest group needed; prompt playbook updates with the group"
+		hint          = "EnableToolGroup group=setup,system or groups=[setup,system] (multi ok) | vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full - enable all needed in one call"
 	}) -Depth 6
 }
 
@@ -7733,6 +7893,19 @@ function Invoke-RunCommand {
 	$timeoutMs = if ($timeout_sec -gt 0) { $timeout_sec * 1000 } else { $CommandTimeoutSec * 1000 }
 	$wd = $script:MB.WorkingDir
 
+	if ($shell -ne 'cmd' -and [string]$command -match '(?i)\bGet-ComputerInfo\b') {
+		try {
+			$summary = Invoke-GetSystemInfo
+			return (
+				"REDIRECTED: Get-ComputerInfo is slow and returns a huge object (often truncates under tool limits). " +
+				"Use GetSystemInfo tool or Get-CimInstance Win32_ComputerSystem/OperatingSystem/Processor for specifics.`n`n" +
+				[string]$summary
+			)
+		} catch {
+			return "ERROR: Get-ComputerInfo blocked (slow/huge). Call GetSystemInfo instead. ($($_.Exception.Message))"
+		}
+	}
+
 	try {
 		if ($shell -eq "cmd") {
 			$rr = Invoke-MBProcessCapture -FileName "cmd.exe" -Arguments ('/c chcp 65001>nul & ' + $command) -WorkingDir $wd -TimeoutMs $timeoutMs
@@ -9456,6 +9629,1304 @@ function Invoke-GetNetworkInfo {
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
+}
+
+function Get-MBShareAccessEntries {
+	# Who can access a local SMB share (share-level ACL). Prefer Get-SmbShareAccess; fallback net share.
+	param(
+		[string]$ShareName,
+		[string]$SharePath = ''
+	)
+	$entries = New-Object System.Collections.ArrayList
+	$name = ([string]$ShareName).Trim()
+	if ([string]::IsNullOrWhiteSpace($name)) { return @() }
+
+	if (Get-Command Get-SmbShareAccess -ErrorAction SilentlyContinue) {
+		try {
+			foreach ($a in @(Get-SmbShareAccess -Name $name -ErrorAction SilentlyContinue)) {
+				if ($null -eq $a) { continue }
+				[void]$entries.Add([ordered]@{
+					account      = [string]$a.AccountName
+					access_right = [string]$a.AccessRight
+					access_control = [string]$a.AccessControlType
+					scope        = 'share'
+				})
+			}
+		} catch {}
+	}
+
+	if ($entries.Count -eq 0) {
+		# net share Name -> parse "Permission" lines when present
+		try {
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $name) -TimeoutSec 12
+			$blob = (([string]$r.out) + "`n" + ([string]$r.err))
+			foreach ($line in ($blob -split "`r?`n")) {
+				# e.g. "Permission         share, FULL" or "Everyone, READ"
+				if ($line -match '(?i)Permission\s+(.+)$') {
+					$rest = $Matches[1].Trim()
+					if ($rest -match '^([^,]+),\s*(.+)$') {
+						[void]$entries.Add([ordered]@{
+							account        = $Matches[1].Trim()
+							access_right   = $Matches[2].Trim()
+							access_control = 'Allow'
+							scope          = 'share'
+						})
+					}
+				} elseif ($line -match '^\s*([^,]+),\s*(FULL|CHANGE|READ)\s*$') {
+					[void]$entries.Add([ordered]@{
+						account        = $Matches[1].Trim()
+						access_right   = $Matches[2].Trim()
+						access_control = 'Allow'
+						scope          = 'share'
+					})
+				}
+			}
+		} catch {}
+	}
+
+	# Optional NTFS ACL summary on the folder (who has filesystem access too)
+	$ntfs = New-Object System.Collections.ArrayList
+	$p = ([string]$SharePath).Trim()
+	if ($p -and (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue)) {
+		try {
+			$acl = Get-Acl -LiteralPath $p -ErrorAction SilentlyContinue
+			foreach ($ace in @($acl.Access)) {
+				if ($null -eq $ace) { continue }
+				# Cap noise: skip inherited-only flood if many; still include explicit + a sample of inherited
+				[void]$ntfs.Add([ordered]@{
+					account        = [string]$ace.IdentityReference
+					access_right   = [string]$ace.FileSystemRights
+					access_control = [string]$ace.AccessControlType
+					inherited      = [bool]$ace.IsInherited
+					scope          = 'ntfs'
+				})
+			}
+		} catch {}
+	}
+
+	return @{
+		share_access = @($entries)
+		ntfs_access  = @($ntfs)
+	}
+}
+
+function Invoke-GetLocalShares {
+	# List SMB shares on THIS PC + who has share (and NTFS) access. Read-only.
+	param(
+		[object]$include_special = $false,
+		[object]$include_ntfs = $true,
+		[int]$max = 80
+	)
+	$incSpecial = $false
+	if ($include_special -is [bool]) { $incSpecial = $include_special }
+	elseif ([string]$include_special -match '^(?i)1|true|yes|y|on$') { $incSpecial = $true }
+	$incNtfs = $true
+	if ($include_ntfs -is [bool]) { $incNtfs = $include_ntfs }
+	elseif ([string]$include_ntfs -match '^(?i)0|false|no|off$') { $incNtfs = $false }
+	if ($max -lt 1) { $max = 1 }
+	if ($max -gt 200) { $max = 200 }
+
+	$shares = New-Object System.Collections.ArrayList
+	$method = ''
+	try {
+		if (Get-Command Get-SmbShare -ErrorAction SilentlyContinue) {
+			$method = 'Get-SmbShare'
+			$raw = @(Get-SmbShare -ErrorAction Stop)
+			foreach ($s in $raw) {
+				if ($null -eq $s) { continue }
+				$nm = [string]$s.Name
+				$isSpecial = ($nm -match '\$$') -or ($nm -eq 'IPC$') -or ($nm -eq 'ADMIN$')
+				if ($isSpecial -and -not $incSpecial) { continue }
+				$path = ''
+				try { $path = [string]$s.Path } catch {}
+				$acc = @{ share_access = @(); ntfs_access = @() }
+				try {
+					$acc = Get-MBShareAccessEntries -ShareName $nm -SharePath $(if ($incNtfs) { $path } else { '' })
+				} catch {}
+				$row = [ordered]@{
+					name           = $nm
+					path           = $path
+					description    = $(try { [string]$s.Description } catch { '' })
+					share_type     = $(try { [string]$s.ShareType } catch { '' })
+					special        = [bool]$isSpecial
+					caching_mode   = $(try { [string]$s.CachingMode } catch { '' })
+					folder_enum    = $(try { [string]$s.FolderEnumerationMode } catch { '' })
+					encrypt_data   = $(try { [bool]$s.EncryptData } catch { $null })
+					concurrent_user_limit = $(try { [int]$s.ConcurrentUserLimit } catch { $null })
+					current_users  = $(try { [int]$s.CurrentUsers } catch { $null })
+					share_access   = @($acc.share_access)
+					access_summary = @($acc.share_access | ForEach-Object {
+						('{0}={1}' -f $_.account, $_.access_right)
+					})
+				}
+				if ($incNtfs) {
+					# Cap NTFS rows per share to keep payload small
+					$nt = @($acc.ntfs_access)
+					if ($nt.Count -gt 40) {
+						$explicit = @($nt | Where-Object { -not $_.inherited })
+						$inh = @($nt | Where-Object { $_.inherited } | Select-Object -First (40 - [math]::Min(40, $explicit.Count)))
+						$nt = @($explicit) + @($inh)
+						if ($nt.Count -gt 40) { $nt = $nt[0..39] }
+					}
+					$row['ntfs_access'] = $nt
+					$row['ntfs_count'] = @($acc.ntfs_access).Count
+				}
+				[void]$shares.Add($row)
+				if ($shares.Count -ge $max) { break }
+			}
+		}
+	} catch {
+		$method = 'Get-SmbShare-failed'
+	}
+
+	if ($shares.Count -eq 0) {
+		# Fallback: net share
+		try {
+			$method = if ($method) { $method + '+net share' } else { 'net share' }
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share') -TimeoutSec 15
+			$blob = [string]$r.out
+			$lines = @($blob -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '^(Share name|---|\s*$)' -and $_ -notmatch '(?i)The command completed' })
+			foreach ($line in $lines) {
+				# "ShareName   Path   Remark"  - share name is first token (may have spaces rarely)
+				if ($line -match '^\s*(\S+)\s+(\S.*?)(?:\s{2,}|\t)(.*)$' -or $line -match '^\s*(\S+)\s+(\S+)\s*(.*)$') {
+					$nm = $Matches[1].Trim()
+					$path = $Matches[2].Trim()
+					$rem = $(if ($Matches.Count -gt 3) { $Matches[3].Trim() } else { '' })
+					if ($nm -match '^(?i)share$' -and $path -match '(?i)name') { continue }
+					$isSpecial = ($nm -match '\$$')
+					if ($isSpecial -and -not $incSpecial) { continue }
+					$acc = Get-MBShareAccessEntries -ShareName $nm -SharePath $(if ($incNtfs) { $path } else { '' })
+					$row = [ordered]@{
+						name           = $nm
+						path           = $path
+						description    = $rem
+						share_type     = ''
+						special        = [bool]$isSpecial
+						share_access   = @($acc.share_access)
+						access_summary = @($acc.share_access | ForEach-Object {
+							('{0}={1}' -f $_.account, $_.access_right)
+						})
+					}
+					if ($incNtfs) {
+						$nt = @($acc.ntfs_access)
+						if ($nt.Count -gt 40) { $nt = $nt[0..39] }
+						$row['ntfs_access'] = $nt
+						$row['ntfs_count'] = @($acc.ntfs_access).Count
+					}
+					[void]$shares.Add($row)
+					if ($shares.Count -ge $max) { break }
+				}
+			}
+		} catch {}
+	}
+
+	$hostName = $env:COMPUTERNAME
+	$uncHints = @()
+	try {
+		foreach ($s in @($shares)) {
+			if ($s.special) { continue }
+			$uncHints += ('\\{0}\{1}' -f $hostName, $s.name)
+		}
+	} catch {}
+
+	return ConvertTo-MBJson ([ordered]@{
+		ok               = $true
+		host             = $hostName
+		method           = $method
+		include_special  = $incSpecial
+		include_ntfs     = $incNtfs
+		share_count      = $shares.Count
+		shares           = @($shares)
+		unc_hints        = @($uncHints)
+		note             = 'Local SMB shares on THIS PC. share_access / access_summary = who can connect over the network (share ACL). ntfs_access = folder filesystem ACL (when include_ntfs=true). Special shares (C$, ADMIN$, IPC$) hidden unless include_special=true. Create with CreateShare; map remote with MapNetworkDrive; find remote with ProbeShares.'
+	}) -Depth 8
+}
+
+function Invoke-GetMappedDrives {
+	# List network drive mappings on THIS PC (letter -> UNC). Read-only.
+	param(
+		[object]$include_disconnected = $true
+	)
+	$incDisc = $true
+	if ($include_disconnected -is [bool]) { $incDisc = $include_disconnected }
+	elseif ([string]$include_disconnected -match '^(?i)0|false|no|off$') { $incDisc = $false }
+
+	$maps = New-Object System.Collections.ArrayList
+	$seen = @{}
+	$methodParts = New-Object System.Collections.ArrayList
+
+	# 1) Get-SmbMapping
+	if (Get-Command Get-SmbMapping -ErrorAction SilentlyContinue) {
+		try {
+			[void]$methodParts.Add('Get-SmbMapping')
+			foreach ($m in @(Get-SmbMapping -ErrorAction SilentlyContinue)) {
+				if ($null -eq $m) { continue }
+				$let = ([string]$m.LocalPath).Trim().TrimEnd('\').TrimEnd(':')
+				if ($let.Length -gt 1) { $let = $let.Substring(0, 1) }
+				$let = $let.ToUpperInvariant()
+				$unc = [string]$m.RemotePath
+				$status = try { [string]$m.Status } catch { '' }
+				if (-not $incDisc -and $status -match '(?i)Unavailable|Disconnected') { continue }
+				$key = if ($let) { $let } else { $unc.ToLowerInvariant() }
+				if ($seen.ContainsKey($key)) { continue }
+				$seen[$key] = $true
+				[void]$maps.Add([ordered]@{
+					letter      = $(if ($let) { "${let}:" } else { '' })
+					unc         = $unc
+					status      = $status
+					persistent  = $(try { [bool]$m.IsPersistent } catch { $null })
+					user        = ''
+					method      = 'Get-SmbMapping'
+				})
+			}
+		} catch {}
+	}
+
+	# 2) PSDrive FileSystem with DisplayRoot / network
+	try {
+		[void]$methodParts.Add('Get-PSDrive')
+		foreach ($d in @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+			$let = ([string]$d.Name).ToUpperInvariant()
+			if ($let -notmatch '^[A-Z]$') { continue }
+			$root = ''
+			try { $root = [string]$d.DisplayRoot } catch {}
+			if (-not $root) {
+				try {
+					if ($d.Root -match '^\\\\') { $root = [string]$d.Root }
+				} catch {}
+			}
+			if (-not $root -or $root -notmatch '^\\\\') {
+				# DriveInfo network type without DisplayRoot
+				try {
+					$di = New-Object System.IO.DriveInfo ("${let}:")
+					if ($di.DriveType -ne [System.IO.DriveType]::Network) { continue }
+					try { $root = [string]$di.RootDirectory.FullName } catch { $root = "${let}:\" }
+				} catch { continue }
+			}
+			if ($seen.ContainsKey($let)) {
+				# fill unc if missing
+				foreach ($row in $maps) {
+					if ($row.letter -eq "${let}:" -and -not $row.unc) { $row.unc = $root }
+				}
+				continue
+			}
+			$seen[$let] = $true
+			[void]$maps.Add([ordered]@{
+				letter     = "${let}:"
+				unc        = $root
+				status     = 'OK'
+				persistent = $null
+				user       = ''
+				method     = 'Get-PSDrive'
+			})
+		}
+	} catch {}
+
+	# 3) net use (status + user often present)
+	try {
+		[void]$methodParts.Add('net use')
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use') -TimeoutSec 12
+		$blob = [string]$r.out
+		foreach ($line in ($blob -split "`r?`n")) {
+			# OK           Z:        \\server\share   Microsoft Windows Network
+			# Unavailable  Y:        \\server\other   Microsoft Windows Network
+			if ($line -match '(?i)^\s*(OK|Unavailable|Disconnected|Status)\s+([A-Z]):\s+(\\\\\S+)\s*(.*)$') {
+				$st = $Matches[1]
+				$let = $Matches[2].ToUpperInvariant()
+				$unc = $Matches[3]
+				if ($st -match '(?i)Status') { continue }
+				if (-not $incDisc -and $st -match '(?i)Unavailable|Disconnected') { continue }
+				if ($seen.ContainsKey($let)) {
+					foreach ($row in $maps) {
+						if ($row.letter -eq "${let}:") {
+							if (-not $row.status) { $row.status = $st }
+							if (-not $row.unc) { $row.unc = $unc }
+						}
+					}
+					continue
+				}
+				$seen[$let] = $true
+				[void]$maps.Add([ordered]@{
+					letter     = "${let}:"
+					unc        = $unc
+					status     = $st
+					persistent = $null
+					user       = ''
+					method     = 'net use'
+				})
+			}
+		}
+	} catch {}
+
+	# Sort by letter
+	$sorted = @($maps | Sort-Object {
+		$l = [string]$_.letter
+		if ($l -match '^([A-Z]):') { [int][char]$Matches[1] } else { 999 }
+	})
+
+	return ConvertTo-MBJson ([ordered]@{
+		ok          = $true
+		host        = $env:COMPUTERNAME
+		method      = ($methodParts -join '+')
+		map_count   = $sorted.Count
+		mappings    = $sorted
+		note        = 'Network drive letters on THIS PC (not remote share discovery). Map with MapNetworkDrive; list local published shares with GetLocalShares; find remote shares with ProbeShares.'
+	}) -Depth 6
+}
+
+function Ensure-MBMacAddressResolver {
+	# SendARP MAC discovery (iphlpapi) — from IPScanner MacAddressResolver; needed for vendor OUI.
+	if ('MiniBot.Native.MBMacResolver' -as [type]) { return $true }
+	try {
+		Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace MiniBot.Native {
+  public static class MBMacResolver {
+    [DllImport("iphlpapi.dll", ExactSpelling = true)]
+    public static extern int SendARP(uint DestIP, uint SrcIP, byte[] pMacAddr, ref int PhyAddrLen);
+
+    public static string GetMacFromIP(string ipAddress) {
+      if (string.IsNullOrEmpty(ipAddress)) return "";
+      try {
+        System.Net.IPAddress ip = System.Net.IPAddress.Parse(ipAddress);
+        byte[] bytes = ip.GetAddressBytes();
+        if (bytes.Length != 4) return "";
+        uint dest = BitConverter.ToUInt32(bytes, 0);
+        byte[] macAddr = new byte[6];
+        int macAddrLen = macAddr.Length;
+        if (SendARP(dest, 0, macAddr, ref macAddrLen) == 0 && macAddrLen >= 6) {
+          return string.Format("{0:X2}:{1:X2}:{2:X2}:{3:X2}:{4:X2}:{5:X2}",
+            macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5]);
+        }
+        return "";
+      } catch {
+        return "";
+      }
+    }
+  }
+}
+"@ -Language CSharp -ErrorAction Stop
+		return $true
+	} catch {
+		return $false
+	}
+}
+
+function Get-MBMacFromIp {
+	param([string]$Ip)
+	$ip = ([string]$Ip).Trim()
+	if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { return '' }
+	if (Ensure-MBMacAddressResolver) {
+		try {
+			$m = [MiniBot.Native.MBMacResolver]::GetMacFromIP($ip)
+			if ($m -and $m -match '^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$') {
+				if ($m -eq '00:00:00:00:00:00') { return '' }
+				return $m.ToUpperInvariant()
+			}
+		} catch {}
+	}
+	return ''
+}
+
+function Get-MBPrimaryLanContext {
+	# Local IPv4, prefix, gateway, MAC, interface index for neighbor filtering.
+	$ctx = [ordered]@{
+		ok            = $false
+		ip            = ''
+		prefix_len    = 24
+		prefix        = ''
+		gateway       = ''
+		mac           = ''
+		interface_index = $null
+		hostname      = [System.Net.Dns]::GetHostName()
+	}
+	try {
+		$cfg = Get-NetIPConfiguration -ErrorAction SilentlyContinue |
+			Where-Object { $_.IPv4Address -and $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
+			Select-Object -First 1
+		if (-not $cfg) {
+			$cfg = Get-NetIPConfiguration -ErrorAction SilentlyContinue |
+				Where-Object { $_.IPv4Address } |
+				Select-Object -First 1
+		}
+		if ($cfg) {
+			$addr = @($cfg.IPv4Address)[0]
+			$ctx.ip = [string]$addr.IPAddress
+			try { $ctx.prefix_len = [int]$addr.PrefixLength } catch { $ctx.prefix_len = 24 }
+			if ($ctx.prefix_len -lt 8 -or $ctx.prefix_len -gt 30) { $ctx.prefix_len = 24 }
+			$parts = $ctx.ip -split '\.'
+			if ($parts.Count -eq 4) {
+				# /24-style scan prefix (IPScanner style gatewayPrefix)
+				$ctx.prefix = '{0}.{1}.{2}.' -f $parts[0], $parts[1], $parts[2]
+			}
+			if ($cfg.IPv4DefaultGateway) {
+				$ctx.gateway = [string]@($cfg.IPv4DefaultGateway.NextHop)[0]
+			}
+			try {
+				$ctx.interface_index = [int]$cfg.InterfaceIndex
+			} catch {}
+			try {
+				$ad = Get-NetAdapter -InterfaceIndex $ctx.interface_index -ErrorAction SilentlyContinue
+				if ($ad -and $ad.MacAddress) {
+					$ctx.mac = ([string]$ad.MacAddress).Replace('-', ':').ToUpperInvariant()
+				}
+			} catch {}
+			if ($ctx.ip) { $ctx.ok = $true }
+		}
+	} catch {}
+	if (-not $ctx.ok) {
+		try {
+			$w = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction Stop |
+				Where-Object { $_.IPAddress } | Select-Object -First 1
+			if ($w) {
+				foreach ($a in @($w.IPAddress)) {
+					if ($a -match '^\d+\.\d+\.\d+\.\d+$' -and $a -notlike '127.*') {
+						$ctx.ip = $a
+						$p = $a -split '\.'
+						$ctx.prefix = '{0}.{1}.{2}.' -f $p[0], $p[1], $p[2]
+						$ctx.ok = $true
+						break
+					}
+				}
+				if ($w.DefaultIPGateway) { $ctx.gateway = [string]@($w.DefaultIPGateway)[0] }
+				if ($w.MACAddress) { $ctx.mac = ([string]$w.MACAddress).Replace('-', ':').ToUpperInvariant() }
+			}
+		} catch {}
+	}
+	return $ctx
+}
+
+function Get-MBLocalHostIdentitySet {
+	# Keys (lowercase) that mean "this machine" for share scan / probe filters.
+	# Covers primary LAN IP, all adapters, DNS names, localhost — not only $ctx.ip.
+	$set = @{}
+	$add = {
+		param([string]$k)
+		if ([string]::IsNullOrWhiteSpace($k)) { return }
+		$k = ([string]$k).Trim().TrimStart('\').TrimEnd('\')
+		if ($k -match '^\[(.+)\]$') { $k = $Matches[1] }
+		# Zone id on IPv6 link-local: fe80::1%12
+		if ($k -match '^([^%]+)%') { $k = $Matches[1] }
+		$set[$k.ToLowerInvariant()] = $true
+	}
+	& $add 'localhost'
+	& $add '127.0.0.1'
+	& $add '::1'
+	& $add '.'
+	try { & $add $env:COMPUTERNAME } catch {}
+	try { & $add ([System.Net.Dns]::GetHostName()) } catch {}
+	try {
+		$dn = [System.Net.Dns]::GetHostEntry([System.Net.Dns]::GetHostName())
+		& $add $dn.HostName
+		foreach ($a in @($dn.AddressList)) { & $add $a.ToString() }
+	} catch {}
+	try {
+		foreach ($a in @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()))) {
+			& $add $a.ToString()
+		}
+	} catch {}
+	try {
+		Get-NetIPAddress -ErrorAction SilentlyContinue | ForEach-Object {
+			if ($_.IPAddress) { & $add ([string]$_.IPAddress) }
+		}
+	} catch {}
+	try {
+		Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction SilentlyContinue |
+			ForEach-Object {
+				foreach ($a in @($_.IPAddress)) { & $add ([string]$a) }
+			}
+	} catch {}
+	try {
+		$ctx = Get-MBPrimaryLanContext
+		if ($ctx.ip) { & $add $ctx.ip }
+		if ($ctx.hostname) { & $add $ctx.hostname }
+	} catch {}
+	return $set
+}
+
+function Test-MBIsLocalHostTarget {
+	# True if $HostName is this PC (IP, hostname, localhost, or \\self\share head).
+	param(
+		[string]$HostName,
+		[hashtable]$IdentitySet = $null
+	)
+	$h = ([string]$HostName).Trim()
+	if ([string]::IsNullOrWhiteSpace($h)) { return $false }
+	if ($h -match '^\\\\([^\\]+)') { $h = $Matches[1] }
+	$h = $h.Trim().TrimStart('\').TrimEnd('\')
+	if ($h -match '^\[(.+)\]$') { $h = $Matches[1] }
+	if ($h -match '^([^%]+)%') { $h = $Matches[1] }
+	$set = $IdentitySet
+	if ($null -eq $set -or $set.Count -eq 0) { $set = Get-MBLocalHostIdentitySet }
+	$key = $h.ToLowerInvariant()
+	if ($set.ContainsKey($key)) { return $true }
+	if ($key.EndsWith('.')) {
+		$k2 = $key.TrimEnd('.')
+		if ($set.ContainsKey($k2)) { return $true }
+	}
+	# COMPUTERNAME without domain vs FQDN: match short name
+	if ($key -match '^([^.]+)\.') {
+		$short = $Matches[1]
+		if ($set.ContainsKey($short)) { return $true }
+	}
+	return $false
+}
+
+function Get-MBScanIpRange {
+	param(
+		[string]$Subnet = '',
+		[string]$DefaultPrefix = '',
+		[int]$MaxHosts = 254
+	)
+	$ips = New-Object System.Collections.ArrayList
+	$sub = ([string]$Subnet).Trim()
+	$prefix = ([string]$DefaultPrefix).Trim()
+	if ($sub -match '^(?<a>\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})?$') {
+		# 192.168.1. or 192.168.1.0
+		$prefix = $Matches['a'] + '.'
+	} elseif ($sub -match '^(?<base>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(?<pl>\d{1,2})$') {
+		$baseIp = $Matches['base']
+		$pl = [int]$Matches['pl']
+		if ($pl -ge 24 -and $pl -le 30) {
+			$p = $baseIp -split '\.'
+			$prefix = '{0}.{1}.{2}.' -f $p[0], $p[1], $p[2]
+			$hostBits = 32 - $pl
+			$count = [math]::Pow(2, $hostBits) - 2
+			if ($count -gt $MaxHosts) { $count = $MaxHosts }
+			$start = 1
+			for ($i = $start; $i -le $count; $i++) {
+				[void]$ips.Add(('{0}{1}' -f $prefix, $i))
+			}
+			return @($ips)
+		}
+		# non-/24: fall through to /24 of base
+		$p = $baseIp -split '\.'
+		$prefix = '{0}.{1}.{2}.' -f $p[0], $p[1], $p[2]
+	} elseif ($sub -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+		$p = $sub -split '\.'
+		$prefix = '{0}.{1}.{2}.' -f $p[0], $p[1], $p[2]
+	}
+	if ([string]::IsNullOrWhiteSpace($prefix) -or $prefix -notmatch '^\d{1,3}\.\d{1,3}\.\d{1,3}\.$') {
+		return @()
+	}
+	$n = [math]::Min(254, [math]::Max(1, $MaxHosts))
+	for ($i = 1; $i -le $n; $i++) {
+		[void]$ips.Add(('{0}{1}' -f $prefix, $i))
+	}
+	return @($ips)
+}
+
+function Get-MBArpNeighborMap {
+	param($InterfaceIndex = $null)
+	$map = @{}
+	try {
+		$nb = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+			Where-Object {
+				($_.State -eq 'Reachable' -or $_.State -eq 'Stale' -or $_.State -eq 'Permanent' -or $_.State -eq 'Delay') -and
+				$_.IPAddress -match '^\d+\.\d+\.\d+\.\d+$' -and
+				$_.IPAddress -notlike '127.*' -and
+				$_.LinkLayerAddress -and
+				$_.LinkLayerAddress -ne '00-00-00-00-00-00'
+			}
+		if ($null -ne $InterfaceIndex) {
+			$nb = $nb | Where-Object { $_.InterfaceIndex -eq $InterfaceIndex }
+		}
+		foreach ($n in @($nb)) {
+			$mac = ([string]$n.LinkLayerAddress).Replace('-', ':').ToUpperInvariant()
+			if ($mac -match '^[0-9A-F]{2}(:[0-9A-F]{2}){5}$') {
+				$map[[string]$n.IPAddress] = $mac
+			}
+		}
+	} catch {}
+	if ($map.Count -eq 0) {
+		try {
+			$r = Invoke-MBSetupNative -File 'arp.exe' -ArgumentList @('-a') -TimeoutSec 15
+			foreach ($line in (([string]$r.out) -split "`r?`n")) {
+				if ($line -match '^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F\-]{17})\s+') {
+					$ip = $Matches[1]
+					$mac = $Matches[2].Replace('-', ':').ToUpperInvariant()
+					if ($ip -notlike '127.*' -and $mac -ne '00:00:00:00:00:00') {
+						$map[$ip] = $mac
+					}
+				}
+			}
+		} catch {}
+	}
+	return $map
+}
+
+function Invoke-MBFloodPingSubnet {
+	# IPScanner Scan-Subnet speed path: Test-Connection -Count 1 -AsJob for every host, then Wait-Job / Receive-Job.
+	# Fires the full wave at once (not throttled). Populates ARP for MAC/vendor resolution.
+	param(
+		[string[]]$Targets,
+		[int]$TimeoutMs = 4000
+	)
+	$alive = New-Object System.Collections.ArrayList
+	$seen = @{}
+	if (-not $Targets -or $Targets.Count -eq 0) { return @() }
+	$pp = $Global:ProgressPreference
+	$Global:ProgressPreference = 'SilentlyContinue'
+	$jobs = New-Object System.Collections.ArrayList
+	$jobIp = @{}  # Job.Id -> target IP (Address field can be empty on some hosts)
+	try {
+		foreach ($t in $Targets) {
+			$ip = [string]$t
+			if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { continue }
+			try {
+				$j = Test-Connection -ComputerName $ip -Count 1 -AsJob -ErrorAction SilentlyContinue
+				if ($j) {
+					[void]$jobs.Add($j)
+					$jobIp[[int]$j.Id] = $ip
+				}
+			} catch {}
+		}
+		if ($jobs.Count -eq 0) { return @() }
+		$waitSec = [math]::Max(3, [int][math]::Ceiling($TimeoutMs / 1000.0))
+		try {
+			$null = Wait-Job -Job @($jobs) -Timeout $waitSec -ErrorAction SilentlyContinue
+		} catch {
+			try { $null = Get-Job | Wait-Job -Timeout $waitSec -ErrorAction SilentlyContinue } catch {}
+		}
+		# IPScanner: Receive-Job where StatusCode -eq 0 -> Address
+		try {
+			$results = @(Receive-Job -Job @($jobs) -ErrorAction SilentlyContinue)
+			foreach ($row in $results) {
+				try {
+					if ($null -eq $row) { continue }
+					$ok = $false
+					if ($null -ne $row.StatusCode -and [int]$row.StatusCode -eq 0) { $ok = $true }
+					elseif ("$($row.Status)" -eq 'Success') { $ok = $true }
+					if (-not $ok) { continue }
+					$addr = $null
+					try { $addr = [string]$row.Address } catch {}
+					if (-not $addr -or $addr -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+						try { $addr = [string]$row.ProtocolAddress } catch {}
+					}
+					if ($addr -and $addr -match '^\d+\.\d+\.\d+\.\d+$' -and -not $seen.ContainsKey($addr)) {
+						$seen[$addr] = $true
+						[void]$alive.Add($addr)
+					}
+				} catch {}
+			}
+		} catch {}
+		# Per-job fallback when Address empty but StatusCode ok
+		foreach ($j in @($jobs)) {
+			try {
+				if ($j.State -eq 'Completed') {
+					$res = @(Receive-Job -Job $j -ErrorAction SilentlyContinue)
+					$hit = $false
+					foreach ($row in $res) {
+						if ($null -ne $row.StatusCode -and [int]$row.StatusCode -eq 0) { $hit = $true; break }
+					}
+					if ($hit -and $jobIp.ContainsKey([int]$j.Id)) {
+						$addr = [string]$jobIp[[int]$j.Id]
+						if (-not $seen.ContainsKey($addr)) {
+							$seen[$addr] = $true
+							[void]$alive.Add($addr)
+						}
+					}
+				} elseif ($j.State -eq 'Running') {
+					# Timed out still running — treat target as no-reply; stop it
+					try { Stop-Job -Job $j -Force -ErrorAction SilentlyContinue } catch {}
+				}
+			} catch {}
+		}
+	} finally {
+		$Global:ProgressPreference = $pp
+		try {
+			if ($jobs.Count -gt 0) {
+				Remove-Job -Job @($jobs) -Force -ErrorAction SilentlyContinue
+			}
+		} catch {
+			try {
+				Get-Job -ErrorAction SilentlyContinue |
+					Where-Object { $_.Command -like '*Test-Connection*' } |
+					Remove-Job -Force -ErrorAction SilentlyContinue
+			} catch {}
+		}
+	}
+	return @($alive)
+}
+
+function Get-MBReverseHostname {
+	param([string]$Ip, [int]$TimeoutSec = 2)
+	$ip = ([string]$Ip).Trim()
+	if ([string]::IsNullOrWhiteSpace($ip)) { return '' }
+	try {
+		if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
+			$r = Resolve-DnsName -Name $ip -DnsOnly -ErrorAction SilentlyContinue -QuickTimeout
+			if ($r) {
+				$nh = @($r | Where-Object { $_.NameHost } | Select-Object -ExpandProperty NameHost -First 1)
+				if ($nh) { return [string]$nh[0] }
+			}
+		}
+	} catch {}
+	try {
+		$entry = [System.Net.Dns]::GetHostEntry($ip)
+		if ($entry -and $entry.HostName) { return [string]$entry.HostName }
+	} catch {}
+	return ''
+}
+
+function Get-MBMacVendor {
+	param([string]$Mac)
+	$mac = ([string]$Mac).Replace('-', '').Replace(':', '').Replace('.', '').Trim().ToUpperInvariant()
+	if ($mac.Length -lt 6) { return '' }
+	$oui = $mac.Substring(0, 6)
+	if (-not $script:MBMacVendorCache) { $script:MBMacVendorCache = @{} }
+	if ($script:MBMacVendorCache.ContainsKey($oui)) {
+		return [string]$script:MBMacVendorCache[$oui]
+	}
+	$vendor = ''
+	try {
+		$ProgressPreference = 'SilentlyContinue'
+		$uri = "https://www.macvendorlookup.com/api/v2/$oui"
+		# short timeout via WebRequest
+		$req = [System.Net.HttpWebRequest]::Create($uri)
+		$req.Method = 'GET'
+		$req.Timeout = 2500
+		$req.ReadWriteTimeout = 2500
+		$req.UserAgent = 'MiniBot-ScanNetwork/1.0'
+		$resp = $req.GetResponse()
+		try {
+			$sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+			$body = $sr.ReadToEnd()
+			$sr.Close()
+			if ($body -match '"company"\s*:\s*"([^"]+)"') {
+				$vendor = $Matches[1]
+			} elseif ($body.Trim().StartsWith('{') -or $body.Trim().StartsWith('[')) {
+				try {
+					$j = $body | ConvertFrom-Json
+					if ($j -is [array] -and $j.Count -gt 0) {
+						if ($j[0].company) { $vendor = [string]$j[0].company }
+						elseif ($j[0].Company) { $vendor = [string]$j[0].Company }
+					} elseif ($j.company) { $vendor = [string]$j.company }
+				} catch {}
+			}
+		} finally {
+			try { $resp.Close() } catch {}
+		}
+	} catch {
+		$vendor = ''
+	}
+	if ($vendor.Length -gt 40) { $vendor = $vendor.Substring(0, 40) }
+	$script:MBMacVendorCache[$oui] = $vendor
+	return $vendor
+}
+
+function Invoke-ScanNetwork {
+	param(
+		[string]$subnet = '',
+		[object]$active = $true,
+		[object]$resolve_mac = $true,
+		[object]$resolve_hostnames = $true,
+		[object]$resolve_vendors = $true,
+		[int]$timeout_ms = 4000,
+		[int]$max_hosts = 254
+	)
+	$doActive = $true
+	if ($active -is [bool]) { $doActive = $active }
+	elseif ([string]$active -match '^(?i)0|false|no|off$') { $doActive = $false }
+	$doMac = $true
+	if ($resolve_mac -is [bool]) { $doMac = $resolve_mac }
+	elseif ([string]$resolve_mac -match '^(?i)0|false|no|off$') { $doMac = $false }
+	$doHost = $true
+	if ($resolve_hostnames -is [bool]) { $doHost = $resolve_hostnames }
+	elseif ([string]$resolve_hostnames -match '^(?i)0|false|no|off$') { $doHost = $false }
+	$doVend = $true
+	if ($resolve_vendors -is [bool]) { $doVend = $resolve_vendors }
+	elseif ([string]$resolve_vendors -match '^(?i)0|false|no|off$') { $doVend = $false }
+	if ($timeout_ms -lt 1000) { $timeout_ms = 1000 }
+	if ($timeout_ms -gt 30000) { $timeout_ms = 30000 }
+	if ($max_hosts -lt 1) { $max_hosts = 1 }
+	if ($max_hosts -gt 1022) { $max_hosts = 1022 }
+
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	$ctx = Get-MBPrimaryLanContext
+	if (-not $ctx.ok -and [string]::IsNullOrWhiteSpace($subnet)) {
+		return "ERROR: Could not detect a local IPv4 interface. Pass subnet=192.168.x.0/24."
+	}
+
+	$range = @(Get-MBScanIpRange -Subnet $subnet -DefaultPrefix $ctx.prefix -MaxHosts $max_hosts)
+	$aliveSet = @{}
+	$probed = 0
+	if ($doActive -and $range.Count -gt 0) {
+		$probed = $range.Count
+		# Flood-ping entire range (IPScanner speed): all -AsJob at once
+		$alive = @(Invoke-MBFloodPingSubnet -Targets $range -TimeoutMs $timeout_ms)
+		foreach ($a in $alive) { $aliveSet[[string]$a] = $true }
+		# Brief pause so ARP/neighbor table can fill after flood for SendARP/MAC
+		Start-Sleep -Milliseconds 250
+	}
+
+	$arp = Get-MBArpNeighborMap -InterfaceIndex $ctx.interface_index
+	# Seed host IPs: ARP + alive + self + gateway
+	$hostIps = @{}
+	foreach ($k in @($arp.Keys)) { $hostIps[[string]$k] = $true }
+	foreach ($k in @($aliveSet.Keys)) { $hostIps[[string]$k] = $true }
+	if ($ctx.ip) { $hostIps[[string]$ctx.ip] = $true }
+	if ($ctx.gateway) { $hostIps[[string]$ctx.gateway] = $true }
+
+	# If active was off, still only ARP peers (plus self)
+	if (-not $doActive -and $hostIps.Count -eq 0 -and $ctx.ip) {
+		$hostIps[[string]$ctx.ip] = $true
+	}
+
+	# Filter to scan prefix when known
+	$prefix = $ctx.prefix
+	if ($subnet) {
+		$tmp = @(Get-MBScanIpRange -Subnet $subnet -DefaultPrefix $ctx.prefix -MaxHosts 1)
+		if ($tmp.Count -gt 0 -and $tmp[0] -match '^(\d+\.\d+\.\d+\.)') { $prefix = $Matches[1] }
+	}
+
+	$macResolverOk = $false
+	if ($doMac) { $macResolverOk = Ensure-MBMacAddressResolver }
+
+	$hosts = New-Object System.Collections.ArrayList
+	foreach ($ip in @($hostIps.Keys | Sort-Object { try { [version]$_ } catch { $_ } })) {
+		if ($prefix -and $ip -notlike ($prefix + '*')) {
+			# keep self/gateway even if outside? skip foreign
+			if ($ip -ne $ctx.ip -and $ip -ne $ctx.gateway) { continue }
+		}
+		$mac = ''
+		$macSource = ''
+		if ($ip -eq $ctx.ip -and $ctx.mac) {
+			$mac = $ctx.mac
+			$macSource = 'local_adapter'
+		} elseif ($arp.ContainsKey($ip)) {
+			$mac = [string]$arp[$ip]
+			$macSource = 'arp'
+		}
+		# MAC discovery (SendARP) when ARP table lacks L2 address — required for vendor OUI
+		if ($doMac -and [string]::IsNullOrWhiteSpace($mac)) {
+			$m2 = Get-MBMacFromIp -Ip $ip
+			if ($m2) {
+				$mac = $m2
+				$macSource = 'sendarp'
+			}
+		}
+		$hostname = ''
+		$isSelf = ($ip -eq $ctx.ip)
+		if ($isSelf) {
+			$hostname = if ($ctx.hostname) { "$($ctx.hostname) (This Device)" } else { '(This Device)' }
+		} elseif ($doHost) {
+			$hostname = Get-MBReverseHostname -Ip $ip
+			if (-not $hostname) { $hostname = '' }
+		}
+		$vendor = ''
+		if ($doVend -and $mac) {
+			$vendor = Get-MBMacVendor -Mac $mac
+		} elseif ($doVend -and -not $mac) {
+			$vendor = ''
+		}
+		$role = 'host'
+		if ($isSelf) { $role = 'self' }
+		elseif ($ctx.gateway -and $ip -eq $ctx.gateway) { $role = 'gateway' }
+
+		[void]$hosts.Add([ordered]@{
+			ip         = $ip
+			mac        = $mac
+			mac_source = $macSource
+			hostname   = $hostname
+			vendor     = $vendor
+			alive      = [bool]($aliveSet.ContainsKey($ip) -or $arp.ContainsKey($ip) -or $isSelf)
+			role       = $role
+		})
+	}
+
+	$sw.Stop()
+	$withMac = @($hosts | Where-Object { $_.mac }).Count
+	$withHost = @($hosts | Where-Object { $_.hostname }).Count
+	$withVend = @($hosts | Where-Object { $_.vendor }).Count
+
+	return ConvertTo-MBJson ([ordered]@{
+		ok                = $true
+		subnet_prefix     = $prefix
+		local_ip          = $ctx.ip
+		gateway           = $ctx.gateway
+		local_mac         = $ctx.mac
+		active_probe      = $doActive
+		probed_count      = $probed
+		mac_discovery     = $doMac
+		mac_resolver      = $macResolverOk
+		resolve_hostnames = $doHost
+		resolve_vendors   = $doVend
+		host_count        = $hosts.Count
+		with_mac          = $withMac
+		with_hostname     = $withHost
+		with_vendor       = $withVend
+		elapsed_ms        = $sw.ElapsedMilliseconds
+		hosts             = @($hosts)
+		note              = 'Active probe uses IPScanner-style flood ping (Test-Connection -AsJob x subnet). MAC via ARP + SendARP (iphlpapi); vendors need MAC OUI. To find shares on hosts, use ProbeShares (not RunCommand Get-SmbShare/CimSession).'
+	}) -Depth 6
+}
+
+function Test-MBTcpPortOpen {
+	# IPScanner-style async TCP connect with short timeout (ms). No hang.
+	param(
+		[string]$Computer,
+		[int]$Port,
+		[int]$TimeoutMs = 300
+	)
+	$targetHost = ([string]$Computer).Trim()
+	if ([string]::IsNullOrWhiteSpace($targetHost)) { return $false }
+	if ($Port -lt 1 -or $Port -gt 65535) { return $false }
+	if ($TimeoutMs -lt 50) { $TimeoutMs = 50 }
+	if ($TimeoutMs -gt 10000) { $TimeoutMs = 10000 }
+	$tcp = $null
+	try {
+		$tcp = New-Object System.Net.Sockets.TcpClient
+		$iar = $tcp.BeginConnect($targetHost, $Port, $null, $null)
+		$ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $true)
+		if (-not $ok) {
+			try { $tcp.Close() } catch {}
+			return $false
+		}
+		try { $tcp.EndConnect($iar) } catch { return $false }
+		return [bool]$tcp.Connected
+	} catch {
+		return $false
+	} finally {
+		try { if ($tcp) { $tcp.Close() } } catch {}
+	}
+}
+
+function Test-MBShareMapGuess {
+	# Guess-and-test: timed "net use \\host\share" then cleanup. Classifies existence without hanging enum.
+	# found: connected OK, or access/logon denied (share exists, auth needed)
+	# missing: path/name not found
+	# unknown: timeout / other
+	param(
+		[string]$Computer,
+		[string]$ShareName,
+		[string]$Username = '',
+		[string]$Password = '',
+		[int]$TimeoutSec = 3
+	)
+	$h = ([string]$Computer).Trim().TrimStart('\')
+	$sn = ([string]$ShareName).Trim().Trim('\')
+	if ([string]::IsNullOrWhiteSpace($h) -or [string]::IsNullOrWhiteSpace($sn)) {
+		return @{ found = $false; status = 'error'; unc = ''; error = 'computer and share_name required' }
+	}
+	if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
+	if ($TimeoutSec -gt 8) { $TimeoutSec = 8 }
+	$unc = '\\{0}\{1}' -f $h, $sn
+	$user = ([string]$Username).Trim()
+	$pass = [string]$Password
+
+	# Cleanup any prior connection to this UNC (best-effort, short)
+	try {
+		$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', $unc, '/delete', '/y') -TimeoutSec 2
+	} catch {}
+
+	$netArgs = New-Object System.Collections.ArrayList
+	[void]$netArgs.Add('use')
+	[void]$netArgs.Add($unc)
+	if ($user) {
+		[void]$netArgs.Add(('/user:' + $user))
+		# empty password still allowed as separate arg for net use
+		[void]$netArgs.Add($(if ($null -eq $pass) { '' } else { $pass }))
+	}
+	[void]$netArgs.Add('/persistent:no')
+
+	$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @($netArgs.ToArray()) -TimeoutSec $TimeoutSec
+	$blob = (([string]$r.out) + "`n" + ([string]$r.err) + "`n" + ([string]$r.exit))
+	$exit = -1
+	try { $exit = [int]$r.exit } catch {}
+
+	# Always try to drop the connection so we don't leave ghost maps
+	try {
+		$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', $unc, '/delete', '/y') -TimeoutSec 2
+	} catch {}
+
+	$status = 'unknown'
+	$found = $false
+	$msg = ($blob -replace '\s+', ' ').Trim()
+	if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) + '...' }
+
+	if ($r.err -match '(?i)\btimeout\b' -or $blob -match '(?i)\btimeout\b') {
+		$status = 'timeout'
+		$found = $false
+	} elseif ($exit -eq 0 -or $blob -match '(?i)The command completed successfully') {
+		$status = 'connected'
+		$found = $true
+	} elseif (
+		$blob -match '(?i)(System error 5|Access is denied|1326|Logon failure|86|network password|user name or password|1219|multiple connections)' -or
+		$exit -in @(5, 86, 1219, 1326, 1909, 2202)
+	) {
+		# Share name resolved; credentials wrong/missing/conflict — still a hit for discovery
+		$status = 'exists_auth_required'
+		$found = $true
+	} elseif (
+		$blob -match '(?i)(System error 53|System error 67|network path was not found|network name cannot be found|51\b|64\b)' -or
+		$exit -in @(53, 67, 51, 64)
+	) {
+		$status = 'not_found'
+		$found = $false
+	} elseif ($exit -ne 0) {
+		$status = 'failed'
+		$found = $false
+	}
+
+	return @{
+		found   = $found
+		status  = $status
+		unc     = $unc
+		exit    = $exit
+		message = $msg
+		method  = 'net use probe'
+	}
+}
+
+function Invoke-ProbeShares {
+	# 1) Port-scan 445/139 (fast filter)
+	# 2) On SMB-open hosts, guess-and-test share names via timed net use (no net view / CimSession hang)
+	param(
+		[object]$hosts = $null,
+		[string]$computer = '',
+		[string]$share_name = '',
+		[object]$share_names = $null,
+		[string]$username = '',
+		[string]$password = '',
+		[int]$port_timeout_ms = 300,
+		[int]$probe_timeout_sec = 3,
+		[object]$stop_on_first_match = $false
+	)
+	$targets = New-Object System.Collections.ArrayList
+	if ($null -ne $hosts) {
+		if ($hosts -is [string]) {
+			foreach ($p in ([string]$hosts -split '[,;\s]+')) {
+				if ($p.Trim()) { [void]$targets.Add($p.Trim()) }
+			}
+		} elseif ($hosts -is [System.Collections.IEnumerable]) {
+			foreach ($h in @($hosts)) {
+				$s = [string]$h
+				if ($s.Trim()) { [void]$targets.Add($s.Trim()) }
+			}
+		}
+	}
+	if (-not [string]::IsNullOrWhiteSpace($computer)) {
+		[void]$targets.Add(([string]$computer).Trim())
+	}
+	$seen = @{}
+	$uniq = New-Object System.Collections.ArrayList
+	foreach ($t in @($targets)) {
+		$key = $t.ToLowerInvariant()
+		if ($seen.ContainsKey($key)) { continue }
+		$seen[$key] = $true
+		[void]$uniq.Add($t)
+	}
+	$targets = $uniq
+	$autoDiscover = $false
+	$discoverNote = ''
+	$selfIds = Get-MBLocalHostIdentitySet
+	$excludedSelf = New-Object System.Collections.ArrayList
+	# Known host(s): use what was given (still drop self). Unknown: auto LAN discover then same guess path.
+	if ($targets.Count -eq 0) {
+		$autoDiscover = $true
+		$ctx = Get-MBPrimaryLanContext
+		if (-not $ctx.ok -or [string]::IsNullOrWhiteSpace([string]$ctx.prefix)) {
+			return "ERROR: No hosts= and could not detect local subnet. Pass computer=IP or hosts=['IP',...] when the machine is known."
+		}
+		$range = @(Get-MBScanIpRange -Subnet '' -DefaultPrefix $ctx.prefix -MaxHosts 254)
+		if ($range.Count -eq 0) {
+			return "ERROR: empty scan range for prefix $($ctx.prefix)"
+		}
+		# Fast liveness (same flood-ping as ScanNetwork), then only those hosts get SMB/share probes
+		$alive = @(Invoke-MBFloodPingSubnet -Targets $range -TimeoutMs 4000)
+		foreach ($a in $alive) {
+			$as = [string]$a
+			if (Test-MBIsLocalHostTarget -HostName $as -IdentitySet $selfIds) {
+				[void]$excludedSelf.Add($as)
+				continue
+			}
+			[void]$targets.Add($as)
+		}
+		$selfLabel = if ($ctx.ip) { $ctx.ip } else { 'local' }
+		$discoverNote = ("auto_discover prefix={0} flood_alive={1} (excluded self {2})" -f $ctx.prefix, $targets.Count, $selfLabel)
+		if ($targets.Count -eq 0) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok = $true
+				mode = 'search'
+				auto_discover = $true
+				host_count = 0
+				share_match_count = 0
+				hosts_with_match = @()
+				found_uncs = @()
+				excluded_self = @($excludedSelf | Select-Object -Unique)
+				note = "No other hosts answered ICMP on $($ctx.prefix)x. Pass computer=IP if you know the target, or run ScanNetwork first."
+				discover = $discoverNote
+			}) -Depth 4
+		}
+	} else {
+		# Targeted list may still include this PC (e.g. from ScanNetwork self row) — never probe self for remote shares
+		$filtered = New-Object System.Collections.ArrayList
+		foreach ($t in @($targets)) {
+			if (Test-MBIsLocalHostTarget -HostName $t -IdentitySet $selfIds) {
+				[void]$excludedSelf.Add([string]$t)
+				continue
+			}
+			[void]$filtered.Add($t)
+		}
+		$targets = $filtered
+		if ($excludedSelf.Count -gt 0) {
+			$discoverNote = ("excluded_self=[{0}]" -f (($excludedSelf | Select-Object -Unique) -join ', '))
+		}
+		if ($targets.Count -eq 0) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok = $true
+				mode = 'targeted'
+				auto_discover = $false
+				host_count = 0
+				share_match_count = 0
+				hosts_with_match = @()
+				found_uncs = @()
+				excluded_self = @($excludedSelf | Select-Object -Unique)
+				note = 'All given hosts were this machine (self). Pass a remote IP/hostname to probe shares.'
+				discover = $discoverNote
+			}) -Depth 4
+		}
+	}
+	$mode = if ($autoDiscover) { 'search' } elseif ($targets.Count -eq 1) { 'targeted' } else { 'targeted_list' }
+	if ($targets.Count -gt 64) {
+		return "ERROR: max 64 hosts per ProbeShares call (got $($targets.Count))."
+	}
+
+	# Candidate share names to try (guess list)
+	$candidates = New-Object System.Collections.ArrayList
+	if (-not [string]::IsNullOrWhiteSpace($share_name)) {
+		[void]$candidates.Add(([string]$share_name).Trim())
+	}
+	if ($null -ne $share_names) {
+		if ($share_names -is [string]) {
+			foreach ($p in ([string]$share_names -split '[,;\s]+')) {
+				if ($p.Trim()) { [void]$candidates.Add($p.Trim()) }
+			}
+		} elseif ($share_names -is [System.Collections.IEnumerable]) {
+			foreach ($n in @($share_names)) {
+				if ([string]$n -and ([string]$n).Trim()) { [void]$candidates.Add(([string]$n).Trim()) }
+			}
+		}
+	}
+	# Defaults when none specified — common residential/business share names
+	if ($candidates.Count -eq 0) {
+		foreach ($n in @('temp', 'share', 'data', 'public', 'users', 'shared', 'media', 'backup', 'files', 'docs')) {
+			[void]$candidates.Add($n)
+		}
+	}
+	$candSeen = @{}
+	$candUniq = New-Object System.Collections.ArrayList
+	foreach ($c in @($candidates)) {
+		$k = $c.ToLowerInvariant()
+		if ($candSeen.ContainsKey($k)) { continue }
+		$candSeen[$k] = $true
+		[void]$candUniq.Add($c)
+	}
+	$candidates = $candUniq
+	if ($candidates.Count -gt 20) {
+		return "ERROR: max 20 share name candidates (got $($candidates.Count))."
+	}
+
+	$user = ([string]$username).Trim()
+	$pass = [string]$password
+	if ($port_timeout_ms -lt 50) { $port_timeout_ms = 50 }
+	if ($port_timeout_ms -gt 5000) { $port_timeout_ms = 5000 }
+	if ($probe_timeout_sec -lt 1) { $probe_timeout_sec = 1 }
+	if ($probe_timeout_sec -gt 8) { $probe_timeout_sec = 8 }
+	$stopFirst = $false
+	if ($stop_on_first_match -is [bool]) { $stopFirst = $stop_on_first_match }
+	elseif ([string]$stop_on_first_match -match '^(?i)1|true|yes|y|on$') { $stopFirst = $true }
+
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	$results = New-Object System.Collections.ArrayList
+	$smbOpen = 0
+	$matchCount = 0
+	$matchedHosts = New-Object System.Collections.ArrayList
+	$openHosts = New-Object System.Collections.ArrayList
+	$foundUncs = New-Object System.Collections.ArrayList
+
+	foreach ($h in $targets) {
+		$row = [ordered]@{
+			host              = $h
+			port_445_smb2     = $false
+			port_139_smb1     = $false
+			smb_likely        = $false
+			share_match       = $false
+			found_shares      = @()
+			tried             = @()
+			best_unc          = ''
+			best_status       = ''
+		}
+		$row.port_445_smb2 = Test-MBTcpPortOpen -Computer $h -Port 445 -TimeoutMs $port_timeout_ms
+		$row.port_139_smb1 = Test-MBTcpPortOpen -Computer $h -Port 139 -TimeoutMs $port_timeout_ms
+		$row.smb_likely = [bool]($row.port_445_smb2 -or $row.port_139_smb1)
+		if (-not $row.smb_likely) {
+			$row.best_status = 'smb_ports_closed'
+			[void]$results.Add($row)
+			continue
+		}
+		$smbOpen++
+		[void]$openHosts.Add($h)
+
+		$foundHere = New-Object System.Collections.ArrayList
+		$triedHere = New-Object System.Collections.ArrayList
+		foreach ($sn in @($candidates)) {
+			$probe = Test-MBShareMapGuess -Computer $h -ShareName $sn -Username $user -Password $pass -TimeoutSec $probe_timeout_sec
+			[void]$triedHere.Add([ordered]@{
+				share  = $sn
+				unc    = $probe.unc
+				found  = [bool]$probe.found
+				status = [string]$probe.status
+				exit   = $probe.exit
+				message = [string]$probe.message
+			})
+			if ($probe.found) {
+				$row.share_match = $true
+				[void]$foundHere.Add($sn)
+				if (-not $row.best_unc) {
+					$row.best_unc = [string]$probe.unc
+					$row.best_status = [string]$probe.status
+				}
+				[void]$foundUncs.Add([string]$probe.unc)
+				# continue trying other names on this host unless stop_on_first_match for whole scan
+			}
+		}
+		$row.found_shares = @($foundHere)
+		$row.tried = @($triedHere)
+		if ($row.share_match) {
+			$matchCount++
+			[void]$matchedHosts.Add($h)
+			if ($stopFirst) {
+				[void]$results.Add($row)
+				break
+			}
+		}
+		[void]$results.Add($row)
+	}
+
+	$sw.Stop()
+	return ConvertTo-MBJson ([ordered]@{
+		ok                = $true
+		mode              = $mode
+		auto_discover     = $autoDiscover
+		discover          = $discoverNote
+		host_count        = $targets.Count
+		smb_port_open     = $smbOpen
+		candidates        = @($candidates)
+		share_match_count = $matchCount
+		hosts_with_smb    = @($openHosts)
+		hosts_with_match  = @($matchedHosts)
+		found_uncs        = @($foundUncs | Select-Object -Unique)
+		excluded_self     = @($excludedSelf | Select-Object -Unique)
+		port_timeout_ms   = $port_timeout_ms
+		probe_timeout_sec = $probe_timeout_sec
+		used_credentials  = (-not [string]::IsNullOrWhiteSpace($user))
+		elapsed_ms        = $sw.ElapsedMilliseconds
+		results           = @($results)
+		note              = 'Modes: known machine → computer=IP or hosts=[IP] (only those; self IP/hostname always skipped). Unknown → omit hosts (auto LAN flood then same guess; self excluded). Port filter then timed net use \\host\share. exists_auth_required = share found, needs MapNetworkDrive + creds.'
+	}) -Depth 8
 }
 
 function Invoke-GetWindowsUpdateStatus {
@@ -12039,14 +13510,18 @@ function Invoke-ListWindowsOptions {
 }
 
 function ConvertTo-MBProcessArgumentString {
-	# One Args element = raw line; multi = quote tokens that have spaces
-	param([string[]]$Args)
-	if ($null -eq $Args -or $Args.Count -eq 0) { return '' }
-	if ($Args.Count -eq 1) { return [string]$Args[0] }
+	# One Args element = raw line; multi = quote tokens that need it.
+	# Quote UNC / backslash paths so CreateProcess does not mangle \\server (net view help text bug).
+	param([string[]]$ArgumentList)
+	if ($null -eq $ArgumentList -or $ArgumentList.Count -eq 0) { return '' }
+	if ($ArgumentList.Count -eq 1) { return [string]$ArgumentList[0] }
 	$parts = New-Object System.Collections.ArrayList
-	foreach ($a in $Args) {
+	foreach ($a in $ArgumentList) {
 		$s = if ($null -eq $a) { '' } else { [string]$a }
-		if ($s -match '[\s"]') {
+		$needQuote = $false
+		if ($s -match '[\s"]') { $needQuote = $true }
+		elseif ($s.StartsWith('\') -or $s.Contains('\')) { $needQuote = $true }
+		if ($needQuote) {
 			$s = '"' + ($s -replace '"', '""') + '"'
 		}
 		[void]$parts.Add($s)
@@ -12176,11 +13651,11 @@ function Invoke-MBSetupStartWait {
 
 function Invoke-MBSetupNative {
 	# Async stdout/stderr drain (sync ReadToEnd after WaitForExit can deadlock).
-	param([string]$File, [string[]]$Args, [int]$TimeoutSec = 30)
+	param([string]$File, [string[]]$ArgumentList, [int]$TimeoutSec = 30)
 	if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
 	$psi = New-Object System.Diagnostics.ProcessStartInfo
 	$psi.FileName = $File
-	$psi.Arguments = ConvertTo-MBProcessArgumentString -Args $Args
+	$psi.Arguments = ConvertTo-MBProcessArgumentString -ArgumentList $ArgumentList
 	$psi.UseShellExecute = $false
 	$psi.RedirectStandardOutput = $true
 	$psi.RedirectStandardError = $true
@@ -12232,7 +13707,7 @@ function Enable-MBFirewallGroup {
 		$detail = $_.Exception.Message
 	}
 	$arg = 'advfirewall firewall set rule group="{0}" new enable=Yes' -f $GroupName
-	$r = Invoke-MBSetupNative -File 'netsh.exe' -Args @($arg) -TimeoutSec $TimeoutSec
+	$r = Invoke-MBSetupNative -File 'netsh.exe' -ArgumentList @($arg) -TimeoutSec $TimeoutSec
 	return @{
 		ok     = $true
 		method = 'netsh'
@@ -12307,7 +13782,7 @@ function Invoke-SetWindowsOption {
 					'power_saver'      = 'a1841308-3541-4fab-bc81-f71556f20b4a'
 				}
 				if (-not $map.ContainsKey($valL)) { return "ERROR: value high_performance|balanced|power_saver" }
-				$r = Invoke-MBSetupNative -File 'powercfg.exe' -Args @('/setactive', $map[$valL])
+				$r = Invoke-MBSetupNative -File 'powercfg.exe' -ArgumentList @('/setactive', $map[$valL])
 				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $valL; exit = $r.exit; out = $r.out; err = $r.err })
 			}
 			'^power\.max_performance$' {
@@ -12327,17 +13802,17 @@ function Invoke-SetWindowsOption {
 					@('/setDCvalueindex','scheme_current','2a737441-1930-4402-8d77-b2bebba308a3','48e6b7a6-50f5-4782-a5d4-53bb8f07e226','0'),
 					@('/setactive','scheme_current')
 				)
-				$null = Invoke-MBSetupNative -File 'powercfg.exe' -Args @('/setactive','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
+				$null = Invoke-MBSetupNative -File 'powercfg.exe' -ArgumentList @('/setactive','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
 				$steps = @()
 				foreach ($c in $cmds) {
-					$r = Invoke-MBSetupNative -File 'powercfg.exe' -Args $c
+					$r = Invoke-MBSetupNative -File 'powercfg.exe' -ArgumentList $c
 					$steps += [ordered]@{ args = ($c -join ' '); ok = $r.ok; exit = $r.exit }
 				}
 				return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; steps = $steps }) -Depth 6
 			}
 			'^boot\.f8_legacy$' {
 				$pol = if ($valL -in @('on','1','true','legacy','enable')) { 'LEGACY' } elseif ($valL -in @('off','0','false','standard','disable')) { 'STANDARD' } else { return "ERROR: value on|off" }
-				$r = Invoke-MBSetupNative -File 'bcdedit.exe' -Args @('/set','{default}','bootmenupolicy', $pol)
+				$r = Invoke-MBSetupNative -File 'bcdedit.exe' -ArgumentList @('/set','{default}','bootmenupolicy', $pol)
 				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $pol; exit = $r.exit; out = $r.out; err = $r.err })
 			}
 			'^network\.discovery$' {
@@ -12347,7 +13822,7 @@ function Invoke-SetWindowsOption {
 					return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; value = $en; method = $r.method; detail = $r.detail })
 				}
 				$arg = 'advfirewall firewall set rule group="Network Discovery" new enable=No'
-				$r = Invoke-MBSetupNative -File 'netsh.exe' -Args @($arg) -TimeoutSec 15
+				$r = Invoke-MBSetupNative -File 'netsh.exe' -ArgumentList @($arg) -TimeoutSec 15
 				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $en; exit = $r.exit; out = $r.out; err = $r.err })
 			}
 			'^network\.file_sharing$' {
@@ -12357,25 +13832,25 @@ function Invoke-SetWindowsOption {
 					return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; value = $en; method = $r.method; detail = $r.detail })
 				}
 				$arg = 'advfirewall firewall set rule group="File and Printer Sharing" new enable=No'
-				$r = Invoke-MBSetupNative -File 'netsh.exe' -Args @($arg) -TimeoutSec 15
+				$r = Invoke-MBSetupNative -File 'netsh.exe' -ArgumentList @($arg) -TimeoutSec 15
 				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $en; exit = $r.exit; out = $r.out; err = $r.err })
 			}
 			'^timezone$' {
 				if ([string]::IsNullOrWhiteSpace($val)) { return "ERROR: value must be a tzutil id (e.g. Eastern Standard Time)" }
-				$r = Invoke-MBSetupNative -File 'tzutil.exe' -Args @('/s', $val)
+				$r = Invoke-MBSetupNative -File 'tzutil.exe' -ArgumentList @('/s', $val)
 				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $val; exit = $r.exit; out = $r.out; err = $r.err })
 			}
 			'^time\.sync$' {
-				$null = Invoke-MBSetupNative -File 'w32tm.exe' -Args @('/config','/manualpeerlist:time.windows.com')
-				$null = Invoke-MBSetupNative -File 'net.exe' -Args @('stop','w32time')
+				$null = Invoke-MBSetupNative -File 'w32tm.exe' -ArgumentList @('/config','/manualpeerlist:time.windows.com')
+				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('stop','w32time')
 				reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' /v Type /t REG_SZ /d NTP /f | Out-Null
-				$null = Invoke-MBSetupNative -File 'sc.exe' -Args @('config','w32time','start=','demand')
-				$null = Invoke-MBSetupNative -File 'net.exe' -Args @('start','w32time')
-				$r = Invoke-MBSetupNative -File 'w32tm.exe' -Args @('/resync')
+				$null = Invoke-MBSetupNative -File 'sc.exe' -ArgumentList @('config','w32time','start=','demand')
+				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('start','w32time')
+				$r = Invoke-MBSetupNative -File 'w32tm.exe' -ArgumentList @('/resync')
 				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; exit = $r.exit; out = $r.out; err = $r.err })
 			}
 			'^bitlocker\.off$' {
-				$r = Invoke-MBSetupNative -File 'manage-bde.exe' -Args @('-off', $drv) -TimeoutSec 300
+				$r = Invoke-MBSetupNative -File 'manage-bde.exe' -ArgumentList @('-off', $drv) -TimeoutSec 300
 				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; drive = $drv; exit = $r.exit; out = $r.out; err = $r.err })
 			}
 			'^edge\.web_widget$' {
@@ -12390,7 +13865,7 @@ function Invoke-SetWindowsOption {
 			}
 			'^cleanmgr\.autoclean$' {
 				$letter = $drv.TrimEnd(':')
-				$r = Invoke-MBSetupNative -File 'cleanmgr.exe' -Args @("/d",$letter,'/Autoclean') -TimeoutSec 600
+				$r = Invoke-MBSetupNative -File 'cleanmgr.exe' -ArgumentList @("/d",$letter,'/Autoclean') -TimeoutSec 600
 				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; drive = $drv; exit = $r.exit })
 			}
 			default { return "ERROR: Unhandled option '$opt'." }
@@ -12515,13 +13990,2216 @@ function Invoke-UninstallSoftware {
 	}
 	try {
 		if ($cmd -match '(?i)msiexec') {
-			$r = Invoke-MBSetupNative -File 'cmd.exe' -Args @('/c', $cmd) -TimeoutSec 900
+			$r = Invoke-MBSetupNative -File 'cmd.exe' -ArgumentList @('/c', $cmd) -TimeoutSec 900
 			return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; name = $h.name; exit = $r.exit; out = $r.out; err = $r.err })
 		}
-		$r = Invoke-MBSetupNative -File 'cmd.exe' -Args @('/c', $cmd) -TimeoutSec 900
+		$r = Invoke-MBSetupNative -File 'cmd.exe' -ArgumentList @('/c', $cmd) -TimeoutSec 900
 		return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; name = $h.name; exit = $r.exit; out = $r.out; err = $r.err; note = 'Uninstall launched; some installers need GUI completion.' })
 	} catch {
 		return "ERROR: Uninstall failed: $($_.Exception.Message)"
+	}
+}
+
+function Get-MBMaskedSecret {
+	param([string]$Text)
+	if ([string]::IsNullOrEmpty($Text)) { return '(empty)' }
+	if ($Text.Length -le 2) { return '**' }
+	return ('*' * [Math]::Min(12, $Text.Length))
+}
+
+function Invoke-AddLocalUser {
+	param(
+		[string]$username,
+		[string]$password,
+		[string]$full_name = '',
+		[string]$description = '',
+		[object]$admin = $false
+	)
+	$user = ([string]$username).Trim()
+	$pass = [string]$password
+	if ([string]::IsNullOrWhiteSpace($user)) { return "ERROR: username required." }
+	if ($user -notmatch '^[A-Za-z0-9._-]{1,20}$') { return "ERROR: username must be 1-20 chars [A-Za-z0-9._-]." }
+	if ([string]::IsNullOrEmpty($pass)) { return "ERROR: password required." }
+	$isAdmin = $false
+	if ($admin -is [bool]) { $isAdmin = $admin }
+	elseif ([string]$admin -match '^(?i)1|true|yes|y|on$') { $isAdmin = $true }
+	$fn = ([string]$full_name).Trim()
+	$desc = ([string]$description).Trim()
+	$details = "Create local user:`n  username = $user`n  password = $(Get-MBMaskedSecret $pass)`n  full_name = $(if ($fn) { $fn } else { '(none)' })`n  description = $(if ($desc) { $desc } else { '(none)' })`n  administrators = $isAdmin"
+	if (-not (Request-Confirmation -Title "AddLocalUser requires approval" -Details $details)) {
+		return "BLOCKED BY USER: AddLocalUser denied."
+	}
+	try {
+		$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+		$created = $false
+		$method = ''
+		if (Get-Command Add-LocalUser -ErrorAction SilentlyContinue) {
+			$p = @{ Name = $user; Password = $sec; PasswordNeverExpires = $true; UserMayNotChangePassword = $false; ErrorAction = 'Stop' }
+			if ($fn) { $p['FullName'] = $fn }
+			if ($desc) { $p['Description'] = $desc }
+			try {
+				$null = Get-LocalUser -Name $user -ErrorAction Stop
+				return "ERROR: Local user '$user' already exists."
+			} catch {}
+			Add-LocalUser @p | Out-Null
+			$created = $true
+			$method = 'Add-LocalUser'
+			if ($isAdmin) {
+				try { Add-LocalGroupMember -Group 'Administrators' -Member $user -ErrorAction Stop } catch {
+					try { net.exe localgroup Administrators $user /add 2>&1 | Out-Null } catch {}
+				}
+			}
+		} else {
+			try {
+				$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
+				if ($chk.ok -or ($chk.out -match '(?i)User name')) {
+					return "ERROR: Local user '$user' already exists."
+				}
+			} catch {}
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass, '/add') -TimeoutSec 30
+			if (-not $r.ok) {
+				return ConvertTo-MBJson ([ordered]@{ ok = $false; username = $user; method = 'net user'; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			$created = $true
+			$method = 'net user'
+			if ($fn -or $desc) {
+				try {
+					$comment = $(if ($fn -and $desc) { "$fn; $desc" } elseif ($fn) { $fn } else { $desc })
+					$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/comment:' + $comment) -TimeoutSec 15
+				} catch {}
+			}
+			if ($isAdmin) {
+				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators', $user, '/add') -TimeoutSec 15
+			}
+		}
+		return ConvertTo-MBJson ([ordered]@{
+			ok             = $created
+			username       = $user
+			administrators = $isAdmin
+			method         = $method
+		})
+	} catch {
+		return "ERROR: AddLocalUser failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-JoinDomain {
+	param(
+		[string]$domain,
+		[string]$username,
+		[string]$password,
+		[string]$ou = '',
+		[string]$new_name = '',
+		[object]$reboot = $false
+	)
+	$dom = ([string]$domain).Trim()
+	$user = ([string]$username).Trim()
+	$pass = [string]$password
+	$ouDn = ([string]$ou).Trim()
+	$rename = ([string]$new_name).Trim()
+	if ([string]::IsNullOrWhiteSpace($dom)) { return "ERROR: domain required (e.g. corp.example.com)." }
+	if ([string]::IsNullOrWhiteSpace($user)) { return "ERROR: username required for domain join." }
+	if ([string]::IsNullOrEmpty($pass)) { return "ERROR: password required." }
+	$doReboot = $false
+	if ($reboot -is [bool]) { $doReboot = $reboot }
+	elseif ([string]$reboot -match '^(?i)1|true|yes|y|on$') { $doReboot = $true }
+	$details = "Join domain:`n  domain = $dom`n  username = $user`n  password = $(Get-MBMaskedSecret $pass)`n  ou = $(if ($ouDn) { $ouDn } else { '(default)' })`n  new_name = $(if ($rename) { $rename } else { '(unchanged)' })`n  reboot = $doReboot`n`nRequires elevation and network access to a domain controller."
+	if (-not (Request-Confirmation -Title "JoinDomain requires approval" -Details $details)) {
+		return "BLOCKED BY USER: JoinDomain denied."
+	}
+	try {
+		$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+		$credUser = $user
+		if ($credUser -notmatch '[\\@]') { $credUser = "$dom\$user" }
+		$cred = New-Object System.Management.Automation.PSCredential ($credUser, $sec)
+		$joinParams = @{
+			DomainName   = $dom
+			Credential   = $cred
+			Force        = $true
+			ErrorAction  = 'Stop'
+			PassThru     = $true
+			WarningAction = 'SilentlyContinue'
+		}
+		if ($ouDn) { $joinParams['OUPath'] = $ouDn }
+		if ($rename) { $joinParams['NewName'] = $rename }
+		if ($doReboot) { $joinParams['Restart'] = $true }
+		$result = Add-Computer @joinParams
+		return ConvertTo-MBJson ([ordered]@{
+			ok        = $true
+			domain    = $dom
+			username  = $user
+			ou        = $ouDn
+			new_name  = $rename
+			reboot    = $doReboot
+			result    = "$result"
+			note      = $(if ($doReboot) { 'Restart initiated after join.' } else { 'Reboot recommended to finish domain join.' })
+		})
+	} catch {
+		return "ERROR: JoinDomain failed: $($_.Exception.Message)"
+	}
+}
+
+function Ensure-MBLogonHelper {
+	if ('MiniBot.Native.MBLogon' -as [type]) { return }
+	Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace MiniBot.Native {
+  public static class MBLogon {
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool LogonUser(string lpszUsername, string lpszDomain, string lpszPassword, int dwLogonType, int dwLogonProvider, out IntPtr phToken);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+    public static bool ValidateLocalUser(string username, string password) {
+      if (string.IsNullOrEmpty(username) || password == null) return false;
+      IntPtr token = IntPtr.Zero;
+      try {
+        string machine = Environment.MachineName;
+        // LOGON32_LOGON_NETWORK=3, INTERACTIVE=2, PROVIDER_DEFAULT=0
+        if (LogonUser(username, ".", password, 3, 0, out token)) return true;
+        if (token != IntPtr.Zero) { CloseHandle(token); token = IntPtr.Zero; }
+        if (LogonUser(username, machine, password, 3, 0, out token)) return true;
+        if (token != IntPtr.Zero) { CloseHandle(token); token = IntPtr.Zero; }
+        if (LogonUser(username, ".", password, 2, 0, out token)) return true;
+        if (token != IntPtr.Zero) { CloseHandle(token); token = IntPtr.Zero; }
+        if (LogonUser(username, machine, password, 2, 0, out token)) return true;
+        return false;
+      } finally {
+        if (token != IntPtr.Zero) CloseHandle(token);
+      }
+    }
+  }
+}
+"@ -Language CSharp -ErrorAction Stop
+}
+
+function Get-MBLocalAdminAccounts {
+	# Local (not domain) members of Administrators — enabled first.
+	$list = New-Object System.Collections.ArrayList
+	$seen = @{}
+	$rawNames = New-Object System.Collections.ArrayList
+	$machine = ([string]$env:COMPUTERNAME).ToUpperInvariant()
+
+	if (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue) {
+		try {
+			Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop | ForEach-Object {
+				try {
+					$oc = [string]$_.ObjectClass
+					if ($oc -match '(?i)group') { return }
+					$src = ''
+					try { $src = [string]$_.PrincipalSource } catch {}
+					$n = [string]$_.Name
+					if ([string]::IsNullOrWhiteSpace($n)) { return }
+					$userPart = $n
+					$domPart = ''
+					if ($n -match '^(?<d>[^\\]+)\\(?<u>.+)$') {
+						$domPart = $Matches['d']
+						$userPart = $Matches['u']
+					}
+					$domU = $domPart.ToUpperInvariant()
+					$isLocal = $false
+					if ($src -eq 'Local') { $isLocal = $true }
+					elseif ($domU -eq $machine -or $domU -eq '.' -or $domU -eq 'BUILTIN' -or [string]::IsNullOrWhiteSpace($domPart)) { $isLocal = $true }
+					# Domain principals: DOMAIN\user with PrincipalSource ActiveDirectory / not Local
+					if (-not $isLocal) { return }
+					if ($domU -eq 'BUILTIN' -and $userPart -match '(?i)^Administrators$') { return }
+					[void]$rawNames.Add($userPart)
+				} catch {}
+			}
+		} catch {}
+	}
+	if ($rawNames.Count -eq 0) {
+		try {
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators') -TimeoutSec 15
+			$inMembers = $false
+			foreach ($line in (([string]$r.out) -split "`r?`n")) {
+				if ($line -match '----') { $inMembers = $true; continue }
+				if (-not $inMembers) { continue }
+				$t = $line.Trim()
+				if ([string]::IsNullOrWhiteSpace($t)) { continue }
+				if ($t -match '(?i)command completed') { break }
+				if ($t -match '^(?<d>[^\\]+)\\(?<u>.+)$') {
+					$domU = $Matches['d'].ToUpperInvariant()
+					if ($domU -ne $machine -and $domU -ne '.') { continue }
+					[void]$rawNames.Add($Matches['u'])
+				} else {
+					[void]$rawNames.Add($t)
+				}
+			}
+		} catch {}
+	}
+
+	foreach ($an in $rawNames) {
+		$key = $an.ToLowerInvariant()
+		if ($seen.ContainsKey($key)) { continue }
+		$seen[$key] = $true
+		$enabled = $true
+		$fn = ''
+		$isLocalUser = $true
+		if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+			try {
+				$u = Get-LocalUser -Name $an -ErrorAction Stop
+				$enabled = [bool]$u.Enabled
+				$fn = [string]$u.FullName
+			} catch {
+				$isLocalUser = $false
+			}
+		}
+		if (-not $isLocalUser) { continue }
+		[void]$list.Add([pscustomobject]@{ name = $an; enabled = $enabled; full_name = $fn })
+	}
+	return @($list | Sort-Object @{ Expression = { -not $_.enabled } }, @{ Expression = { $_.name } })
+}
+
+function Test-MBLocalAdminCredential {
+	param(
+		[string]$Username,
+		[string]$Password
+	)
+	$user = ([string]$Username).Trim()
+	if ([string]::IsNullOrWhiteSpace($user)) { return $false }
+	if ($null -eq $Password) { return $false }
+	try { Ensure-MBLogonHelper } catch { return $false }
+	$okLogon = $false
+	try { $okLogon = [MiniBot.Native.MBLogon]::ValidateLocalUser($user, [string]$Password) } catch { $okLogon = $false }
+	if (-not $okLogon) { return $false }
+	$admins = @(Get-MBLocalAdminAccounts)
+	foreach ($a in $admins) {
+		if ([string]$a.name -eq $user) { return $true }
+	}
+	# Last resort: net localgroup check
+	try {
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators', $user) -TimeoutSec 10
+		if ($r.ok -or ([string]$r.out + [string]$r.err) -match '(?i)is a member|The command completed') {
+			# net localgroup Administrators user (without /add) is not valid; membership listing already done above
+		}
+	} catch {}
+	return $false
+}
+
+function New-MBLocalAdminAccountCore {
+	# Create local admin without an extra approval (caller already confirmed intent).
+	param(
+		[string]$username,
+		[string]$password,
+		[string]$full_name = ''
+	)
+	$user = ([string]$username).Trim()
+	$pass = [string]$password
+	if ([string]::IsNullOrWhiteSpace($user)) { return @{ ok = $false; error = 'username required' } }
+	if ($user -notmatch '^[A-Za-z0-9._-]{1,20}$') { return @{ ok = $false; error = 'username must be 1-20 chars [A-Za-z0-9._-]' } }
+	if ([string]::IsNullOrEmpty($pass)) { return @{ ok = $false; error = 'password required' } }
+	$fn = ([string]$full_name).Trim()
+	try {
+		$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+		if (Get-Command Add-LocalUser -ErrorAction SilentlyContinue) {
+			try {
+				$null = Get-LocalUser -Name $user -ErrorAction Stop
+				return @{ ok = $false; error = "Local user '$user' already exists" }
+			} catch {}
+			$p = @{ Name = $user; Password = $sec; PasswordNeverExpires = $true; UserMayNotChangePassword = $false; ErrorAction = 'Stop' }
+			if ($fn) { $p['FullName'] = $fn }
+			Add-LocalUser @p | Out-Null
+			try { Add-LocalGroupMember -Group 'Administrators' -Member $user -ErrorAction Stop } catch {
+				try { net.exe localgroup Administrators $user /add 2>&1 | Out-Null } catch {}
+			}
+			return @{ ok = $true; username = $user; method = 'Add-LocalUser' }
+		}
+		$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
+		if ($chk.ok -or ($chk.out -match '(?i)User name')) {
+			return @{ ok = $false; error = "Local user '$user' already exists" }
+		}
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass, '/add') -TimeoutSec 30
+		if (-not $r.ok) {
+			return @{ ok = $false; error = "net user failed (exit $($r.exit)): $($r.err) $($r.out)" }
+		}
+		if ($fn) {
+			try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/comment:' + $fn) -TimeoutSec 15 } catch {}
+		}
+		$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators', $user, '/add') -TimeoutSec 15
+		return @{ ok = $true; username = $user; method = 'net user' }
+	} catch {
+		return @{ ok = $false; error = $_.Exception.Message }
+	}
+}
+
+function Show-MBCreateLocalAdminForm {
+	# STA WinForms: username + password + confirm. Cancel is safe (no double Close).
+	param([string]$Title = 'Create local administrator')
+	$rs = $null; $ps = $null
+	try {
+		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
+		$rs = [runspacefactory]::CreateRunspace()
+		$rs.ApartmentState = 'STA'
+		$rs.ThreadOptions = 'ReuseThread'
+		$rs.Open()
+		$ps = [powershell]::Create()
+		$ps.Runspace = $rs
+		[void]$ps.AddScript({
+			param($Title)
+			Add-Type -AssemblyName System.Windows.Forms
+			Add-Type -AssemblyName System.Drawing
+			$form = New-Object System.Windows.Forms.Form
+			$form.Text = $Title
+			$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+			$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+			$form.MaximizeBox = $false
+			$form.MinimizeBox = $false
+			$form.ShowInTaskbar = $false
+			$form.ClientSize = New-Object System.Drawing.Size(420, 250)
+			$form.TopMost = $true
+			$bag = @{ Cancelled = $true; Username = ''; Password = '' }
+			$lbl = New-Object System.Windows.Forms.Label
+			$lbl.Text = "Create a local admin account you can use after leaving the domain.`nWithout this, you may be locked out of the PC."
+			$lbl.Location = New-Object System.Drawing.Point(14, 12)
+			$lbl.Size = New-Object System.Drawing.Size(390, 44)
+			$form.Controls.Add($lbl)
+			$lUser = New-Object System.Windows.Forms.Label
+			$lUser.Text = 'Username'
+			$lUser.Location = New-Object System.Drawing.Point(14, 64)
+			$lUser.AutoSize = $true
+			$form.Controls.Add($lUser)
+			$tbUser = New-Object System.Windows.Forms.TextBox
+			$tbUser.Location = New-Object System.Drawing.Point(14, 82)
+			$tbUser.Width = 390
+			$tbUser.Text = 'LocalAdmin'
+			$form.Controls.Add($tbUser)
+			$lPass = New-Object System.Windows.Forms.Label
+			$lPass.Text = 'Password'
+			$lPass.Location = New-Object System.Drawing.Point(14, 112)
+			$lPass.AutoSize = $true
+			$form.Controls.Add($lPass)
+			$tbPass = New-Object System.Windows.Forms.TextBox
+			$tbPass.Location = New-Object System.Drawing.Point(14, 130)
+			$tbPass.Width = 390
+			$tbPass.UseSystemPasswordChar = $true
+			$form.Controls.Add($tbPass)
+			$lPass2 = New-Object System.Windows.Forms.Label
+			$lPass2.Text = 'Confirm password'
+			$lPass2.Location = New-Object System.Drawing.Point(14, 158)
+			$lPass2.AutoSize = $true
+			$form.Controls.Add($lPass2)
+			$tbPass2 = New-Object System.Windows.Forms.TextBox
+			$tbPass2.Location = New-Object System.Drawing.Point(14, 176)
+			$tbPass2.Width = 390
+			$tbPass2.UseSystemPasswordChar = $true
+			$form.Controls.Add($tbPass2)
+			$err = New-Object System.Windows.Forms.Label
+			$err.ForeColor = [System.Drawing.Color]::Firebrick
+			$err.Location = New-Object System.Drawing.Point(14, 202)
+			$err.Size = New-Object System.Drawing.Size(250, 36)
+			$form.Controls.Add($err)
+			$btnOk = New-Object System.Windows.Forms.Button
+			$btnOk.Text = 'Create'
+			$btnOk.Location = New-Object System.Drawing.Point(230, 208)
+			$btnOk.Width = 84
+			$btnCancel = New-Object System.Windows.Forms.Button
+			$btnCancel.Text = 'Cancel'
+			$btnCancel.Location = New-Object System.Drawing.Point(320, 208)
+			$btnCancel.Width = 84
+			# DialogResult alone closes modal — do not also call Close() (causes unhandled exceptions)
+			$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+			$form.Controls.Add($btnOk)
+			$form.Controls.Add($btnCancel)
+			$form.AcceptButton = $btnOk
+			$form.CancelButton = $btnCancel
+			$btnOk.Add_Click({
+				param($sender, $e)
+				try {
+					$u = $tbUser.Text.Trim()
+					$p1 = $tbPass.Text
+					$p2 = $tbPass2.Text
+					if ([string]::IsNullOrWhiteSpace($u)) { $err.Text = 'Username required.'; return }
+					if ($u -notmatch '^[A-Za-z0-9._-]{1,20}$') { $err.Text = 'Username: 1-20 chars A-Z 0-9 . _ -'; return }
+					if ([string]::IsNullOrEmpty($p1)) { $err.Text = 'Password required.'; return }
+					if ($p1 -cne $p2) { $err.Text = 'Passwords do not match.'; return }
+					$bag.Cancelled = $false
+					$bag.Username = $u
+					$bag.Password = $p1
+					$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+				} catch {
+					$err.Text = $_.Exception.Message
+				}
+			})
+			try {
+				[void]$form.ShowDialog()
+			} catch {}
+			return $bag
+		})
+		[void]$ps.AddArgument([string]$Title)
+		$out = $ps.Invoke()
+		if ($ps.HadErrors) {
+			# Cancel / close noise — do not throw
+			$fatal = @($ps.Streams.Error | ForEach-Object { "$_" } | Where-Object {
+				$_ -and $_ -notmatch '(?i)cancel|closed|disposed|DialogResult|ShowDialog'
+			})
+			if ($fatal.Count -gt 0) {
+				return @{ Cancelled = $true; Username = ''; Password = ''; Error = ($fatal -join '; ') }
+			}
+		}
+		if ($out -and @($out).Count -gt 0) { return @($out)[-1] }
+		return @{ Cancelled = $true; Username = ''; Password = '' }
+	} catch {
+		return @{ Cancelled = $true; Username = ''; Password = ''; Error = $_.Exception.Message }
+	} finally {
+		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
+		try { if ($ps) { $ps.Dispose() } } catch {}
+		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
+	}
+}
+
+function Show-MBSharePasswordForm {
+	# Password-only prompt for fixed local user "share". Cancel-safe.
+	param(
+		[string]$Title = 'Share user password',
+		[string]$ShareName = '',
+		[string]$FolderPath = ''
+	)
+	$rs = $null; $ps = $null
+	try {
+		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
+		$rs = [runspacefactory]::CreateRunspace()
+		$rs.ApartmentState = 'STA'
+		$rs.ThreadOptions = 'ReuseThread'
+		$rs.Open()
+		$ps = [powershell]::Create()
+		$ps.Runspace = $rs
+		[void]$ps.AddScript({
+			param($Title, $ShareName, $FolderPath)
+			Add-Type -AssemblyName System.Windows.Forms
+			Add-Type -AssemblyName System.Drawing
+			$form = New-Object System.Windows.Forms.Form
+			$form.Text = $Title
+			$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+			$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+			$form.MaximizeBox = $false
+			$form.MinimizeBox = $false
+			$form.ShowInTaskbar = $false
+			$form.ClientSize = New-Object System.Drawing.Size(420, 210)
+			$form.TopMost = $true
+			$bag = @{ Cancelled = $true; Password = '' }
+			$lbl = New-Object System.Windows.Forms.Label
+			$bits = New-Object System.Collections.ArrayList
+			[void]$bits.Add('Local account: share  (password-protected network access)')
+			if ($ShareName) { [void]$bits.Add("Share name: $ShareName") }
+			if ($FolderPath) { [void]$bits.Add("Folder: $FolderPath") }
+			[void]$bits.Add('Enter a password for the share account.')
+			$lbl.Text = ($bits -join "`n")
+			$lbl.Location = New-Object System.Drawing.Point(14, 12)
+			$lbl.Size = New-Object System.Drawing.Size(390, 62)
+			$form.Controls.Add($lbl)
+			$lPass = New-Object System.Windows.Forms.Label
+			$lPass.Text = 'Password'
+			$lPass.Location = New-Object System.Drawing.Point(14, 80)
+			$lPass.AutoSize = $true
+			$form.Controls.Add($lPass)
+			$tbPass = New-Object System.Windows.Forms.TextBox
+			$tbPass.Location = New-Object System.Drawing.Point(14, 98)
+			$tbPass.Width = 390
+			$tbPass.UseSystemPasswordChar = $true
+			$form.Controls.Add($tbPass)
+			$lPass2 = New-Object System.Windows.Forms.Label
+			$lPass2.Text = 'Confirm password'
+			$lPass2.Location = New-Object System.Drawing.Point(14, 126)
+			$lPass2.AutoSize = $true
+			$form.Controls.Add($lPass2)
+			$tbPass2 = New-Object System.Windows.Forms.TextBox
+			$tbPass2.Location = New-Object System.Drawing.Point(14, 144)
+			$tbPass2.Width = 390
+			$tbPass2.UseSystemPasswordChar = $true
+			$form.Controls.Add($tbPass2)
+			$err = New-Object System.Windows.Forms.Label
+			$err.ForeColor = [System.Drawing.Color]::Firebrick
+			$err.Location = New-Object System.Drawing.Point(14, 172)
+			$err.Size = New-Object System.Drawing.Size(250, 28)
+			$form.Controls.Add($err)
+			$btnOk = New-Object System.Windows.Forms.Button
+			$btnOk.Text = 'OK'
+			$btnOk.Location = New-Object System.Drawing.Point(230, 172)
+			$btnOk.Width = 84
+			$btnCancel = New-Object System.Windows.Forms.Button
+			$btnCancel.Text = 'Cancel'
+			$btnCancel.Location = New-Object System.Drawing.Point(320, 172)
+			$btnCancel.Width = 84
+			$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+			$form.Controls.Add($btnOk)
+			$form.Controls.Add($btnCancel)
+			$form.AcceptButton = $btnOk
+			$form.CancelButton = $btnCancel
+			$btnOk.Add_Click({
+				param($sender, $e)
+				try {
+					$p1 = $tbPass.Text
+					$p2 = $tbPass2.Text
+					if ([string]::IsNullOrEmpty($p1)) { $err.Text = 'Password required.'; return }
+					if ($p1 -cne $p2) { $err.Text = 'Passwords do not match.'; return }
+					$bag.Cancelled = $false
+					$bag.Password = $p1
+					$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+				} catch {
+					$err.Text = $_.Exception.Message
+				}
+			})
+			try { [void]$tbPass.Focus() } catch {}
+			try { [void]$form.ShowDialog() } catch {}
+			return $bag
+		})
+		[void]$ps.AddArgument([string]$Title)
+		[void]$ps.AddArgument([string]$ShareName)
+		[void]$ps.AddArgument([string]$FolderPath)
+		$out = $ps.Invoke()
+		if ($ps.HadErrors) {
+			$fatal = @($ps.Streams.Error | ForEach-Object { "$_" } | Where-Object {
+				$_ -and $_ -notmatch '(?i)cancel|closed|disposed|DialogResult|ShowDialog'
+			})
+			if ($fatal.Count -gt 0) {
+				return @{ Cancelled = $true; Password = ''; Error = ($fatal -join '; ') }
+			}
+		}
+		if ($out -and @($out).Count -gt 0) { return @($out)[-1] }
+		return @{ Cancelled = $true; Password = '' }
+	} catch {
+		return @{ Cancelled = $true; Password = ''; Error = $_.Exception.Message }
+	} finally {
+		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
+		try { if ($ps) { $ps.Dispose() } } catch {}
+		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
+	}
+}
+
+function Ensure-MBShareLocalUser {
+	# Create or update fixed local user "share" (non-admin) with the given password.
+	param([string]$Password)
+	$user = 'share'
+	$pass = [string]$Password
+	if ([string]::IsNullOrEmpty($pass)) {
+		return @{ ok = $false; error = 'share password required' }
+	}
+	try {
+		$exists = $false
+		if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+			try { $null = Get-LocalUser -Name $user -ErrorAction Stop; $exists = $true } catch { $exists = $false }
+		} else {
+			$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
+			if ($chk.ok -or ($chk.out -match '(?i)User name')) { $exists = $true }
+		}
+		if ($exists) {
+			$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+			if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
+				Set-LocalUser -Name $user -Password $sec -ErrorAction Stop
+			} else {
+				$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass) -TimeoutSec 30
+				if (-not $r.ok) {
+					return @{ ok = $false; error = "Failed to set password for existing user share: $($r.err) $($r.out)" }
+				}
+			}
+			try { Enable-LocalUser -Name $user -ErrorAction SilentlyContinue } catch {}
+			try { Remove-LocalGroupMember -Group 'Administrators' -Member $user -ErrorAction SilentlyContinue } catch {}
+			return @{ ok = $true; username = $user; created = $false; method = 'update' }
+		}
+		$cr = New-MBLocalShareUserCore -username $user -password $pass -full_name 'Network share access'
+		if (-not $cr.ok) { return $cr }
+		return @{ ok = $true; username = $user; created = $true; method = $cr.method }
+	} catch {
+		return @{ ok = $false; error = $_.Exception.Message }
+	}
+}
+
+function Show-MBLocalAdminGateDialog {
+	# Dropdown of local admins + password. Actions: verified | create | cancel.
+	param(
+		[string]$DomainName = '',
+		[object[]]$Accounts = @(),
+		[string]$Hint = ''
+	)
+	$names = @()
+	$labels = @()
+	foreach ($a in @($Accounts)) {
+		$n = [string]$a.name
+		if ([string]::IsNullOrWhiteSpace($n)) { continue }
+		$names += $n
+		$en = if ($a.enabled) { '' } else { ' (disabled)' }
+		$fn = if ($a.full_name) { " — $($a.full_name)" } else { '' }
+		$labels += "$n$en$fn"
+	}
+	$rs = $null; $ps = $null
+	try {
+		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
+		$rs = [runspacefactory]::CreateRunspace()
+		$rs.ApartmentState = 'STA'
+		$rs.ThreadOptions = 'ReuseThread'
+		$rs.Open()
+		$ps = [powershell]::Create()
+		$ps.Runspace = $rs
+		[void]$ps.AddScript({
+			param($DomainName, $Names, $Labels, $Hint)
+			Add-Type -AssemblyName System.Windows.Forms
+			Add-Type -AssemblyName System.Drawing
+			$form = New-Object System.Windows.Forms.Form
+			$form.Text = 'Leave Domain — local admin required'
+			$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+			$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+			$form.MaximizeBox = $false
+			$form.MinimizeBox = $false
+			$form.ClientSize = New-Object System.Drawing.Size(460, 280)
+			$form.TopMost = $true
+			$domLine = if ($DomainName) { "Domain: $DomainName`n" } else { '' }
+			$lbl = New-Object System.Windows.Forms.Label
+			$lbl.Text = "${domLine}Before leaving the domain, prove you can sign in as a local administrator.`nAfter disjoin, only local accounts work — wrong/missing admin = lockout."
+			$lbl.Location = New-Object System.Drawing.Point(14, 10)
+			$lbl.Size = New-Object System.Drawing.Size(430, 58)
+			$form.Controls.Add($lbl)
+			$lAcct = New-Object System.Windows.Forms.Label
+			$lAcct.Text = 'Local administrator'
+			$lAcct.Location = New-Object System.Drawing.Point(14, 74)
+			$lAcct.AutoSize = $true
+			$form.Controls.Add($lAcct)
+			$combo = New-Object System.Windows.Forms.ComboBox
+			$combo.Location = New-Object System.Drawing.Point(14, 92)
+			$combo.Width = 430
+			$combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+			if ($Labels -and @($Labels).Count -gt 0) {
+				for ($i = 0; $i -lt @($Labels).Count; $i++) {
+					[void]$combo.Items.Add([string]$Labels[$i])
+				}
+				$combo.SelectedIndex = 0
+			} else {
+				[void]$combo.Items.Add('(no local admin accounts found)')
+				$combo.SelectedIndex = 0
+				$combo.Enabled = $false
+			}
+			$form.Controls.Add($combo)
+			$lPass = New-Object System.Windows.Forms.Label
+			$lPass.Text = 'Password for selected account'
+			$lPass.Location = New-Object System.Drawing.Point(14, 128)
+			$lPass.AutoSize = $true
+			$form.Controls.Add($lPass)
+			$tbPass = New-Object System.Windows.Forms.TextBox
+			$tbPass.Location = New-Object System.Drawing.Point(14, 146)
+			$tbPass.Width = 430
+			$tbPass.UseSystemPasswordChar = $true
+			$tbPass.Enabled = ($Names -and @($Names).Count -gt 0)
+			$form.Controls.Add($tbPass)
+			$status = New-Object System.Windows.Forms.Label
+			$status.ForeColor = [System.Drawing.Color]::Firebrick
+			$status.Location = New-Object System.Drawing.Point(14, 176)
+			$status.Size = New-Object System.Drawing.Size(430, 36)
+			if ($Hint) { $status.Text = [string]$Hint }
+			$form.Controls.Add($status)
+			$btnVerify = New-Object System.Windows.Forms.Button
+			$btnVerify.Text = 'Verify && continue'
+			$btnVerify.Location = New-Object System.Drawing.Point(14, 224)
+			$btnVerify.Width = 130
+			$btnVerify.Enabled = ($Names -and @($Names).Count -gt 0)
+			$btnCreate = New-Object System.Windows.Forms.Button
+			$btnCreate.Text = 'Create local admin...'
+			$btnCreate.Location = New-Object System.Drawing.Point(154, 224)
+			$btnCreate.Width = 150
+			$btnCancel = New-Object System.Windows.Forms.Button
+			$btnCancel.Text = 'Cancel leave'
+			$btnCancel.Location = New-Object System.Drawing.Point(340, 224)
+			$btnCancel.Width = 104
+			$form.Controls.Add($btnVerify)
+			$form.Controls.Add($btnCreate)
+			$form.Controls.Add($btnCancel)
+			$form.AcceptButton = $btnVerify
+			$form.CancelButton = $btnCancel
+			$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+			$result = @{ Action = 'cancel'; Username = ''; Password = '' }
+			$btnVerify.Add_Click({
+				if (-not $Names -or @($Names).Count -eq 0) {
+					$status.Text = 'No local admin to verify. Create one first.'
+					return
+				}
+				$idx = $combo.SelectedIndex
+				if ($idx -lt 0 -or $idx -ge @($Names).Count) {
+					$status.Text = 'Select a local admin account.'
+					return
+				}
+				$u = [string]$Names[$idx]
+				$p = [string]$tbPass.Text
+				if ([string]::IsNullOrEmpty($p)) {
+					$status.Text = 'Enter the password for the selected account.'
+					return
+				}
+				$result.Action = 'verify'
+				$result.Username = $u
+				$result.Password = $p
+				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+			}.GetNewClosure())
+			$btnCreate.Add_Click({
+				$result.Action = 'create'
+				$result.Username = ''
+				$result.Password = ''
+				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+			}.GetNewClosure())
+			try { [void]$form.ShowDialog() } catch {}
+			return $result
+		})
+		[void]$ps.AddArgument([string]$DomainName)
+		[void]$ps.AddArgument([object[]]$names)
+		[void]$ps.AddArgument([object[]]$labels)
+		[void]$ps.AddArgument([string]$Hint)
+		$out = $ps.Invoke()
+		if ($ps.HadErrors) {
+			$errMsgs = @($ps.Streams.Error | ForEach-Object { "$_" }) -join '; '
+			if ($errMsgs) { throw $errMsgs }
+		}
+		if ($out -and @($out).Count -gt 0) { return @($out)[-1] }
+		return @{ Action = 'cancel'; Username = ''; Password = '' }
+	} catch {
+		return @{ Action = 'cancel'; Username = ''; Password = ''; Error = $_.Exception.Message }
+	} finally {
+		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
+		try { if ($ps) { $ps.Dispose() } } catch {}
+		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
+	}
+}
+
+function Request-MBLocalAdminGateForDomainLeave {
+	# Foolproof gate: verify local admin password (dropdown) or create one; cancel = refuse leave.
+	param([string]$DomainName = '')
+	$hint = ''
+	$preferUser = ''
+	for ($round = 0; $round -lt 12; $round++) {
+		$accounts = @(Get-MBLocalAdminAccounts)
+		$enabled = @($accounts | Where-Object { $_.enabled })
+		if ($enabled.Count -eq 0 -and $accounts.Count -eq 0) {
+			$offer = Request-Confirmation -Title "LeaveDomain — no local admin" -Details @"
+No local administrator accounts were found on this PC.
+
+Leaving the domain without a known local admin password can permanently lock you out (domain logons stop working after disjoin).
+
+Create a local administrator account now?
+"@
+			if (-not $offer) {
+				return @{
+					ok     = $false
+					reason = 'No local admin accounts and create was refused. LeaveDomain blocked to prevent lockout.'
+				}
+			}
+			$created = Show-MBCreateLocalAdminForm -Title 'Create local administrator (required)'
+			if (-not $created -or $created.Cancelled) {
+				return @{
+					ok     = $false
+					reason = 'Local admin creation cancelled. LeaveDomain blocked to prevent lockout.'
+				}
+			}
+			$cr = New-MBLocalAdminAccountCore -username $created.Username -password $created.Password
+			if (-not $cr.ok) {
+				$hint = "Create failed: $($cr.error)"
+				continue
+			}
+			$preferUser = $created.Username
+			# Auto-verify with the password just set
+			if (Test-MBLocalAdminCredential -Username $created.Username -Password $created.Password) {
+				return @{
+					ok       = $true
+					Username = $created.Username
+					Password = $created.Password
+					Created  = $true
+				}
+			}
+			$hint = "Account '$($created.Username)' created but could not verify password. Try again."
+			continue
+		}
+
+		# Prefer enabled accounts in the dialog list (include disabled with label)
+		$dlg = Show-MBLocalAdminGateDialog -DomainName $DomainName -Accounts $accounts -Hint $hint
+		if (-not $dlg -or $dlg.Action -eq 'cancel') {
+			return @{
+				ok     = $false
+				reason = 'Local admin verification cancelled. LeaveDomain blocked to prevent lockout.'
+			}
+		}
+		if ($dlg.Action -eq 'create') {
+			$offer = Request-Confirmation -Title "Create local admin before leave" -Details @"
+Create a new local administrator account before leaving domain '$DomainName'?
+
+You will need this account (and its password) to sign in after the PC leaves the domain.
+"@
+			if (-not $offer) {
+				# Creating refused while existing admins may exist — return to gate, do not leave
+				$hint = 'Create declined. Verify an existing local admin, or cancel leave.'
+				continue
+			}
+			$created = Show-MBCreateLocalAdminForm -Title 'Create local administrator'
+			if (-not $created -or $created.Cancelled) {
+				$hint = 'Create cancelled. Verify an existing local admin or cancel leave.'
+				continue
+			}
+			$cr = New-MBLocalAdminAccountCore -username $created.Username -password $created.Password
+			if (-not $cr.ok) {
+				$hint = "Create failed: $($cr.error)"
+				continue
+			}
+			if (Test-MBLocalAdminCredential -Username $created.Username -Password $created.Password) {
+				return @{
+					ok       = $true
+					Username = $created.Username
+					Password = $created.Password
+					Created  = $true
+				}
+			}
+			$hint = "Created '$($created.Username)' but verification failed. Select it and enter the password."
+			continue
+		}
+		if ($dlg.Action -eq 'verify') {
+			if (Test-MBLocalAdminCredential -Username $dlg.Username -Password $dlg.Password) {
+				return @{
+					ok       = $true
+					Username = $dlg.Username
+					Password = $dlg.Password
+					Created  = $false
+				}
+			}
+			$hint = "Authentication failed for '$($dlg.Username)'. Check the password, or create a new local admin."
+			continue
+		}
+		$hint = 'Unexpected gate response. Try again.'
+	}
+	return @{
+		ok     = $false
+		reason = 'Too many failed local-admin verification attempts. LeaveDomain blocked.'
+	}
+}
+
+function Invoke-LeaveDomain {
+	param(
+		[string]$workgroup = 'WORKGROUP',
+		[object]$reboot = $false,
+		[string]$local_username = '',
+		[string]$local_password = ''
+	)
+	$cs = $null
+	try {
+		$cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+	} catch {
+		try { $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop } catch {}
+	}
+	if (-not $cs) { return "ERROR: Could not read computer domain membership." }
+	$partOfDomain = $false
+	try { $partOfDomain = [bool]$cs.PartOfDomain } catch {}
+	$dom = [string]$cs.Domain
+	if (-not $partOfDomain) {
+		return "ERROR: This PC is not domain-joined (workgroup/domain label: $dom). Nothing to leave."
+	}
+	$wg = ([string]$workgroup).Trim()
+	if ([string]::IsNullOrWhiteSpace($wg)) { $wg = 'WORKGROUP' }
+	$doReboot = $false
+	if ($reboot -is [bool]) { $doReboot = $reboot }
+	elseif ([string]$reboot -match '^(?i)1|true|yes|y|on$') { $doReboot = $true }
+
+	# Always require verified local admin (lockout safety). Optional tool args can short-circuit the UI if valid.
+	$verifiedUser = ''
+	$verifiedPass = ''
+	$createdAdmin = $false
+	$lu = ([string]$local_username).Trim()
+	$lp = [string]$local_password
+	if ($lu -and -not [string]::IsNullOrEmpty($lp) -and (Test-MBLocalAdminCredential -Username $lu -Password $lp)) {
+		$verifiedUser = $lu
+		$verifiedPass = $lp
+	} else {
+		if ($lu -and -not [string]::IsNullOrEmpty($lp)) {
+			Write-MBWarn "LeaveDomain: provided local credentials failed verification; opening local-admin gate."
+		}
+		$gate = Request-MBLocalAdminGateForDomainLeave -DomainName $dom
+		if (-not $gate -or -not $gate.ok) {
+			$why = if ($gate -and $gate.reason) { [string]$gate.reason } else { 'Local admin verification failed or was cancelled.' }
+			return "BLOCKED BY USER: LeaveDomain refused — $why"
+		}
+		$verifiedUser = [string]$gate.Username
+		$verifiedPass = [string]$gate.Password
+		if ($gate.Created) { $createdAdmin = $true }
+	}
+
+	$details = @"
+LEAVE DOMAIN (lockout-safe gate passed):
+  current domain = $dom
+  target workgroup = $wg
+  verified local admin = $verifiedUser
+  local admin created this run = $createdAdmin
+  reboot after leave = $doReboot
+
+After this, domain accounts cannot sign in. Use local\$verifiedUser (or other local accounts).
+"@
+	if (-not (Request-Confirmation -Title "LeaveDomain requires approval" -Details $details)) {
+		return "BLOCKED BY USER: LeaveDomain denied."
+	}
+	try {
+		$sec = ConvertTo-SecureString -String $verifiedPass -AsPlainText -Force
+		$localCred = New-Object System.Management.Automation.PSCredential (".\$verifiedUser", $sec)
+		$rmParams = @{
+			WorkgroupName   = $wg
+			LocalCredential = $localCred
+			Force           = $true
+			PassThru        = $true
+			ErrorAction     = 'Stop'
+			WarningAction   = 'SilentlyContinue'
+		}
+		if ($doReboot) { $rmParams['Restart'] = $true }
+		$result = Remove-Computer @rmParams
+		return ConvertTo-MBJson ([ordered]@{
+			ok              = $true
+			left_domain     = $dom
+			workgroup       = $wg
+			local_admin     = $verifiedUser
+			created_admin   = $createdAdmin
+			reboot          = $doReboot
+			result          = "$result"
+			note            = $(if ($doReboot) { 'Restart initiated after leave.' } else { 'Reboot recommended to finish leaving the domain. Sign in with the verified local admin.' })
+		})
+	} catch {
+		return "ERROR: LeaveDomain failed: $($_.Exception.Message)"
+	}
+}
+
+function Resolve-MBWindowsAccountName {
+	# Normalize HOST\user for net use / New-SmbMapping (JSON often doubles backslashes).
+	param(
+		[string]$Username = '',
+		[string]$Domain = ''
+	)
+	$u = ([string]$Username).Trim().Trim('"').Trim("'")
+	$d = ([string]$Domain).Trim().Trim('"').Trim("'").TrimEnd('\')
+	if ([string]::IsNullOrWhiteSpace($u)) { return '' }
+	# Collapse accidental multi-backslashes from JSON (keep single \)
+	while ($u.Contains('\\')) { $u = $u.Replace('\\', '\') }
+	$u = $u -replace '/', '\'
+	# Strip leading .\ or \\
+	if ($u.StartsWith('.\')) { $u = $u.Substring(2) }
+	if ($u.StartsWith('\\') -and $u -match '^\\\\(?<host>[^\\]+)\\(?<user>.+)$') {
+		# \\server\user form
+		return ($Matches['host'] + '\' + $Matches['user'])
+	}
+	if (-not [string]::IsNullOrWhiteSpace($d)) {
+		if ($u -match '^(?<h>[^\\]+)\\(?<n>.+)$') {
+			# already qualified — keep as-is unless domain was meant to override host part
+			return $u
+		}
+		if ($u -match '@') { return $u }
+		return ($d + '\' + $u)
+	}
+	return $u
+}
+
+function Normalize-MBUncPath {
+	param([string]$Path)
+	$p = ([string]$Path).Trim().Trim('"').Trim("'")
+	if ([string]::IsNullOrWhiteSpace($p)) { return $p }
+	# JSON often produces \\\\server\\share → normalize to \\server\share
+	while ($p -match '\\\\\\') { $p = $p -replace '\\\\', '\' } # too aggressive?
+	# Safer: replace runs of 2+ backslashes with single, then ensure leading \\
+	$p = [regex]::Replace($p, '\\{2,}', '\')
+	if ($p.StartsWith('\')) {
+		# \server\share -> \\server\share
+		if (-not $p.StartsWith('\\')) { $p = '\' + $p }
+		else {
+			# became \server\share after collapse of \\\\server -> need \\
+			# After {2,} -> \, leading \\ becomes \ — fix UNC root
+			if ($p -match '^\\[^\\]') { $p = '\' + $p }
+		}
+	} elseif ($p -match '^[A-Za-z0-9._-]+\\.+') {
+		$p = '\\' + $p
+	}
+	# Final: must start with \\ for UNC
+	if ($p -match '^\\[^\\]') { $p = '\' + $p }
+	return $p
+}
+
+function Test-MBDriveLetterFreeForMap {
+	# Port of RescueMaker :AVAILABLEDRIVELETTERS
+	#   FOR D..Z:
+	#     IF NOT EXIST L:\* (
+	#       FSUTIL FSINFO drivetype L:
+	#       IF token3 != CD-ROM AND token3 == "No"  (from "No such Drive")
+	#         → free letter
+	#     )
+	# Empty CD/DVD: EXIST may be false (no media) but drivetype is CD-ROM → skipped.
+	# Only "No such Drive" is accepted — Fixed/Remote/Removable/RAM are not free.
+	param([string]$Letter)
+	$L = ([string]$Letter).Trim().TrimEnd(':').ToUpperInvariant()
+	if ($L -notmatch '^[A-Z]$') { return $false }
+
+	# Step 1 — RescueMaker: IF NOT EXIST L:\*
+	# (cmd EXIST L:\* is false for empty CD and for truly unused letters)
+	try {
+		if (Test-Path -LiteralPath "${L}:\") { return $false }
+		if ([System.IO.Directory]::Exists("${L}:\")) { return $false }
+	} catch {
+		return $false
+	}
+
+	# Step 2 — FSUTIL FSINFO drivetype L:
+	#   "E: - No such Drive"  → free
+	#   "D: - CD-ROM Drive"   → reserved (looks free without media; never use)
+	#   "C: - Fixed Drive" / "Remote Network Drive" / etc. → in use
+	try {
+		$r = Invoke-MBSetupNative -File 'fsutil.exe' -ArgumentList @('fsinfo', 'drivetype', "${L}:") -TimeoutSec 5
+		$blob = ((([string]$r.out) + ' ' + ([string]$r.err)).Trim())
+		if (-not $blob) { throw 'empty fsutil' }
+		# token3 of "X: - CD-ROM Drive" / "X: - No such Drive" style output
+		if ($blob -match '(?i)CD-ROM') { return $false }
+		if ($blob -match '(?i)No such') { return $true }
+		return $false
+	} catch {
+		# fsutil unavailable — DriveInfo fallback (same rules)
+		try {
+			$di = New-Object System.IO.DriveInfo ("${L}:")
+			if ($di.DriveType -eq [System.IO.DriveType]::CDRom) { return $false }
+			if ($di.DriveType -eq [System.IO.DriveType]::NoRootDirectory) { return $true }
+			return $false
+		} catch {
+			return $false
+		}
+	}
+}
+
+function Get-MBAvailableDriveLetter {
+	# RescueMaker: scan D..Z; only "No such Drive" and not CD-ROM. Optional Prefer= if free.
+	param([string]$Prefer = '')
+	$pref = ([string]$Prefer).Trim().TrimEnd(':').ToUpperInvariant()
+	$order = New-Object System.Collections.ArrayList
+	if ($pref -match '^[A-Z]$' -and $pref -notin @('A', 'B', 'C')) { [void]$order.Add($pref) }
+	# D through Z only (same as RescueMaker FOR D E F ... Z) — never auto-pick A/B/C
+	foreach ($code in 68..90) { # D=68 .. Z=90
+		$ch = [string][char]$code
+		if ($ch -ne $pref) { [void]$order.Add($ch) }
+	}
+	foreach ($L in @($order)) {
+		if (Test-MBDriveLetterFreeForMap -Letter $L) { return $L }
+	}
+	return $null
+}
+
+function Invoke-MapNetworkDrive {
+	param(
+		[string]$letter = '',
+		[string]$path,
+		[string]$username = '',
+		[string]$domain = '',
+		[string]$password = '',
+		[object]$persistent = $true,
+		[object]$force = $false
+	)
+	$want = ([string]$letter).Trim().TrimEnd(':').ToUpperInvariant()
+	$unc = Normalize-MBUncPath -Path $path
+	if ($unc -notmatch '^\\\\[^\\]+\\.+') {
+		return "ERROR: path must be a UNC share (\\\\server\\share). Got: $unc"
+	}
+
+	# Pick letter: prefer requested if free; else auto (RescueMaker-style, skip CD/DVD reserved)
+	$autoLetter = $false
+	$let = $null
+	if ($want -match '^[A-Z]$') {
+		if (Test-MBDriveLetterFreeForMap -Letter $want) {
+			$let = $want
+		} elseif ($force) {
+			# force = reclaim requested letter
+			$let = $want
+		} else {
+			$let = Get-MBAvailableDriveLetter -Prefer $want
+			$autoLetter = $true
+			if (-not $let) {
+				return "ERROR: letter ${want}: is not free (in use or CD/DVD reserved) and no other free letter found."
+			}
+		}
+	} else {
+		$let = Get-MBAvailableDriveLetter
+		$autoLetter = $true
+		if (-not $let) {
+			return "ERROR: no free drive letter available (checked D-Z; CD/DVD reserved letters skipped)."
+		}
+	}
+
+	$user = Resolve-MBWindowsAccountName -Username $username -Domain $domain
+	$pass = [string]$password
+	$persist = $true
+	if ($persistent -is [bool]) { $persist = $persistent }
+	elseif ([string]$persistent -match '^(?i)0|false|no|off$') { $persist = $false }
+	$doForce = $false
+	if ($force -is [bool]) { $doForce = $force }
+	elseif ([string]$force -match '^(?i)1|true|yes|y|on$') { $doForce = $true }
+
+	$details = "Map network drive:`n  letter = ${let}:$(if ($autoLetter) { ' (auto-picked free letter; CD/DVD reserved skipped)' } else { '' })`n  path = $unc`n  username = $(if ($user) { $user } else { '(current user)' })`n  password = $(if ($user) { (Get-MBMaskedSecret $pass) } else { '(n/a)' })`n  persistent = $persist`n  force = $doForce"
+	if (-not (Request-Confirmation -Title "MapNetworkDrive requires approval" -Details $details)) {
+		return "BLOCKED BY USER: MapNetworkDrive denied."
+	}
+	try {
+		if ($doForce) {
+			try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', "${let}:", '/delete', '/y') -TimeoutSec 15 } catch {}
+			try {
+				if (Get-Command Remove-SmbMapping -ErrorAction SilentlyContinue) {
+					Remove-SmbMapping -LocalPath "${let}:" -Force -UpdateProfile -ErrorAction SilentlyContinue
+				}
+			} catch {}
+			try { Remove-PSDrive -Name $let -Force -ErrorAction SilentlyContinue } catch {}
+		}
+
+		$method = ''
+		$ok = $false
+		$out = ''
+		$err = ''
+		$exit = 0
+
+		# Prefer New-SmbMapping — UserName as PowerShell string (HOST\user safe)
+		if (Get-Command New-SmbMapping -ErrorAction SilentlyContinue) {
+			try {
+				$mapParams = @{
+					LocalPath   = "${let}:"
+					RemotePath  = $unc
+					Persistent  = $persist
+					ErrorAction = 'Stop'
+				}
+				if ($user) {
+					$mapParams['UserName'] = $user
+					if (-not [string]::IsNullOrEmpty($pass)) { $mapParams['Password'] = $pass }
+				}
+				New-SmbMapping @mapParams | Out-Null
+				$ok = $true
+				$method = 'New-SmbMapping'
+			} catch {
+				$err = $_.Exception.Message
+				$method = 'New-SmbMapping-failed'
+			}
+		}
+
+		# Fallback: net use (same shape as manual: net use M: \\IP\temp /user:share pass /persistent:yes)
+		if (-not $ok) {
+			$netArgs = New-Object System.Collections.ArrayList
+			[void]$netArgs.Add('use')
+			[void]$netArgs.Add("${let}:")
+			[void]$netArgs.Add($unc)
+			if ($user) {
+				[void]$netArgs.Add('/user:' + $user)
+				[void]$netArgs.Add($(if ($null -eq $pass) { '' } else { $pass }))
+			}
+			[void]$netArgs.Add($(if ($persist) { '/persistent:yes' } else { '/persistent:no' }))
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @($netArgs.ToArray()) -TimeoutSec 60
+			$ok = [bool]$r.ok
+			$exit = $r.exit
+			$out = [string]$r.out
+			$err = if ($err -and -not $r.ok) { ($err + '; ' + [string]$r.err) } else { [string]$r.err }
+			$method = if ($method -eq 'New-SmbMapping-failed') { 'net use (after New-SmbMapping failed)' } else { 'net use' }
+		}
+
+		return ConvertTo-MBJson ([ordered]@{
+			ok          = $ok
+			letter      = "${let}:"
+			letter_auto = $autoLetter
+			path        = $unc
+			username    = $user
+			persistent  = $persist
+			method      = $method
+			exit        = $exit
+			out         = $out
+			err         = $err
+		})
+	} catch {
+		return "ERROR: MapNetworkDrive failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-AddNetworkPrinter {
+	param(
+		[string]$path,
+		[string]$name = '',
+		[object]$set_default = $false
+	)
+	$unc = ([string]$path).Trim()
+	$friendly = ([string]$name).Trim()
+	if ($unc -notmatch '^\\\\') { return "ERROR: path must be a printer share UNC (\\\\server\\printer)." }
+	$makeDefault = $false
+	if ($set_default -is [bool]) { $makeDefault = $set_default }
+	elseif ([string]$set_default -match '^(?i)1|true|yes|y|on$') { $makeDefault = $true }
+	$details = "Add network printer:`n  path = $unc`n  name = $(if ($friendly) { $friendly } else { '(driver/share default)' })`n  set_default = $makeDefault"
+	if (-not (Request-Confirmation -Title "AddNetworkPrinter requires approval" -Details $details)) {
+		return "BLOCKED BY USER: AddNetworkPrinter denied."
+	}
+	try {
+		$method = ''
+		if (Get-Command Add-Printer -ErrorAction SilentlyContinue) {
+			$p = @{ ConnectionName = $unc; ErrorAction = 'Stop' }
+			if ($friendly) { $p['Name'] = $friendly }
+			Add-Printer @p
+			$method = 'Add-Printer'
+			$printName = if ($friendly) { $friendly } else { $unc }
+			if ($makeDefault -and (Get-Command Set-Printer -ErrorAction SilentlyContinue)) {
+				try {
+					# Resolve installed name
+					$inst = Get-Printer -ErrorAction SilentlyContinue | Where-Object {
+						$_.Name -eq $printName -or $_.Name -eq $unc -or $_.ComputerName
+					} | Select-Object -First 1
+					if (-not $inst) {
+						$inst = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$([System.IO.Path]::GetFileName($unc.TrimEnd('\')))*" } | Select-Object -First 1
+					}
+					if ($inst) {
+						$null = Invoke-MBSetupNative -File 'rundll32.exe' -ArgumentList @('printui.dll,PrintUIEntry', '/y', '/n', $inst.Name) -TimeoutSec 30
+					}
+				} catch {}
+			} elseif ($makeDefault) {
+				$null = Invoke-MBSetupNative -File 'rundll32.exe' -ArgumentList @('printui.dll,PrintUIEntry', '/y', '/n', $unc) -TimeoutSec 30
+			}
+		} else {
+			$r = Invoke-MBSetupNative -File 'rundll32.exe' -ArgumentList @('printui.dll,PrintUIEntry', '/in', '/n', $unc) -TimeoutSec 120
+			if (-not $r.ok) {
+				return ConvertTo-MBJson ([ordered]@{ ok = $false; path = $unc; method = 'printui'; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			$method = 'printui'
+			if ($makeDefault) {
+				$null = Invoke-MBSetupNative -File 'rundll32.exe' -ArgumentList @('printui.dll,PrintUIEntry', '/y', '/n', $unc) -TimeoutSec 30
+			}
+		}
+		return ConvertTo-MBJson ([ordered]@{
+			ok          = $true
+			path        = $unc
+			name        = $friendly
+			set_default = $makeDefault
+			method      = $method
+		})
+	} catch {
+		return "ERROR: AddNetworkPrinter failed: $($_.Exception.Message)"
+	}
+}
+
+function Test-MBLocalUserCredential {
+	# Logon check only (not admin membership).
+	param(
+		[string]$Username,
+		[string]$Password
+	)
+	$user = ([string]$Username).Trim()
+	if ([string]::IsNullOrWhiteSpace($user)) { return $false }
+	if ($null -eq $Password) { return $false }
+	try { Ensure-MBLogonHelper } catch { return $false }
+	try { return [bool][MiniBot.Native.MBLogon]::ValidateLocalUser($user, [string]$Password) } catch { return $false }
+}
+
+function Get-MBLocalUserAccountNames {
+	$list = New-Object System.Collections.ArrayList
+	$seen = @{}
+	if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+		try {
+			Get-LocalUser -ErrorAction Stop | ForEach-Object {
+				$n = [string]$_.Name
+				if ([string]::IsNullOrWhiteSpace($n)) { return }
+				if (-not $_.Enabled) { return }
+				$key = $n.ToLowerInvariant()
+				if ($seen.ContainsKey($key)) { return }
+				$seen[$key] = $true
+				[void]$list.Add($n)
+			}
+		} catch {}
+	}
+	if ($list.Count -eq 0) {
+		try {
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user') -TimeoutSec 15
+			$in = $false
+			foreach ($line in (([string]$r.out) -split "`r?`n")) {
+				if ($line -match '----') { $in = $true; continue }
+				if (-not $in) { continue }
+				if ($line -match '(?i)command completed') { break }
+				foreach ($tok in ($line -split '\s+')) {
+					$t = $tok.Trim()
+					if ([string]::IsNullOrWhiteSpace($t)) { continue }
+					$key = $t.ToLowerInvariant()
+					if ($seen.ContainsKey($key)) { continue }
+					$seen[$key] = $true
+					[void]$list.Add($t)
+				}
+			}
+		} catch {}
+	}
+	return @($list | Sort-Object)
+}
+
+function New-MBLocalShareUserCore {
+	# Non-admin local user for share access (caller already confirmed intent).
+	param(
+		[string]$username,
+		[string]$password,
+		[string]$full_name = ''
+	)
+	$user = ([string]$username).Trim()
+	$pass = [string]$password
+	if ([string]::IsNullOrWhiteSpace($user)) { return @{ ok = $false; error = 'username required' } }
+	if ($user -notmatch '^[A-Za-z0-9._-]{1,20}$') { return @{ ok = $false; error = 'username must be 1-20 chars [A-Za-z0-9._-]' } }
+	if ([string]::IsNullOrEmpty($pass)) { return @{ ok = $false; error = 'password required' } }
+	$fn = ([string]$full_name).Trim()
+	if (-not $fn) { $fn = 'MiniBot share access' }
+	try {
+		$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+		if (Get-Command Add-LocalUser -ErrorAction SilentlyContinue) {
+			try {
+				$null = Get-LocalUser -Name $user -ErrorAction Stop
+				return @{ ok = $false; error = "Local user '$user' already exists" }
+			} catch {}
+			$p = @{
+				Name                     = $user
+				Password                 = $sec
+				FullName                 = $fn
+				Description              = 'MiniBot network share access account'
+				PasswordNeverExpires     = $true
+				UserMayNotChangePassword = $false
+				ErrorAction              = 'Stop'
+			}
+			Add-LocalUser @p | Out-Null
+			# Ensure not in Administrators
+			try { Remove-LocalGroupMember -Group 'Administrators' -Member $user -ErrorAction SilentlyContinue } catch {}
+			return @{ ok = $true; username = $user; method = 'Add-LocalUser'; admin = $false }
+		}
+		$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
+		if ($chk.ok -or ($chk.out -match '(?i)User name')) {
+			return @{ ok = $false; error = "Local user '$user' already exists" }
+		}
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass, '/add') -TimeoutSec 30
+		if (-not $r.ok) {
+			return @{ ok = $false; error = "net user failed (exit $($r.exit)): $($r.err) $($r.out)" }
+		}
+		try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/comment:MiniBot network share access') -TimeoutSec 15 } catch {}
+		return @{ ok = $true; username = $user; method = 'net user'; admin = $false }
+	} catch {
+		return @{ ok = $false; error = $_.Exception.Message }
+	}
+}
+
+function Enable-MBPasswordProtectedSharing {
+	# Win10/11 Advanced sharing: password protected sharing ON (not Guest/simple sharing).
+	$steps = New-Object System.Collections.ArrayList
+	try {
+		$lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+		if (Test-Path -LiteralPath $lsa) {
+			Set-ItemProperty -LiteralPath $lsa -Name 'ForceGuest' -Value 0 -Type DWord -Force -ErrorAction Stop
+			[void]$steps.Add('ForceGuest=0')
+			try {
+				Set-ItemProperty -LiteralPath $lsa -Name 'everyoneincludesanonymous' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+				[void]$steps.Add('everyoneincludesanonymous=0')
+			} catch {}
+		}
+	} catch {
+		[void]$steps.Add(('Lsa reg failed: {0}' -f $_.Exception.Message))
+	}
+	# Guest account off
+	try {
+		if (Get-Command Disable-LocalUser -ErrorAction SilentlyContinue) {
+			try { Disable-LocalUser -Name 'Guest' -ErrorAction Stop; [void]$steps.Add('Guest disabled') } catch {
+				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', 'Guest', '/active:no') -TimeoutSec 15
+				[void]$steps.Add('Guest /active:no')
+			}
+		} else {
+			$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', 'Guest', '/active:no') -TimeoutSec 15
+			[void]$steps.Add('Guest /active:no')
+		}
+	} catch {
+		[void]$steps.Add(('Guest disable note: {0}' -f $_.Exception.Message))
+	}
+	return @{ ok = $true; steps = @($steps) }
+}
+
+function Enable-MBLanmanServer {
+	try {
+		$svc = Get-Service -Name 'LanmanServer' -ErrorAction Stop
+		if ($svc.StartType -eq 'Disabled') {
+			try { Set-Service -Name 'LanmanServer' -StartupType Automatic -ErrorAction Stop } catch {}
+		}
+		if ($svc.Status -ne 'Running') {
+			Start-Service -Name 'LanmanServer' -ErrorAction Stop
+		}
+		return @{ ok = $true; status = 'Running' }
+	} catch {
+		$r = Invoke-MBSetupNative -File 'sc.exe' -ArgumentList @('config', 'LanmanServer', 'start=', 'auto') -TimeoutSec 15
+		$r2 = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('start', 'Server') -TimeoutSec 30
+		return @{ ok = [bool]($r2.ok); status = $(if ($r2.ok) { 'Running' } else { 'unknown' }); detail = "$($r.out) $($r2.out) $($r2.err)" }
+	}
+}
+
+function Get-MBSmb1Status {
+	# Report whether SMBv1 client/server bits look enabled (older devices sometimes need it).
+	$info = [ordered]@{
+		ok              = $true
+		enabled         = $false
+		server_protocol = $null
+		feature_state   = ''
+		detail          = ''
+	}
+	try {
+		if (Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue) {
+			$cfg = Get-SmbServerConfiguration -ErrorAction SilentlyContinue
+			if ($null -ne $cfg -and $null -ne $cfg.EnableSMB1Protocol) {
+				$info.server_protocol = [bool]$cfg.EnableSMB1Protocol
+				if ($cfg.EnableSMB1Protocol) { $info.enabled = $true }
+			}
+		}
+	} catch {
+		$info.detail = $_.Exception.Message
+	}
+	try {
+		if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+			$f = Get-WindowsOptionalFeature -Online -FeatureName 'SMB1Protocol' -ErrorAction SilentlyContinue
+			if ($f) {
+				$info.feature_state = [string]$f.State
+				if ("$($f.State)" -match '(?i)Enabled') { $info.enabled = $true }
+			}
+		}
+	} catch {
+		if (-not $info.detail) { $info.detail = $_.Exception.Message }
+	}
+	# Registry fallback (LanmanServer parameters)
+	if ($null -eq $info.server_protocol) {
+		try {
+			$v = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'SMB1' -ErrorAction SilentlyContinue
+			if ($null -ne $v -and $null -ne $v.SMB1) {
+				$info.server_protocol = ([int]$v.SMB1 -ne 0)
+				if ($v.SMB1 -ne 0) { $info.enabled = $true }
+			}
+		} catch {}
+	}
+	return $info
+}
+
+function Enable-MBSmb1Protocol {
+	# Best-effort enable SMBv1 server + optional feature (may need reboot on some builds).
+	$steps = New-Object System.Collections.ArrayList
+	$ok = $false
+	try {
+		if (Get-Command Set-SmbServerConfiguration -ErrorAction SilentlyContinue) {
+			Set-SmbServerConfiguration -EnableSMB1Protocol $true -Force -ErrorAction Stop
+			[void]$steps.Add('Set-SmbServerConfiguration EnableSMB1Protocol=true')
+			$ok = $true
+		}
+	} catch {
+		[void]$steps.Add(('Set-SmbServerConfiguration failed: {0}' -f $_.Exception.Message))
+	}
+	try {
+		if (Get-Command Enable-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+			$f = Enable-WindowsOptionalFeature -Online -FeatureName 'SMB1Protocol' -All -NoRestart -ErrorAction Stop
+			[void]$steps.Add(('Enable-WindowsOptionalFeature SMB1Protocol state={0}' -f $f.State))
+			if ("$($f.State)" -match '(?i)Enabled|EnablePending') { $ok = $true }
+			if ($f.RestartNeeded) { [void]$steps.Add('restart_needed=true') }
+		}
+	} catch {
+		[void]$steps.Add(('OptionalFeature enable note: {0}' -f $_.Exception.Message))
+		# DISM fallback
+		$r = Invoke-MBSetupNative -File 'dism.exe' -ArgumentList @('/Online', '/Enable-Feature', '/FeatureName:SMB1Protocol', '/All', '/NoRestart') -TimeoutSec 300
+		[void]$steps.Add(('dism SMB1Protocol exit={0}' -f $r.exit))
+		if ($r.ok -or $r.exit -eq 3010) { $ok = $true }
+		if ($r.exit -eq 3010) { [void]$steps.Add('restart_needed=true') }
+	}
+	try {
+		reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' /v SMB1 /t REG_DWORD /d 1 /f 2>$null | Out-Null
+		[void]$steps.Add('reg LanmanServer\\Parameters SMB1=1')
+	} catch {}
+	$after = Get-MBSmb1Status
+	if ($after.enabled) { $ok = $true }
+	return @{
+		ok      = $ok
+		enabled = [bool]$after.enabled
+		steps   = @($steps)
+		status  = $after
+	}
+}
+
+function Request-MBSmb1ForShare {
+	# If SMBv1 is off, ask whether older clients need it; enable only on Yes.
+	$st = Get-MBSmb1Status
+	if ($st.enabled) {
+		return @{
+			ok       = $true
+			enabled  = $true
+			action   = 'already_on'
+			message  = 'SMBv1 already enabled'
+			status   = $st
+		}
+	}
+	$ask = Request-Confirmation -Title "Enable SMBv1 for this share?" -Details @"
+SMBv1 is currently OFF on this PC.
+
+Some older devices (legacy printers, NAS, media players, older Windows) still need SMBv1 to connect to a share.
+Modern Windows/PCs usually do not (SMBv2/v3 is enough).
+
+Enable SMBv1 now?
+  Yes = turn on SMBv1 (may need a reboot later on some systems)
+  No  = leave SMBv1 off and continue creating the share with SMBv2/v3 only
+"@
+	if (-not $ask) {
+		return @{
+			ok       = $true
+			enabled  = $false
+			action   = 'left_off'
+			message  = 'Operator declined SMBv1; share will use SMBv2/v3 only'
+			status   = $st
+		}
+	}
+	$en = Enable-MBSmb1Protocol
+	return @{
+		ok       = [bool]$en.ok
+		enabled  = [bool]$en.enabled
+		action   = $(if ($en.enabled) { 'enabled' } else { 'enable_attempted' })
+		message  = $(if ($en.enabled) { 'SMBv1 enabled' } else { 'SMBv1 enable attempted (may need reboot or admin)' })
+		steps    = $en.steps
+		status   = $en.status
+	}
+}
+
+function Grant-MBNtfsFullControl {
+	param(
+		[string]$Path,
+		[string]$Identity
+	)
+	# (OI)(CI)F = object+container inherit Full access (read/write/execute/delete)
+	$id = ([string]$Identity).Trim()
+	if ([string]::IsNullOrWhiteSpace($id)) { return @{ ok = $false; error = 'identity required' } }
+	$p = [string]$Path
+	$grant = '{0}:(OI)(CI)F' -f $id
+	$r = Invoke-MBSetupNative -File 'icacls.exe' -ArgumentList @($p, '/grant', $grant, '/C') -TimeoutSec 60
+	return @{ ok = $r.ok; identity = $id; exit = $r.exit; out = $r.out; err = $r.err }
+}
+
+function Grant-MBSmbShareFullAccess {
+	param(
+		[string]$ShareName,
+		[string]$Account
+	)
+	$acct = ([string]$Account).Trim()
+	$name = ([string]$ShareName).Trim()
+	if (Get-Command Grant-SmbShareAccess -ErrorAction SilentlyContinue) {
+		try {
+			Grant-SmbShareAccess -Name $name -AccountName $acct -AccessRight Full -Force -ErrorAction Stop | Out-Null
+			return @{ ok = $true; method = 'Grant-SmbShareAccess'; account = $acct }
+		} catch {
+			return @{ ok = $false; method = 'Grant-SmbShareAccess'; account = $acct; error = $_.Exception.Message }
+		}
+	}
+	$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $name, ('/GRANT:{0},FULL' -f $acct)) -TimeoutSec 30
+	return @{ ok = $r.ok; method = 'net share /GRANT'; account = $acct; exit = $r.exit; out = $r.out; err = $r.err }
+}
+
+function Show-MBShareAccessGateDialog {
+	# Multi-user access picker. Actions: verify | create | done | cancel
+	param(
+		[string[]]$LocalUsers = @(),
+		[string[]]$VerifiedUsers = @(),
+		[string]$PreferUser = '',
+		[bool]$EveryoneFull = $true,
+		[string]$Hint = '',
+		[string]$ShareLabel = ''
+	)
+	$rs = $null; $ps = $null
+	try {
+		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
+		$rs = [runspacefactory]::CreateRunspace()
+		$rs.ApartmentState = 'STA'
+		$rs.ThreadOptions = 'ReuseThread'
+		$rs.Open()
+		$ps = [powershell]::Create()
+		$ps.Runspace = $rs
+		[void]$ps.AddScript({
+			param($LocalUsers, $VerifiedUsers, $PreferUser, $EveryoneFull, $Hint, $ShareLabel)
+			Add-Type -AssemblyName System.Windows.Forms
+			Add-Type -AssemblyName System.Drawing
+			$form = New-Object System.Windows.Forms.Form
+			$form.Text = 'CreateShare - who can access'
+			$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+			$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+			$form.MaximizeBox = $false
+			$form.MinimizeBox = $false
+			$form.ClientSize = New-Object System.Drawing.Size(480, 390)
+			$form.TopMost = $true
+			$top = New-Object System.Windows.Forms.Label
+			$top.Text = "Password-protected sharing (Win10/11). Verify each account with its password.`nCurrent operator should be included (you know that password). If verify fails, create a share user."
+			if ($ShareLabel) { $top.Text = "$ShareLabel`n`n" + $top.Text }
+			$top.Location = New-Object System.Drawing.Point(14, 10)
+			$top.Size = New-Object System.Drawing.Size(450, 58)
+			$form.Controls.Add($top)
+			$cbEvery = New-Object System.Windows.Forms.CheckBox
+			$cbEvery.Text = 'Everyone = Full (read/write/execute/delete) on share + NTFS'
+			$cbEvery.Checked = [bool]$EveryoneFull
+			$cbEvery.Location = New-Object System.Drawing.Point(14, 70)
+			$cbEvery.Size = New-Object System.Drawing.Size(450, 22)
+			$form.Controls.Add($cbEvery)
+			$note = New-Object System.Windows.Forms.Label
+			$note.Text = 'Also always grant Full explicitly per verified user (Everyone alone often fails).'
+			$note.Location = New-Object System.Drawing.Point(14, 92)
+			$note.Size = New-Object System.Drawing.Size(450, 18)
+			$note.ForeColor = [System.Drawing.Color]::DimGray
+			$form.Controls.Add($note)
+			$lVer = New-Object System.Windows.Forms.Label
+			$lVer.Text = 'Verified access accounts'
+			$lVer.Location = New-Object System.Drawing.Point(14, 118)
+			$lVer.AutoSize = $true
+			$form.Controls.Add($lVer)
+			$lb = New-Object System.Windows.Forms.ListBox
+			$lb.Location = New-Object System.Drawing.Point(14, 136)
+			$lb.Size = New-Object System.Drawing.Size(450, 70)
+			foreach ($u in @($VerifiedUsers)) { if ($u) { [void]$lb.Items.Add([string]$u) } }
+			$form.Controls.Add($lb)
+			$lUser = New-Object System.Windows.Forms.Label
+			$lUser.Text = 'Local user to verify'
+			$lUser.Location = New-Object System.Drawing.Point(14, 214)
+			$lUser.AutoSize = $true
+			$form.Controls.Add($lUser)
+			$combo = New-Object System.Windows.Forms.ComboBox
+			$combo.Location = New-Object System.Drawing.Point(14, 232)
+			$combo.Width = 450
+			$combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+			$names = @($LocalUsers)
+			if ($names.Count -eq 0) { $names = @($PreferUser) | Where-Object { $_ } }
+			foreach ($n in $names) { if ($n) { [void]$combo.Items.Add([string]$n) } }
+			if ($combo.Items.Count -gt 0) {
+				$idx = 0
+				if ($PreferUser) {
+					for ($i = 0; $i -lt $combo.Items.Count; $i++) {
+						if ([string]$combo.Items[$i] -eq $PreferUser) { $idx = $i; break }
+					}
+				}
+				$combo.SelectedIndex = $idx
+			}
+			$form.Controls.Add($combo)
+			$lPass = New-Object System.Windows.Forms.Label
+			$lPass.Text = 'Password (verify this account is valid)'
+			$lPass.Location = New-Object System.Drawing.Point(14, 262)
+			$lPass.AutoSize = $true
+			$form.Controls.Add($lPass)
+			$tbPass = New-Object System.Windows.Forms.TextBox
+			$tbPass.Location = New-Object System.Drawing.Point(14, 280)
+			$tbPass.Width = 450
+			$tbPass.UseSystemPasswordChar = $true
+			$form.Controls.Add($tbPass)
+			$status = New-Object System.Windows.Forms.Label
+			$status.ForeColor = [System.Drawing.Color]::Firebrick
+			$status.Location = New-Object System.Drawing.Point(14, 308)
+			$status.Size = New-Object System.Drawing.Size(450, 32)
+			if ($Hint) { $status.Text = [string]$Hint }
+			$form.Controls.Add($status)
+			$btnVerify = New-Object System.Windows.Forms.Button
+			$btnVerify.Text = 'Verify && add'
+			$btnVerify.Location = New-Object System.Drawing.Point(14, 348)
+			$btnVerify.Width = 100
+			$btnCreate = New-Object System.Windows.Forms.Button
+			$btnCreate.Text = 'Create user...'
+			$btnCreate.Location = New-Object System.Drawing.Point(122, 348)
+			$btnCreate.Width = 100
+			$btnDone = New-Object System.Windows.Forms.Button
+			$btnDone.Text = 'Done'
+			$btnDone.Location = New-Object System.Drawing.Point(280, 348)
+			$btnDone.Width = 90
+			$btnCancel = New-Object System.Windows.Forms.Button
+			$btnCancel.Text = 'Cancel'
+			$btnCancel.Location = New-Object System.Drawing.Point(378, 348)
+			$btnCancel.Width = 86
+			$form.Controls.Add($btnVerify)
+			$form.Controls.Add($btnCreate)
+			$form.Controls.Add($btnDone)
+			$form.Controls.Add($btnCancel)
+			$form.AcceptButton = $btnVerify
+			$form.CancelButton = $btnCancel
+			$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+			$result = @{ Action = 'cancel'; Username = ''; Password = ''; EveryoneFull = [bool]$EveryoneFull; Verified = @($VerifiedUsers) }
+			$btnVerify.Add_Click({
+				if ($combo.SelectedIndex -lt 0) { $status.Text = 'Select a local user.'; return }
+				$u = [string]$combo.SelectedItem
+				$p = [string]$tbPass.Text
+				if ([string]::IsNullOrEmpty($p)) { $status.Text = 'Enter the password for the selected user.'; return }
+				$result.Action = 'verify'
+				$result.Username = $u
+				$result.Password = $p
+				$result.EveryoneFull = [bool]$cbEvery.Checked
+				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+			}.GetNewClosure())
+			$btnCreate.Add_Click({
+				$result.Action = 'create'
+				$result.Username = ''
+				$result.Password = ''
+				$result.EveryoneFull = [bool]$cbEvery.Checked
+				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+			}.GetNewClosure())
+			$btnDone.Add_Click({
+				if ($lb.Items.Count -eq 0) {
+					$status.Text = 'Verify at least one account (operator recommended), or create a share user.'
+					return
+				}
+				$result.Action = 'done'
+				$result.EveryoneFull = [bool]$cbEvery.Checked
+				$result.Verified = @($lb.Items | ForEach-Object { [string]$_ })
+				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+			}.GetNewClosure())
+			try { [void]$form.ShowDialog() } catch {}
+			return $result
+		})
+		[void]$ps.AddArgument([object[]]@($LocalUsers))
+		[void]$ps.AddArgument([object[]]@($VerifiedUsers))
+		[void]$ps.AddArgument([string]$PreferUser)
+		[void]$ps.AddArgument([bool]$EveryoneFull)
+		[void]$ps.AddArgument([string]$Hint)
+		[void]$ps.AddArgument([string]$ShareLabel)
+		$out = $ps.Invoke()
+		if ($out -and @($out).Count -gt 0) { return @($out)[-1] }
+		return @{ Action = 'cancel' }
+	} catch {
+		return @{ Action = 'cancel'; Error = $_.Exception.Message }
+	} finally {
+		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
+		try { if ($ps) { $ps.Dispose() } } catch {}
+		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
+	}
+}
+
+function Request-MBShareAccessGate {
+	# Collect verified access users (+ everyone flag). At least one user required.
+	param(
+		[string]$ShareName = '',
+		[string]$FolderPath = '',
+		[bool]$EveryoneFull = $true
+	)
+	$current = ''
+	try {
+		$current = [Environment]::UserName
+		if ($env:USERNAME) { $current = [string]$env:USERNAME }
+	} catch {}
+	$verified = New-Object System.Collections.ArrayList
+	# Store password only for newly created users we may need to report once (not all verified)
+	$createdUsers = New-Object System.Collections.ArrayList
+	$createdPass = @{}
+	$everyone = [bool]$EveryoneFull
+	$hint = "Verify the current user ($current) first if you know the password, then Done — or add more accounts."
+	$label = "Share: $ShareName`nFolder: $FolderPath"
+	for ($round = 0; $round -lt 20; $round++) {
+		$locals = @(Get-MBLocalUserAccountNames)
+		$dlg = Show-MBShareAccessGateDialog -LocalUsers $locals -VerifiedUsers @($verified) -PreferUser $current -EveryoneFull $everyone -Hint $hint -ShareLabel $label
+		if (-not $dlg -or $dlg.Action -eq 'cancel') {
+			return @{ ok = $false; reason = 'Share access setup cancelled. CreateShare blocked.' }
+		}
+		if ($null -ne $dlg.EveryoneFull) { $everyone = [bool]$dlg.EveryoneFull }
+		if ($dlg.Action -eq 'done') {
+			$final = @()
+			if ($dlg.Verified) { $final = @($dlg.Verified) }
+			elseif ($verified.Count -gt 0) { $final = @($verified) }
+			if ($final.Count -eq 0) {
+				$hint = 'Add at least one verified account before Done.'
+				continue
+			}
+			return @{
+				ok            = $true
+				Users         = @($final)
+				EveryoneFull  = $everyone
+				CreatedUsers  = @($createdUsers)
+				CreatedPass   = $createdPass
+				OperatorUser  = $current
+			}
+		}
+		if ($dlg.Action -eq 'create') {
+			$offer = Request-Confirmation -Title "Create share access user" -Details @"
+Create a new limited (non-admin) local account for network share access?
+
+Password-protected sharing requires a real username/password on the other PC.
+This account will get Full share + NTFS rights (same as other access users).
+"@
+			if (-not $offer) {
+				$hint = 'Create declined. Verify an existing local user password, or Cancel.'
+				continue
+			}
+			$created = Show-MBCreateLocalAdminForm -Title 'Create share access user (non-admin)'
+			if (-not $created -or $created.Cancelled) {
+				$hint = 'Create cancelled. Verify an existing user or Cancel share.'
+				continue
+			}
+			$cr = New-MBLocalShareUserCore -username $created.Username -password $created.Password
+			if (-not $cr.ok) {
+				$hint = "Create failed: $($cr.error)"
+				continue
+			}
+			if (-not (Test-MBLocalUserCredential -Username $created.Username -Password $created.Password)) {
+				$hint = "Created '$($created.Username)' but logon verify failed. Try again."
+				continue
+			}
+			$key = $created.Username.ToLowerInvariant()
+			$exists = $false
+			foreach ($v in @($verified)) { if ($v.ToLowerInvariant() -eq $key) { $exists = $true; break } }
+			if (-not $exists) { [void]$verified.Add($created.Username) }
+			if (-not ($createdUsers -contains $created.Username)) { [void]$createdUsers.Add($created.Username) }
+			$createdPass[$created.Username] = $created.Password
+			$hint = "Added share user '$($created.Username)'. Verify more accounts or Done."
+			continue
+		}
+		if ($dlg.Action -eq 'verify') {
+			$u = [string]$dlg.Username
+			$p = [string]$dlg.Password
+			if (-not (Test-MBLocalUserCredential -Username $u -Password $p)) {
+				$offer = Request-Confirmation -Title "Password verify failed for $u" -Details @"
+Could not authenticate local user '$u' with that password.
+
+Create a new limited share-access user instead?
+(If you refuse, you can retry another account or cancel CreateShare.)
+"@
+				if ($offer) {
+					$created = Show-MBCreateLocalAdminForm -Title 'Create share access user (non-admin)'
+					if ($created -and -not $created.Cancelled) {
+						$cr = New-MBLocalShareUserCore -username $created.Username -password $created.Password
+						if ($cr.ok -and (Test-MBLocalUserCredential -Username $created.Username -Password $created.Password)) {
+							$key = $created.Username.ToLowerInvariant()
+							$exists = $false
+							foreach ($v in @($verified)) { if ($v.ToLowerInvariant() -eq $key) { $exists = $true; break } }
+							if (-not $exists) { [void]$verified.Add($created.Username) }
+							if (-not ($createdUsers -contains $created.Username)) { [void]$createdUsers.Add($created.Username) }
+							$createdPass[$created.Username] = $created.Password
+							$hint = "Created and added '$($created.Username)'. Add more or Done."
+						} else {
+							$err = if ($cr -and $cr.error) { $cr.error } else { 'verify failed after create' }
+							$hint = "Create failed: $err"
+						}
+					} else {
+						$hint = "Verify failed for '$u'. Try another password/user, create user, or Cancel."
+					}
+				} else {
+					$hint = "Verify failed for '$u'. Fix password, pick another user, create one, or Cancel."
+				}
+				continue
+			}
+			$key = $u.ToLowerInvariant()
+			$exists = $false
+			foreach ($v in @($verified)) { if ($v.ToLowerInvariant() -eq $key) { $exists = $true; break } }
+			if (-not $exists) { [void]$verified.Add($u) }
+			$hint = "Verified '$u'. Add another account or Done."
+			continue
+		}
+		$hint = 'Unexpected response. Try again.'
+	}
+	return @{ ok = $false; reason = 'Too many attempts. CreateShare blocked.' }
+}
+
+function Format-MBShareAccessHowTo {
+	param(
+		[string]$HostName,
+		[string]$ShareName,
+		[string[]]$Users,
+		[string[]]$CreatedUsers = @(),
+		[hashtable]$CreatedPass = @{},
+		[bool]$EveryoneFull = $true
+	)
+	$uncHost = "\\$HostName\$ShareName"
+	$ipList = New-Object System.Collections.ArrayList
+	try {
+		$ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+			Where-Object {
+				$_.IPAddress -notlike '127.*' -and
+				$_.IPAddress -notlike '169.254.*' -and
+				$_.PrefixOrigin -ne 'WellKnown'
+			} |
+			Select-Object -ExpandProperty IPAddress -Unique)
+		foreach ($ip in $ips) {
+			if ($ip) { [void]$ipList.Add([string]$ip) }
+		}
+	} catch {}
+	if ($ipList.Count -eq 0) {
+		try {
+			$cfg = @(Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue |
+				Where-Object { $_.IPEnabled -and $_.IPAddress })
+			foreach ($c in $cfg) {
+				foreach ($a in @($c.IPAddress)) {
+					if ($a -match '^\d+\.\d+\.\d+\.\d+$' -and $a -notlike '127.*' -and $a -notlike '169.254.*') {
+						if (-not ($ipList -contains $a)) { [void]$ipList.Add([string]$a) }
+					}
+				}
+			}
+		} catch {}
+	}
+	$primaryIp = if ($ipList.Count -gt 0) { [string]$ipList[0] } else { '' }
+	$uncIp = if ($primaryIp) { "\\$primaryIp\$ShareName" } else { '' }
+	$ipAllUnc = if ($ipList.Count -gt 0) { ($ipList | ForEach-Object { "\\$_\$ShareName" }) -join '  |  ' } else { '' }
+
+	$lines = New-Object System.Collections.ArrayList
+	[void]$lines.Add('HOW TO OPEN THIS SHARE FROM ANOTHER PC')
+	[void]$lines.Add('1. Both PCs on the same LAN (prefer Private network profile).')
+	[void]$lines.Add('2. On the other PC, File Explorer address bar (hostname):')
+	[void]$lines.Add("     $uncHost")
+	if ($uncIp) {
+		[void]$lines.Add('   If hostname fails (DNS / name resolution), use IP instead:')
+		[void]$lines.Add("     $uncIp")
+		if ($ipList.Count -gt 1) {
+			[void]$lines.Add("   Other local IPs on this PC: $ipAllUnc")
+		}
+	} else {
+		[void]$lines.Add(("   Note: if hostname fails (DNS issues), retry with \\THIS-PC-IP\{0} (check ipconfig on this machine)." -f $ShareName))
+	}
+	[void]$lines.Add('3. Windows will prompt for credentials (password-protected sharing is ON).')
+	[void]$lines.Add('   Use one of these verified accounts:')
+	foreach ($u in @($Users)) {
+		[void]$lines.Add("     Username: $u   (or $HostName\$u)")
+	}
+	if ($primaryIp -and $Users -and @($Users).Count -gt 0) {
+		$u0 = [string]$Users[0]
+		[void]$lines.Add("   When using the IP path, still sign in as $HostName\$u0 (not IP\$u0).")
+	} elseif ($primaryIp) {
+		[void]$lines.Add("   When using the IP path, still sign in as $HostName\\USER (not IP\\USER).")
+	}
+	[void]$lines.Add('   Password: the password you just verified for that account.')
+	if ($CreatedUsers -and @($CreatedUsers).Count -gt 0) {
+		[void]$lines.Add('   New share users created this run:')
+		foreach ($cu in @($CreatedUsers)) {
+			$pw = if ($CreatedPass -and $CreatedPass.ContainsKey($cu)) { [string]$CreatedPass[$cu] } else { '(set during create)' }
+			[void]$lines.Add("     $HostName\$cu  password=$pw")
+		}
+	}
+	[void]$lines.Add('4. Optional map drive (Command Prompt on client):')
+	$first = if ($Users -and $Users.Count -gt 0) { $Users[0] } else { 'USERNAME' }
+	[void]$lines.Add("     net use Z: $uncHost /user:$HostName\$first *")
+	if ($uncIp) {
+		[void]$lines.Add("     net use Z: $uncIp /user:$HostName\$first *")
+		[void]$lines.Add('     (prefer the IP line when hostname mapping fails due to DNS)')
+	}
+	[void]$lines.Add('5. Guest is off. Do not use blank passwords.')
+	if ($EveryoneFull) {
+		[void]$lines.Add('ACL: Everyone=Full on share+NTFS, plus explicit Full for each verified user (Everyone alone often fails).')
+	} else {
+		[void]$lines.Add('ACL: Everyone not granted; explicit Full for each verified user only.')
+	}
+	return ($lines -join "`n")
+}
+
+function Invoke-CreateShare {
+	param(
+		[string]$path,
+		[string]$name,
+		[string]$share_password = '',
+		[string]$description = '',
+		[object]$everyone_full = $true,
+		[object]$ensure_network = $true,
+		[object]$ensure_discovery = $true,
+		[object]$ensure_folder = $true,
+		[object]$force = $false
+	)
+	$folder = ([string]$path).Trim().Trim('"')
+	$shareName = ([string]$name).Trim()
+	$desc = ([string]$description).Trim()
+	$shareUser = 'share'
+	if ([string]::IsNullOrWhiteSpace($folder)) { return "ERROR: path required (any local folder to share)." }
+	if ([string]::IsNullOrWhiteSpace($shareName)) { return "ERROR: name required (share name for \\\\PC\\name)." }
+	if ($shareName -notmatch '^[A-Za-z0-9][A-Za-z0-9._$-]{0,79}$') {
+		return "ERROR: share name must be 1-80 chars starting with letter/digit [A-Za-z0-9._$-]."
+	}
+	$everyoneFull = $true
+	if ($everyone_full -is [bool]) { $everyoneFull = $everyone_full }
+	elseif ([string]$everyone_full -match '^(?i)0|false|no|off$') { $everyoneFull = $false }
+	$doNet = $true
+	if ($ensure_network -is [bool]) { $doNet = $ensure_network }
+	elseif ([string]$ensure_network -match '^(?i)0|false|no|off$') { $doNet = $false }
+	$doDisc = $true
+	if ($ensure_discovery -is [bool]) { $doDisc = $ensure_discovery }
+	elseif ([string]$ensure_discovery -match '^(?i)0|false|no|off$') { $doDisc = $false }
+	$doFolder = $true
+	if ($ensure_folder -is [bool]) { $doFolder = $ensure_folder }
+	elseif ([string]$ensure_folder -match '^(?i)0|false|no|off$') { $doFolder = $false }
+	$doForce = $false
+	if ($force -is [bool]) { $doForce = $force }
+	elseif ([string]$force -match '^(?i)1|true|yes|y|on$') { $doForce = $true }
+
+	try {
+		if (-not [System.IO.Path]::IsPathRooted($folder)) {
+			$folder = [System.IO.Path]::GetFullPath((Join-Path $script:MB.WorkingDir $folder))
+		} else {
+			$folder = [System.IO.Path]::GetFullPath($folder)
+		}
+	} catch {
+		return "ERROR: invalid path: $($_.Exception.Message)"
+	}
+
+	$hostName = $env:COMPUTERNAME
+	try { $hostName = [System.Net.Dns]::GetHostName() } catch {}
+	if ([string]::IsNullOrWhiteSpace($hostName)) { $hostName = $env:COMPUTERNAME }
+
+	# Password for fixed local user "share" — use model-supplied password if given; prompt only when omitted
+	$pass = [string]$share_password
+	$passFromPrompt = $false
+	if ([string]::IsNullOrEmpty($pass)) {
+		$pwDlg = $null
+		try {
+			$pwDlg = Show-MBSharePasswordForm -Title 'CreateShare — password for user share' -ShareName $shareName -FolderPath $folder
+		} catch {
+			return "BLOCKED BY USER: CreateShare password prompt failed (cancelled or error): $($_.Exception.Message)"
+		}
+		if (-not $pwDlg -or $pwDlg.Cancelled -or [string]::IsNullOrEmpty([string]$pwDlg.Password)) {
+			return "BLOCKED BY USER: CreateShare cancelled (no password for local user share)."
+		}
+		$pass = [string]$pwDlg.Password
+		$passFromPrompt = $true
+	}
+
+	$details = @"
+Create SMB share (password-protected):
+  folder            = $folder
+  share name        = $shareName
+  UNC               = \\$hostName\$shareName
+  access account    = $shareUser  (create or update local non-admin user)
+  password          = $(Get-MBMaskedSecret $pass)  source=$(if ($passFromPrompt) { 'operator prompt' } else { 'tool arg' })
+  Everyone Full     = $everyoneFull  (+ explicit Full for $shareUser)
+  ensure_folder     = $doFolder  (existing paths OK)
+  ensure network    = $doNet
+  ensure discovery  = $doDisc
+  force replace     = $doForce
+"@
+	if (-not (Request-Confirmation -Title "CreateShare requires approval" -Details $details)) {
+		return "BLOCKED BY USER: CreateShare denied."
+	}
+
+	$steps = New-Object System.Collections.ArrayList
+	$aclLog = New-Object System.Collections.ArrayList
+	try {
+		# Any existing folder is fine; only create when missing + ensure_folder
+		if (-not (Test-Path -LiteralPath $folder)) {
+			if (-not $doFolder) {
+				return "ERROR: folder does not exist: $folder. Pass an existing path, or ensure_folder=true to create it."
+			}
+			New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null
+			[void]$steps.Add("created folder $folder")
+		} else {
+			[void]$steps.Add("using existing folder $folder")
+		}
+		if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+			return "ERROR: path is not a folder: $folder"
+		}
+
+		$acct = Ensure-MBShareLocalUser -Password $pass
+		if (-not $acct.ok) {
+			return "ERROR: could not prepare local user '$shareUser': $($acct.error)"
+		}
+		[void]$steps.Add(("local user $shareUser : {0}" -f $(if ($acct.created) { 'created' } else { 'password updated' })))
+
+		$pps = Enable-MBPasswordProtectedSharing
+		[void]$steps.Add(('password-protected sharing: {0}' -f (($pps.steps) -join '; ')))
+
+		$srv = Enable-MBLanmanServer
+		[void]$steps.Add(('LanmanServer: {0}' -f $srv.status))
+
+		# SMBv1: check first; if off, ask whether older devices need it
+		$smb1 = Request-MBSmb1ForShare
+		[void]$steps.Add(('SMBv1: {0} ({1})' -f $smb1.action, $smb1.message))
+		if ($smb1.steps) {
+			foreach ($s1 in @($smb1.steps)) { [void]$steps.Add(('  SMBv1 step: {0}' -f $s1)) }
+		}
+
+		if ($doNet) {
+			$fw = Enable-MBFirewallGroup -GroupName 'File and Printer Sharing' -TimeoutSec 15
+			[void]$steps.Add(('firewall File and Printer Sharing: {0}' -f $fw.method))
+		}
+		if ($doDisc) {
+			$fw2 = Enable-MBFirewallGroup -GroupName 'Network Discovery' -TimeoutSec 15
+			[void]$steps.Add(('firewall Network Discovery: {0}' -f $fw2.method))
+		}
+
+		$exists = $false
+		if (Get-Command Get-SmbShare -ErrorAction SilentlyContinue) {
+			try { $null = Get-SmbShare -Name $shareName -ErrorAction Stop; $exists = $true } catch { $exists = $false }
+		} else {
+			$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $shareName) -TimeoutSec 15
+			if ($chk.ok -or ($chk.out -match [regex]::Escape($shareName))) { $exists = $true }
+		}
+		if ($exists) {
+			if (-not $doForce) {
+				return "ERROR: share '$shareName' already exists. Pass force=true to replace, or pick another name."
+			}
+			if (Get-Command Remove-SmbShare -ErrorAction SilentlyContinue) {
+				try { Remove-SmbShare -Name $shareName -Force -ErrorAction Stop } catch {}
+			} else {
+				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $shareName, '/delete', '/y') -TimeoutSec 30
+			}
+			[void]$steps.Add("removed existing share $shareName")
+		}
+
+		$fullAccounts = New-Object System.Collections.ArrayList
+		if ($everyoneFull) { [void]$fullAccounts.Add('Everyone') }
+		[void]$fullAccounts.Add("$hostName\$shareUser")
+
+		$shareMethod = ''
+		if (Get-Command New-SmbShare -ErrorAction SilentlyContinue) {
+			try {
+				$np = @{
+					Name        = $shareName
+					Path        = $folder
+					FullAccess  = @($fullAccounts)
+					ErrorAction = 'Stop'
+				}
+				if ($desc) { $np['Description'] = $desc }
+				try { $np['CachingMode'] = 'None' } catch {}
+				New-SmbShare @np | Out-Null
+				$shareMethod = 'New-SmbShare'
+			} catch {
+				try {
+					$np2 = @{ Name = $shareName; Path = $folder; ErrorAction = 'Stop' }
+					if ($desc) { $np2['Description'] = $desc }
+					New-SmbShare @np2 | Out-Null
+					$shareMethod = 'New-SmbShare+Grant'
+				} catch {
+					return "ERROR: New-SmbShare failed: $($_.Exception.Message)"
+				}
+			}
+		} else {
+			$netArgs = New-Object System.Collections.ArrayList
+			[void]$netArgs.Add('share')
+			[void]$netArgs.Add(('{0}={1}' -f $shareName, $folder))
+			if ($desc) { [void]$netArgs.Add(('/REMARK:{0}' -f $desc)) }
+			foreach ($a in @($fullAccounts)) { [void]$netArgs.Add(('/GRANT:{0},FULL' -f $a)) }
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @($netArgs.ToArray()) -TimeoutSec 60
+			if (-not $r.ok) {
+				return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'net share failed'; exit = $r.exit; out = $r.out; err = $r.err })
+			}
+			$shareMethod = 'net share'
+		}
+		[void]$steps.Add("share created ($shareMethod)")
+
+		if ($everyoneFull) {
+			$g = Grant-MBSmbShareFullAccess -ShareName $shareName -Account 'Everyone'
+			[void]$aclLog.Add([ordered]@{ layer = 'share'; account = 'Everyone'; right = 'Full'; ok = $g.ok; detail = $(if ($g.error) { $g.error } else { $g.method }) })
+			$n = Grant-MBNtfsFullControl -Path $folder -Identity 'Everyone'
+			[void]$aclLog.Add([ordered]@{ layer = 'ntfs'; account = 'Everyone'; right = 'Full'; ok = $n.ok; detail = $(if ($n.err) { $n.err } else { "exit $($n.exit)" }) })
+		}
+		foreach ($acct in @("$hostName\$shareUser", $shareUser, ".\$shareUser")) {
+			$g = Grant-MBSmbShareFullAccess -ShareName $shareName -Account $acct
+			if ($g.ok) {
+				[void]$aclLog.Add([ordered]@{ layer = 'share'; account = $acct; right = 'Full'; ok = $true; detail = $g.method })
+				break
+			}
+		}
+		$n = Grant-MBNtfsFullControl -Path $folder -Identity $shareUser
+		if (-not $n.ok) {
+			$n = Grant-MBNtfsFullControl -Path $folder -Identity "$hostName\$shareUser"
+		}
+		[void]$aclLog.Add([ordered]@{ layer = 'ntfs'; account = $shareUser; right = 'Full'; ok = $n.ok; detail = $(if ($n.err) { $n.err } else { "exit $($n.exit)" }) })
+
+		$createdList = @()
+		$createdPass = @{}
+		if ($acct.created) {
+			$createdList = @($shareUser)
+			$createdPass[$shareUser] = $pass
+		}
+		$how = Format-MBShareAccessHowTo -HostName $hostName -ShareName $shareName -Users @($shareUser) -CreatedUsers $createdList -CreatedPass $createdPass -EveryoneFull $everyoneFull
+		$report = [ordered]@{
+			ok                 = $true
+			path               = $folder
+			name               = $shareName
+			unc                = "\\$hostName\$shareName"
+			hostname           = $hostName
+			access_user        = $shareUser
+			share_user_created = [bool]$acct.created
+			everyone_full      = $everyoneFull
+			password_protected = $true
+			smb1               = $(if ($smb1) { [ordered]@{ action = $smb1.action; enabled = $smb1.enabled; message = $smb1.message } } else { $null })
+			method             = $shareMethod
+			steps              = @($steps)
+			acl                = @($aclLog)
+			how_to_access      = $how
+		}
+		$json = ConvertTo-MBJson $report -Depth 8
+		return @"
+OK: share \\$hostName\$shareName -> $folder
+Connect as: $hostName\$shareUser  (password set for this share account)
+
+$how
+
+---
+$json
+"@
+	} catch {
+		return "ERROR: CreateShare failed: $($_.Exception.Message)"
 	}
 }
 
@@ -12680,11 +16358,17 @@ function Invoke-MBEnsureSevenZipForExtract {
 }
 
 function Get-MBNewMachineSoftwareManifest {
-	# Entire installer catalog for NewMachineSetup software steps.
+	param([string]$Profile)
 	$cat = Get-MBInstallerCatalog
+	$prof = ([string]$Profile).Trim().ToLowerInvariant()
+	if ($prof -notin @('residential', 'business')) { $prof = 'residential' }
 	$list = New-Object System.Collections.ArrayList
 	foreach ($key in @($cat.Keys)) {
-		[void]$list.Add($cat[$key])
+		$p = $cat[$key]
+		$profiles = @($p.profiles)
+		if ($profiles -contains 'common' -or $profiles -contains $prof) {
+			[void]$list.Add($p)
+		}
 	}
 	return @($list)
 }
@@ -12807,7 +16491,7 @@ function Invoke-MBSetupInstallPackage {
 				if (-not $ens.ok) {
 					return @{ ok = $false; name = $name; phase = 'extract'; error = $ens.error; net_error = $netErr }
 				}
-				$r7 = Invoke-MBSetupNative -File $ens.path -Args @('e', '-y', "-o$WorkDir", $out, $entry) -TimeoutSec 300
+				$r7 = Invoke-MBSetupNative -File $ens.path -ArgumentList @('e', '-y', "-o$WorkDir", $out, $entry) -TimeoutSec 300
 				if (-not (Test-Path -LiteralPath $msiPath)) {
 					$msiPath = Get-ChildItem -LiteralPath $WorkDir -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 				}
@@ -12878,15 +16562,21 @@ function Invoke-MBSetupInstallPackage {
 }
 
 function Invoke-ListInstallers {
+	param([string]$profile = 'all')
+	$prof = ([string]$profile).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($prof)) { $prof = 'all' }
 	$cat = Get-MBInstallerCatalog
 	$rows = @()
 	foreach ($key in @($cat.Keys)) {
 		$p = $cat[$key]
+		$profiles = @($p.profiles)
+		if ($prof -ne 'all' -and $profiles -notcontains $prof -and $profiles -notcontains 'common') { continue }
 		$runsScan = $false
 		try { $runsScan = [bool]$p.runs_scan } catch { $runsScan = ($p.id -eq 'adwcleaner') }
 		$rows += [ordered]@{
 			id        = [string]$p.id
 			name      = [string]$p.name
+			profiles  = $profiles
 			kind      = [string]$p.kind
 			install   = (Get-MBPackageInstallArgs -Package $p)
 			runs_scan = $runsScan
@@ -12895,6 +16585,7 @@ function Invoke-ListInstallers {
 	}
 	return ConvertTo-MBJson ([ordered]@{
 		ok       = $true
+		profile  = $prof
 		count    = $rows.Count
 		note     = 'Silent installs; temp files cleaned after each package. ADWCleaner runs a scan/clean.'
 		packages = $rows
@@ -12917,7 +16608,7 @@ function Invoke-InstallPackage {
 	}
 	$ids = @($ids | Select-Object -Unique)
 	if ($ids.Count -eq 0) {
-		return "ERROR: package= or packages= required. Call ListInstallers for ids (7zip, chrome, adobe_reader, adwcleaner, vlc)."
+		return "ERROR: package= or packages= required. Call ListInstallers for ids (7zip, chrome, adobe_reader, adwcleaner, vlc, gotoassist, avast_portal)."
 	}
 
 	$cat = Get-MBInstallerCatalog
@@ -12987,11 +16678,16 @@ function Invoke-InstallPackage {
 
 function Invoke-NewMachineSetup {
 	param(
+		[string]$profile = 'residential',
 		[bool]$dry_run = $false,
 		[string]$timezone = '',
 		[bool]$skip_restore_point = $false,
 		[bool]$skip_software = $false
 	)
+	$prof = ([string]$profile).Trim().ToLowerInvariant()
+	if ($prof -in @('normal','home','consumer','residential')) { $prof = 'residential' }
+	elseif ($prof -in @('business','biz','work','corp','commercial')) { $prof = 'business' }
+	else { return "ERROR: profile must be residential or business." }
 
 	$steps = New-Object System.Collections.ArrayList
 	$add = {
@@ -13001,12 +16697,12 @@ function Invoke-NewMachineSetup {
 	if (-not $skip_restore_point) {
 		& $add $steps 'restore_enable' 'Enable System Restore on C:' { Enable-ComputerRestore -Drive 'C:\' -ErrorAction SilentlyContinue; @{ ok = $true } }
 		& $add $steps 'restore_point' 'Create restore point' {
-			Checkpoint-Computer -Description "MiniBot NewMachineSetup $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -RestorePointType MODIFY_SETTINGS -ErrorAction SilentlyContinue
+			Checkpoint-Computer -Description "MiniBot NewMachineSetup $prof $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -RestorePointType MODIFY_SETTINGS -ErrorAction SilentlyContinue
 			@{ ok = $true }
 		}
 	}
 	& $add $steps 'boot_f8' 'Enable legacy F8 boot menu' {
-		$r = Invoke-MBSetupNative -File 'bcdedit.exe' -Args @('/set','{default}','bootmenupolicy','LEGACY')
+		$r = Invoke-MBSetupNative -File 'bcdedit.exe' -ArgumentList @('/set','{default}','bootmenupolicy','LEGACY')
 		@{ ok = $r.ok; exit = $r.exit; detail = $r.out }
 	}
 	& $add $steps 'power_max' 'Max performance power settings' {
@@ -13045,27 +16741,35 @@ function Invoke-NewMachineSetup {
 	if (-not [string]::IsNullOrWhiteSpace($timezone)) {
 		$tz = [string]$timezone
 		$tzSb = {
-			$r = Invoke-MBSetupNative -File 'tzutil.exe' -Args @('/s', $tz)
+			$r = Invoke-MBSetupNative -File 'tzutil.exe' -ArgumentList @('/s', $tz)
 			@{ ok = $r.ok; exit = $r.exit }
 		}.GetNewClosure()
 		& $add $steps 'timezone' "Set timezone: $tz" $tzSb
 	}
 	& $add $steps 'time_sync' 'Sync Windows time' {
-		$null = Invoke-MBSetupNative -File 'w32tm.exe' -Args @('/config','/manualpeerlist:time.windows.com')
-		$null = Invoke-MBSetupNative -File 'net.exe' -Args @('stop','w32time')
+		$null = Invoke-MBSetupNative -File 'w32tm.exe' -ArgumentList @('/config','/manualpeerlist:time.windows.com')
+		$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('stop','w32time')
 		reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Parameters' /v Type /t REG_SZ /d NTP /f | Out-Null
-		$null = Invoke-MBSetupNative -File 'net.exe' -Args @('start','w32time')
-		$r = Invoke-MBSetupNative -File 'w32tm.exe' -Args @('/resync')
+		$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('start','w32time')
+		$r = Invoke-MBSetupNative -File 'w32tm.exe' -ArgumentList @('/resync')
 		@{ ok = $true; resync_exit = $r.exit }
 	}
 	& $add $steps 'bitlocker_off' 'Disable Device Encryption on C: (manage-bde -off)' {
-		$r = Invoke-MBSetupNative -File 'manage-bde.exe' -Args @('-off', 'C:') -TimeoutSec 300
+		$r = Invoke-MBSetupNative -File 'manage-bde.exe' -ArgumentList @('-off', 'C:') -TimeoutSec 300
 		@{ ok = $r.ok; exit = $r.exit; out = $r.out; err = $r.err }
+	}
+
+	# Portable = form factor / use pattern, not desktop vs laptop labels.
+	# Always recommend re-enabling encryption when portable; stress it more for business.
+	$portableEncryptNote = if ($prof -eq 'business') {
+		'If this machine is portable, re-enable Device Encryption / BitLocker after setup (strongly recommended for business machines).'
+	} else {
+		'If this machine is portable, re-enable Device Encryption / BitLocker after setup.'
 	}
 
 	$software = @()
 	if (-not $skip_software) {
-		$software = @(Get-MBNewMachineSoftwareManifest)
+		$software = @(Get-MBNewMachineSoftwareManifest -Profile $prof)
 		foreach ($pkg in $software) {
 			$stepId = 'sw_' + [string]$pkg.id
 			$runsScan = $false
@@ -13082,13 +16786,15 @@ function Invoke-NewMachineSetup {
 	}
 
 	$plan = @($steps | ForEach-Object { [ordered]@{ id = $_.id; title = $_.title; section = $_.section } })
-	$dryNote = 'ADWCleaner will run a scan if software is included. Device Encryption is turned off during setup. UAC is not changed.'
+	$dryNote = "Device Encryption is turned OFF during setup. $portableEncryptNote ADWCleaner will run a scan if software is included. UAC is not changed by this profile."
 	if ($dry_run) {
 		return ConvertTo-MBJson ([ordered]@{
 			ok             = $true
 			dry_run        = $true
+			profile        = $prof
 			skip_software  = [bool]$skip_software
 			note           = $dryNote
+			recommendation = $portableEncryptNote
 			settings_steps = @($plan | Where-Object { $_.section -ne 'software' })
 			software       = @($software | ForEach-Object {
 				$rs = $false
@@ -13100,7 +16806,7 @@ function Invoke-NewMachineSetup {
 	}
 
 	$detailLines = New-Object System.Collections.ArrayList
-	[void]$detailLines.Add('NewMachineSetup')
+	[void]$detailLines.Add("NewMachineSetup profile=$prof")
 	[void]$detailLines.Add('This will change Windows settings' + $(if (-not $skip_software) { ' and download/install software' } else { ' only (software skipped)' }) + '.')
 	[void]$detailLines.Add('')
 	[void]$detailLines.Add('SETTINGS:')
@@ -13108,9 +16814,12 @@ function Invoke-NewMachineSetup {
 		if ($p.section -eq 'software') { continue }
 		[void]$detailLines.Add("  - $($p.title)")
 	}
+	[void]$detailLines.Add('')
+	[void]$detailLines.Add('NOTE: Device Encryption will be disabled for setup.')
+	[void]$detailLines.Add("  $portableEncryptNote")
 	if (-not $skip_software) {
 		[void]$detailLines.Add('')
-		[void]$detailLines.Add('SOFTWARE - silent download/install:')
+		[void]$detailLines.Add("SOFTWARE ($prof) - silent download/install:")
 		foreach ($pkg in $software) {
 			$runsScan = $false
 			try { $runsScan = [bool]$pkg.runs_scan } catch { $runsScan = ($pkg.id -eq 'adwcleaner') }
@@ -13138,7 +16847,7 @@ function Invoke-NewMachineSetup {
 
 	$totalSteps = $steps.Count
 	$stepIdx = 0
-	Write-Host ("  NewMachineSetup: {0} step(s), silent installers" -f $totalSteps) -ForegroundColor DarkCyan
+	Write-Host ("  NewMachineSetup profile={0}: {1} step(s), silent installers" -f $prof, $totalSteps) -ForegroundColor DarkCyan
 
 	try {
 		foreach ($s in $steps) {
@@ -13147,7 +16856,7 @@ function Invoke-NewMachineSetup {
 			Write-MBSetupProgress -Phase start -Index $stepIdx -Total $totalSteps -Title ([string]$s.title)
 			try {
 				if ($s.id -eq 'power_max') {
-					$null = Invoke-MBSetupNative -File 'powercfg.exe' -Args @('/setactive','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
+					$null = Invoke-MBSetupNative -File 'powercfg.exe' -ArgumentList @('/setactive','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
 					foreach ($c in @(
 						@('/change','monitor-timeout-ac','0'),
 						@('/change','monitor-timeout-dc','0'),
@@ -13163,7 +16872,7 @@ function Invoke-NewMachineSetup {
 						@('/setACvalueindex','scheme_current','2a737441-1930-4402-8d77-b2bebba308a3','48e6b7a6-50f5-4782-a5d4-53bb8f07e226','0'),
 						@('/setDCvalueindex','scheme_current','2a737441-1930-4402-8d77-b2bebba308a3','48e6b7a6-50f5-4782-a5d4-53bb8f07e226','0'),
 						@('/setactive','scheme_current')
-					)) { $null = Invoke-MBSetupNative -File 'powercfg.exe' -Args $c }
+					)) { $null = Invoke-MBSetupNative -File 'powercfg.exe' -ArgumentList $c }
 					$row.ok = $true
 				} elseif ($s.section -eq 'software' -and $pkgById.ContainsKey($s.id)) {
 					$inst = Invoke-MBSetupInstallPackage -Package $pkgById[$s.id] -WorkDir $workDir
@@ -13204,16 +16913,24 @@ function Invoke-NewMachineSetup {
 	$okN = @($results | Where-Object { $_.ok }).Count
 	$swOk = @($results | Where-Object { $_.section -eq 'software' -and $_.ok }).Count
 	$swTotal = @($results | Where-Object { $_.section -eq 'software' }).Count
-	$doneNote = 'Device Encryption was turned off during setup. ADWCleaner runs a scan when included. Failed downloads often mean a vendor URL changed.'
+	$doneNote = "Device Encryption was turned OFF during setup. $portableEncryptNote ADWCleaner runs a scan when included. Failed downloads often mean a vendor URL changed."
+	for ($i = 0; $i -lt $results.Count; $i++) {
+		if ([string]$results[$i].id -eq 'bitlocker_off') {
+			$results[$i]['recommendation'] = $portableEncryptNote
+			break
+		}
+	}
 	Write-Host ("  NewMachineSetup done: {0}/{1} OK" -f $okN, $totalSteps) -ForegroundColor $(if ($okN -eq $totalSteps) { 'Green' } else { 'Yellow' })
 	return ConvertTo-MBJson ([ordered]@{
 		ok             = ($okN -eq $results.Count)
+		profile        = $prof
 		passed         = $okN
 		total          = $results.Count
 		software_ok    = $swOk
 		software_total = $swTotal
 		skip_software  = [bool]$skip_software
 		note           = $doneNote
+		recommendation = $portableEncryptNote
 		results        = @($results)
 	}) -Depth 8
 }
@@ -13433,6 +17150,40 @@ function Invoke-MBTool {
 			"GetStartupItems"         { Invoke-GetStartupItems }
 			"GetMemoryInfo"           { Invoke-GetMemoryInfo }
 			"GetNetworkInfo"          { Invoke-GetNetworkInfo }
+			"GetLocalShares" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'include_special') { $p['include_special'] = (Get-MBProp $ArgsObj 'include_special') }
+				if (Test-MBHasProp $ArgsObj 'include_ntfs') { $p['include_ntfs'] = (Get-MBProp $ArgsObj 'include_ntfs') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				Invoke-GetLocalShares @p
+			}
+			"GetMappedDrives" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'include_disconnected') { $p['include_disconnected'] = (Get-MBProp $ArgsObj 'include_disconnected') }
+				Invoke-GetMappedDrives @p
+			}
+			"ScanNetwork" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'subnet') { $p['subnet'] = (Get-MBProp $ArgsObj 'subnet') }
+				if (Test-MBHasProp $ArgsObj 'active') { $p['active'] = (Get-MBProp $ArgsObj 'active') }
+				if (Test-MBHasProp $ArgsObj 'resolve_mac') { $p['resolve_mac'] = (Get-MBProp $ArgsObj 'resolve_mac') }
+				if (Test-MBHasProp $ArgsObj 'resolve_hostnames') { $p['resolve_hostnames'] = (Get-MBProp $ArgsObj 'resolve_hostnames') }
+				if (Test-MBHasProp $ArgsObj 'resolve_vendors') { $p['resolve_vendors'] = (Get-MBProp $ArgsObj 'resolve_vendors') }
+				if (Test-MBHasProp $ArgsObj 'timeout_ms') { $p['timeout_ms'] = [int](Get-MBProp $ArgsObj 'timeout_ms') }
+				if (Test-MBHasProp $ArgsObj 'max_hosts') { $p['max_hosts'] = [int](Get-MBProp $ArgsObj 'max_hosts') }
+				Invoke-ScanNetwork @p
+			}
+			"ProbeShares" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'hosts') { $p['hosts'] = (Get-MBProp $ArgsObj 'hosts') }
+				if (Test-MBHasProp $ArgsObj 'computer') { $p['computer'] = (Get-MBProp $ArgsObj 'computer') }
+				if (Test-MBHasProp $ArgsObj 'host') { $p['computer'] = (Get-MBProp $ArgsObj 'host') }
+				if (Test-MBHasProp $ArgsObj 'share_name') { $p['share_name'] = (Get-MBProp $ArgsObj 'share_name') }
+				if (Test-MBHasProp $ArgsObj 'list_shares') { $p['list_shares'] = (Get-MBProp $ArgsObj 'list_shares') }
+				if (Test-MBHasProp $ArgsObj 'port_timeout_ms') { $p['port_timeout_ms'] = [int](Get-MBProp $ArgsObj 'port_timeout_ms') }
+				if (Test-MBHasProp $ArgsObj 'list_timeout_sec') { $p['list_timeout_sec'] = [int](Get-MBProp $ArgsObj 'list_timeout_sec') }
+				Invoke-ProbeShares @p
+			}
 			"GetWindowsUpdateStatus"  { Invoke-GetWindowsUpdateStatus }
 			"GetSystemUptime"         { Invoke-GetSystemUptime }
 			"RunQuickDiagnostics"     { Invoke-RunQuickDiagnostics }
@@ -13610,8 +17361,67 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'product_code') { $p['product_code'] = (Get-MBProp $ArgsObj 'product_code') }
 				Invoke-UninstallSoftware @p
 			}
-			"NewMachineSetup" {
+			"AddLocalUser" {
+				$p = @{
+					username = (Get-MBProp $ArgsObj 'username')
+					password = (Get-MBProp $ArgsObj 'password')
+				}
+				if (Test-MBHasProp $ArgsObj 'full_name') { $p['full_name'] = (Get-MBProp $ArgsObj 'full_name') }
+				if (Test-MBHasProp $ArgsObj 'description') { $p['description'] = (Get-MBProp $ArgsObj 'description') }
+				if (Test-MBHasProp $ArgsObj 'admin') { $p['admin'] = (Get-MBProp $ArgsObj 'admin') }
+				Invoke-AddLocalUser @p
+			}
+			"JoinDomain" {
+				$p = @{
+					domain   = (Get-MBProp $ArgsObj 'domain')
+					username = (Get-MBProp $ArgsObj 'username')
+					password = (Get-MBProp $ArgsObj 'password')
+				}
+				if (Test-MBHasProp $ArgsObj 'ou') { $p['ou'] = (Get-MBProp $ArgsObj 'ou') }
+				if (Test-MBHasProp $ArgsObj 'new_name') { $p['new_name'] = (Get-MBProp $ArgsObj 'new_name') }
+				if (Test-MBHasProp $ArgsObj 'reboot') { $p['reboot'] = (Get-MBProp $ArgsObj 'reboot') }
+				Invoke-JoinDomain @p
+			}
+			"LeaveDomain" {
 				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'workgroup') { $p['workgroup'] = (Get-MBProp $ArgsObj 'workgroup') }
+				if (Test-MBHasProp $ArgsObj 'reboot') { $p['reboot'] = (Get-MBProp $ArgsObj 'reboot') }
+				if (Test-MBHasProp $ArgsObj 'local_username') { $p['local_username'] = (Get-MBProp $ArgsObj 'local_username') }
+				if (Test-MBHasProp $ArgsObj 'local_password') { $p['local_password'] = (Get-MBProp $ArgsObj 'local_password') }
+				Invoke-LeaveDomain @p
+			}
+			"MapNetworkDrive" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'letter') { $p['letter'] = (Get-MBProp $ArgsObj 'letter') }
+				if (Test-MBHasProp $ArgsObj 'username') { $p['username'] = (Get-MBProp $ArgsObj 'username') }
+				if (Test-MBHasProp $ArgsObj 'domain') { $p['domain'] = (Get-MBProp $ArgsObj 'domain') }
+				if (Test-MBHasProp $ArgsObj 'password') { $p['password'] = (Get-MBProp $ArgsObj 'password') }
+				if (Test-MBHasProp $ArgsObj 'persistent') { $p['persistent'] = (Get-MBProp $ArgsObj 'persistent') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Get-MBProp $ArgsObj 'force') }
+				Invoke-MapNetworkDrive @p
+			}
+			"AddNetworkPrinter" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'set_default') { $p['set_default'] = (Get-MBProp $ArgsObj 'set_default') }
+				Invoke-AddNetworkPrinter @p
+			}
+			"CreateShare" {
+				$p = @{
+					path = (Get-MBProp $ArgsObj 'path')
+					name = (Get-MBProp $ArgsObj 'name')
+				}
+				if (Test-MBHasProp $ArgsObj 'share_password') { $p['share_password'] = (Get-MBProp $ArgsObj 'share_password') }
+				if (Test-MBHasProp $ArgsObj 'description') { $p['description'] = (Get-MBProp $ArgsObj 'description') }
+				if (Test-MBHasProp $ArgsObj 'everyone_full') { $p['everyone_full'] = (Get-MBProp $ArgsObj 'everyone_full') }
+				if (Test-MBHasProp $ArgsObj 'ensure_network') { $p['ensure_network'] = (Get-MBProp $ArgsObj 'ensure_network') }
+				if (Test-MBHasProp $ArgsObj 'ensure_discovery') { $p['ensure_discovery'] = (Get-MBProp $ArgsObj 'ensure_discovery') }
+				if (Test-MBHasProp $ArgsObj 'ensure_folder') { $p['ensure_folder'] = (Get-MBProp $ArgsObj 'ensure_folder') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Get-MBProp $ArgsObj 'force') }
+				Invoke-CreateShare @p
+			}
+			"NewMachineSetup" {
+				$p = @{ profile = (Get-MBProp $ArgsObj 'profile') }
 				if (Test-MBHasProp $ArgsObj 'dry_run') { $p['dry_run'] = [bool](Get-MBProp $ArgsObj 'dry_run') }
 				if (Test-MBHasProp $ArgsObj 'timezone') { $p['timezone'] = (Get-MBProp $ArgsObj 'timezone') }
 				if (Test-MBHasProp $ArgsObj 'skip_restore_point') { $p['skip_restore_point'] = [bool](Get-MBProp $ArgsObj 'skip_restore_point') }
@@ -13619,7 +17429,9 @@ function Invoke-MBTool {
 				Invoke-NewMachineSetup @p
 			}
 			"ListInstallers" {
-				Invoke-ListInstallers
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'profile') { $p['profile'] = (Get-MBProp $ArgsObj 'profile') }
+				Invoke-ListInstallers @p
 			}
 			"InstallPackage" {
 				$p = @{}
@@ -13627,7 +17439,12 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'packages') { $p['packages'] = (Get-MBProp $ArgsObj 'packages') }
 				Invoke-InstallPackage @p
 			}
-			"EnableToolGroup" { Enable-MBToolGroup -Group (Get-MBProp $ArgsObj 'group') }
+			"EnableToolGroup" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'group') { $p['Group'] = [string](Get-MBProp $ArgsObj 'group') }
+				if (Test-MBHasProp $ArgsObj 'groups') { $p['groups'] = (Get-MBProp $ArgsObj 'groups') }
+				Enable-MBToolGroup @p
+			}
 			"ListToolGroups"  { Get-MBToolGroupsStatus }
 			default {
 				$hint = Get-MBToolEnableHint -ToolName $Name
@@ -14866,6 +18683,7 @@ function Read-MBUserInput {
 
 function Get-MBSessionFormat {
 	param([string]$Path)
+	# .md / .markdown = transcript markdown; everything else (incl. default) = JSON
 	$ext = ''
 	try { $ext = [System.IO.Path]::GetExtension([string]$Path) } catch { $ext = '' }
 	if ($ext -match '^(?i)\.(md|markdown)$') { return 'md' }
@@ -14874,6 +18692,7 @@ function Get-MBSessionFormat {
 
 function Ensure-MBSessionScanType {
 	if ('MiniBot.SessionScan' -as [type]) { return }
+	# C# 5 scan helper only (UI is main-window overlay in PowerShell)
 	$code = @'
 using System;
 using System.Collections.Generic;
@@ -14938,6 +18757,7 @@ namespace MiniBot
 }
 
 function Suspend-MBWpfForModal {
+	# Pause host UI timers/loops so modal dialogs (session picker) stay smooth.
 	if (-not (Test-MBWpfActive)) { return }
 	try { $script:MB.Wpf.ModalUi = $true } catch {}
 	$d = $null
@@ -14965,6 +18785,7 @@ function Suspend-MBWpfForModal {
 }
 
 function Resume-MBWpfForModal {
+	# Restart host UI after modal closes (Open / Cancel / X).
 	if (-not $script:MB.Wpf) { return }
 	try { $script:MB.Wpf.ModalUi = $false } catch {}
 	$d = $null
@@ -15012,6 +18833,7 @@ function Get-MBSessionFileRows {
 			}
 		}
 	} catch {}
+	# PS fallback
 	try {
 		if (-not [System.IO.Directory]::Exists($Dir)) { return @() }
 		$all = [System.IO.Directory]::GetFiles($Dir)
@@ -15097,6 +18919,7 @@ function Show-MBSessionFilePicker {
 	}
 	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) { $InitialDirectory = [string]$env:TEMP }
 
+	# Main-window overlay path (same host as auth/confirm — no janky second window)
 	if (Test-MBWpfActive -and $script:MB.Wpf.SessionPickerOverlay) {
 		$W = $script:MB.Wpf
 		try { Ensure-MBSessionScanType } catch {}
@@ -15144,6 +18967,7 @@ function Show-MBSessionFilePicker {
 						$W.SessionPickerOverlay.Visibility = [System.Windows.Visibility]::Visible
 					}
 					try { if ($W.SessionPickerPath) { [void]$W.SessionPickerPath.Focus() } } catch {}
+					# reload list
 					try {
 						if ($W.SessionPickerReload) { & $W.SessionPickerReload }
 					} catch {}
@@ -15171,6 +18995,7 @@ function Show-MBSessionFilePicker {
 		}
 	}
 
+	# Fallback: STA WinForms common dialog
 	$filter = 'MiniBot session (*.json)|*.json|Markdown transcript (*.md;*.markdown)|*.md;*.markdown|All files (*.*)|*.*'
 	$rs = $null; $ps = $null
 	try {
@@ -15373,6 +19198,7 @@ function Load-MBSessionJson {
 	if ($obj.cwd) {
 		try { Invoke-SetWorkingDirectory -path $obj.cwd | Out-Null } catch {}
 	}
+	# Last user for /retry
 	try {
 		for ($i = $rawMsgs.Count - 1; $i -ge 0; $i--) {
 			if ([string](Get-MBProp $rawMsgs[$i] 'role') -eq 'user') {
@@ -15409,6 +19235,7 @@ function Load-MBSession {
 	$lp = Resolve-MBPath $Path
 	if (-not (Test-Path -LiteralPath $lp)) { throw "File not found: $lp" }
 	$fmt = Get-MBSessionFormat -Path $lp
+	# Sniff: .md by extension, else if file starts with # MiniBot Transcript treat as md
 	if ($fmt -ne 'md') {
 		try {
 			$head = Get-Content -LiteralPath $lp -TotalCount 3 -ErrorAction SilentlyContinue
@@ -15430,6 +19257,8 @@ function Load-MBSession {
 		}
 	}
 	if ($Append) {
+		# JSON append: merge message lists after load of sticky/tools from file would clobber;
+		# for simplicity, JSON load always replaces (markdown supports append).
 		throw "Append is only supported for .md transcripts. Use /load path.md with append, or /load file.json to replace."
 	}
 	return (Load-MBSessionJson -Path $lp -NoPaint:$NoPaint)
@@ -15439,6 +19268,7 @@ function ConvertFrom-MBTranscriptMarkdown {
 	param(
 		[Parameter(Mandatory = $true)][string]$Text
 	)
+	# Parse MiniBot transcript markdown into chat messages for context continue.
 	$raw = [string]$Text
 	if ($raw.Length -gt 0 -and [int][char]$raw[0] -eq 0xFEFF) {
 		$raw = $raw.Substring(1)
@@ -15454,7 +19284,7 @@ function ConvertFrom-MBTranscriptMarkdown {
 	$metaToolProfile = $null
 
 	$out = New-Object System.Collections.ArrayList
-	$role = $null
+	$role = $null          # user | assistant | tool
 	$body = New-Object System.Collections.ArrayList
 	$toolCalls = New-Object System.Collections.ArrayList
 	$toolName = ''
@@ -15462,6 +19292,7 @@ function ConvertFrom-MBTranscriptMarkdown {
 	$tcId = 0
 
 	foreach ($line in $lines) {
+		# Meta (before first message section)
 		if (-not $role -and $line -match '^(?i)Model:\s*(.+)$') {
 			$metaModel = $Matches[1].Trim(); continue
 		}
@@ -15512,6 +19343,7 @@ function ConvertFrom-MBTranscriptMarkdown {
 		}
 
 		if ($isHeader) {
+			# flush current section
 			if ($role) {
 				$text = (($body | ForEach-Object { $_ }) -join "`n").TrimEnd()
 				if ($text.StartsWith("`n")) { $text = $text.Substring(1) }
@@ -15546,6 +19378,7 @@ function ConvertFrom-MBTranscriptMarkdown {
 			continue
 		}
 
+		# Tool call lines under assistant
 		if ($role -eq 'assistant' -and -not $inFence -and $line -match '^\s*-\s*tool:\s*(\S+)\s+`([^`]*)`\s*$') {
 			$tcId++
 			[void]$toolCalls.Add(@{
@@ -15565,6 +19398,7 @@ function ConvertFrom-MBTranscriptMarkdown {
 			continue
 		}
 
+		# Fenced code in tool results: drop fence lines, keep content
 		if ($line -match '^```') {
 			$inFence = -not $inFence
 			if ($role -eq 'tool') { continue }
@@ -15575,6 +19409,7 @@ function ConvertFrom-MBTranscriptMarkdown {
 		if ($role) { [void]$body.Add($line) }
 	}
 
+	# final flush
 	if ($role) {
 		$text = (($body | ForEach-Object { $_ }) -join "`n").TrimEnd()
 		if ($text.StartsWith("`n")) { $text = $text.Substring(1) }
@@ -15612,6 +19447,7 @@ function Set-MBActiveToolGroupsFromList {
 		[string[]]$Groups,
 		[switch]$Merge
 	)
+	# Restore ActiveToolGroups from transcript meta (or merge when appending).
 	$order = @(Get-MBToolGroupOrder)
 	$want = New-Object System.Collections.ArrayList
 	[void]$want.Add('core')
@@ -15660,6 +19496,8 @@ function Show-MBImportedMessages {
 		[array]$Messages,
 		[string]$Label = 'loaded'
 	)
+	# Console replay only: user turns + assistant text (what the operator saw).
+	# Tool JSON / tool results stay in $script:Messages for the model — not painted.
 	if (-not $Messages -or $Messages.Count -eq 0) { return }
 	try {
 		Write-Host ""
@@ -15680,6 +19518,7 @@ function Show-MBImportedMessages {
 			continue
 		}
 		if ($r -ne 'assistant') { continue }
+		# Skip pure tool-call turns with no visible reply text
 		$hasText = -not [string]::IsNullOrWhiteSpace($c)
 		if (-not $hasText) { continue }
 		try {
@@ -15742,6 +19581,7 @@ function Import-MBTranscript {
 
 	$imported = @($parsed.Messages)
 
+	# Restore tool groups from export header (merge when appending)
 	$toolsRestored = @()
 	if ($parsed.Tools -and @($parsed.Tools).Count -gt 0) {
 		try {
@@ -15750,6 +19590,7 @@ function Import-MBTranscript {
 			$toolsRestored = @($script:MB.ActiveToolGroups)
 		}
 	} elseif (-not $Append) {
+		# No Tools: line in older transcripts - leave current groups alone
 		$toolsRestored = @($script:MB.ActiveToolGroups)
 	} else {
 		$toolsRestored = @($script:MB.ActiveToolGroups)
@@ -15763,6 +19604,7 @@ function Import-MBTranscript {
 	}
 
 	if ($Append) {
+		# Keep prior non-system turns, then append import
 		$prior = @()
 		foreach ($m in @($script:Messages)) {
 			$r = [string](Get-MBProp $m 'role')
@@ -15778,6 +19620,7 @@ function Import-MBTranscript {
 		try { Invoke-SetWorkingDirectory -path $parsed.Cwd | Out-Null } catch {}
 	}
 
+	# Last user text for /retry
 	for ($i = $imported.Count - 1; $i -ge 0; $i--) {
 		if ([string](Get-MBProp $imported[$i] 'role') -eq 'user') {
 			$script:LastUserMessage = [string](Get-MBProp $imported[$i] 'content')
@@ -17026,6 +20869,9 @@ function Update-MBWpfSticky {
 	if ($PSBoundParameters.ContainsKey('PoweredBy')) { $cur.PoweredBy = ConvertTo-MBWpfSafeText -Text $PoweredBy }
 	if ($PSBoundParameters.ContainsKey('AutoCompactLine')) { $cur.AutoCompactLine = ConvertTo-MBWpfSafeText -Text $AutoCompactLine }
 	if ($PSBoundParameters.ContainsKey('Status')) {
+		# Status mode for spinner; UI timer paints glyph.
+		# Strip leading spinner/glyph junk without Unicode literals in source
+		# (PS 5.1 can mangle UTF-8 script bytes when there is no BOM).
 		$raw = [string]$Status
 		$label = $raw.Trim()
 		while ($label.Length -gt 0) {
@@ -17072,7 +20918,23 @@ function Update-MBWpfSticky {
 	$script:MB.Wpf.PendingSticky = $cur
 }
 
+function Sync-MBAutoApproveFromWpf {
+	# Pull click-toggle from UI bag into session (and push session → bag when not dirty).
+	if (-not $script:MB.Wpf) { return }
+	try {
+		if ([bool]$script:MB.Wpf.AutoApproveDirty) {
+			$script:MB.AutoApprove = [bool]$script:MB.Wpf.AutoApproveOn
+			$script:MB.Wpf.AutoApproveDirty = $false
+		} else {
+			$script:MB.Wpf.AutoApproveOn = [bool]$script:MB.AutoApprove
+		}
+	} catch {
+		try { $script:MB.Wpf.AutoApproveOn = [bool]$script:MB.AutoApprove } catch {}
+	}
+}
+
 function Get-MBWpfLowerRightText {
+	try { Sync-MBAutoApproveFromWpf } catch {}
 	$dot = [string][char]0x00B7
 	$parts = New-Object System.Collections.ArrayList
 	$n = 0
@@ -17080,7 +20942,8 @@ function Get-MBWpfLowerRightText {
 	if ($n -gt 0) {
 		[void]$parts.Add(("compact {0}x" -f $n))
 	}
-	$auto = if ($script:MB.AutoApprove) { 'auto-approve: ON' } else { 'auto-approve: OFF' }
+	$autoOn = [bool]$script:MB.AutoApprove
+	$auto = if ($autoOn) { 'auto-approve: ON' } else { 'auto-approve: OFF' }
 	[void]$parts.Add($auto)
 	[void]$parts.Add(("tools used {0}" -f [int]$script:MB.ToolCalls))
 	return ($parts -join ("  {0}  " -f $dot))
@@ -17274,6 +21137,7 @@ function Read-MBWpfUserInput {
 					$script:MB.Wpf.InputResult = $null
 					Write-MBDebugLog -Step 'READ_WPF_INPUT_RECEIVED' -Detail ("len={0}" -f $(if ($null -eq $r) { -1 } else { $r.Length }))
 					Set-MBWpfPromptEnabled -Enabled $false
+					# Same interrupt chrome as thinking/working elsewhere — never a bare "working" flash
 					try {
 						Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  model working..." -f ([char]0x00B7))
 					} catch {}
@@ -17364,9 +21228,17 @@ function Request-MBWpfConfirmation {
 					'^(n|no)$'  { $script:MB.ApprovalsDenied++; return $false }
 					'^(a|all|yes to all|yestoall)$' {
 						$script:MB.AutoApprove = $true
+						try {
+							if ($script:MB.Wpf) {
+								$script:MB.Wpf.AutoApproveOn = $true
+								$script:MB.Wpf.AutoApproveDirty = $false
+								$script:MB.Wpf.LowerRightSig = ''
+							}
+						} catch {}
 						$script:MB.ApprovalsGranted++
 						$script:MB.ModeSwitch = $true
 						Write-MBWpfRaw -Text "  Auto-Approve ENABLED for this session." -Color Green
+						try { Update-MBWpfLiveChrome -Force } catch {}
 						return $true
 					}
 					default {
@@ -17660,7 +21532,7 @@ function Start-MBWpfHost {
 		AuthFocusTicks = 0          # re-apply username focus for a few timer frames
 		AuthNeedActivate = $false   # keep forcing OS foreground until window is active
 		BootstrapTopmost = $true    # Topmost until main screen loads; then cleared
-		ModalUi       = $false
+		ModalUi       = $false      # true while file picker / modal blocks Activate steals
 		History       = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 		HistIndex     = -1
 		ReadyWait     = New-Object System.Threading.ManualResetEvent $false
@@ -17671,6 +21543,9 @@ function Start-MBWpfHost {
 		Version       = [string]$Version
 		ModelAlias    = $(try { [string]$ModelAlias } catch { '' })
 		AutoCompactOn = $(try { [bool]$script:MB.AutoCompact } catch { $true })
+		AutoApproveOn = $(try { [bool]$script:MB.AutoApprove } catch { $false })
+		AutoApproveDirty = $false
+		LowerRightSig = ''
 		Ps            = $null
 		Runspace      = $null
 		WriteQueue    = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
@@ -18120,9 +21995,8 @@ function Start-MBWpfHost {
                          VerticalAlignment="Center" Margin="0,0,10,0" FontWeight="SemiBold"/>
               <TextBlock x:Name="CtxTokText" Text="" Foreground="#6A6A76" VerticalAlignment="Center"/>
             </StackPanel>
-            <TextBlock x:Name="LowerRight" Grid.Column="2" Text="" Foreground="#8A8A96"
-                       VerticalAlignment="Center" HorizontalAlignment="Right" TextTrimming="CharacterEllipsis"
-                       Margin="12,0,0,0"/>
+            <StackPanel x:Name="LowerRight" Grid.Column="2" Orientation="Horizontal"
+                        VerticalAlignment="Center" HorizontalAlignment="Right" Margin="12,0,0,0"/>
           </Grid>
         </Border>
 
@@ -18245,6 +22119,7 @@ function Start-MBWpfHost {
         </Border>
       </Grid>
 
+ <!-- Session load/save picker overlay (invisible until /load /save) -->
       <Grid x:Name="SessionPickerOverlay" Visibility="Collapsed" Panel.ZIndex="250">
         <Border Background="#E6121216"/>
         <Border Width="720" Height="480" MinWidth="480" MinHeight="320"
@@ -18316,6 +22191,7 @@ function Start-MBWpfHost {
                        FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
             </DockPanel>
             <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+              <!-- IsDefault/IsCancel set only while overlay is visible (avoid fighting auth/main) -->
               <Button x:Name="SessionPickerOk" Style="{StaticResource MbAuthPrimaryBtn}"
                       Content="Open" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0"
                       IsDefault="False"/>
@@ -18402,6 +22278,7 @@ function Start-MBWpfHost {
 			$W.SessionPickerRows = New-Object System.Collections.ArrayList
 
 			
+			# Session picker overlay (load/save) — same UI thread as host
 			try {
 			$sessionPickerReload = {
 				try {
@@ -18423,6 +22300,7 @@ function Start-MBWpfHost {
 					}
 					$found = @()
 					try {
+						# Prefer process-wide C# scanner if loaded
 						if ('MiniBot.SessionScan' -as [type]) {
 							$raw = [MiniBot.SessionScan]::ListSessions($dir, 400, 3000)
 							if ($raw) {
@@ -19715,6 +23593,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 			$timer.Interval = [TimeSpan]::FromMilliseconds(16)
 			$timer.add_Tick({
 				try {
+					# Session picker / modal open — freeze host UI work for smooth dialog
 					try { if ([bool]$W.ModalUi) { return } } catch {}
 					$rtb = $W.Log
 					$q = $W.WriteQueue
@@ -21243,39 +25122,254 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$W.HdrAutoCompact.Foreground = $W.BrushCache[$hex]
 							} catch {}
 						}
-						# Lower status: meta and context bar
-						# auto-approve: ON = orange, OFF = green (all caps); rest muted grey
+						# Lower status: compact · auto-approve [OFF|ON] toggle · tools used
 						if ($null -ne $pend.Right -and ($W.LowerRight -or $W.HdrRight)) {
 							$lr = if ($W.LowerRight) { $W.LowerRight } else { $W.HdrRight }
 							$txt = [string]$pend.Right
 							try {
-								$lr.Inlines.Clear()
 								$grayHex = '#8A8A96'
-								$onHex = '#FF9E64'   # orange when auto-approve ON
-								$offHex = '#9ECE6A'  # green when OFF
-								foreach ($hx in @($grayHex, $onHex, $offHex)) {
+								$onHex = '#FF9E64'    # orange when auto-approve ON
+								$offHex = '#9ECE6A'   # green when OFF
+								$chipBgHex = '#2A2A30'
+								$chipBorderHex = '#3A3A42'
+								$activeBgOn = '#3D2E22'   # warm dim when ON selected
+								$activeBgOff = '#2A3328'  # cool dim when OFF selected
+								foreach ($hx in @($grayHex, $onHex, $offHex, $chipBgHex, $chipBorderHex, $activeBgOn, $activeBgOff)) {
 									if (-not $W.BrushCache.ContainsKey($hx)) {
 										$W.BrushCache[$hx] = $conv.ConvertFromString($hx)
 									}
 								}
-								$addRun = {
-									param([string]$t, [string]$hex)
-									if ([string]::IsNullOrEmpty($t)) { return }
-									$run = New-Object System.Windows.Documents.Run ($t)
-									$run.Foreground = $W.BrushCache[$hex]
-									[void]$lr.Inlines.Add($run)
+								$autoOn = $false
+								try { $autoOn = [bool]$W.AutoApproveOn } catch {
+									$autoOn = ($txt -match 'auto-approve:\s*ON')
 								}
-								if ($txt -match '(?s)^(.*)(auto-approve:\s*)(ON|OFF)(.*)$') {
-									& $addRun $Matches[1] $grayHex
-									& $addRun $Matches[2] $grayHex
-									$valHex = if ($Matches[3] -eq 'ON') { $onHex } else { $offHex }
-									& $addRun $Matches[3] $valHex
-									& $addRun $Matches[4] $grayHex
+								$compactPart = ''
+								$toolsPart = ''
+								if ($txt -match '(compact\s+\d+x)') { $compactPart = $Matches[1] }
+								if ($txt -match '(tools used\s+\d+)') { $toolsPart = $Matches[1] }
+								$sig = ('{0}|{1}|{2}' -f $compactPart, $(if ($autoOn) { 'ON' } else { 'OFF' }), $toolsPart)
+								$isPanel = $false
+								try { $isPanel = ($lr -is [System.Windows.Controls.Panel]) } catch { $isPanel = $false }
+								if ($isPanel) {
+									if ([string]$W.LowerRightSig -eq $sig) {
+										# already painted for this state
+									} else {
+										$W.LowerRightSig = $sig
+										try { $lr.Children.Clear() } catch {}
+										$mono = $null
+										try { $mono = $W.MonoFont } catch {}
+										$dot = [string][char]0x00B7
+										$addMuted = {
+											param([string]$t)
+											if ([string]::IsNullOrEmpty($t)) { return }
+											$tb = New-Object System.Windows.Controls.TextBlock
+											$tb.Text = $t
+											$tb.Foreground = $W.BrushCache[$grayHex]
+											$tb.FontSize = 12
+											$tb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+											if ($mono) { try { $tb.FontFamily = $mono } catch {} }
+											[void]$lr.Children.Add($tb)
+										}
+										if ($compactPart) {
+											& $addMuted $compactPart
+											& $addMuted ("  {0}  " -f $dot)
+										}
+										& $addMuted 'auto-approve '
+										# Segmented OFF | ON toggle
+										$outer = New-Object System.Windows.Controls.Border
+										$outer.Background = $W.BrushCache[$chipBgHex]
+										$outer.BorderBrush = $W.BrushCache[$chipBorderHex]
+										$outer.BorderThickness = New-Object System.Windows.Thickness(1)
+										$outer.CornerRadius = New-Object System.Windows.CornerRadius(4)
+										$outer.Padding = New-Object System.Windows.Thickness(1)
+										$outer.Margin = New-Object System.Windows.Thickness(2, 0, 2, 0)
+										$outer.Cursor = [System.Windows.Input.Cursors]::Hand
+										$outer.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$outer.ToolTip = $(if ($autoOn) {
+											'Auto-approve is ON - click to require confirmation again'
+										} else {
+											'Auto-approve is OFF - click to skip confirmation prompts'
+										})
+										$seg = New-Object System.Windows.Controls.StackPanel
+										$seg.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+										$mkSeg = {
+											param([string]$label, [bool]$active, [string]$activeFg, [string]$activeBg)
+											$b = New-Object System.Windows.Controls.Border
+											$b.CornerRadius = New-Object System.Windows.CornerRadius(3)
+											$b.Padding = New-Object System.Windows.Thickness(7, 1, 7, 1)
+											$b.Margin = New-Object System.Windows.Thickness(0)
+											$b.IsHitTestVisible = $false
+											if ($active) {
+												$b.Background = $W.BrushCache[$activeBg]
+											} else {
+												$b.Background = [System.Windows.Media.Brushes]::Transparent
+											}
+											$t = New-Object System.Windows.Controls.TextBlock
+											$t.Text = $label
+											$t.FontSize = 11
+											$t.FontWeight = [System.Windows.FontWeights]::SemiBold
+											$t.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+											$t.IsHitTestVisible = $false
+											if ($mono) { try { $t.FontFamily = $mono } catch {} }
+											if ($active) {
+												$t.Foreground = $W.BrushCache[$activeFg]
+											} else {
+												$t.Foreground = $W.BrushCache[$grayHex]
+												$t.Opacity = 0.55
+											}
+											$b.Child = $t
+											return $b
+										}
+										$offSeg = & $mkSeg 'OFF' (-not $autoOn) $offHex $activeBgOff
+										$onSeg = & $mkSeg 'ON' $autoOn $onHex $activeBgOn
+										$W.AutoApproveOffSeg = $offSeg
+										$W.AutoApproveOnSeg = $onSeg
+										[void]$seg.Children.Add($offSeg)
+										[void]$seg.Children.Add($onSeg)
+										# Visual layer (not hit-test) under full-area invisible click surface
+										$seg.IsHitTestVisible = $false
+										$layer = New-Object System.Windows.Controls.Grid
+										[void]$layer.Children.Add($seg)
+										$hitBtn = New-Object System.Windows.Controls.Button
+										$hitBtn.Opacity = 0.01
+										$hitBtn.Background = [System.Windows.Media.Brushes]::Transparent
+										$hitBtn.BorderThickness = New-Object System.Windows.Thickness(0)
+										$hitBtn.Padding = New-Object System.Windows.Thickness(0)
+										$hitBtn.Margin = New-Object System.Windows.Thickness(0)
+										$hitBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+										$hitBtn.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+										$hitBtn.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
+										$hitBtn.Focusable = $false
+										$hitBtn.IsTabStop = $false
+										try {
+											$hitBtn.Template = [System.Windows.Markup.XamlReader]::Parse(
+												'<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="Transparent"/></ControlTemplate>'
+											)
+										} catch {}
+										$hitBtn.ToolTip = $(if ($autoOn) {
+											'Auto-approve is ON - click to require confirmation again'
+										} else {
+											'Auto-approve is OFF - click to skip confirmation prompts'
+										})
+										$W.AutoApproveToggleTip = $hitBtn
+										[void]$layer.Children.Add($hitBtn)
+										$outer.Child = $layer
+										$outer.IsHitTestVisible = $true
+										$applySegLook = {
+											param([bool]$isOn)
+											try {
+												$offB = $W.AutoApproveOffSeg
+												$onB = $W.AutoApproveOnSeg
+												if ($offB) {
+													$offB.Background = $(if (-not $isOn) { $W.BrushCache['#2A3328'] } else { [System.Windows.Media.Brushes]::Transparent })
+													if ($offB.Child) {
+														$offB.Child.Foreground = $(if (-not $isOn) { $W.BrushCache['#9ECE6A'] } else { $W.BrushCache['#8A8A96'] })
+														$offB.Child.Opacity = $(if (-not $isOn) { 1.0 } else { 0.55 })
+													}
+												}
+												if ($onB) {
+													$onB.Background = $(if ($isOn) { $W.BrushCache['#3D2E22'] } else { [System.Windows.Media.Brushes]::Transparent })
+													if ($onB.Child) {
+														$onB.Child.Foreground = $(if ($isOn) { $W.BrushCache['#FF9E64'] } else { $W.BrushCache['#8A8A96'] })
+														$onB.Child.Opacity = $(if ($isOn) { 1.0 } else { 0.55 })
+													}
+												}
+												if ($W.AutoApproveToggleTip) {
+													$W.AutoApproveToggleTip.ToolTip = $(if ($isOn) {
+														'Auto-approve is ON - click to require confirmation again'
+													} else {
+														'Auto-approve is OFF - click to skip confirmation prompts'
+													})
+												}
+											} catch {}
+										}.GetNewClosure()
+										# Whole control = one toggle (invisible full-area button).
+										$toggleClick = {
+											param($s, $e)
+											try {
+												if ($null -ne $e) {
+													try { $e.Handled = $true } catch {}
+												}
+												# Debounce double delivery
+												$now = [Environment]::TickCount
+												$last = 0
+												try { $last = [int]$W.AutoApproveClickTick } catch { $last = 0 }
+												if ($last -ne 0 -and ((($now - $last) -band 0x7fffffff) -lt 280)) { return }
+												$W.AutoApproveClickTick = $now
+
+												$cur = $false
+												try { $cur = [bool]$W.AutoApproveOn } catch { $cur = $false }
+												$nxt = -not $cur
+
+												$W.AutoApproveOn = $nxt
+												$W.AutoApproveDirty = $true
+												# Keep sig in sync so next chrome paint does not thrash
+												try {
+													$cp = ''
+													$tp = ''
+													try {
+														$rt = [string]$W.PendingSticky.Right
+														if ($rt -match '(compact\s+\d+x)') { $cp = $Matches[1] }
+														if ($rt -match '(tools used\s+\d+)') { $tp = $Matches[1] }
+													} catch {}
+													$W.LowerRightSig = ('{0}|{1}|{2}' -f $cp, $(if ($nxt) { 'ON' } else { 'OFF' }), $tp)
+												} catch { $W.LowerRightSig = '' }
+												try { & $applySegLook $nxt } catch {}
+												try {
+													# Blank line above + below for clean console spacing
+													$msg = if ($nxt) {
+														"`n  Auto-approve ON - modifying actions will not prompt.`n"
+													} else {
+														"`n  Auto-approve OFF - confirmations restored.`n"
+													}
+													$col = if ($nxt) { 'DarkYellow' } else { 'Green' }
+													if ($W.WriteQueue) {
+														$W.WriteQueue.Enqueue([pscustomobject]@{
+															Kind      = 'text'
+															Text      = $msg
+															Color     = $col
+															NoNewline = $false
+															Brand     = $(try { [string]$W.AgentName } catch { 'MiniBot' })
+														})
+													}
+												} catch {}
+											} catch {}
+										}.GetNewClosure()
+										$hitBtn.add_Click($toggleClick)
+										[void]$lr.Children.Add($outer)
+										if ($toolsPart) {
+											& $addMuted ("  {0}  " -f $dot)
+											& $addMuted $toolsPart
+										}
+									}
 								} else {
-									& $addRun $txt $grayHex
+									# Fallback TextBlock path
+									try {
+										$lr.Inlines.Clear()
+										$addRun = {
+											param([string]$t, [string]$hex)
+											if ([string]::IsNullOrEmpty($t)) { return }
+											$run = New-Object System.Windows.Documents.Run ($t)
+											$run.Foreground = $W.BrushCache[$hex]
+											[void]$lr.Inlines.Add($run)
+										}
+										if ($txt -match '(?s)^(.*)(auto-approve:\s*)(ON|OFF)(.*)$') {
+											& $addRun $Matches[1] $grayHex
+											& $addRun $Matches[2] $grayHex
+											$valHex = if ($Matches[3] -eq 'ON') { $onHex } else { $offHex }
+											& $addRun $Matches[3] $valHex
+											& $addRun $Matches[4] $grayHex
+										} else {
+											& $addRun $txt $grayHex
+										}
+									} catch {
+										try { $lr.Text = $txt } catch {}
+									}
 								}
 							} catch {
-								try { $lr.Text = $txt } catch {}
+								try {
+									if ($lr -is [System.Windows.Controls.TextBlock]) { $lr.Text = $txt }
+								} catch {}
 							}
 						}
 						if ($null -ne $pend.Hint -and $W.HintBar) { $W.HintBar.Text = [string]$pend.Hint }
@@ -22278,8 +26372,16 @@ function Start-LocalAgent {
 
 	Show-MBBanner
 	Write-MBOk "Connected ($($connTest.AuthType), $($connTest.ElapsedMs) ms)"
+	$nativeBits = New-Object System.Collections.ArrayList
 	if ($script:HasNative) {
-		Write-MBInfo "Native helpers loaded (process timeout + HTML extract)"
+		[void]$nativeBits.Add('ProcHelper')
+		[void]$nativeBits.Add('HTML extract')
+	}
+	if ($script:HasCredMan) { [void]$nativeBits.Add('CredMan') }
+	if ($script:HasDiskWalk) { [void]$nativeBits.Add('DiskWalk') }
+	if ($script:HasDpiScreen) { [void]$nativeBits.Add('VisionHelper') }
+	if ($nativeBits.Count -gt 0) {
+		Write-MBInfo ("Native helpers loaded ({0})" -f ($nativeBits -join ', '))
 	}
 	if ($script:MB.SpeechEnabled -and (Test-MBSpeechUiOk)) {
 		$dict = if ($script:MB.SpeechEngine) { 'PTT+TTS' } elseif ($script:MB.SpeechReady) { 'TTS only' } else { 'init failed' }
@@ -22578,6 +26680,14 @@ function Start-LocalAgent {
 							Write-MBOk "auto-approve OFF"
 						}
 					}
+					try {
+						if ($script:MB.Wpf) {
+							$script:MB.Wpf.AutoApproveOn = [bool]$script:MB.AutoApprove
+							$script:MB.Wpf.AutoApproveDirty = $false
+							$script:MB.Wpf.LowerRightSig = ''
+						}
+						Update-MBWpfLiveChrome -Force
+					} catch {}
 					$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
 					try { Refresh-MBWpfStickyFromSession } catch {}
 					continue
@@ -22635,6 +26745,8 @@ function Start-LocalAgent {
 						if ($r.PSObject.Properties['Model'] -and $r.Model) {
 							Write-Host ("  file model: {0}" -f $r.Model) -ForegroundColor DarkGray
 						}
+						# Model call to refill context; instruction is private (not painted as user bubble).
+						# If the model replies anyway, show it normally.
 						$userInput = 'Context Fully Reloaded.. Wait for the next message from the user before responding.'
 						$trimmed = $userInput
 						$script:MB.LoadResumeTurn = $true
@@ -22669,6 +26781,7 @@ function Start-LocalAgent {
 		try { $isLoadResume = [bool]$script:MB.LoadResumeTurn } catch { $isLoadResume = $false }
 		if ($isLoadResume) { $script:MB.LoadResumeTurn = $false }
 		Write-MBDebugLog -Step 'TURN_BEGIN' -Detail ("preview={0} loadResume={1}" -f $trimmed, $isLoadResume)
+		# Keep /retry on the real last user line from the loaded session
 		if (-not $isLoadResume) {
 			$script:LastUserMessage = $userInput
 		}
@@ -22913,9 +27026,23 @@ function Start-LocalAgent {
 					if (-not $argsObj) { $argsObj = [pscustomobject]@{} }
 
 					Write-Host "  -> " -NoNewline -ForegroundColor DarkGreen
-					Write-Host $fn -NoNewline -ForegroundColor Green
+					$fnLabel = Get-MBToolConsoleLabel -Name $fn -ArgsObj $argsObj
+					Write-Host $fnLabel -NoNewline -ForegroundColor Green
 					$hint = ""
-					if (Test-MBHasProp $argsObj 'path') { $hint = "  $(Get-MBProp $argsObj 'path')" }
+					if ($fn -eq 'EnableToolGroup') {
+						$eg = ''; $egs = $null
+						if (Test-MBHasProp $argsObj 'group') { $eg = [string](Get-MBProp $argsObj 'group') }
+						if (Test-MBHasProp $argsObj 'groups') { $egs = (Get-MBProp $argsObj 'groups') }
+						$etoks = @(Get-MBEnableToolGroupTokens -Group $eg -groups $egs)
+						if ($etoks.Count -gt 0) { $hint = "  $($etoks -join ', ')" }
+					}
+					elseif ($fn -eq 'ScanNetwork') {
+						$hint = '  (usually ~30s)'
+					}
+					elseif ($fn -eq 'ProbeShares') {
+						$hint = '  (port filter + map guess)'
+					}
+					elseif (Test-MBHasProp $argsObj 'path') { $hint = "  $(Get-MBProp $argsObj 'path')" }
 					elseif (Test-MBHasProp $argsObj 'name') { $hint = "  $(Get-MBProp $argsObj 'name')" }
 					elseif (Test-MBHasProp $argsObj 'piece') { $hint = "  piece=$(Get-MBProp $argsObj 'piece')" }
 					elseif (Test-MBHasProp $argsObj 'command') {
