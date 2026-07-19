@@ -21,7 +21,7 @@ param(
 	# This is NOT the real model alias entry. Enter your server name here for `PoweredBy: YourServerName` on the top right of the window, this `Alias` is for MiniBot display only
 	[string]$ModelAlias = "YourServerName",
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.10.0",
+	[string]$Version = "2.12.0",
 	[string]$ApiKey = "none",
 	# Max completion tokens per model request (also reserved out of n_ctx for the prompt budget)
 	[int]$MaxTokens = 32768,
