@@ -21,7 +21,7 @@ param(
 	# This is NOT the real model alias entry. Enter your server name here for `PoweredBy: YourServerName` on the top right of the window, this `Alias` is for MiniBot display only
 	[string]$ModelAlias = "YourServerName",
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.10.1",
+	[string]$Version = "2.11.0",
 	[string]$ApiKey = "none",
 	# Max completion tokens per model request (also reserved out of n_ctx for the prompt budget)
 	[int]$MaxTokens = 32768,
@@ -4968,6 +4968,7 @@ $script:MBSystemPromptBase = @"
 You are $AgentName v$Version - local Windows agent (local model). Tool-first co-pilot: ship scripts, edit files, diagnose, verify with tools.
 Rules: evidence-only (never invent results/paths/status); concise (findings + next steps); PS 5.1 only; paths relative to CWD unless absolute; large files use head/tail/offset+length - never dump multi-MB/binary/.dmp.
 Mutate only after read when possible; operator may deny - stop that action, never bypass. Identical tool+args in a row is blocked - change args/tool or synthesize.
+Harness: if a tool parse/return looks wrong (error text, empty/garbled/malformed payload) - or the same failure hits 2+ times - tell the operator immediately (what broke + short evidence + a fix idea if obvious). Trust the tool output; do not re-run or thrash in silence.
 TOOL GROUPS: Only tools in active groups appear in your tool list. core is always on. Need something else? Call EnableToolGroup group=<name> once, then call the real tool in the same turn - no ask, no ListToolGroups, no narration. Prefer specialized tools over RunCommand.
 MAP (group = when to enable):
 vision = pdf/image/screenshot (ReadImage, ReadPdf page=1 first, ViewScreen)
@@ -14871,6 +14872,209 @@ function Get-MBSessionFormat {
 	return 'json'
 }
 
+function Ensure-MBSessionScanType {
+	if ('MiniBot.SessionScan' -as [type]) { return }
+	$code = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
+
+namespace MiniBot
+{
+	public static class SessionScan
+	{
+		public static List<string[]> ListSessions(string dir, int max, int timeoutMs)
+		{
+			List<string[]> empty = new List<string[]>();
+			if (string.IsNullOrWhiteSpace(dir) || max < 1) return empty;
+			if (!Directory.Exists(dir)) return empty;
+			string[] files = null;
+			try
+			{
+				Task<string[]> task = Task.Factory.StartNew<string[]>(delegate { return Directory.GetFiles(dir); });
+				if (!task.Wait(timeoutMs)) return empty;
+				files = task.Result;
+			}
+			catch { return empty; }
+			if (files == null || files.Length == 0) return empty;
+			List<Tuple<long, string[]>> acc = new List<Tuple<long, string[]>>();
+			int i;
+			for (i = 0; i < files.Length; i++)
+			{
+				string fp = files[i];
+				string ext = null;
+				try { ext = Path.GetExtension(fp); } catch { continue; }
+				if (string.IsNullOrEmpty(ext)) continue;
+				ext = ext.ToLowerInvariant();
+				if (ext != ".json" && ext != ".md" && ext != ".markdown") continue;
+				FileInfo fi = null;
+				try { fi = new FileInfo(fp); if (!fi.Exists) continue; } catch { continue; }
+				long n = fi.Length;
+				string sz;
+				if (n < 1024L) sz = n.ToString() + " B";
+				else if (n < 1048576L) sz = (n / 1024.0).ToString("0.0") + " KB";
+				else sz = (n / 1048576.0).ToString("0.0") + " MB";
+				string type = ext.TrimStart('.');
+				if (type == "markdown") type = "md";
+				string mod = fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss");
+				string line = mod + "  |  " + fi.Name + "  |  " + sz;
+				acc.Add(Tuple.Create(fi.LastWriteTime.Ticks, new string[] { fi.Name, fi.FullName, mod, sz, type, line }));
+			}
+			acc.Sort(delegate(Tuple<long, string[]> a, Tuple<long, string[]> b) { return b.Item1.CompareTo(a.Item1); });
+			List<string[]> result = new List<string[]>();
+			int take = Math.Min(max, acc.Count);
+			for (i = 0; i < take; i++) result.Add(acc[i].Item2);
+			return result;
+		}
+	}
+}
+'@
+	try {
+		Add-Type -TypeDefinition $code -ReferencedAssemblies @('System.dll', 'System.Core.dll') -ErrorAction Stop
+	} catch {
+		try { Add-Type -TypeDefinition $code -ErrorAction Stop } catch { throw }
+	}
+}
+
+function Suspend-MBWpfForModal {
+	if (-not (Test-MBWpfActive)) { return }
+	try { $script:MB.Wpf.ModalUi = $true } catch {}
+	$d = $null
+	try { $d = $script:MB.Wpf.Dispatcher } catch {}
+	if (-not $d) { return }
+	$act = {
+		try {
+			$t = $null
+			try { $t = $script:MB.Wpf.PumpTimer } catch {}
+			if ($null -ne $t) {
+				try { $script:MB.Wpf.PumpWasRunning = [bool]$t.IsEnabled } catch { $script:MB.Wpf.PumpWasRunning = $true }
+				try { if ($t.IsEnabled) { $t.Stop() } } catch {}
+			} else {
+				try { $script:MB.Wpf.PumpWasRunning = $true } catch {}
+			}
+		} catch {}
+		try { Stop-MBAnimation } catch {}
+	}.GetNewClosure()
+	try {
+		if ($d.CheckAccess()) { & $act }
+		else { [void]$d.Invoke([Action]$act, [System.Windows.Threading.DispatcherPriority]::Send) }
+	} catch {
+		try { & $act } catch {}
+	}
+}
+
+function Resume-MBWpfForModal {
+	if (-not $script:MB.Wpf) { return }
+	try { $script:MB.Wpf.ModalUi = $false } catch {}
+	$d = $null
+	try { $d = $script:MB.Wpf.Dispatcher } catch {}
+	if (-not $d) { return }
+	$act = {
+		try {
+			$want = $true
+			try { $want = [bool]$script:MB.Wpf.PumpWasRunning } catch { $want = $true }
+			$t = $null
+			try { $t = $script:MB.Wpf.PumpTimer } catch {}
+			if ($null -ne $t -and $want -and -not $t.IsEnabled) {
+				$t.Start()
+			}
+		} catch {}
+	}.GetNewClosure()
+	try {
+		if ($d.CheckAccess()) { & $act }
+		else { [void]$d.Invoke([Action]$act, [System.Windows.Threading.DispatcherPriority]::Normal) }
+	} catch {
+		try {
+			$t = $script:MB.Wpf.PumpTimer
+			if ($t -and -not $t.IsEnabled) { $t.Start() }
+		} catch {}
+	}
+}
+
+function Get-MBSessionFileRows {
+	param([string]$Dir, [int]$Max = 400)
+	$rows = New-Object System.Collections.ArrayList
+	if ([string]::IsNullOrWhiteSpace($Dir)) { return @() }
+	try { Ensure-MBSessionScanType } catch {}
+	try {
+		if ('MiniBot.SessionScan' -as [type]) {
+			$found = [MiniBot.SessionScan]::ListSessions([string]$Dir, [int]$Max, 3000)
+			if ($found) {
+				foreach ($r in @($found)) {
+					if ($null -eq $r -or $r.Length -lt 6) { continue }
+					[void]$rows.Add(@{
+						Name = [string]$r[0]; Path = [string]$r[1]; Modified = [string]$r[2]
+						Size = [string]$r[3]; Type = [string]$r[4]; Line = [string]$r[5]
+					})
+				}
+				return @($rows)
+			}
+		}
+	} catch {}
+	try {
+		if (-not [System.IO.Directory]::Exists($Dir)) { return @() }
+		$all = [System.IO.Directory]::GetFiles($Dir)
+		$tmp = New-Object System.Collections.ArrayList
+		for ($i = 0; $i -lt $all.Length; $i++) {
+			$fp = [string]$all[$i]
+			$ext = [System.IO.Path]::GetExtension($fp)
+			if ([string]::IsNullOrEmpty($ext)) { continue }
+			$extL = $ext.ToLowerInvariant()
+			if ($extL -ne '.json' -and $extL -ne '.md' -and $extL -ne '.markdown') { continue }
+			try {
+				$fi = New-Object System.IO.FileInfo ($fp)
+				if (-not $fi.Exists) { continue }
+				$n = [long]$fi.Length
+				if ($n -lt 1024) { $sz = ('{0} B' -f $n) }
+				elseif ($n -lt 1048576) { $sz = ('{0:N1} KB' -f ($n / 1024.0)) }
+				else { $sz = ('{0:N1} MB' -f ($n / 1048576.0)) }
+				$type = $extL.TrimStart('.')
+				if ($type -eq 'markdown') { $type = 'md' }
+				$mod = $fi.LastWriteTime
+				$line = ('{0:yyyy-MM-dd HH:mm:ss}  |  {1}  |  {2}' -f $mod, $fi.Name, $sz)
+				[void]$tmp.Add([pscustomobject]@{
+					Name = [string]$fi.Name; Path = [string]$fi.FullName
+					Modified = $mod.ToString('yyyy-MM-dd HH:mm:ss'); Size = $sz; Type = $type
+					Line = $line; Ticks = [int64]$mod.Ticks
+				})
+			} catch {}
+		}
+		$sorted = @($tmp | Sort-Object Ticks -Descending | Select-Object -First $Max)
+		foreach ($s in $sorted) {
+			[void]$rows.Add(@{
+				Name = $s.Name; Path = $s.Path; Modified = $s.Modified
+				Size = $s.Size; Type = $s.Type; Line = $s.Line
+			})
+		}
+	} catch {}
+	return @($rows)
+}
+
+function Hide-MBSessionPickerOverlay {
+	if (-not $script:MB.Wpf) { return }
+	$W = $script:MB.Wpf
+	$d = $W.Dispatcher
+	if (-not $d) { return }
+	$hide = {
+		try {
+			if ($W.SessionPickerOverlay) {
+				$W.SessionPickerOverlay.Visibility = [System.Windows.Visibility]::Collapsed
+			}
+			if ($W.SessionPickerOk) {
+				try { $W.SessionPickerOk.IsDefault = $false } catch {}
+			}
+			if ($W.SessionPickerCancel) {
+				try { $W.SessionPickerCancel.IsCancel = $false } catch {}
+			}
+		} catch {}
+	}.GetNewClosure()
+	try {
+		if ($d.CheckAccess()) { & $hide }
+		else { [void]$d.Invoke([Action]$hide, [System.Windows.Threading.DispatcherPriority]::Normal) }
+	} catch {}
+}
+
 function Show-MBSessionFilePicker {
 	param(
 		[ValidateSet('Open', 'Save')]
@@ -14879,88 +15083,145 @@ function Show-MBSessionFilePicker {
 		[string]$FileName = '',
 		[string]$InitialDirectory = ''
 	)
+	$agentTitle = try { Get-MBAgentDisplayTitle } catch { '[{0}-Agent]' -f $(if ($AgentName) { $AgentName } else { 'MiniBot' }) }
 	if ([string]::IsNullOrWhiteSpace($Title)) {
-		$Title = if ($Mode -eq 'Save') { 'Save MiniBot session' } else { 'Load MiniBot session' }
+		$Title = if ($Mode -eq 'Save') { ("{0} Save session" -f $agentTitle) } else { ("{0} Load session" -f $agentTitle) }
 	}
 	if ([string]::IsNullOrWhiteSpace($FileName) -and $Mode -eq 'Save') {
-		$FileName = ("MiniBot-session-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
+		$safe = try { [string]$AgentName } catch { 'MiniBot' }
+		if ([string]::IsNullOrWhiteSpace($safe)) { $safe = 'MiniBot' }
+		$FileName = ("{0}-session-{1:yyyyMMdd-HHmmss}.json" -f $safe, (Get-Date))
 	}
 	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) {
-		try {
-			$InitialDirectory = [Environment]::GetFolderPath('Desktop')
-		} catch {
-			$InitialDirectory = [string]$env:USERPROFILE
+		try { $InitialDirectory = [Environment]::GetFolderPath('Desktop') } catch { $InitialDirectory = [string]$env:USERPROFILE }
+	}
+	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) { $InitialDirectory = [string]$env:TEMP }
+
+	if (Test-MBWpfActive -and $script:MB.Wpf.SessionPickerOverlay) {
+		$W = $script:MB.Wpf
+		try { Ensure-MBSessionScanType } catch {}
+		$W.SessionPickerResult = $null
+		$W.SessionPickerMode = [string]$Mode
+		$W.SessionPickerRows = New-Object System.Collections.ArrayList
+		try { [void]$W.SessionPickerWait.Reset() } catch {
+			$W.SessionPickerWait = New-Object System.Threading.ManualResetEvent $false
 		}
-	}
-	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) {
-		$InitialDirectory = [string]$env:TEMP
+		$modeL = [string]$Mode
+		$titleL = [string]$Title
+		$fileL = [string]$FileName
+		$initL = [string]$InitialDirectory
+		try {
+			Suspend-MBWpfForModal
+			$show = {
+				try {
+					if ($W.SessionPickerTitle) { $W.SessionPickerTitle.Text = $titleL }
+					if ($W.SessionPickerPath) { $W.SessionPickerPath.Text = $initL }
+					if ($W.SessionPickerName) {
+						$W.SessionPickerName.Text = $(if ($modeL -eq 'Save') { $fileL } else { '' })
+						$W.SessionPickerName.IsReadOnly = ($modeL -ne 'Save')
+					}
+					if ($W.SessionPickerOk) {
+						$W.SessionPickerOk.Content = $(if ($modeL -eq 'Save') { 'Save' } else { 'Open' })
+					}
+					if ($W.SessionPickerStatus) {
+						$W.SessionPickerStatus.Text = 'Sessions (newest first)'
+						try {
+							$bc = New-Object System.Windows.Media.BrushConverter
+							$W.SessionPickerStatus.Foreground = $bc.ConvertFromString('#6A6A76')
+						} catch {}
+					}
+					if ($W.SessionPickerList) {
+						$W.SessionPickerList.Items.Clear()
+						[void]$W.SessionPickerList.Items.Add('(scanning...)')
+					}
+					if ($W.SessionPickerOk) {
+						try { $W.SessionPickerOk.IsDefault = $true } catch {}
+					}
+					if ($W.SessionPickerCancel) {
+						try { $W.SessionPickerCancel.IsCancel = $true } catch {}
+					}
+					if ($W.SessionPickerOverlay) {
+						$W.SessionPickerOverlay.Visibility = [System.Windows.Visibility]::Visible
+					}
+					try { if ($W.SessionPickerPath) { [void]$W.SessionPickerPath.Focus() } } catch {}
+					try {
+						if ($W.SessionPickerReload) { & $W.SessionPickerReload }
+					} catch {}
+				} catch {}
+			}.GetNewClosure()
+			$d = $W.Dispatcher
+			if ($d.CheckAccess()) { & $show }
+			else { [void]$d.Invoke([Action]$show, [System.Windows.Threading.DispatcherPriority]::Normal) }
+
+			while ($true) {
+				if ($W.ExitRequested) {
+					Hide-MBSessionPickerOverlay
+					return $null
+				}
+				if ($W.SessionPickerWait.WaitOne(50)) { break }
+			}
+			$path = $null
+			try { $path = [string]$W.SessionPickerResult } catch { $path = $null }
+			Hide-MBSessionPickerOverlay
+			if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+			return $path
+		} finally {
+			try { Resume-MBWpfForModal } catch {}
+			try { Hide-MBSessionPickerOverlay } catch {}
+		}
 	}
 
 	$filter = 'MiniBot session (*.json)|*.json|Markdown transcript (*.md;*.markdown)|*.md;*.markdown|All files (*.*)|*.*'
-	$rs = $null
-	$ps = $null
+	$rs = $null; $ps = $null
 	try {
-		$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-		$rs.ApartmentState = [System.Threading.ApartmentState]::STA
-		$rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
+		$rs = [runspacefactory]::CreateRunspace()
+		$rs.ApartmentState = 'STA'
+		$rs.ThreadOptions = 'ReuseThread'
 		$rs.Open()
-		$ps = [System.Management.Automation.PowerShell]::Create()
+		$ps = [powershell]::Create()
 		$ps.Runspace = $rs
-		[void]$ps.AddScript(@'
-param(
-	[string]$Mode,
-	[string]$Title,
-	[string]$FileName,
-	[string]$InitDir,
-	[string]$Filter
-)
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-try { [void][System.Windows.Forms.Application]::EnableVisualStyles() } catch {}
-if ($Mode -eq 'Save') {
-	$dlg = New-Object System.Windows.Forms.SaveFileDialog
-	$dlg.FileName = $FileName
-	$dlg.OverwritePrompt = $true
-	$dlg.AddExtension = $true
-	$dlg.CheckPathExists = $true
-} else {
-	$dlg = New-Object System.Windows.Forms.OpenFileDialog
-	$dlg.CheckFileExists = $true
-	$dlg.Multiselect = $false
-}
-$dlg.Title = $Title
-$dlg.Filter = $Filter
-$dlg.FilterIndex = 1
-$dlg.DefaultExt = 'json'
-$dlg.RestoreDirectory = $true
-if ($InitDir -and (Test-Path -LiteralPath $InitDir)) {
-	$dlg.InitialDirectory = $InitDir
-}
-$res = $dlg.ShowDialog()
-if ($res -eq [System.Windows.Forms.DialogResult]::OK) {
-	return [string]$dlg.FileName
-}
-return $null
-'@)
-		[void]$ps.AddParameter('Mode', [string]$Mode)
-		[void]$ps.AddParameter('Title', [string]$Title)
-		[void]$ps.AddParameter('FileName', [string]$FileName)
-		[void]$ps.AddParameter('InitDir', [string]$InitialDirectory)
-		[void]$ps.AddParameter('Filter', [string]$filter)
+		[void]$ps.AddScript({
+			param($Mode, $Title, $FileName, $InitDir, $Filter)
+			Add-Type -AssemblyName System.Windows.Forms
+			if ($Mode -eq 'Save') {
+				$dlg = New-Object System.Windows.Forms.SaveFileDialog
+				$dlg.FileName = $FileName
+				$dlg.OverwritePrompt = $true
+				$dlg.AddExtension = $true
+				$dlg.CheckPathExists = $true
+			} else {
+				$dlg = New-Object System.Windows.Forms.OpenFileDialog
+				$dlg.CheckFileExists = $true
+				$dlg.Multiselect = $false
+			}
+			$dlg.Title = $Title
+			$dlg.Filter = $Filter
+			$dlg.FilterIndex = 1
+			$dlg.DefaultExt = 'json'
+			$dlg.RestoreDirectory = $true
+			if ($InitDir -and (Test-Path -LiteralPath $InitDir)) { $dlg.InitialDirectory = $InitDir }
+			if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return [string]$dlg.FileName }
+			return $null
+		})
+		[void]$ps.AddArgument([string]$Mode)
+		[void]$ps.AddArgument([string]$Title)
+		[void]$ps.AddArgument([string]$FileName)
+		[void]$ps.AddArgument([string]$InitialDirectory)
+		[void]$ps.AddArgument([string]$filter)
 		$out = $ps.Invoke()
 		if ($ps.HadErrors) {
 			$errMsgs = @($ps.Streams.Error | ForEach-Object { "$_" }) -join '; '
 			if ($errMsgs) { throw $errMsgs }
 		}
 		$path = $null
-		if ($out -and @($out).Count -gt 0) {
-			$path = [string]@($out)[-1]
-		}
+		if ($out -and @($out).Count -gt 0) { $path = [string]@($out)[-1] }
 		if ([string]::IsNullOrWhiteSpace($path) -or $path -eq 'null') { return $null }
 		return $path
 	} catch {
 		throw "File picker failed: $($_.Exception.Message)"
 	} finally {
+		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
 		try { if ($ps) { $ps.Dispose() } } catch {}
 		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
 	}
@@ -16765,7 +17026,6 @@ function Update-MBWpfSticky {
 	if ($PSBoundParameters.ContainsKey('PoweredBy')) { $cur.PoweredBy = ConvertTo-MBWpfSafeText -Text $PoweredBy }
 	if ($PSBoundParameters.ContainsKey('AutoCompactLine')) { $cur.AutoCompactLine = ConvertTo-MBWpfSafeText -Text $AutoCompactLine }
 	if ($PSBoundParameters.ContainsKey('Status')) {
-		# Status mode for spinner; UI timer paints glyph
 		$raw = [string]$Status
 		$label = $raw.Trim()
 		while ($label.Length -gt 0) {
@@ -16922,6 +17182,7 @@ function Set-MBWpfPromptEnabled {
 
 function Focus-MBWpfPrompt {
 	if (-not (Test-MBWpfActive)) { return }
+	try { if ([bool]$script:MB.Wpf.ModalUi) { return } } catch {}
 	$promptRef = $null
 	$winRef = $null
 	$d = $null
@@ -16942,6 +17203,7 @@ function Focus-MBWpfPrompt {
 		if (-not $p) { return }
 		try {
 			try {
+				if ([bool]$script:MB.Wpf.ModalUi) { return }
 				if ([bool]$script:MB.Wpf.AuthActive) { return }
 				if ($script:MB.Wpf.AuthOverlay -and $script:MB.Wpf.AuthOverlay.Visibility -eq [System.Windows.Visibility]::Visible) { return }
 				if ($script:MB.Wpf.ConfirmOverlay -and $script:MB.Wpf.ConfirmOverlay.Visibility -eq [System.Windows.Visibility]::Visible) { return }
@@ -17164,6 +17426,7 @@ function Hide-MBNativeConsole {
 function Invoke-MBWpfBringToFront {
 	param([switch]$StayTopmost)
 	if (-not (Test-MBWpfActive)) { return }
+	try { if ([bool]$script:MB.Wpf.ModalUi) { return } } catch {}
 	try { Ensure-MBConNative } catch {}
 	$keep = [bool]$StayTopmost
 	try {
@@ -17181,6 +17444,7 @@ function Invoke-MBWpfBringToFront {
 		$keepTop = $keep
 		if (-not $w) { return }
 		try {
+			try { if ([bool]$script:MB.Wpf.ModalUi) { return } } catch {}
 			if ($w.WindowState -eq [System.Windows.WindowState]::Minimized) {
 				$w.WindowState = [System.Windows.WindowState]::Normal
 			}
@@ -17396,6 +17660,7 @@ function Start-MBWpfHost {
 		AuthFocusTicks = 0          # re-apply username focus for a few timer frames
 		AuthNeedActivate = $false   # keep forcing OS foreground until window is active
 		BootstrapTopmost = $true    # Topmost until main screen loads; then cleared
+		ModalUi       = $false
 		History       = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 		HistIndex     = -1
 		ReadyWait     = New-Object System.Threading.ManualResetEvent $false
@@ -17436,6 +17701,12 @@ function Start-MBWpfHost {
 		ConfirmYes    = $null
 		ConfirmNo     = $null
 		ConfirmAccentBar = $null
+		SessionPickerWait = New-Object System.Threading.ManualResetEvent $false
+		SessionPickerResult = $null
+		SessionPickerMode = 'Open'
+		SessionPickerRows = $null
+		SessionPickerReload = $null
+		SessionPickerOverlay = $null
 		InitStoreCreds = $false
 		DebugLogPath  = (Get-MBDebugLogPath)
 		DebugLogEnabled = [bool]$(try { [bool]$script:MB.DebugLogEnabled } catch { $false })
@@ -17973,6 +18244,88 @@ function Start-MBWpfHost {
           </Grid>
         </Border>
       </Grid>
+
+      <Grid x:Name="SessionPickerOverlay" Visibility="Collapsed" Panel.ZIndex="250">
+        <Border Background="#E6121216"/>
+        <Border Width="720" Height="480" MinWidth="480" MinHeight="320"
+                MaxWidth="920" MaxHeight="620"
+                HorizontalAlignment="Center" VerticalAlignment="Center"
+                Background="#1E1E24" BorderBrush="#3A3A42" BorderThickness="1"
+                CornerRadius="8" Padding="16,14,16,14">
+          <Grid>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="*"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock x:Name="SessionPickerTitle" Grid.Row="0" Text="Load session"
+                       Foreground="#E0E0E8" FontSize="16" FontWeight="Bold" Margin="0,0,0,10"/>
+            <DockPanel Grid.Row="1" Margin="0,0,0,8" LastChildFill="True">
+              <Button x:Name="SessionPickerBrowse" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="Browse..." MinWidth="84" Height="30" Margin="6,0,0,0"
+                      DockPanel.Dock="Right" Padding="10,0"/>
+              <Button x:Name="SessionPickerUp" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="Up" MinWidth="52" Height="30" Margin="6,0,0,0"
+                      DockPanel.Dock="Right" Padding="10,0"/>
+              <Button x:Name="SessionPickerGo" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="Go" MinWidth="52" Height="30" Margin="6,0,0,0"
+                      DockPanel.Dock="Right" Padding="10,0"/>
+              <TextBox x:Name="SessionPickerPath" Height="30" Padding="8,5"
+                       Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                       BorderBrush="#3A3A42" BorderThickness="1" VerticalContentAlignment="Center"
+                       FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
+            </DockPanel>
+            <TextBlock x:Name="SessionPickerStatus" Grid.Row="2" Text="Sessions (newest first)"
+                       Foreground="#6A6A76" FontSize="11" Margin="0,0,0,6"/>
+            <ListBox x:Name="SessionPickerList" Grid.Row="3"
+                     Background="#121216" Foreground="#C8C8D0" BorderBrush="#3A3A42"
+                     BorderThickness="1" FontFamily="Consolas, Cascadia Mono, Courier New"
+                     FontSize="12" Padding="2"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+              <ListBox.Resources>
+                <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#3A3A42"/>
+                <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#7DCFFF"/>
+                <SolidColorBrush x:Key="{x:Static SystemColors.ControlBrushKey}" Color="#121216"/>
+                <Style TargetType="ListBoxItem">
+                  <Setter Property="Padding" Value="8,4"/>
+                  <Setter Property="Background" Value="Transparent"/>
+                  <Setter Property="Foreground" Value="#C8C8D0"/>
+                  <Setter Property="BorderThickness" Value="0"/>
+                  <Style.Triggers>
+                    <Trigger Property="IsMouseOver" Value="True">
+                      <Setter Property="Background" Value="#363640"/>
+                      <Setter Property="Foreground" Value="#E0E0E8"/>
+                    </Trigger>
+                    <Trigger Property="IsSelected" Value="True">
+                      <Setter Property="Background" Value="#3A3A42"/>
+                      <Setter Property="Foreground" Value="#7DCFFF"/>
+                    </Trigger>
+                  </Style.Triggers>
+                </Style>
+              </ListBox.Resources>
+            </ListBox>
+            <DockPanel Grid.Row="4" Margin="0,10,0,10" LastChildFill="True">
+              <TextBlock Text="File name:  " Foreground="#8A8A96" VerticalAlignment="Center"
+                         DockPanel.Dock="Left"/>
+              <TextBox x:Name="SessionPickerName" Height="30" Padding="8,5"
+                       Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                       BorderBrush="#3A3A42" BorderThickness="1" VerticalContentAlignment="Center"
+                       FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
+            </DockPanel>
+            <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+              <Button x:Name="SessionPickerOk" Style="{StaticResource MbAuthPrimaryBtn}"
+                      Content="Open" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0"
+                      IsDefault="False"/>
+              <Button x:Name="SessionPickerCancel" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="Cancel" MinWidth="88" Height="30" Padding="16,0"
+                      IsCancel="False"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+      </Grid>
     </Grid>
   </Border>
 </Window>
@@ -18035,6 +18388,228 @@ function Start-MBWpfHost {
 			$W.ConfirmYes = $window.FindName('ConfirmYes')
 			$W.ConfirmNo = $window.FindName('ConfirmNo')
 			$W.ConfirmAccentBar = $window.FindName('ConfirmAccentBar')
+			$W.SessionPickerOverlay = $window.FindName('SessionPickerOverlay')
+			$W.SessionPickerTitle = $window.FindName('SessionPickerTitle')
+			$W.SessionPickerPath = $window.FindName('SessionPickerPath')
+			$W.SessionPickerGo = $window.FindName('SessionPickerGo')
+			$W.SessionPickerUp = $window.FindName('SessionPickerUp')
+			$W.SessionPickerBrowse = $window.FindName('SessionPickerBrowse')
+			$W.SessionPickerStatus = $window.FindName('SessionPickerStatus')
+			$W.SessionPickerList = $window.FindName('SessionPickerList')
+			$W.SessionPickerName = $window.FindName('SessionPickerName')
+			$W.SessionPickerOk = $window.FindName('SessionPickerOk')
+			$W.SessionPickerCancel = $window.FindName('SessionPickerCancel')
+			$W.SessionPickerRows = New-Object System.Collections.ArrayList
+
+			
+			try {
+			$sessionPickerReload = {
+				try {
+					$list = $W.SessionPickerList
+					$pathBox = $W.SessionPickerPath
+					$status = $W.SessionPickerStatus
+					if (-not $list -or -not $pathBox) { return }
+					$dir = ([string]$pathBox.Text).Trim().Trim('"')
+					$pathBox.Text = $dir
+					$list.Items.Clear()
+					$W.SessionPickerRows = New-Object System.Collections.ArrayList
+					[void]$list.Items.Add('(scanning...)')
+					if ($status) {
+						$status.Text = 'Scanning...'
+						try {
+							$bc = New-Object System.Windows.Media.BrushConverter
+							$status.Foreground = $bc.ConvertFromString('#6A6A76')
+						} catch {}
+					}
+					$found = @()
+					try {
+						if ('MiniBot.SessionScan' -as [type]) {
+							$raw = [MiniBot.SessionScan]::ListSessions($dir, 400, 3000)
+							if ($raw) {
+								foreach ($r in @($raw)) {
+									if ($null -eq $r -or $r.Length -lt 6) { continue }
+									[void]$W.SessionPickerRows.Add(@{
+										Name = [string]$r[0]; Path = [string]$r[1]; Modified = [string]$r[2]
+										Size = [string]$r[3]; Type = [string]$r[4]; Line = [string]$r[5]
+									})
+								}
+							}
+						}
+					} catch {}
+					if ($W.SessionPickerRows.Count -eq 0) {
+						try {
+							if ([System.IO.Directory]::Exists($dir)) {
+								$all = [System.IO.Directory]::GetFiles($dir)
+								$tmp = New-Object System.Collections.ArrayList
+								for ($i = 0; $i -lt $all.Length; $i++) {
+									$fp = [string]$all[$i]
+									$ext = [System.IO.Path]::GetExtension($fp)
+									if ([string]::IsNullOrEmpty($ext)) { continue }
+									$extL = $ext.ToLowerInvariant()
+									if ($extL -ne '.json' -and $extL -ne '.md' -and $extL -ne '.markdown') { continue }
+									try {
+										$fi = New-Object System.IO.FileInfo ($fp)
+										if (-not $fi.Exists) { continue }
+										$n = [long]$fi.Length
+										if ($n -lt 1024) { $sz = ('{0} B' -f $n) }
+										elseif ($n -lt 1048576) { $sz = ('{0:N1} KB' -f ($n / 1024.0)) }
+										else { $sz = ('{0:N1} MB' -f ($n / 1048576.0)) }
+										$type = $extL.TrimStart('.')
+										if ($type -eq 'markdown') { $type = 'md' }
+										$mod = $fi.LastWriteTime
+										$line = ('{0:yyyy-MM-dd HH:mm:ss}  |  {1}  |  {2}' -f $mod, $fi.Name, $sz)
+										[void]$tmp.Add([pscustomobject]@{
+											Name = [string]$fi.Name; Path = [string]$fi.FullName
+											Modified = $mod.ToString('yyyy-MM-dd HH:mm:ss'); Size = $sz
+											Type = $type; Line = $line; Ticks = [int64]$mod.Ticks
+										})
+									} catch {}
+								}
+								foreach ($s in @($tmp | Sort-Object Ticks -Descending | Select-Object -First 400)) {
+									[void]$W.SessionPickerRows.Add(@{
+										Name = $s.Name; Path = $s.Path; Modified = $s.Modified
+										Size = $s.Size; Type = $s.Type; Line = $s.Line
+									})
+								}
+							}
+						} catch {}
+					}
+					$list.Items.Clear()
+					if ($W.SessionPickerRows.Count -eq 0) {
+						if ($status) { $status.Text = 'No .json / .md sessions here (or scan timed out)' }
+						[void]$list.Items.Add('(none)')
+					} else {
+						if ($status) {
+							$status.Text = ('{0} session(s)  |  newest first  |  date | name | size' -f $W.SessionPickerRows.Count)
+						}
+						foreach ($row in $W.SessionPickerRows) {
+							[void]$list.Items.Add([string]$row.Line)
+						}
+					}
+				} catch {
+					try {
+						if ($W.SessionPickerList) {
+							$W.SessionPickerList.Items.Clear()
+							[void]$W.SessionPickerList.Items.Add('(scan failed)')
+						}
+					} catch {}
+				}
+			}.GetNewClosure()
+			$W.SessionPickerReload = $sessionPickerReload
+
+			$sessionPickerAccept = {
+				try {
+					$mode = [string]$W.SessionPickerMode
+					if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'Open' }
+					$p = $null
+					if ($mode -eq 'Save') {
+						$nm = ''
+						try { $nm = ([string]$W.SessionPickerName.Text).Trim().Trim('"') } catch {}
+						$idx = -1
+						try { $idx = [int]$W.SessionPickerList.SelectedIndex } catch {}
+						if ([string]::IsNullOrWhiteSpace($nm) -and $idx -ge 0 -and $idx -lt $W.SessionPickerRows.Count) {
+							$nm = [string]$W.SessionPickerRows[$idx].Name
+						}
+						if ([string]::IsNullOrWhiteSpace($nm)) { return }
+						$low = $nm.ToLowerInvariant()
+						if (-not ($low.EndsWith('.json') -or $low.EndsWith('.md') -or $low.EndsWith('.markdown'))) {
+							$nm = $nm + '.json'
+						}
+						$dir = ''
+						try { $dir = ([string]$W.SessionPickerPath.Text).Trim() } catch {}
+						$p = [System.IO.Path]::Combine($dir, $nm)
+						if ([System.IO.File]::Exists($p)) {
+							$r = [System.Windows.MessageBox]::Show(
+								$W.Window,
+								('Overwrite?' + [Environment]::NewLine + [Environment]::NewLine + $p),
+								([string]$W.SessionPickerTitle.Text),
+								[System.Windows.MessageBoxButton]::YesNo,
+								[System.Windows.MessageBoxImage]::Warning
+							)
+							if ($r -ne [System.Windows.MessageBoxResult]::Yes) { return }
+						}
+					} else {
+						$idx = -1
+						try { $idx = [int]$W.SessionPickerList.SelectedIndex } catch {}
+						if ($idx -ge 0 -and $idx -lt $W.SessionPickerRows.Count) {
+							$p = [string]$W.SessionPickerRows[$idx].Path
+						}
+						if ([string]::IsNullOrWhiteSpace($p) -or -not [System.IO.File]::Exists($p)) { return }
+					}
+					$W.SessionPickerResult = $p
+					try { [void]$W.SessionPickerWait.Set() } catch {}
+				} catch {}
+			}.GetNewClosure()
+
+			if ($W.SessionPickerGo) {
+				$W.SessionPickerGo.add_Click({ & $sessionPickerReload }.GetNewClosure())
+			}
+			if ($W.SessionPickerUp) {
+				$W.SessionPickerUp.add_Click({
+					try {
+						$cur = ([string]$W.SessionPickerPath.Text).Trim()
+						$parent = [System.IO.Directory]::GetParent($cur)
+						if ($parent) {
+							$W.SessionPickerPath.Text = $parent.FullName
+							& $sessionPickerReload
+						}
+					} catch {}
+				}.GetNewClosure())
+			}
+			if ($W.SessionPickerBrowse) {
+				$W.SessionPickerBrowse.add_Click({
+					try {
+						Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+						$fb = New-Object System.Windows.Forms.FolderBrowserDialog
+						$fb.Description = 'Choose folder'
+						$fb.ShowNewFolderButton = $true
+						try {
+							$cur = ([string]$W.SessionPickerPath.Text).Trim()
+							if ($cur -and [System.IO.Directory]::Exists($cur)) { $fb.SelectedPath = $cur }
+						} catch {}
+						$dr = $fb.ShowDialog()
+						if ($dr -eq [System.Windows.Forms.DialogResult]::OK -and $fb.SelectedPath) {
+							$W.SessionPickerPath.Text = [string]$fb.SelectedPath
+							& $sessionPickerReload
+						}
+					} catch {}
+				}.GetNewClosure())
+			}
+			if ($W.SessionPickerPath) {
+				$W.SessionPickerPath.add_KeyDown({
+					param($s, $e)
+					if ($e.Key -eq 'Return') {
+						$e.Handled = $true
+						& $sessionPickerReload
+					}
+				}.GetNewClosure())
+			}
+			if ($W.SessionPickerList) {
+				$W.SessionPickerList.add_SelectionChanged({
+					try {
+						$idx = [int]$W.SessionPickerList.SelectedIndex
+						if ($idx -ge 0 -and $idx -lt $W.SessionPickerRows.Count -and $W.SessionPickerName) {
+							$W.SessionPickerName.Text = [string]$W.SessionPickerRows[$idx].Name
+						}
+					} catch {}
+				}.GetNewClosure())
+				$W.SessionPickerList.add_MouseDoubleClick({
+					& $sessionPickerAccept
+				}.GetNewClosure())
+			}
+			if ($W.SessionPickerOk) {
+				$W.SessionPickerOk.add_Click({ & $sessionPickerAccept }.GetNewClosure())
+			}
+			if ($W.SessionPickerCancel) {
+				$W.SessionPickerCancel.add_Click({
+					$W.SessionPickerResult = $null
+					try { [void]$W.SessionPickerWait.Set() } catch {}
+				}.GetNewClosure())
+			}
+			} catch {
+				try { $W['SessionPickerWireError'] = [string]$_.Exception.Message } catch {}
+			}
+
 			$W.Dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
 			$window.Title = ("MiniBot v{0}" -f $W.Version)
 			try {
@@ -19140,6 +19715,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 			$timer.Interval = [TimeSpan]::FromMilliseconds(16)
 			$timer.add_Tick({
 				try {
+					try { if ([bool]$W.ModalUi) { return } } catch {}
 					$rtb = $W.Log
 					$q = $W.WriteQueue
 					if (-not $rtb -or -not $q) { return }
@@ -21094,14 +21670,20 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							}
 							try { if ($W.SyncSendBtn) { & $W.SyncSendBtn $en } } catch {}
 							if ($en -and $wantFocus -and $W.Prompt) {
-								try {
-									if ($W.Window) { [void]$W.Window.Activate() }
-								} catch {}
-								try { [void]$W.Prompt.Focus() } catch {}
-								try { [void][System.Windows.Input.Keyboard]::Focus($W.Prompt) } catch {}
-								try {
-									if ($null -ne $W.Prompt.Text) { $W.Prompt.CaretIndex = $W.Prompt.Text.Length }
-								} catch {}
+								$modal = $false
+								try { $modal = [bool]$W.ModalUi } catch { $modal = $false }
+								if (-not $modal) {
+									try {
+										if ($W.Window) { [void]$W.Window.Activate() }
+									} catch {}
+									try { [void]$W.Prompt.Focus() } catch {}
+									try { [void][System.Windows.Input.Keyboard]::Focus($W.Prompt) } catch {}
+									try {
+										if ($null -ne $W.Prompt.Text) { $W.Prompt.CaretIndex = $W.Prompt.Text.Length }
+									} catch {}
+								} else {
+									try { $W.PendingPromptFocus = $true } catch {}
+								}
 							}
 						}
 					}
@@ -21492,6 +22074,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 
 	if ($wpf.Failed -or -not $wpf.Ready) {
 		$msg = if ($wpf.FailMsg) { $wpf.FailMsg } else { 'timeout starting WPF host' }
+		try { $script:MB.LastWpfFailMsg = [string]$msg } catch {}
 		Write-Warning "WPF host failed: $msg"
 		try { Write-MBDebugLog -Step 'WPF_HOST_FAIL' -Detail $msg } catch {}
 		$script:MB.HostUi = 'wpf'
@@ -21653,10 +22236,20 @@ function Start-LocalAgent {
 
 	if (-not (Start-MBWpfHost)) {
 		Write-MBDebugLog -Step 'AGENT_WPF_FAILED'
+		$detail = ''
+		try { $detail = [string]$script:MB.LastWpfFailMsg } catch {}
+		if ([string]::IsNullOrWhiteSpace($detail)) {
+			try {
+				if ($script:MB.Wpf -and $script:MB.Wpf.FailMsg) { $detail = [string]$script:MB.Wpf.FailMsg }
+			} catch {}
+		}
+		if ([string]::IsNullOrWhiteSpace($detail)) { $detail = 'timeout or unknown error starting WPF host' }
+		$msg = "MiniBot requires the WPF host and it failed to start.`n`n$detail`n`nCheck MiniBot-debug.log if present."
+		try { Write-Warning "WPF host failed: $detail" } catch {}
 		try {
 			Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
 			[void][System.Windows.MessageBox]::Show(
-				'MiniBot requires the WPF host and it failed to start. Check MiniBot-debug.log if present.',
+				$msg,
 				'MiniBot',
 				[System.Windows.MessageBoxButton]::OK,
 				[System.Windows.MessageBoxImage]::Error
@@ -21994,7 +22587,7 @@ function Start-LocalAgent {
 						$spath = [string]$arg
 						if ([string]::IsNullOrWhiteSpace($spath)) {
 							$def = ("MiniBot-session-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
-							$spath = Show-MBSessionFilePicker -Mode Save -Title 'Save MiniBot session' -FileName $def
+							$spath = Show-MBSessionFilePicker -Mode Save -FileName $def
 							if ([string]::IsNullOrWhiteSpace($spath)) {
 								Write-MBInfo "Save cancelled."
 								continue
@@ -22025,7 +22618,7 @@ function Start-LocalAgent {
 							}
 						}
 						if ([string]::IsNullOrWhiteSpace($lpath)) {
-							$title = if ($append) { 'Load MiniBot session (append markdown)' } else { 'Load MiniBot session' }
+							$title = if ($append) { ('{0} Load session (append markdown)' -f (Get-MBAgentDisplayTitle)) } else { '' }
 							$lpath = Show-MBSessionFilePicker -Mode Open -Title $title
 							if ([string]::IsNullOrWhiteSpace($lpath)) {
 								Write-MBInfo "Load cancelled."
@@ -22042,8 +22635,13 @@ function Start-LocalAgent {
 						if ($r.PSObject.Properties['Model'] -and $r.Model) {
 							Write-Host ("  file model: {0}" -f $r.Model) -ForegroundColor DarkGray
 						}
-					} catch { Write-MBErr $_.Exception.Message }
-					continue
+						$userInput = 'Context Fully Reloaded.. Wait for the next message from the user before responding.'
+						$trimmed = $userInput
+						$script:MB.LoadResumeTurn = $true
+					} catch {
+						Write-MBErr $_.Exception.Message
+						continue
+					}
 				}
 				'^/retry$' {
 					if (-not $script:LastUserMessage) {
@@ -22060,15 +22658,20 @@ function Start-LocalAgent {
 					}
 				}
 			}
-			if ($cmd -eq '/retry') {
+			if ($cmd -eq '/retry' -or [bool]$script:MB.LoadResumeTurn) {
 			} elseif ($trimmed.StartsWith('/') -or $lower -in @('autoapproveenable','autoapprovedisable')) {
 				continue
 			}
 		}
 
 		try {
-		Write-MBDebugLog -Step 'TURN_BEGIN' -Detail ("preview={0}" -f $trimmed)
-		$script:LastUserMessage = $userInput
+		$isLoadResume = $false
+		try { $isLoadResume = [bool]$script:MB.LoadResumeTurn } catch { $isLoadResume = $false }
+		if ($isLoadResume) { $script:MB.LoadResumeTurn = $false }
+		Write-MBDebugLog -Step 'TURN_BEGIN' -Detail ("preview={0} loadResume={1}" -f $trimmed, $isLoadResume)
+		if (-not $isLoadResume) {
+			$script:LastUserMessage = $userInput
+		}
 		$script:MB.UserTurns++
 		try {
 			Write-MBDebugLog -Step 'TURN_ADD_USER_MSG'
@@ -22094,12 +22697,18 @@ function Start-LocalAgent {
 		try {
 			Write-MBDebugLog -Step 'TURN_PAINT_USER'
 			Write-Host ""
-			Write-MBUserMessage -Text $userInput
+			if ($isLoadResume) {
+				Write-MBInfo "Refilling model context..."
+			} else {
+				Write-MBUserMessage -Text $userInput
+			}
 			Show-MBWorkingHint
 			Write-MBDebugLog -Step 'TURN_PAINT_USER_OK'
 		} catch {
 			Write-MBDebugLog -Step 'TURN_PAINT_USER_ERR' -Detail $_.Exception.Message
-			try { Write-MBUserMessage -Text $userInput } catch {}
+			if (-not $isLoadResume) {
+				try { Write-MBUserMessage -Text $userInput } catch {}
+			}
 			try { Hide-MBPromptForWork } catch {}
 		}
 
@@ -22166,6 +22775,10 @@ function Start-LocalAgent {
 				if ($tcList.Count -eq 0) {
 					$finalText = Get-MBProp $assistantMessage 'content'
 					if ([string]::IsNullOrWhiteSpace([string]$finalText)) {
+						if ($isLoadResume) {
+							Write-MBInfo "Context refilled - waiting for your next message."
+							break
+						}
 						Write-MBWarn "Model returned no text and no tools (context may be too noisy). Try GetBSODInfo or a narrower question."
 						break
 					}
