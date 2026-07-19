@@ -2169,9 +2169,8 @@ function Show-MBHelp {
 		@{ c = "/wd";              d = "Print working directory" },
 		@{ c = "/tools [group]";   d = "List tools by group; enable a group or full|core" },
 		@{ c = "/sandbox [clear|clear all]"; d = "Show SandBox root; clear this session or all machine sessions" },
-		@{ c = "/save [path]";     d = "Save conversation JSON (default: Desktop)" },
-		@{ c = "/load <path>";     d = "Load conversation JSON" },
-		@{ c = "/export [path]";   d = "Export readable transcript markdown" },
+		@{ c = "/save [path]";     d = "Save session (file picker if no path; .json or .md)" },
+		@{ c = "/load [path]";     d = "Load session (file picker if no path; .json or .md)" },
 		@{ c = "/model";           d = "Show current model id" },
 		@{ c = "/retry";           d = "Re-send the last user message" },
 		@{ c = "exit | quit";      d = "End session" },
@@ -4990,7 +4989,7 @@ $script:MBGroupPrompt = [ordered]@{
 	core = @"
 CORE (always on): ReadFile/WriteFile/EditFile/ApplyPatch/ListDirectory/SearchFiles/FindFiles/DiffText; RunCommand; CWD+env; EnableToolGroup/ListToolGroups.
 Edit: EditFile unique search (or occurrence/replaceAll); ApplyPatch multi-hunk; WriteFile only new/full rewrite. Preserve encoding/newlines. On miss: re-read, never invent nearby text.
-RunCommand: safe read-only auto; nested shells/writers/downloads/sfc|dism|chkdsk/multi-statement/redirect always prompt. If you need a specialized tool not listed above, EnableToolGroup from MAP first.
+RunCommand: runs command text in-process via -EncodedCommand (no outer expansion) or cmd /c - full PS 5.1 syntax works (pipeline `$_, escapes, multi-statement, env vars). Prefer specialized tools over shell. Safe read-only auto-runs; nested shells/writers/downloads/sfc|dism|chkdsk/multi-statement/redirect always prompt. shell=powershell (default) or cmd. Pass the command exactly as you would type it in a .ps1 - do not pre-escape for an outer host.
 "@
 	vision = @"
 VISION: ReadImage path= (vision next turn). ReadPdf: default page=1 only - multipage render is expensive; do not page through a PDF unless the user asks for later pages, full doc, or a page the first pass cannot answer. Text extract when clean; auto page-render vision if empty/garbled/CID (still page 1 unless page=N). render=true forces vision. ViewScreen no approval - look only, or save=true/path= (report exact path). Trust vision over garbled PDF text. Do not spam captures or multi-page ReadPdf loops.
@@ -5082,7 +5081,7 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "WriteFile"; description = "Create or overwrite a whole file. Prefer EditFile/ApplyPatch for existing files. Preserves encoding/newlines when overwriting. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" } }; required = @("path","content") } } },
 	@{ type = "function"; function = @{ name = "EditFile"; description = "Precise search/replace edit. Default requires a UNIQUE match (include surrounding context). Use replaceAll=true only when intentional; occurrence=N for the Nth match; edits[] for multiple hunks in one approval. CRLF/LF tolerant. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string"; description = "Exact text to find (include context lines to make unique)" }; replace = @{ type = "string"; description = "Replacement text" }; useRegex = @{ type = "boolean"; description = "Treat search as regex (default false)" }; replaceAll = @{ type = "boolean"; description = "Replace every match (default false — unique match required)" }; occurrence = @{ type = "integer"; description = "1-based match index when multiple matches exist" }; edits = @{ type = "array"; description = "Optional multi-hunk list of {search, replace, useRegex?, replaceAll?, occurrence?}"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply a unified diff or *** Update File patch to existing file(s). Best for multi-hunk structured edits. Include enough context lines so each hunk matches once. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string"; description = "Unified diff or *** Update File patch body" }; path = @{ type = "string"; description = "Optional default file path if patch omits headers" } }; required = @("patch") } } },
-	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell or CMD. Safe read-only commands auto-run; others require approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string" }; shell = @{ type = "string"; enum = @("powershell","cmd") }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default session setting)" } }; required = @("command") } } },
+	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell (default) or CMD. PowerShell is sent in-memory via -EncodedCommand (full PS 5.1 syntax: pipeline vars, escapes, multi-statement; no outer-host expansion). Pass command exactly as in a .ps1 - do not wrap or pre-escape. Safe read-only auto-runs; mutating/multi-statement/redirects require approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string"; description = "Exact PowerShell or CMD text to run" }; shell = @{ type = "string"; enum = @("powershell","cmd"); description = "powershell (default) or cmd" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default session setting)" } }; required = @("command") } } },
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory entries as JSON (up to 500; reports total/truncated)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Search text file contents under a path (skips common binaries; max 50 matches default)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Root path to search" }; pattern = @{ type = "string"; description = "Regex pattern" }; glob = @{ type = "string"; description = "File filter e.g. *.log, *.ps1" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer"; description = "Max matches (default 50, max 200)" } }; required = @("path","pattern") } } },
 	@{ type = "function"; function = @{ name = "DiffText"; description = "Show a simple line diff between two strings or two files."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string"; description = "Left text OR path if leftIsFile=true" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" } }; required = @("left","right") } } },
@@ -7735,23 +7734,29 @@ function Invoke-RunCommand {
 
 	try {
 		if ($shell -eq "cmd") {
-			# force UTF-8 code page for high-bit characters
-			$rr = Invoke-MBProcessCapture -FileName "cmd.exe" -Arguments "/c chcp 65001>nul & $command" -WorkingDir $wd -TimeoutMs $timeoutMs
+			$rr = Invoke-MBProcessCapture -FileName "cmd.exe" -Arguments ('/c chcp 65001>nul & ' + $command) -WorkingDir $wd -TimeoutMs $timeoutMs
 		} else {
-			# -NoProfile; UTF-8 console for high-bit characters
 			$psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
 			if (-not (Test-Path -LiteralPath $psExe)) {
 				$psExe = "powershell.exe"
 			}
-			$wrapped = @"
-try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
-try { [Console]::InputEncoding  = [System.Text.Encoding]::UTF8 } catch {}
-`$OutputEncoding = [System.Text.Encoding]::UTF8
-try { chcp 65001 | Out-Null } catch {}
-$command
-"@
-			$enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapped))
-			$rr = Invoke-MBProcessCapture -FileName $psExe -Arguments "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc" -WorkingDir $wd -TimeoutMs $timeoutMs
+			$preamble = @(
+				'try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}'
+				'try { [Console]::InputEncoding  = [System.Text.Encoding]::UTF8 } catch {}'
+				'$OutputEncoding = [System.Text.Encoding]::UTF8'
+				'try { chcp 65001 | Out-Null } catch {}'
+			) -join "`r`n"
+			$body = $preamble + "`r`n" + [string]$command + "`r`n"
+			$ms = New-Object System.IO.MemoryStream
+			try {
+				$encW = New-Object System.Text.UnicodeEncoding $false, $false
+				$bytes = $encW.GetBytes($body)
+				$ms.Write($bytes, 0, $bytes.Length)
+				$enc = [Convert]::ToBase64String($ms.ToArray())
+			} finally {
+				try { $ms.Dispose() } catch {}
+			}
+			$rr = Invoke-MBProcessCapture -FileName $psExe -Arguments ("-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + $enc) -WorkingDir $wd -TimeoutMs $timeoutMs
 		}
 		if ($rr.Cancelled) {
 			$script:MB.Interrupt = $true
@@ -14858,13 +14863,121 @@ function Read-MBUserInput {
 	return $result
 }
 
-function Save-MBSession {
-	param([array]$Messages, [string]$Path)
-	if ([string]::IsNullOrWhiteSpace($Path)) {
-		$desktop = [Environment]::GetFolderPath('Desktop')
-		$Path = Join-Path $desktop ("MiniBot-session-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
+function Get-MBSessionFormat {
+	param([string]$Path)
+	$ext = ''
+	try { $ext = [System.IO.Path]::GetExtension([string]$Path) } catch { $ext = '' }
+	if ($ext -match '^(?i)\.(md|markdown)$') { return 'md' }
+	return 'json'
+}
+
+function Show-MBSessionFilePicker {
+	param(
+		[ValidateSet('Open', 'Save')]
+		[string]$Mode = 'Open',
+		[string]$Title = '',
+		[string]$FileName = '',
+		[string]$InitialDirectory = ''
+	)
+	if ([string]::IsNullOrWhiteSpace($Title)) {
+		$Title = if ($Mode -eq 'Save') { 'Save MiniBot session' } else { 'Load MiniBot session' }
 	}
+	if ([string]::IsNullOrWhiteSpace($FileName) -and $Mode -eq 'Save') {
+		$FileName = ("MiniBot-session-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
+	}
+	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) {
+		try {
+			$InitialDirectory = [Environment]::GetFolderPath('Desktop')
+		} catch {
+			$InitialDirectory = [string]$env:USERPROFILE
+		}
+	}
+	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) {
+		$InitialDirectory = [string]$env:TEMP
+	}
+
+	$filter = 'MiniBot session (*.json)|*.json|Markdown transcript (*.md;*.markdown)|*.md;*.markdown|All files (*.*)|*.*'
+	$rs = $null
+	$ps = $null
+	try {
+		$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+		$rs.ApartmentState = [System.Threading.ApartmentState]::STA
+		$rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+		$rs.Open()
+		$ps = [System.Management.Automation.PowerShell]::Create()
+		$ps.Runspace = $rs
+		[void]$ps.AddScript(@'
+param(
+	[string]$Mode,
+	[string]$Title,
+	[string]$FileName,
+	[string]$InitDir,
+	[string]$Filter
+)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+try { [void][System.Windows.Forms.Application]::EnableVisualStyles() } catch {}
+if ($Mode -eq 'Save') {
+	$dlg = New-Object System.Windows.Forms.SaveFileDialog
+	$dlg.FileName = $FileName
+	$dlg.OverwritePrompt = $true
+	$dlg.AddExtension = $true
+	$dlg.CheckPathExists = $true
+} else {
+	$dlg = New-Object System.Windows.Forms.OpenFileDialog
+	$dlg.CheckFileExists = $true
+	$dlg.Multiselect = $false
+}
+$dlg.Title = $Title
+$dlg.Filter = $Filter
+$dlg.FilterIndex = 1
+$dlg.DefaultExt = 'json'
+$dlg.RestoreDirectory = $true
+if ($InitDir -and (Test-Path -LiteralPath $InitDir)) {
+	$dlg.InitialDirectory = $InitDir
+}
+$res = $dlg.ShowDialog()
+if ($res -eq [System.Windows.Forms.DialogResult]::OK) {
+	return [string]$dlg.FileName
+}
+return $null
+'@)
+		[void]$ps.AddParameter('Mode', [string]$Mode)
+		[void]$ps.AddParameter('Title', [string]$Title)
+		[void]$ps.AddParameter('FileName', [string]$FileName)
+		[void]$ps.AddParameter('InitDir', [string]$InitialDirectory)
+		[void]$ps.AddParameter('Filter', [string]$filter)
+		$out = $ps.Invoke()
+		if ($ps.HadErrors) {
+			$errMsgs = @($ps.Streams.Error | ForEach-Object { "$_" }) -join '; '
+			if ($errMsgs) { throw $errMsgs }
+		}
+		$path = $null
+		if ($out -and @($out).Count -gt 0) {
+			$path = [string]@($out)[-1]
+		}
+		if ([string]::IsNullOrWhiteSpace($path) -or $path -eq 'null') { return $null }
+		return $path
+	} catch {
+		throw "File picker failed: $($_.Exception.Message)"
+	} finally {
+		try { if ($ps) { $ps.Dispose() } } catch {}
+		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
+	}
+}
+
+function Save-MBSessionJson {
+	param([array]$Messages, [string]$Path)
 	$Path = Resolve-MBPath $Path
+	$activeTools = @('core')
+	try {
+		$activeTools = @(
+			@($script:MB.ActiveToolGroups) |
+				ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
+				Where-Object { $_ }
+		)
+		if ($activeTools.Count -eq 0) { $activeTools = @('core') }
+	} catch { $activeTools = @('core') }
 	$payload = @{
 		version  = $Version
 		savedAt  = (Get-Date).ToString("o")
@@ -14872,6 +14985,8 @@ function Save-MBSession {
 		baseUrl  = $BaseUrl
 		cwd      = $script:MB.WorkingDir
 		messages = $Messages
+		tools    = @($activeTools)
+		toolProfile = [string]$script:MB.ToolProfile
 		context  = @{
 			windowTokens   = $script:MB.ContextWindow
 			lastPct        = $script:MB.LastCtxPct
@@ -14888,35 +15003,59 @@ function Save-MBSession {
 	return $Path
 }
 
-function Export-MBTranscript {
+function Save-MBSessionMarkdown {
 	param([array]$Messages, [string]$Path)
-	if ([string]::IsNullOrWhiteSpace($Path)) {
-		$desktop = [Environment]::GetFolderPath('Desktop')
-		$Path = Join-Path $desktop ("MiniBot-transcript-{0:yyyyMMdd-HHmmss}.md" -f (Get-Date))
-	}
 	$Path = Resolve-MBPath $Path
 	$sb = New-Object System.Text.StringBuilder
 	[void]$sb.AppendLine("# MiniBot Transcript")
 	[void]$sb.AppendLine("Model: $Model")
+	[void]$sb.AppendLine("Agent: $AgentName")
+	[void]$sb.AppendLine("Cwd: $($script:MB.WorkingDir)")
+	$toolsList = @('core')
+	try {
+		$toolsList = @(
+			@($script:MB.ActiveToolGroups) |
+				ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
+				Where-Object { $_ }
+		)
+		if ($toolsList.Count -eq 0) { $toolsList = @('core') }
+		if ($toolsList -notcontains 'core') { $toolsList = @('core') + $toolsList }
+	} catch { $toolsList = @('core') }
+	[void]$sb.AppendLine(('Tools: {0}' -f ($toolsList -join ', ')))
+	try {
+		$tp = [string]$script:MB.ToolProfile
+		if (-not [string]::IsNullOrWhiteSpace($tp)) {
+			[void]$sb.AppendLine(('ToolProfile: {0}' -f $tp))
+		}
+	} catch {}
 	[void]$sb.AppendLine("Saved: $((Get-Date).ToString('o'))")
 	[void]$sb.AppendLine("")
 	foreach ($m in $Messages) {
 		if ($m.role -eq 'system') { continue }
 		if ($m.role -eq 'user') {
 			[void]$sb.AppendLine("## You")
-			[void]$sb.AppendLine($m.content)
+			[void]$sb.AppendLine([string]$m.content)
 		} elseif ($m.role -eq 'assistant') {
 			[void]$sb.AppendLine("## $AgentName")
 			if ($m.content) { [void]$sb.AppendLine([string]$m.content) }
 			if ($m.tool_calls) {
 				foreach ($tc in @($m.tool_calls)) {
-					[void]$sb.AppendLine("- tool: $($tc.function.name) ``$($tc.function.arguments)``")
+					$fn = Get-MBProp $tc 'function'
+					$tn = if ($fn) { [string](Get-MBProp $fn 'name') } else { '' }
+					$ta = if ($fn) { [string](Get-MBProp $fn 'arguments') } else { '' }
+					if (-not $tn) { $tn = [string](Get-MBProp $tc 'name') }
+					[void]$sb.AppendLine(('- tool: {0} `{1}`' -f $tn, ($ta -replace '`', "'")))
 				}
 			}
 		} elseif ($m.role -eq 'tool') {
-			[void]$sb.AppendLine("### tool result")
+			$tn = [string](Get-MBProp $m 'name')
+			if ($tn) {
+				[void]$sb.AppendLine("### tool result ($tn)")
+			} else {
+				[void]$sb.AppendLine("### tool result")
+			}
 			$c = [string]$m.content
-			if ($c.Length -gt 2000) { $c = $c.Substring(0,2000) + "..." }
+			if ($c.Length -gt 8000) { $c = $c.Substring(0, 8000) + "..." }
 			[void]$sb.AppendLine('```')
 			[void]$sb.AppendLine($c)
 			[void]$sb.AppendLine('```')
@@ -14926,6 +15065,480 @@ function Export-MBTranscript {
 	$utf8NoBom = New-Object System.Text.UTF8Encoding $false
 	[System.IO.File]::WriteAllText($Path, $sb.ToString(), $utf8NoBom)
 	return $Path
+}
+
+function Save-MBSession {
+	param([array]$Messages, [string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) {
+		$desktop = [Environment]::GetFolderPath('Desktop')
+		$Path = Join-Path $desktop ("MiniBot-session-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
+	}
+	$fmt = Get-MBSessionFormat -Path $Path
+	if ($fmt -eq 'md') {
+		return (Save-MBSessionMarkdown -Messages $Messages -Path $Path)
+	}
+	return (Save-MBSessionJson -Messages $Messages -Path $Path)
+}
+
+function Load-MBSessionJson {
+	param(
+		[string]$Path,
+		[switch]$NoPaint
+	)
+	$lp = Resolve-MBPath $Path
+	if (-not (Test-Path -LiteralPath $lp)) { throw "File not found: $lp" }
+	$obj = Get-Content -LiteralPath $lp -Raw -Encoding UTF8 | ConvertFrom-Json
+	if ($obj.sticky) {
+		Clear-MBSticky
+		foreach ($n in @($obj.sticky.notes)) {
+			if ($n) { [void]$script:MB.StickyNotes.Add([string]$n) }
+		}
+		foreach ($f in @($obj.sticky.findings)) {
+			if ($f) { [void]$script:MB.StickyFindings.Add([string]$f) }
+		}
+		if ($obj.sticky.extra) { $script:MB.StickyExtra = [string]$obj.sticky.extra }
+	}
+	if ($obj.tools) {
+		try { $null = Set-MBActiveToolGroupsFromList -Groups @($obj.tools) } catch {}
+	}
+	if ($obj.toolProfile) {
+		try {
+			$tp = [string]$obj.toolProfile
+			if ($tp -match '^(?i)core|full$') { $script:MB.ToolProfile = $tp.ToLowerInvariant() }
+		} catch {}
+	}
+	$rawMsgs = @($obj.messages)
+	$script:Messages = @(Repair-MBMessagesEncoding -Messages @(Sync-MBSystemMessages -Messages $rawMsgs))
+	if ($obj.cwd) {
+		try { Invoke-SetWorkingDirectory -path $obj.cwd | Out-Null } catch {}
+	}
+	try {
+		for ($i = $rawMsgs.Count - 1; $i -ge 0; $i--) {
+			if ([string](Get-MBProp $rawMsgs[$i] 'role') -eq 'user') {
+				$script:LastUserMessage = [string](Get-MBProp $rawMsgs[$i] 'content')
+				break
+			}
+		}
+	} catch {}
+	try { Sync-MBPromptAfterToolGroups } catch {}
+	if (-not $NoPaint) {
+		$paint = New-Object System.Collections.ArrayList
+		foreach ($m in $rawMsgs) {
+			$r = [string](Get-MBProp $m 'role')
+			if ($r -and $r -ne 'system') { [void]$paint.Add($m) }
+		}
+		try { Show-MBImportedMessages -Messages @($paint) -Label 'loaded' } catch {}
+	}
+	try { Refresh-MBWpfStickyFromSession } catch {}
+	return [pscustomobject]@{
+		Path   = $lp
+		Format = 'json'
+		Count  = @($script:Messages).Count
+		Tools  = @($script:MB.ActiveToolGroups)
+		Cwd    = $script:MB.WorkingDir
+	}
+}
+
+function Load-MBSession {
+	param(
+		[Parameter(Mandatory = $true)][string]$Path,
+		[switch]$Append,
+		[switch]$NoPaint
+	)
+	$lp = Resolve-MBPath $Path
+	if (-not (Test-Path -LiteralPath $lp)) { throw "File not found: $lp" }
+	$fmt = Get-MBSessionFormat -Path $lp
+	if ($fmt -ne 'md') {
+		try {
+			$head = Get-Content -LiteralPath $lp -TotalCount 3 -ErrorAction SilentlyContinue
+			$joined = ($head -join "`n")
+			if ($joined -match '(?i)MiniBot\s+Transcript') { $fmt = 'md' }
+		} catch {}
+	}
+	if ($fmt -eq 'md') {
+		$r = Import-MBTranscript -Path $lp -Append:$Append -NoPaint:$NoPaint
+		return [pscustomobject]@{
+			Path   = $r.Path
+			Format = 'md'
+			Count  = $r.Total
+			Turns  = $r.Count
+			Tools  = @($r.Tools)
+			Cwd    = $r.Cwd
+			Model  = $r.Model
+			Appended = [bool]$r.Appended
+		}
+	}
+	if ($Append) {
+		throw "Append is only supported for .md transcripts. Use /load path.md with append, or /load file.json to replace."
+	}
+	return (Load-MBSessionJson -Path $lp -NoPaint:$NoPaint)
+}
+
+function ConvertFrom-MBTranscriptMarkdown {
+	param(
+		[Parameter(Mandatory = $true)][string]$Text
+	)
+	$raw = [string]$Text
+	if ($raw.Length -gt 0 -and [int][char]$raw[0] -eq 0xFEFF) {
+		$raw = $raw.Substring(1)
+	}
+	$raw = $raw -replace "`r`n", "`n" -replace "`r", "`n"
+	$lines = @($raw -split "`n", -1)
+
+	$agent = [string]$AgentName
+	$metaModel = $null
+	$metaCwd = $null
+	$metaAgent = $null
+	$metaTools = @()
+	$metaToolProfile = $null
+
+	$out = New-Object System.Collections.ArrayList
+	$role = $null
+	$body = New-Object System.Collections.ArrayList
+	$toolCalls = New-Object System.Collections.ArrayList
+	$toolName = ''
+	$inFence = $false
+	$tcId = 0
+
+	foreach ($line in $lines) {
+		if (-not $role -and $line -match '^(?i)Model:\s*(.+)$') {
+			$metaModel = $Matches[1].Trim(); continue
+		}
+		if (-not $role -and $line -match '^(?i)Agent:\s*(.+)$') {
+			$metaAgent = $Matches[1].Trim()
+			if ($metaAgent) { $agent = $metaAgent }
+			continue
+		}
+		if (-not $role -and $line -match '^(?i)Cwd:\s*(.+)$') {
+			$metaCwd = $Matches[1].Trim(); continue
+		}
+		if (-not $role -and $line -match '^(?i)Tools?:\s*(.+)$') {
+			$metaTools = @(
+				$Matches[1] -split '[,;\s]+' |
+					ForEach-Object { $_.Trim().ToLowerInvariant() } |
+					Where-Object { $_ }
+			)
+			continue
+		}
+		if (-not $role -and $line -match '^(?i)ToolProfile:\s*(.+)$') {
+			$metaToolProfile = $Matches[1].Trim().ToLowerInvariant(); continue
+		}
+		if (-not $role -and $line -match '^(?i)Saved:\s*') { continue }
+		if ($line -match '^(?i)#\s+MiniBot\s+Transcript\s*$') { continue }
+
+		$isHeader = $false
+		$nextRole = $null
+		$nextToolName = ''
+
+		if (-not $inFence -and $line -match '^(?i)##\s+You\s*$') {
+			$isHeader = $true; $nextRole = 'user'
+		} elseif (-not $inFence -and $line -match '^(?i)##\s+User\s*$') {
+			$isHeader = $true; $nextRole = 'user'
+		} elseif (-not $inFence -and $line -match '^(?i)##\s+(Assistant|Agent|MiniBot)\s*$') {
+			$isHeader = $true; $nextRole = 'assistant'
+		} elseif (-not $inFence -and $line -match '^(?i)###\s+tool\s+result(?:\s*\(([^)]+)\))?\s*$') {
+			$isHeader = $true; $nextRole = 'tool'
+			if ($Matches[1]) { $nextToolName = $Matches[1].Trim() }
+		} elseif (-not $inFence -and $line -match '^(?i)##\s+(.+?)\s*$') {
+			$hdr = $Matches[1].Trim()
+			$hdrBare = $hdr -replace '^\[|\]$', '' -replace '-Agent$', ''
+			$isAgent = $false
+			if ($agent -and ($hdr -eq $agent -or $hdrBare -eq $agent)) { $isAgent = $true }
+			elseif ($hdr -match '(?i)agent$') { $isAgent = $true }
+			if ($isAgent) {
+				$isHeader = $true; $nextRole = 'assistant'
+			}
+		}
+
+		if ($isHeader) {
+			if ($role) {
+				$text = (($body | ForEach-Object { $_ }) -join "`n").TrimEnd()
+				if ($text.StartsWith("`n")) { $text = $text.Substring(1) }
+				if ($role -eq 'user') {
+					if ($text.Length -gt 0) {
+						[void]$out.Add(@{ role = 'user'; content = (Sanitize-MBText -Text $text) })
+					}
+				} elseif ($role -eq 'assistant') {
+					if ($text.Length -gt 0 -or $toolCalls.Count -gt 0) {
+						$msg = @{ role = 'assistant'; content = (Sanitize-MBText -Text $text) }
+						if ($toolCalls.Count -gt 0) { $msg['tool_calls'] = @($toolCalls.ToArray()) }
+						[void]$out.Add($msg)
+					}
+				} elseif ($role -eq 'tool') {
+					if ($text.Length -gt 0) {
+						$tcId++
+						$tm = @{
+							role         = 'tool'
+							content      = (Sanitize-MBText -Text $text.Trim())
+							tool_call_id = ('import_tool_{0}' -f $tcId)
+						}
+						if ($toolName) { $tm['name'] = $toolName }
+						[void]$out.Add($tm)
+					}
+				}
+			}
+			$role = $nextRole
+			$body = New-Object System.Collections.ArrayList
+			$toolCalls = New-Object System.Collections.ArrayList
+			$toolName = $nextToolName
+			$inFence = $false
+			continue
+		}
+
+		if ($role -eq 'assistant' -and -not $inFence -and $line -match '^\s*-\s*tool:\s*(\S+)\s+`([^`]*)`\s*$') {
+			$tcId++
+			[void]$toolCalls.Add(@{
+				id       = ('import_call_{0}' -f $tcId)
+				type     = 'function'
+				function = @{ name = $Matches[1]; arguments = $Matches[2] }
+			})
+			continue
+		}
+		if ($role -eq 'assistant' -and -not $inFence -and $line -match '^\s*-\s*tool:\s*(\S+)\s*$') {
+			$tcId++
+			[void]$toolCalls.Add(@{
+				id       = ('import_call_{0}' -f $tcId)
+				type     = 'function'
+				function = @{ name = $Matches[1]; arguments = '{}' }
+			})
+			continue
+		}
+
+		if ($line -match '^```') {
+			$inFence = -not $inFence
+			if ($role -eq 'tool') { continue }
+			if ($role) { [void]$body.Add($line) }
+			continue
+		}
+
+		if ($role) { [void]$body.Add($line) }
+	}
+
+	if ($role) {
+		$text = (($body | ForEach-Object { $_ }) -join "`n").TrimEnd()
+		if ($text.StartsWith("`n")) { $text = $text.Substring(1) }
+		if ($role -eq 'user' -and $text.Length -gt 0) {
+			[void]$out.Add(@{ role = 'user'; content = (Sanitize-MBText -Text $text) })
+		} elseif ($role -eq 'assistant' -and ($text.Length -gt 0 -or $toolCalls.Count -gt 0)) {
+			$msg = @{ role = 'assistant'; content = (Sanitize-MBText -Text $text) }
+			if ($toolCalls.Count -gt 0) { $msg['tool_calls'] = @($toolCalls.ToArray()) }
+			[void]$out.Add($msg)
+		} elseif ($role -eq 'tool' -and $text.Length -gt 0) {
+			$tcId++
+			$tm = @{
+				role         = 'tool'
+				content      = (Sanitize-MBText -Text $text.Trim())
+				tool_call_id = ('import_tool_{0}' -f $tcId)
+			}
+			if ($toolName) { $tm['name'] = $toolName }
+			[void]$out.Add($tm)
+		}
+	}
+
+	return [pscustomobject]@{
+		Messages    = @($out.ToArray())
+		Model       = $metaModel
+		Agent       = $metaAgent
+		Cwd         = $metaCwd
+		Tools       = @($metaTools)
+		ToolProfile = $metaToolProfile
+		Count       = $out.Count
+	}
+}
+
+function Set-MBActiveToolGroupsFromList {
+	param(
+		[string[]]$Groups,
+		[switch]$Merge
+	)
+	$order = @(Get-MBToolGroupOrder)
+	$want = New-Object System.Collections.ArrayList
+	[void]$want.Add('core')
+	foreach ($g in @($Groups)) {
+		$gl = ([string]$g).Trim().ToLowerInvariant()
+		if ([string]::IsNullOrWhiteSpace($gl)) { continue }
+		if ($gl -in @('full', 'all', 'everything')) {
+			foreach ($n in $order) {
+				if (-not ($want -contains $n)) { [void]$want.Add($n) }
+			}
+			continue
+		}
+		$resolved = $null
+		try { $resolved = Resolve-MBToolGroupName -Group $gl } catch { $resolved = $null }
+		if (-not $resolved) { $resolved = $gl }
+		if ($resolved -in @('full', 'all')) {
+			foreach ($n in $order) {
+				if (-not ($want -contains $n)) { [void]$want.Add($n) }
+			}
+			continue
+		}
+		if ($resolved -eq 'core') { continue }
+		if ($script:MBToolCatalog -and $script:MBToolCatalog.Contains($resolved)) {
+			if (-not ($want -contains $resolved)) { [void]$want.Add($resolved) }
+		}
+	}
+	if ($Merge) {
+		foreach ($g in @($script:MB.ActiveToolGroups)) {
+			$gl = ([string]$g).Trim().ToLowerInvariant()
+			if ($gl -and -not ($want -contains $gl)) { [void]$want.Add($gl) }
+		}
+	}
+	if (-not $script:MB.ActiveToolGroups) {
+		$script:MB.ActiveToolGroups = New-Object System.Collections.ArrayList
+	}
+	$script:MB.ActiveToolGroups.Clear()
+	foreach ($g in @($want)) {
+		[void]$script:MB.ActiveToolGroups.Add($g)
+	}
+	try { Sync-MBPromptAfterToolGroups } catch {}
+	return @($script:MB.ActiveToolGroups)
+}
+
+function Show-MBImportedMessages {
+	param(
+		[array]$Messages,
+		[string]$Label = 'loaded'
+	)
+	if (-not $Messages -or $Messages.Count -eq 0) { return }
+	try {
+		Write-Host ""
+		Write-MBRule -Label $Label
+	} catch {
+		Write-Host ""
+	}
+	foreach ($m in @($Messages)) {
+		$r = [string](Get-MBProp $m 'role')
+		if ($r -eq 'system' -or $r -eq 'tool') { continue }
+		$c = [string](Get-MBProp $m 'content')
+		if ($null -eq $c) { $c = '' }
+		if ($r -eq 'user') {
+			try { Write-MBUserMessage -Text $c } catch {
+				Write-Host "[user]" -ForegroundColor Cyan
+				Write-Host $c -ForegroundColor Gray
+			}
+			continue
+		}
+		if ($r -ne 'assistant') { continue }
+		$hasText = -not [string]::IsNullOrWhiteSpace($c)
+		if (-not $hasText) { continue }
+		try {
+			try { Reset-MBMdStream } catch {}
+			Write-MBBrand -NoNewline
+			Write-Host ""
+			if (Test-MBWpfActive) {
+				$norm = $c -replace "`r`n", "`n" -replace "`r", "`n"
+				if (-not $norm.EndsWith("`n")) { $norm += "`n" }
+				$pos = 0
+				$len = $norm.Length
+				$chunk = 480
+				while ($pos -lt $len) {
+					$n = [math]::Min($chunk, $len - $pos)
+					$piece = $norm.Substring($pos, $n)
+					$pos += $n
+					if ($pos -lt $len) {
+						$nl = $piece.LastIndexOf("`n")
+						if ($nl -gt 80) {
+							$pos -= ($piece.Length - $nl - 1)
+							$piece = $piece.Substring(0, $nl + 1)
+						}
+					}
+					Write-MBMdStreamAppend -Text $piece
+					try { Write-MBMdStreamFlush } catch {}
+				}
+				try { Write-MBMdStreamFlush } catch {}
+			} else {
+				Write-Host $c -ForegroundColor Gray
+			}
+		} catch {
+			Write-Host ("[{0}]" -f $AgentName) -ForegroundColor DarkRed
+			Write-Host $c -ForegroundColor Gray
+		}
+	}
+	try { Write-Host "" } catch {}
+	try { Update-MBWpfLiveChrome -Force } catch {}
+}
+
+function Import-MBTranscript {
+	param(
+		[Parameter(Mandatory = $true)][string]$Path,
+		[switch]$NoPaint,
+		[switch]$Append
+	)
+	$lp = Resolve-MBPath $Path
+	if (-not (Test-Path -LiteralPath $lp)) {
+		throw "File not found: $lp"
+	}
+	$bytes = [System.IO.File]::ReadAllBytes($lp)
+	$offset = 0
+	if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+		$offset = 3
+	}
+	$text = [System.Text.Encoding]::UTF8.GetString($bytes, $offset, $bytes.Length - $offset)
+	$parsed = ConvertFrom-MBTranscriptMarkdown -Text $text
+	if (-not $parsed.Messages -or @($parsed.Messages).Count -eq 0) {
+		throw "No chat turns found in markdown (expected ## You / ## $AgentName sections)."
+	}
+
+	$imported = @($parsed.Messages)
+
+	$toolsRestored = @()
+	if ($parsed.Tools -and @($parsed.Tools).Count -gt 0) {
+		try {
+			$toolsRestored = @(Set-MBActiveToolGroupsFromList -Groups @($parsed.Tools) -Merge:$Append)
+		} catch {
+			$toolsRestored = @($script:MB.ActiveToolGroups)
+		}
+	} elseif (-not $Append) {
+		$toolsRestored = @($script:MB.ActiveToolGroups)
+	} else {
+		$toolsRestored = @($script:MB.ActiveToolGroups)
+	}
+	if ($parsed.ToolProfile -and -not $Append) {
+		try {
+			if ($parsed.ToolProfile -match '^(?i)core|full$') {
+				$script:MB.ToolProfile = $parsed.ToolProfile
+			}
+		} catch {}
+	}
+
+	if ($Append) {
+		$prior = @()
+		foreach ($m in @($script:Messages)) {
+			$r = [string](Get-MBProp $m 'role')
+			if ($r -and $r -ne 'system') { $prior += $m }
+		}
+		$merged = @($prior) + @($imported)
+		$script:Messages = @(Repair-MBMessagesEncoding -Messages @(Sync-MBSystemMessages -Messages $merged))
+	} else {
+		$script:Messages = @(Repair-MBMessagesEncoding -Messages @(Sync-MBSystemMessages -Messages $imported))
+	}
+
+	if ($parsed.Cwd) {
+		try { Invoke-SetWorkingDirectory -path $parsed.Cwd | Out-Null } catch {}
+	}
+
+	for ($i = $imported.Count - 1; $i -ge 0; $i--) {
+		if ([string](Get-MBProp $imported[$i] 'role') -eq 'user') {
+			$script:LastUserMessage = [string](Get-MBProp $imported[$i] 'content')
+			break
+		}
+	}
+
+	if (-not $NoPaint) {
+		try { Show-MBImportedMessages -Messages $imported -Label 'loaded' } catch {}
+	}
+	try { Sync-MBPromptAfterToolGroups } catch {}
+	try { Refresh-MBWpfStickyFromSession } catch {}
+
+	return [pscustomobject]@{
+		Path     = $lp
+		Count    = $imported.Count
+		Total    = @($script:Messages).Count
+		Model    = $parsed.Model
+		Cwd      = $parsed.Cwd
+		Tools    = @($toolsRestored)
+		Appended = [bool]$Append
+	}
 }
 
 
@@ -16154,7 +16767,13 @@ function Update-MBWpfSticky {
 	if ($PSBoundParameters.ContainsKey('Status')) {
 		# Status mode for spinner; UI timer paints glyph
 		$raw = [string]$Status
-		$label = ($raw -replace '^[·*#o○●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]+', '').Trim()
+		$label = $raw.Trim()
+		while ($label.Length -gt 0) {
+			$c = [int][char]$label[0]
+			$isLetter = (($c -ge 65 -and $c -le 90) -or ($c -ge 97 -and $c -le 122))
+			if ($isLetter) { break }
+			$label = $label.Substring(1).TrimStart()
+		}
 		if ([string]::IsNullOrWhiteSpace($label)) { $label = $raw.Trim() }
 		$mode = 'ready'
 		if ($label -match '(?i)autocompact|compact') {
@@ -16393,7 +17012,9 @@ function Read-MBWpfUserInput {
 					$script:MB.Wpf.InputResult = $null
 					Write-MBDebugLog -Step 'READ_WPF_INPUT_RECEIVED' -Detail ("len={0}" -f $(if ($null -eq $r) { -1 } else { $r.Length }))
 					Set-MBWpfPromptEnabled -Enabled $false
-					try { Refresh-MBWpfStickyFromSession -Hint "… working …" } catch {}
+					try {
+						Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  model working..." -f ([char]0x00B7))
+					} catch {}
 					Write-MBDebugLog -Step 'READ_WPF_INPUT_RETURN'
 					return $r
 				}
@@ -17210,7 +17831,7 @@ function Start-MBWpfHost {
               <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             <StackPanel x:Name="StatusBand" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
-              <TextBlock x:Name="StatusDot" Text="· ready" Foreground="#9ECE6A"
+              <TextBlock x:Name="StatusDot" Text="* ready" Foreground="#9ECE6A"
                          VerticalAlignment="Center" Margin="0,0,0,0" FontWeight="SemiBold"
                          FontFamily="Consolas, Cascadia Mono, Segoe UI Symbol, Courier New"/>
               <TextBlock x:Name="StatusTimer" Text="" Foreground="#6A6A76"
@@ -17259,7 +17880,7 @@ function Start-MBWpfHost {
 
  <!-- Hints below prompt -->
         <Border Grid.Row="5" Background="#16161A" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="12,4">
-          <TextBlock x:Name="HintBar" Text="enter send  ·  Ctrl+Enter newline  ·  Esc / Stop interrupt  ·  /help"
+          <TextBlock x:Name="HintBar" Text="enter send  |  Ctrl+Enter newline  |  Esc / Stop interrupt  |  /help"
                      Foreground="#5A5A66" FontSize="11"/>
         </Border>
       </Grid>
@@ -21370,39 +21991,57 @@ function Start-LocalAgent {
 				}
 				'^/save$' {
 					try {
-						$p = Save-MBSession -Messages $script:Messages -Path $arg
-						Write-MBOk "Saved: $p"
+						$spath = [string]$arg
+						if ([string]::IsNullOrWhiteSpace($spath)) {
+							$def = ("MiniBot-session-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
+							$spath = Show-MBSessionFilePicker -Mode Save -Title 'Save MiniBot session' -FileName $def
+							if ([string]::IsNullOrWhiteSpace($spath)) {
+								Write-MBInfo "Save cancelled."
+								continue
+							}
+						} else {
+							$spath = $spath.Trim().Trim('"').Trim("'")
+						}
+						$p = Save-MBSession -Messages $script:Messages -Path $spath
+						$fmt = Get-MBSessionFormat -Path $p
+						Write-MBOk ("Saved ({0}): {1}" -f $fmt, $p)
 					} catch { Write-MBErr $_.Exception.Message }
 					continue
 				}
 				'^/load$' {
-					if (-not $arg) { Write-MBWarn "Usage: /load <path>"; continue }
 					try {
-						$lp = Resolve-MBPath $arg
-						$obj = Get-Content -LiteralPath $lp -Raw | ConvertFrom-Json
-						if ($obj.sticky) {
-							Clear-MBSticky
-							foreach ($n in @($obj.sticky.notes)) {
-								if ($n) { [void]$script:MB.StickyNotes.Add([string]$n) }
+						$append = $false
+						$lpath = [string]$arg
+						if (-not [string]::IsNullOrWhiteSpace($lpath)) {
+							$lpath = $lpath.Trim()
+							if ($lpath -match '^(?i)append\s*$') {
+								$append = $true
+								$lpath = ''
+							} elseif ($lpath -match '^(?i)append\s+(.+)$') {
+								$append = $true
+								$lpath = $Matches[1].Trim().Trim('"').Trim("'")
+							} else {
+								$lpath = $lpath.Trim('"').Trim("'")
 							}
-							foreach ($f in @($obj.sticky.findings)) {
-								if ($f) { [void]$script:MB.StickyFindings.Add([string]$f) }
+						}
+						if ([string]::IsNullOrWhiteSpace($lpath)) {
+							$title = if ($append) { 'Load MiniBot session (append markdown)' } else { 'Load MiniBot session' }
+							$lpath = Show-MBSessionFilePicker -Mode Open -Title $title
+							if ([string]::IsNullOrWhiteSpace($lpath)) {
+								Write-MBInfo "Load cancelled."
+								continue
 							}
-							if ($obj.sticky.extra) { $script:MB.StickyExtra = [string]$obj.sticky.extra }
 						}
-						$script:Messages = @(Repair-MBMessagesEncoding -Messages @(Sync-MBSystemMessages -Messages @($obj.messages)))
-						if ($obj.cwd) {
-							try { Invoke-SetWorkingDirectory -path $obj.cwd | Out-Null } catch {}
+						$r = Load-MBSession -Path $lpath -Append:$append
+						$fmt = [string]$r.Format
+						Write-MBOk ("Loaded ({0}): {1}  |  messages: {2}" -f $fmt, $r.Path, $r.Count)
+						if ($r.Cwd) { Write-Host ("  cwd: {0}" -f $r.Cwd) -ForegroundColor DarkGray }
+						if ($r.Tools -and @($r.Tools).Count -gt 0) {
+							Write-Host ("  tools: {0}" -f ((@($r.Tools) -join ', '))) -ForegroundColor DarkGray
 						}
-						Write-MBOk "Loaded + re-synced system/state ($($script:Messages.Count) messages) from $lp"
-						try { Refresh-MBWpfStickyFromSession } catch {}
-					} catch { Write-MBErr $_.Exception.Message }
-					continue
-				}
-				'^/export$' {
-					try {
-						$p = Export-MBTranscript -Messages $script:Messages -Path $arg
-						Write-MBOk "Exported: $p"
+						if ($r.PSObject.Properties['Model'] -and $r.Model) {
+							Write-Host ("  file model: {0}" -f $r.Model) -ForegroundColor DarkGray
+						}
 					} catch { Write-MBErr $_.Exception.Message }
 					continue
 				}
