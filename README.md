@@ -198,9 +198,7 @@ Enable via agent (`EnableToolGroup`) or `/tools <group>`.
 
 ---
 
-## Personal installer catalog (R-specific)
-
-**MiniBot-R** ships a **personal** catalog only. There is **no** GoToAssist / Avast business portal package set.
+## Installer catalog
 
 | Id | Package |
 |----|---------|
