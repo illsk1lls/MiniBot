@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.10.0 - Mini Repair-Bot (Or whatever you want it to be!)
+	MiniBot v2.20.0 - Mini Repair-Bot (Or whatever you want it to be!)
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -21,7 +21,7 @@ param(
 	# This is NOT the real model alias entry. Enter your server name here for `PoweredBy: YourServerName` on the top right of the window, this `Alias` is for MiniBot display only
 	[string]$ModelAlias = "YourServerName",
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.12.0",
+	[string]$Version = "2.20.0",
 	[string]$ApiKey = "none",
 	# Max completion tokens per model request (also reserved out of n_ctx for the prompt budget)
 	[int]$MaxTokens = 32768,
@@ -407,6 +407,8 @@ $script:MB = @{
 	UserTurns          = 0
 	AgentTurns         = 0
 	ToolCalls          = 0
+	# Tool names invoked this session (for sticky tool-list glow)
+	UsedToolNames      = @{}
 	ApprovalsGranted   = 0
 	ApprovalsDenied    = 0
 	LastToolMs         = 0
@@ -1868,6 +1870,8 @@ function Write-MBErr {
 	param([string]$Message)
 	$mark = if (Test-MBWpfActive) { [string][char]0x2717 } else { 'x' }  # ballot X in WPF
 	Write-Host ("{0} {1}" -f $mark, $Message) -ForegroundColor Red
+	try { Update-MBWpfSticky -Status 'error' } catch {}
+	try { Set-MBWpfRobotMood -Mode 'error' -Force } catch {}
 }
 
 function Write-MBOk {
@@ -1960,7 +1964,7 @@ function Write-MBRule {
 			}
 			return
 		}
-		# Full-width section rule (sticky accent color)
+		# Full-width section rule
 		Write-MBWpfSectionBanner -Label $Label -Color Magenta
 		return
 	}
@@ -2136,13 +2140,13 @@ function Show-MBBanner {
 	} else {
 		'OFF  (modifying actions need Y/N/A)'
 	}
-	# ON (caution) = orange/dark-yellow; OFF (safe) = green — matches sticky prompt
+	# Auto-approve ON=caution orange; OFF=green
 	$autoColor = if ($script:MB.AutoApprove) { [ConsoleColor]::DarkYellow } else { [ConsoleColor]::Green }
 
 	Write-Host ''
 	Write-MBKV 'Model' (Get-MBShortModel -MaxLen 64) -ValueColor Magenta
 	Write-MBKV 'Host'  ([string]$BaseUrl) -ValueColor Gray
-	Write-MBKV 'Path'  ([string]$script:MB.WorkingDir) -ValueColor Cyan
+	Write-MBKV 'WorkingDir'  ([string]$script:MB.WorkingDir) -ValueColor Cyan
 	Write-MBKV 'Budget' ("n_ctx ~{0:N0}  {1}  usable ~{2:N0} tok  {1}  soft {3:P0}/{4:P0}  {1}  autocompact {5}" -f `
 		$script:MB.ContextWindow, $dot, $effBudget, $script:MB.ContextSoftPct, $script:MB.ContextHardPct, $ac) -ValueColor Gray
 	Write-MBKV 'auto-approve' $autoVal -ValueColor $autoColor
@@ -2690,63 +2694,6 @@ if ($script:MB_ClearCredsFromEnv) {
 	}
 }
 
-function Read-MBWpfLine {
-	param(
-		[string]$Label = '',
-		[switch]$Secret
-	)
-	if (-not (Test-MBWpfActive)) { return $null }
-
-	if ($Label) {
-		Write-MBWpfRaw -Text $Label -Color DarkYellow
-	}
-	Update-MBWpfSticky -Hint $(if ($Secret) { ("enter password  {0}  Enter to submit" -f ([char]0x00B7)) } else { ("type response  {0}  Enter to submit" -f ([char]0x00B7)) })
-	Set-MBWpfPromptEnabled -Enabled $true
-
-	if ($Secret) {
-		Invoke-MBWpf -Action {
-			try {
-				$script:MB.Wpf.Prompt.PasswordChar = [char]0x25CF  # ●
-			} catch {
-				try { $script:MB.Wpf.Prompt.PasswordChar = '*' } catch {}
-			}
-		}
-	}
-
-	$script:MB.Wpf.InputResult = $null
-	try {
-		while ($true) {
-			if ($script:MB.Wpf.ExitRequested) { return $null }
-			if ($script:MB.Wpf.NeedPathBudgetRefresh) {
-				$script:MB.Wpf.NeedPathBudgetRefresh = $false
-				try { Refresh-MBWpfStickyFromSession } catch {}
-			}
-			if ($script:MB.Wpf.InputWait.WaitOne(20)) {
-				$r = [string]$script:MB.Wpf.InputResult
-				$script:MB.Wpf.InputResult = $null
-				if (-not $Secret) {
-					if ([string]::IsNullOrWhiteSpace($r)) {
-						Write-MBWpfRaw -Text '  (empty)' -Color DarkGray
-					} else {
-						Write-MBWpfRaw -Text ("  → " + $r) -Color Cyan
-					}
-				} else {
-					Write-MBWpfRaw -Text '  → ********' -Color DarkGray
-				}
-				return $r
-			}
-		}
-	} finally {
-		Invoke-MBWpf -Action {
-			try {
-				$script:MB.Wpf.Prompt.PasswordChar = [char]0
-				$script:MB.Wpf.Prompt.Clear()
-			} catch {}
-		}
-		Set-MBWpfPromptEnabled -Enabled $false
-	}
-}
-
 function Show-MBWpfAuthOverlay {
 	param([string]$ServerHint = '')
 	if (-not (Test-MBWpfActive)) { return $null }
@@ -2891,11 +2838,14 @@ function Start-MBLoginSession {
 
 	$hint = if ($ServerHint) { [string]$ServerHint } else { [string]$BaseUrl }
 	$ver = try { [string]$Version } catch { '' }
+	$agentNm = try {
+		if (-not [string]::IsNullOrWhiteSpace([string]$AgentName)) { [string]$AgentName.Trim() } else { 'MiniBot' }
+	} catch { 'MiniBot' }
 	$bag = [hashtable]::Synchronized(@{
 		Failed       = $false
 		FailMsg      = ''
 		Closed       = $false
-		Cmd          = ''           # show_login | show_confirm | close
+		Cmd          = ''           # show_login | show_confirm | success | close
 		ConfirmPrompt = ''
 		ConfirmTitle  = 'Invalid Entry'
 		CredResult   = $null
@@ -2905,6 +2855,9 @@ function Start-MBLoginSession {
 		ReadyWait    = New-Object System.Threading.ManualResetEvent $false
 		Done         = New-Object System.Threading.ManualResetEvent $false
 		Ready        = $false
+		AuthOk       = $false
+		RobotSuccessPainted = $false
+		AgentName    = $agentNm
 	})
 
 	$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
@@ -2920,15 +2873,18 @@ function Start-MBLoginSession {
 			Add-Type -AssemblyName PresentationCore
 			Add-Type -AssemblyName WindowsBase
 			$title = if ($Ver) { "MiniBot v$Ver" } else { 'MiniBot' }
+			# Borderless window with custom titlebar
 			$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="$title"
-        Width="420" SizeToContent="Height"
-        MinWidth="360" MinHeight="280"
+        Width="440" SizeToContent="Height"
+        MinWidth="380" MinHeight="300"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
-        Background="#1A1A1E"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
         Foreground="#C8C8D0"
         FontFamily="Consolas, Cascadia Mono, Courier New"
         FontSize="13"
@@ -2936,6 +2892,15 @@ function Start-MBLoginSession {
         ShowActivated="True"
         Topmost="True">
   <Window.Resources>
+    <ControlTemplate x:Key="NoMouseOverButtonTemplate" TargetType="Button">
+      <Border Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}"
+              Padding="{TemplateBinding Padding}"
+              CornerRadius="4" SnapsToDevicePixels="True">
+        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+      </Border>
+    </ControlTemplate>
     <Style x:Key="MbAuthPrimaryBtn" TargetType="Button">
       <Setter Property="Background" Value="#4A4A56"/>
       <Setter Property="Foreground" Value="#E0E0E8"/>
@@ -2946,7 +2911,8 @@ function Start-MBLoginSession {
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="3" SnapsToDevicePixels="True">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="4" SnapsToDevicePixels="True"
+                    Padding="{TemplateBinding Padding}">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
@@ -2974,7 +2940,8 @@ function Start-MBLoginSession {
             <Border x:Name="Bd" Background="{TemplateBinding Background}"
                     BorderBrush="{TemplateBinding BorderBrush}"
                     BorderThickness="{TemplateBinding BorderThickness}"
-                    CornerRadius="3" SnapsToDevicePixels="True">
+                    CornerRadius="4" SnapsToDevicePixels="True"
+                    Padding="{TemplateBinding Padding}">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
@@ -2992,99 +2959,207 @@ function Start-MBLoginSession {
       </Setter>
     </Style>
   </Window.Resources>
-  <Border BorderBrush="#3A3A42" BorderThickness="1" Background="#1E1E24" Padding="22,18,22,14">
+  <Border x:Name="MainChromeBorder" BorderBrush="#2A2A30" BorderThickness="1" Background="#121216"
+          CornerRadius="8" ClipToBounds="True" SnapsToDevicePixels="True">
     <Grid>
-      <!-- LOGIN LAYER -->
-      <Grid x:Name="LoginLayer">
-        <Grid.RowDefinitions>
-          <RowDefinition Height="Auto"/>
-          <RowDefinition Height="18"/>
-          <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <StackPanel Grid.Row="0">
-          <TextBlock Text="Authentication required" Foreground="#E0E0E8"
-                     FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
-          <TextBlock x:Name="AuthSubtitle" Text="" Foreground="#8A8A96" TextWrapping="Wrap"
-                     FontSize="12" Margin="0,0,0,10" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
-          <TextBlock Text="Username" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
-          <TextBox x:Name="AuthUser" Height="32" Padding="8,6" Margin="0,0,0,8"
-                   Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
-                   BorderBrush="#3A3A42" BorderThickness="1"
-                   FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
-          <TextBlock Text="Password" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
-          <PasswordBox x:Name="AuthPass" Height="32" Padding="8,6" Margin="0,0,0,6"
+      <Grid.RowDefinitions>
+        <RowDefinition Height="36"/>
+        <RowDefinition Height="*"/>
+      </Grid.RowDefinitions>
+      <!-- Custom titlebar -->
+      <Border x:Name="LoginTitleBar" Grid.Row="0" Background="#2A2A30" BorderBrush="#3A3A42"
+              BorderThickness="0,0,0,1" Padding="10,0,0,0" CornerRadius="8,8,0,0"
+              SnapsToDevicePixels="True">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
+            <Grid x:Name="LoginRobotHost" Width="22" Height="22" Margin="9,0,0,0"
+                  VerticalAlignment="Center" ToolTip="MiniBot">
+              <!-- Login robot -->
+              <Path x:Name="LoginRobotPath" Width="18" Height="18" Stretch="Uniform"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Data="M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z">
+                <Path.Fill>
+                  <LinearGradientBrush StartPoint="0.15,0" EndPoint="0.9,1">
+                    <GradientStop x:Name="LoginRobotStop0" Color="#C8C8D0" Offset="0"/>
+                    <GradientStop x:Name="LoginRobotStop1" Color="#6A6A74" Offset="0.48"/>
+                    <GradientStop x:Name="LoginRobotStop2" Color="#3A3A42" Offset="1"/>
+                  </LinearGradientBrush>
+                </Path.Fill>
+                <Path.Effect>
+                  <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="1.25"
+                                    Opacity="0.72" Direction="315"/>
+                </Path.Effect>
+              </Path>
+            </Grid>
+            <Ellipse Width="3.5" Height="3.5" Fill="#8A8A96"
+                     Margin="9,1,9,0" VerticalAlignment="Center" Opacity="0.9"
+                     SnapsToDevicePixels="False">
+              <Ellipse.Effect>
+                <DropShadowEffect Color="#000000" BlurRadius="1.5" ShadowDepth="0.5" Opacity="0.45" Direction="270"/>
+              </Ellipse.Effect>
+            </Ellipse>
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+              <TextBlock Text="[" Foreground="#A0A0AA" FontSize="13" FontWeight="SemiBold"
+                         VerticalAlignment="Center"/>
+              <Grid VerticalAlignment="Center" MaxWidth="140">
+                <TextBlock x:Name="LoginBrandNameShadow" Text="MiniBot" Foreground="#000000"
+                           FontSize="13" FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis" MaxWidth="140"
+                           Margin="1.2,1.2,0,0" Opacity="0.9" IsHitTestVisible="False">
+                  <TextBlock.Effect>
+                    <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="0"
+                                      Opacity="0.85" Direction="0"/>
+                  </TextBlock.Effect>
+                </TextBlock>
+                <TextBlock x:Name="LoginBrandName" Text="MiniBot" Foreground="#B80F0A"
+                           FontSize="13" FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis" MaxWidth="140">
+                  <TextBlock.Effect>
+                    <DropShadowEffect Color="#FF3A1A" BlurRadius="10" ShadowDepth="0"
+                                      Opacity="0.72" Direction="0"/>
+                  </TextBlock.Effect>
+                </TextBlock>
+              </Grid>
+              <TextBlock Text="-" Foreground="#A0A0AA" FontSize="13" FontWeight="SemiBold"
+                         VerticalAlignment="Center"/>
+              <Grid VerticalAlignment="Center">
+                <TextBlock Text="Agent" Foreground="#000000" FontSize="13" FontWeight="SemiBold"
+                           Margin="1.2,1.2,0,0" Opacity="0.9" IsHitTestVisible="False">
+                  <TextBlock.Effect>
+                    <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="0"
+                                      Opacity="0.85" Direction="0"/>
+                  </TextBlock.Effect>
+                </TextBlock>
+                <TextBlock Text="Agent" Foreground="#B80F0A" FontSize="13" FontWeight="SemiBold">
+                  <TextBlock.Effect>
+                    <DropShadowEffect Color="#FF3A1A" BlurRadius="10" ShadowDepth="0"
+                                      Opacity="0.55" Direction="0"/>
+                  </TextBlock.Effect>
+                </TextBlock>
+              </Grid>
+              <TextBlock Text="]" Foreground="#A0A0AA" FontSize="13" FontWeight="SemiBold"
+                         VerticalAlignment="Center"/>
+            </StackPanel>
+            <Grid VerticalAlignment="Center" Margin="12,0,0,0">
+              <TextBlock x:Name="LoginTitleLabelShadow" Text="Login" Foreground="#000000" FontSize="12"
+                         VerticalAlignment="Center" Margin="1.2,1.2,0,0" Opacity="0.9"
+                         IsHitTestVisible="False">
+                <TextBlock.Effect>
+                  <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="0"
+                                    Opacity="0.85" Direction="0"/>
+                </TextBlock.Effect>
+              </TextBlock>
+              <TextBlock x:Name="LoginTitleLabel" Text="Login" Foreground="#C8C8D0" FontSize="12"
+                         VerticalAlignment="Center"/>
+            </Grid>
+          </StackPanel>
+          <Button x:Name="LoginTitleClose" Grid.Column="1" Width="46" Height="36"
+                  Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
+                  Template="{StaticResource NoMouseOverButtonTemplate}" ToolTip="Close">
+            <Path Width="10" Height="10" Stretch="Uniform" Stroke="#C8C8D0" StrokeThickness="1.15"
+                  Data="M0,0 L10,10 M10,0 L0,10" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Button>
+        </Grid>
+      </Border>
+      <Border Grid.Row="1" Background="#121216" Padding="22,18,22,14">
+        <Grid>
+          <!-- Login -->
+          <Grid x:Name="LoginLayer">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="18"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <StackPanel Grid.Row="0">
+              <TextBlock Text="Authentication required" Foreground="#E0E0E8"
+                         FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+              <TextBlock x:Name="AuthSubtitle" Text="" Foreground="#8A8A96" TextWrapping="Wrap"
+                         FontSize="12" Margin="0,0,0,10" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
+              <TextBlock Text="Username" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+              <TextBox x:Name="AuthUser" Height="32" Padding="8,6" Margin="0,0,0,8"
                        Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
                        BorderBrush="#3A3A42" BorderThickness="1"
                        FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
-          <CheckBox x:Name="AuthSaveCreds" Margin="0,0,0,0" Cursor="Hand" Focusable="True"
-                    IsChecked="False" VerticalContentAlignment="Center">
-            <CheckBox.Template>
-              <ControlTemplate TargetType="CheckBox">
-                <StackPanel Orientation="Horizontal" Background="Transparent">
-                  <Border x:Name="Box" Width="13" Height="13" Background="#121216"
-                          BorderBrush="#52525C" BorderThickness="1" CornerRadius="2"
-                          VerticalAlignment="Center" Margin="0,0,8,0">
-                    <Path x:Name="CheckMark" Data="M1.5,6.5 L4.8,10 L11.5,2.5"
-                          Stroke="#9ECE6A" StrokeThickness="1.7" Visibility="Collapsed"
-                          Stretch="None" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                  </Border>
-                  <ContentPresenter VerticalAlignment="Center"/>
-                </StackPanel>
-                <ControlTemplate.Triggers>
-                  <Trigger Property="IsChecked" Value="True">
-                    <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
-                    <Setter TargetName="Box" Property="BorderBrush" Value="#6A6A76"/>
-                    <Setter TargetName="Box" Property="Background" Value="#1A1A1E"/>
-                  </Trigger>
-                  <Trigger Property="IsMouseOver" Value="True">
-                    <Setter TargetName="Box" Property="BorderBrush" Value="#8A8A96"/>
-                  </Trigger>
-                </ControlTemplate.Triggers>
-              </ControlTemplate>
-            </CheckBox.Template>
-            <CheckBox.Content>
-              <TextBlock Text="Save credentials" Foreground="#A0A0AA" FontSize="12"/>
-            </CheckBox.Content>
-          </CheckBox>
-        </StackPanel>
-        <TextBlock x:Name="AuthError" Grid.Row="1" Text="" Foreground="#F7768E" FontSize="11"
-                   TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
-          <Button x:Name="AuthOk" Style="{StaticResource MbAuthPrimaryBtn}"
-                  Content="Sign in" Width="96" Height="30" Margin="0,0,8,0" IsDefault="True"/>
-          <Button x:Name="AuthCancel" Style="{StaticResource MbAuthSecondaryBtn}"
-                  Content="Cancel" Width="88" Height="30" IsCancel="True"/>
-        </StackPanel>
-      </Grid>
-      <!-- CONFIRM LAYER (usually collapsed) -->
-      <Grid x:Name="ConfirmLayer" Visibility="Collapsed">
-        <Grid.RowDefinitions>
-          <RowDefinition Height="Auto"/>
-          <RowDefinition Height="Auto"/>
-          <RowDefinition Height="Auto"/>
-          <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <TextBlock x:Name="ConfirmTitle" Text="Invalid Entry" Foreground="#E0E0E8"
-                   FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
-        <Rectangle x:Name="ConfirmAccentBar" Grid.Row="1" Height="3" Margin="0,0,0,14"
-                   RadiusX="1.5" RadiusY="1.5" Opacity="0.55">
-          <Rectangle.Fill>
-            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
-              <GradientStop Color="#7DCFFF" Offset="0"/>
-              <GradientStop Color="#FFFFFF" Offset="0.5"/>
-              <GradientStop Color="#7DCFFF" Offset="1"/>
-            </LinearGradientBrush>
-          </Rectangle.Fill>
-        </Rectangle>
-        <TextBlock x:Name="ConfirmPrompt" Grid.Row="2" Text="" Foreground="#C8C8D0"
-                   FontSize="13" TextWrapping="Wrap" Margin="0,0,0,18" LineHeight="20"/>
-        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
-          <Button x:Name="ConfirmYes" Style="{StaticResource MbAuthPrimaryBtn}"
-                  Content="Yes" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0" IsDefault="True"/>
-          <Button x:Name="ConfirmNo" Style="{StaticResource MbAuthSecondaryBtn}"
-                  Content="No" MinWidth="88" Height="30" Padding="16,0" IsCancel="True"/>
-        </StackPanel>
-      </Grid>
+              <TextBlock Text="Password" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+              <PasswordBox x:Name="AuthPass" Height="32" Padding="8,6" Margin="0,0,0,6"
+                           Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                           BorderBrush="#3A3A42" BorderThickness="1"
+                           FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
+              <CheckBox x:Name="AuthSaveCreds" Margin="0,0,0,0" Cursor="Hand" Focusable="True"
+                        IsChecked="False" VerticalContentAlignment="Center">
+                <CheckBox.Template>
+                  <ControlTemplate TargetType="CheckBox">
+                    <StackPanel Orientation="Horizontal" Background="Transparent">
+                      <Border x:Name="Box" Width="13" Height="13" Background="#121216"
+                              BorderBrush="#52525C" BorderThickness="1" CornerRadius="2"
+                              VerticalAlignment="Center" Margin="0,0,8,0">
+                        <Path x:Name="CheckMark" Data="M1.5,6.5 L4.8,10 L11.5,2.5"
+                              Stroke="#9ECE6A" StrokeThickness="1.7" Visibility="Collapsed"
+                              Stretch="None" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                      </Border>
+                      <ContentPresenter VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsChecked" Value="True">
+                        <Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+                        <Setter TargetName="Box" Property="BorderBrush" Value="#6A6A76"/>
+                        <Setter TargetName="Box" Property="Background" Value="#1A1A1E"/>
+                      </Trigger>
+                      <Trigger Property="IsMouseOver" Value="True">
+                        <Setter TargetName="Box" Property="BorderBrush" Value="#8A8A96"/>
+                      </Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </CheckBox.Template>
+                <CheckBox.Content>
+                  <TextBlock Text="Save credentials" Foreground="#A0A0AA" FontSize="12"/>
+                </CheckBox.Content>
+              </CheckBox>
+            </StackPanel>
+            <TextBlock x:Name="AuthError" Grid.Row="1" Text="" Foreground="#F05C5C" FontSize="11"
+                       TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
+              <Button x:Name="AuthOk" Style="{StaticResource MbAuthPrimaryBtn}"
+                      Content="Sign in" Width="96" Height="30" Margin="0,0,8,0" IsDefault="True"/>
+              <Button x:Name="AuthCancel" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="Cancel" Width="88" Height="30" IsCancel="True"/>
+            </StackPanel>
+          </Grid>
+          <!-- Confirm -->
+          <Grid x:Name="ConfirmLayer" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock x:Name="ConfirmTitle" Text="Invalid Entry" Foreground="#E0E0E8"
+                       FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+            <Rectangle x:Name="ConfirmAccentBar" Grid.Row="1" Height="3" Margin="0,0,0,14"
+                       RadiusX="1.5" RadiusY="1.5" Opacity="0.55">
+              <Rectangle.Fill>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                  <GradientStop Color="#7DCFFF" Offset="0"/>
+                  <GradientStop Color="#FFFFFF" Offset="0.5"/>
+                  <GradientStop Color="#7DCFFF" Offset="1"/>
+                </LinearGradientBrush>
+              </Rectangle.Fill>
+            </Rectangle>
+            <TextBlock x:Name="ConfirmPrompt" Grid.Row="2" Text="" Foreground="#C8C8D0"
+                       FontSize="13" TextWrapping="Wrap" Margin="0,0,0,18" LineHeight="20"/>
+            <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+              <Button x:Name="ConfirmYes" Style="{StaticResource MbAuthPrimaryBtn}"
+                      Content="Yes" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0" IsDefault="True"/>
+              <Button x:Name="ConfirmNo" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="No" MinWidth="88" Height="30" Padding="16,0" IsCancel="True"/>
+            </StackPanel>
+          </Grid>
+        </Grid>
+      </Border>
     </Grid>
   </Border>
 </Window>
@@ -3105,7 +3180,206 @@ function Start-MBLoginSession {
 			$cYes = $win.FindName('ConfirmYes')
 			$cNo = $win.FindName('ConfirmNo')
 			$cBar = $win.FindName('ConfirmAccentBar')
+			$loginTitleBar = $win.FindName('LoginTitleBar')
+			$loginTitleClose = $win.FindName('LoginTitleClose')
+			$loginTitleLabel = $win.FindName('LoginTitleLabel')
+			$loginTitleLabelShadow = $win.FindName('LoginTitleLabelShadow')
+			$loginBrandName = $win.FindName('LoginBrandName')
+			$loginBrandNameShadow = $win.FindName('LoginBrandNameShadow')
+			try {
+				$an = ''
+				try { $an = [string]$B.AgentName } catch {}
+				if ([string]::IsNullOrWhiteSpace($an)) { $an = 'MiniBot' }
+				if ($loginBrandName) { $loginBrandName.Text = $an }
+				if ($loginBrandNameShadow) { $loginBrandNameShadow.Text = $an }
+			} catch {}
+			$setLoginTitleLabel = {
+				param([string]$Text)
+				try {
+					if ($loginTitleLabel) { $loginTitleLabel.Text = $Text }
+					if ($loginTitleLabelShadow) { $loginTitleLabelShadow.Text = $Text }
+				} catch {}
+			}.GetNewClosure()
+			$loginRobotPath = $win.FindName('LoginRobotPath')
+			$loginRobotHost = $win.FindName('LoginRobotHost')
+			$loginRobotStop0 = $win.FindName('LoginRobotStop0')
+			$loginRobotStop1 = $win.FindName('LoginRobotStop1')
+			$loginRobotStop2 = $win.FindName('LoginRobotStop2')
+			if ((-not $loginRobotStop0 -or -not $loginRobotStop1 -or -not $loginRobotStop2) -and $loginRobotPath) {
+				try {
+					$lrb = $loginRobotPath.Fill
+					if ($lrb -is [System.Windows.Media.LinearGradientBrush] -and $lrb.GradientStops.Count -ge 3) {
+						$loginRobotStop0 = $lrb.GradientStops[0]
+						$loginRobotStop1 = $lrb.GradientStops[1]
+						$loginRobotStop2 = $lrb.GradientStops[2]
+					}
+				} catch {}
+			}
+			$loginRobotDataDefault = 'M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z'
+			$loginRobotDataHappy = 'M22 14H21C21 10.13 17.87 7 14 7H13V5.73C13.6 5.39 14 4.74 14 4C14 2.9 13.11 2 12 2S10 2.9 10 4C10 4.74 10.4 5.39 11 5.73V7H10C6.13 7 3 10.13 3 14H2C1.45 14 1 14.45 1 15V18C1 18.55 1.45 19 2 19H3V20C3 21.11 3.9 22 5 22H19C20.11 22 21 21.11 21 20V19H22C22.55 19 23 18.55 23 18V15C23 14.45 22.55 14 22 14M9.79 16.5C9.4 15.62 8.53 15 7.5 15S5.6 15.62 5.21 16.5C5.08 16.19 5 15.86 5 15.5C5 14.12 6.12 13 7.5 13S10 14.12 10 15.5C10 15.86 9.92 16.19 9.79 16.5M18.79 16.5C18.4 15.62 17.5 15 16.5 15S14.6 15.62 14.21 16.5C14.08 16.19 14 15.86 14 15.5C14 14.12 15.12 13 16.5 13S19 14.12 19 15.5C19 15.86 18.92 16.19 18.79 16.5Z'
+			$setLoginRobotFace = {
+				param([string]$Face = 'default')
+				try {
+					if (-not $loginRobotPath) { return }
+					$face = ([string]$Face).ToLowerInvariant()
+					$data = if ($face -eq 'happy') { $loginRobotDataHappy } else { $loginRobotDataDefault }
+					$loginRobotPath.Data = [System.Windows.Media.Geometry]::Parse($data)
+					$cols = @('#C8C8D0', '#6A6A74', '#3A3A42')
+					$st = @($loginRobotStop0, $loginRobotStop1, $loginRobotStop2)
+					for ($i = 0; $i -lt 3; $i++) {
+						if (-not $st[$i]) { continue }
+						try { $st[$i].Color = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$cols[$i]) } catch {}
+					}
+					$dot = [string][char]0x00B7
+					$tip = if ($face -eq 'happy') { "MiniBot $dot signed in" } else { "MiniBot $dot sign in" }
+					if ($loginRobotHost) { $loginRobotHost.ToolTip = $tip }
+				} catch {}
+			}.GetNewClosure()
+			# Login window icon
+			$toShellIcon = {
+				param($Source)
+				if (-not $Source) { return $null }
+				try {
+					$enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+					[void]$enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($Source))
+					$ms = New-Object System.IO.MemoryStream
+					try {
+						$enc.Save($ms)
+						$ms.Position = 0
+						$frame = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+							$ms,
+							[System.Windows.Media.Imaging.BitmapCreateOptions]::None,
+							[System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+						)
+						if ($frame.CanFreeze) { $frame.Freeze() }
+						return $frame
+					} finally { try { $ms.Dispose() } catch {} }
+				} catch { return $Source }
+			}.GetNewClosure()
+			$setNativeIcon = {
+				param($Window, $BitmapSource)
+				if (-not $Window -or -not $BitmapSource) { return }
+				try {
+					if (-not ('MiniBot.UI.NativeIcon' -as [type])) {
+						Add-Type -Namespace MiniBot.UI -Name NativeIcon -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Auto)]
+public static extern System.IntPtr SendMessage(System.IntPtr hWnd, int Msg, System.IntPtr wParam, System.IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
+public static extern bool DestroyIcon(System.IntPtr hIcon);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
+public static extern System.IntPtr CopyIcon(System.IntPtr hIcon);
+public const int WM_SETICON = 0x0080;
+public const int ICON_SMALL = 0;
+public const int ICON_BIG = 1;
+"@ -ErrorAction Stop
+					}
+					Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+					$enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+					[void]$enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($BitmapSource))
+					$ms = New-Object System.IO.MemoryStream
+					try {
+						$enc.Save($ms)
+						$ms.Position = 0
+						$gdi = [System.Drawing.Bitmap]::FromStream($ms)
+						try {
+							$hIcon = $gdi.GetHicon()
+							try {
+								$helper = New-Object System.Windows.Interop.WindowInteropHelper($Window)
+								$hwnd = $helper.EnsureHandle()
+								if ($hwnd -ne [IntPtr]::Zero) {
+									$hSmall = [MiniBot.UI.NativeIcon]::CopyIcon($hIcon)
+									$hBig = [MiniBot.UI.NativeIcon]::CopyIcon($hIcon)
+									$prevSmall = [MiniBot.UI.NativeIcon]::SendMessage($hwnd, [MiniBot.UI.NativeIcon]::WM_SETICON, [IntPtr][MiniBot.UI.NativeIcon]::ICON_SMALL, $hSmall)
+									$prevBig = [MiniBot.UI.NativeIcon]::SendMessage($hwnd, [MiniBot.UI.NativeIcon]::WM_SETICON, [IntPtr][MiniBot.UI.NativeIcon]::ICON_BIG, $hBig)
+									if ($prevSmall -ne [IntPtr]::Zero) { try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($prevSmall) } catch {} }
+									if ($prevBig -ne [IntPtr]::Zero) { try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($prevBig) } catch {} }
+								}
+							} finally { try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($hIcon) } catch {} }
+						} finally { try { $gdi.Dispose() } catch {} }
+					} finally { try { $ms.Dispose() } catch {} }
+				} catch {}
+			}.GetNewClosure()
+			$renderLoginRobotIcon = {
+				param([string]$Face = 'default', [int]$Size = 64)
+				try {
+					if ($Size -lt 16) { $Size = 16 }
+					$data = if ($Face -eq 'happy') { $loginRobotDataHappy } else { $loginRobotDataDefault }
+					$cols = @('#C8C8D0', '#6A6A74', '#3A3A42')
+					$geom = [System.Windows.Media.Geometry]::Parse($data)
+					$brush = New-Object System.Windows.Media.LinearGradientBrush
+					$brush.StartPoint = New-Object System.Windows.Point(0.15, 0.0)
+					$brush.EndPoint = New-Object System.Windows.Point(0.9, 1.0)
+					for ($ci = 0; $ci -lt 3; $ci++) {
+						$off = @(0.0, 0.48, 1.0)[$ci]
+						$col = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$cols[$ci])
+						[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($col, $off)))
+					}
+					$brush.Freeze()
+					$bgBrush = New-Object System.Windows.Media.SolidColorBrush(([System.Windows.Media.ColorConverter]::ConvertFromString('#252530')))
+					$bgBrush.Freeze()
+					$visual = New-Object System.Windows.Media.DrawingVisual
+					$dc = $visual.RenderOpen()
+					try {
+						$cx = [double]$Size / 2.0
+						$dc.DrawEllipse($bgBrush, $null, (New-Object System.Windows.Point($cx, $cx)), ($cx - 0.5), ($cx - 0.5))
+						$pad = [math]::Max(2.0, [double]$Size * 0.14)
+						$inner = [double]$Size - (2.0 * $pad)
+						$scale = $inner / 24.0
+						$dc.PushTransform((New-Object System.Windows.Media.TranslateTransform($pad, $pad)))
+						$dc.PushTransform((New-Object System.Windows.Media.ScaleTransform($scale, $scale)))
+						$dc.DrawGeometry($brush, $null, $geom)
+						$dc.Pop(); $dc.Pop()
+					} finally { $dc.Close() }
+					$rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(
+						[int]$Size, [int]$Size, 96, 96,
+						[System.Windows.Media.PixelFormats]::Pbgra32
+					)
+					$rtb.Render($visual)
+					return (& $toShellIcon $rtb)
+				} catch { return $null }
+			}.GetNewClosure()
+			$applyLoginWindowIcon = {
+				param([string]$Face = 'default')
+				try {
+					$bmp = & $renderLoginRobotIcon $Face 64
+					if (-not $bmp) { return }
+					$win.Icon = $bmp
+					if (-not $win.TaskbarItemInfo) {
+						$win.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
+					}
+					$win.TaskbarItemInfo.Overlay = $bmp
+					$win.TaskbarItemInfo.Description = $(if ($Ver) { "MiniBot v$Ver" } else { 'MiniBot' })
+					try { & $setNativeIcon $win $bmp } catch {}
+				} catch {}
+			}.GetNewClosure()
+			try { & $setLoginRobotFace 'default' } catch {}
+			try { & $applyLoginWindowIcon 'default' } catch {}
 			if ($sub) { $sub.Text = ("Sign in to access:`n{0}" -f $Hint) }
+			# Titlebar drag and close hover
+			try {
+				if ($loginTitleBar) {
+					$loginTitleBar.add_MouseLeftButtonDown({
+						param($s, $e)
+						try {
+							if ($e.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) { $win.DragMove() }
+						} catch {}
+					}.GetNewClosure())
+				}
+				if ($loginTitleClose) {
+					$bcL = New-Object System.Windows.Media.BrushConverter
+					$loginTitleClose.add_MouseEnter({
+						try { $loginTitleClose.Background = $bcL.ConvertFromString('#E81123') } catch {}
+					}.GetNewClosure())
+					$loginTitleClose.add_MouseLeave({
+						try { $loginTitleClose.Background = [System.Windows.Media.Brushes]::Transparent } catch {}
+					}.GetNewClosure())
+				}
+			} catch {}
+			try {
+				if ($loginTitleLabel -and $confirmLayer) {
+					# keep label in sync when layers swap
+				}
+			} catch {}
 
 			$stopConfirmPulse = {
 				try {
@@ -3139,6 +3413,7 @@ function Start-MBLoginSession {
 					& $stopConfirmPulse
 					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Visible }
+					& $setLoginTitleLabel 'Login'
 					if ($ok) { $ok.IsDefault = $true }
 					if ($cYes) { $cYes.IsDefault = $false }
 					if ($err) { $err.Text = '' }
@@ -3152,6 +3427,7 @@ function Start-MBLoginSession {
 				try {
 					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Visible }
+					& $setLoginTitleLabel 'Confirm'
 					if ($cTitle) {
 						try { $cTitle.Inlines.Clear() } catch {}
 						$cTitle.Text = 'Invalid Entry'
@@ -3198,8 +3474,7 @@ function Start-MBLoginSession {
 			}.GetNewClosure()
 
 			$ok.add_Click({ param($s,$e) try { & $submit } catch {} }.GetNewClosure())
-			$cancel.add_Click({
-				param($s,$e)
+			$doLoginCancel = {
 				try {
 					$B.CredResult = @{
 						User = $null; Pass = $null; Cancelled = $true
@@ -3209,7 +3484,17 @@ function Start-MBLoginSession {
 					try { [void]$B.ConfirmWait.Set() } catch {}
 					try { $win.Close() } catch {}
 				} catch {}
+			}.GetNewClosure()
+			$cancel.add_Click({
+				param($s,$e)
+				try { & $doLoginCancel } catch {}
 			}.GetNewClosure())
+			if ($loginTitleClose) {
+				$loginTitleClose.add_Click({
+					param($s,$e)
+					try { & $doLoginCancel } catch {}
+				}.GetNewClosure())
+			}
 			$pass.add_KeyDown({
 				param($s,$e)
 				try { if ($e.Key -eq 'Return') { $e.Handled = $true; & $submit } } catch {}
@@ -3233,9 +3518,22 @@ function Start-MBLoginSession {
 					if ([string]::IsNullOrWhiteSpace($cmd)) { return }
 					$B.Cmd = ''
 					switch ($cmd) {
-						'show_login' { & $showLogin }
+						'show_login' {
+							try { & $setLoginRobotFace 'default' } catch {}
+							& $showLogin
+						}
 						'show_confirm' {
 							& $showConfirm ([string]$B.ConfirmPrompt) ([string]$B.ConfirmTitle)
+						}
+						'success' {
+							try {
+								$B.AuthOk = $true
+								& $setLoginRobotFace 'happy'
+								try { & $applyLoginWindowIcon 'happy' } catch {}
+								if ($err) { $err.Text = '' }
+								& $setLoginTitleLabel 'Signed in'
+							} catch {}
+							try { $B.RobotSuccessPainted = $true } catch {}
 						}
 						'close' {
 							try { $timer.Stop() } catch {}
@@ -3322,79 +3620,6 @@ function Start-MBLoginSession {
 			}.GetNewClosure())
 
 			try {
-				if (-not ('MiniBot.UI.IconExtractor' -as [type])) {
-					Add-Type -AssemblyName PresentationCore -ErrorAction SilentlyContinue
-					Add-Type -AssemblyName WindowsBase -ErrorAction SilentlyContinue
-					$iconCode = @'
-using System;
-using System.Runtime.InteropServices;
-using System.Windows.Interop;
-using System.Windows.Media.Imaging;
-using System.Windows;
-
-namespace MiniBot.UI
-{
-    public static class IconExtractor
-    {
-        [DllImport("Shell32.dll", EntryPoint = "ExtractIconExW", CharSet = CharSet.Unicode, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
-        private static extern int ExtractIconEx(string sFile, int iIndex, out IntPtr piLargeVersion, out IntPtr piSmallVersion, int amountIcons);
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool DestroyIcon(IntPtr hIcon);
-        public static BitmapSource ExtractBitmapSource(string file, int number, bool largeIcon)
-        {
-            IntPtr large = IntPtr.Zero, small = IntPtr.Zero;
-            ExtractIconEx(file, number, out large, out small, 1);
-            IntPtr use = largeIcon ? large : small;
-            IntPtr other = largeIcon ? small : large;
-            try
-            {
-                if (use == IntPtr.Zero) return null;
-                BitmapSource bmp = Imaging.CreateBitmapSourceFromHIcon(use, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
-                if (bmp != null && bmp.CanFreeze) bmp.Freeze();
-                return bmp;
-            }
-            catch { return null; }
-            finally
-            {
-                if (use != IntPtr.Zero) DestroyIcon(use);
-                if (other != IntPtr.Zero) DestroyIcon(other);
-            }
-        }
-    }
-}
-'@
-					$refs = @()
-					foreach ($name in @('PresentationCore', 'WindowsBase', 'PresentationFramework', 'System.Xaml')) {
-						try {
-							$a = [Reflection.Assembly]::LoadWithPartialName($name)
-							if ($a -and $a.Location) { $refs += $a.Location }
-						} catch {}
-					}
-					if ($refs.Count -gt 0) {
-						Add-Type -TypeDefinition $iconCode -ReferencedAssemblies $refs -ErrorAction Stop
-					} else {
-						Add-Type -TypeDefinition $iconCode -ErrorAction Stop
-					}
-				}
-				$sys = $env:SystemRoot
-				if ([string]::IsNullOrWhiteSpace($sys)) { $sys = 'C:\Windows' }
-				$iconFile = Join-Path $sys 'System32\compstui.dll'
-				$bmp = [MiniBot.UI.IconExtractor]::ExtractBitmapSource($iconFile, 11, $true)
-				if (-not $bmp) { $bmp = [MiniBot.UI.IconExtractor]::ExtractBitmapSource($iconFile, 11, $false) }
-				if ($bmp) {
-					$win.Icon = $bmp
-					try {
-						# TaskbarItemInfo.Overlay: show titlebar icon on the taskbar button
-						if (-not $win.TaskbarItemInfo) {
-							$win.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
-						}
-						$win.TaskbarItemInfo.Overlay = $bmp
-						$win.TaskbarItemInfo.Description = $(if ($Ver) { "MiniBot v$Ver" } else { 'MiniBot' })
-					} catch {}
-				}
-			} catch {}
-
-			try {
 				if (-not ("MB.Native.Dwm" -as [type])) {
 					Add-Type -Namespace MB.Native -Name Dwm -MemberDefinition @"
 [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
@@ -3432,7 +3657,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 
 			$B.Ready = $true
 			try { [void]$B.ReadyWait.Set() } catch {}
-			# Keep login window topmost for its lifetime
+			# Keep login window topmost
 			try { $win.Topmost = $true } catch {}
 			[void]$win.Show()
 			try {
@@ -3470,7 +3695,10 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 }
 
 function Close-MBLoginSession {
-	param($Session = $null)
+	param(
+		$Session = $null,
+		[switch]$Success
+	)
 	if ($null -eq $Session) {
 		try { $Session = $script:MB.LoginSession } catch { $Session = $null }
 	}
@@ -3479,6 +3707,19 @@ function Close-MBLoginSession {
 		try { [void]$Session.CredWait.Set() } catch {}
 		try { [void]$Session.ConfirmWait.Set() } catch {}
 		if (-not [bool]$Session.Closed) {
+			# Show happy robot briefly before close
+			if ($Success) {
+				try {
+					$Session.AuthOk = $true
+					$Session.RobotSuccessPainted = $false
+					$Session.Cmd = 'success'
+					$t0 = [Environment]::TickCount
+					while (-not [bool]$Session.RobotSuccessPainted -and (([Environment]::TickCount - $t0) -lt 1000)) {
+						Start-Sleep -Milliseconds 30
+					}
+					Start-Sleep -Milliseconds 450
+				} catch {}
+			}
 			$Session.Cmd = 'close'
 			# Short wait for STA to shut down; always force-stop after
 			[void]$Session.Done.WaitOne(2000)
@@ -3541,17 +3782,6 @@ function Show-MBLoginSessionConfirm {
 		if ($Session.ConfirmWait.WaitOne(50)) { break }
 	}
 	try { return [bool]$Session.ConfirmResult } catch { return $false }
-}
-
-function Show-MBStandaloneLoginDialog {
-	param([string]$ServerHint = '')
-	$sess = Start-MBLoginSession -ServerHint $ServerHint
-	try {
-		$r = Wait-MBLoginSessionCred -Session $sess
-		return $r
-	} finally {
-		Close-MBLoginSession -Session $sess
-	}
 }
 
 function Read-MBCredentialPrompt {
@@ -3880,7 +4110,7 @@ function Connect-MBModelEndpoint {
 		$connTest = Test-ModelConnection @testParams
 
 		if ($connTest.Success) {
-			# Persist creds after accept: login checkbox or -StoreCredentials / store=1
+			# Persist credentials when requested
 			$doStore = $wantStore
 			try {
 				if ($entered.StoreSpecified) { $doStore = [bool]$entered.Store }
@@ -3893,7 +4123,7 @@ function Connect-MBModelEndpoint {
 				$script:MB_StoreCredsFromEnv = $false
 				$wantStore = $false
 			}
-			try { Close-MBLoginSession } catch {}
+			try { Close-MBLoginSession -Success } catch {}
 			return @{ Success = $true; ConnTest = $connTest; Exit = $false }
 		}
 
@@ -4045,6 +4275,7 @@ function Test-IsSafeCommand {
 	if ($trimmed -match '[\r\n]') { return $false }
 	if ($trimmed -match '`') { return $false }
 	if ($trimmed -match '\$\(') { return $false }
+	# Here-strings (@' / @") and hashtables (@{) — single-quoted pattern avoids ` escapes breaking []
 	if ($trimmed -match '@[''"]|@\{') { return $false }
 	if ($trimmed -match ';') { return $false }
 	if ($trimmed -match '&&|\|\|') { return $false }
@@ -4951,44 +5182,52 @@ function New-MBChatRequestBody {
 # Capability map kept short for cold-start token cost.
 # Cold-start group map. Model enables groups by these names.
 $script:MBGroupQuickMap = [ordered]@{
-	vision    = 'pdf/image/screenshot: ReadImage, ReadPdf, ViewScreen'
-	system    = 'OS inventory: processes, ports, services, disk, BSOD, events, software'
-	repair    = 'RunQuickDiagnostics; RunRepairTool sfc|dism|chkdsk'
-	setup     = 'tune PC + user/domain(join|leave)/drive/printer/share + NewMachineSetup'
-	installers = 'silent download/install catalog: 7zip, chrome, adobe, adwcleaner, vlc'
-	sandbox   = 'multi-step PS lab (SandBoxWrite/SandBox pieces)'
-	files     = 'DownloadFile; zip ExpandArchive/CompressArchive'
-	packages  = 'PS Gallery Find/Install/Update modules'
-	registry  = 'ReadRegistry / SetRegistry'
-	clipboard = 'Clipboard read/write'
-	web       = 'HTTP MakeHttpRequest; BrowsePage; GitHub raw/list'
-	speech    = 'SpeakText TTS'
+	senses     = 'see/hear: ReadImage, ReadPdf, ViewScreen, SpeakText'
+	system     = 'light inventory: OS, processes, memory, services, software, uptime'
+	network    = 'LAN, ProbeShares, local shares/maps list, printers list'
+	diag       = 'BSOD, events, disk, startup/tasks/drivers, StopProcess, quick diagnostics'
+	repair     = 'RunRepairTool sfc|dism|chkdsk'
+	setup      = 'tune/restore/reboot/NewMachineSetup'
+	identity   = 'local users, join/leave domain'
+	shares     = 'map/unmap, create/remove share, add/remove printer'
+	installers = 'silent install catalog'
+	sandbox    = 'multi-step PS lab'
+	files      = 'DownloadFile; zip expand/compress'
+	packages   = 'PS Gallery modules'
+	registry   = 'ReadRegistry / SetRegistry'
+	clipboard  = 'Clipboard read/write'
+	web        = 'HTTP; BrowsePage; GitHub'
 }
+
 
 $script:MBSystemPromptBase = @"
 You are $AgentName v$Version - local Windows agent (local model). Tool-first co-pilot: ship scripts, edit files, diagnose, verify with tools.
 Rules: evidence-only (never invent results/paths/status); concise (findings + next steps); PS 5.1 only; paths relative to CWD unless absolute; large files use head/tail/offset+length - never dump multi-MB/binary/.dmp.
+DATA is paramount: never delete or destroy anything (files, folders, profiles, users, shares, maps, printers, etc.) unless the operator explicitly asked to delete that specific thing — never as cleanup, tidy-up, or a helpful side effect. RemoveLocalUser removes the account only; profile data stays. RemoveShare unpublishes only; folder stays.
 Mutate only after read when possible; operator may deny - stop that action, never bypass. Identical tool+args in a row is blocked - change args/tool or synthesize.
 Harness: if a tool parse/return looks wrong (error text, empty/garbled/malformed payload) - or the same failure hits 2+ times - tell the operator immediately (what broke + short evidence + a fix idea if obvious). Trust the tool output; do not re-run or thrash in silence.
-TOOL GROUPS: Only tools in active groups appear in your tool list. core is always on. On every new user task, re-check which groups you need (task may differ from what is already enabled) and EnableToolGroup any missing ones before you work — one call can unlock several (group=setup,system or groups=[setup,system]). Need something else mid-task? EnableToolGroup once (multi ok), then call the real tools in the same turn - no ask, no ListToolGroups, no narration. Prefer specialized tools over RunCommand.
+TOOL GROUPS: Only tools in active groups appear in your tool list. core is always on. On every new user task, re-check which groups you need (task may differ from what is already enabled) and EnableToolGroup any missing ones before you work — one call can unlock several (group=network,shares or groups=[diag,repair]). Need something else mid-task? EnableToolGroup once (multi ok), then call the real tools in the same turn - no ask, no ListToolGroups, no narration. Prefer specialized tools over RunCommand.
 MAP (group = when to enable):
-vision = pdf/image/screenshot (ReadImage, ReadPdf page=1 first, ViewScreen)
-system = processes/ports/services/disk/BSOD/events/software inventory; ScanNetwork; ProbeShares
-repair = RunQuickDiagnostics, sfc/dism/chkdsk
-setup = volume/brightness/explorer/power/F8 boot/UAC/restore/uninstall; AddLocalUser; JoinDomain; LeaveDomain; MapNetworkDrive; AddNetworkPrinter; CreateShare; NewMachineSetup residential|business
-installers = silent app installs: ListInstallers / InstallPackage (7zip, chrome, adobe, adwcleaner, vlc, gotoassist)
+senses = see/hear: ReadImage, ReadPdf (page=1 first), ViewScreen, SpeakText TTS
+system = light inventory: GetSystemInfo, processes, memory, services, software, uptime
+network = LAN, ProbeShares, GetLocalShares/GetMappedDrives/GetPrinters (lists), connections
+diag = BSOD, events, disk health/space, startup/tasks/drivers, StopProcess, RunQuickDiagnostics
+repair = sfc/dism/chkdsk only
+setup = volume/brightness/options/restore/uninstall/reboot/NewMachineSetup
+identity = AddLocalUser/RemoveLocalUser, JoinDomain/LeaveDomain
+shares = Map/Unmap, CreateShare/RemoveShare, Add/Remove printer
+installers = ListInstallers / InstallPackage
 sandbox = multi-step PowerShell lab pieces
 files = DownloadFile, zip expand/compress
 packages = PowerShell Gallery modules
 registry = registry read/write
 clipboard = clipboard read/write
 web = HTTP API, BrowsePage, GitHub files
-speech = SpeakText TTS
 SHARE PLAYBOOK (mandatory tools — do not invent shell loops):
-- User asks to find/locate/discover a network share (or "who has temp share") → EnableToolGroup groups=[system,setup] then call ProbeShares (same turn). Do not answer from guesswork; do not RunCommand net view / Get-SmbShare / New-CimSession / foreach Test-Path \\host\...
-- Know the machine IP/name → ProbeShares computer=IP share_name=NAME (and username/password if operator gave them). Do not know which PC → ProbeShares with hosts omitted (auto LAN search) + share_name if given.
-- Optional ScanNetwork first only if you also need MAC/hostname/vendor inventory; for "find the share" ProbeShares alone is enough.
-- Found (found_uncs / hosts_with_match) → MapNetworkDrive path=\\IP\share letter=Z username=... password=... (setup group). Creating a share on THIS PC → CreateShare (not ProbeShares).
+- Find/locate a share → EnableToolGroup groups=[network,shares] then ProbeShares (same turn). No RunCommand net view / Get-SmbShare loops.
+- Known IP → ProbeShares computer=IP share_name=NAME [username= password=]. Unknown host → ProbeShares share_name=NAME (auto search).
+- Optional ScanNetwork only if you need MAC/hostname/vendor inventory; for "find the share" ProbeShares alone.
+- Found → MapNetworkDrive (shares group). Create local share → CreateShare (shares). List local → GetLocalShares (network).
 User-facing text = results and next steps only - never announce enabling tools.
 "@
 
@@ -4998,28 +5237,45 @@ CORE (always on): ReadFile/WriteFile/EditFile/ApplyPatch/ListDirectory/SearchFil
 Edit: EditFile unique search (or occurrence/replaceAll); ApplyPatch multi-hunk; WriteFile only new/full rewrite. Preserve encoding/newlines. On miss: re-read, never invent nearby text.
 RunCommand: runs command text in-process via -EncodedCommand (no outer expansion) or cmd /c - full PS 5.1 syntax works (pipeline `$_, escapes, multi-statement, env vars). Prefer specialized tools over shell. Safe read-only auto-runs; nested shells/writers/downloads/sfc|dism|chkdsk/multi-statement/redirect always prompt. shell=powershell (default) or cmd. Pass the command exactly as you would type it in a .ps1 - do not pre-escape for an outer host.
 "@
-	vision = @"
-VISION: ReadImage path= (vision next turn). ReadPdf: default page=1 only - multipage render is expensive; do not page through a PDF unless the user asks for later pages, full doc, or a page the first pass cannot answer. Text extract when clean; auto page-render vision if empty/garbled/CID (still page 1 unless page=N). render=true forces vision. ViewScreen no approval - look only, or save=true/path= (report exact path). Trust vision over garbled PDF text. Do not spam captures or multi-page ReadPdf loops.
+	senses = @"
+SENSES (see + speak): ReadImage path= (vision next turn). ReadPdf: default page=1 only - multipage render is expensive; only page>1 if needed. Text extract when clean; auto vision if garbled. ViewScreen: look-only by default (no PNG unless user asked to save). SpeakText: short plain sentences (Windows SAPI). Operator hold-to-talk is Right-Ctrl only. Trust vision over garbled PDF text; do not spam captures or multi-page ReadPdf loops.
 "@
 	system = @"
-SYSTEM: inventory via GetSystemInfo, GetProcessList/Tree, GetMemoryInfo, GetNetworkInfo, GetLocalShares (this PC shares + who has access), GetMappedDrives (letter->UNC maps), ScanNetwork, ProbeShares, GetNetConnections, GetDiskSpace/Health, GetServiceStatus, ControlService (prompt), GetPowerInfo, GetStartupItems, GetInstalledSoftware, GetDriverInfo, GetWindowsUpdateStatus, GetScheduledTasks, GetBSODInfo, GetEventLogs, GetSystemUptime.
-LAN / SHARES — use tools, not shell:
-- Find/locate a share on the network → call ProbeShares immediately (after EnableToolGroup system if needed). NEVER RunCommand for share discovery (net view, Get-SmbShare, New-CimSession, Test-Path \\host\... loops hang or lie).
-- Known IP/hostname → ProbeShares computer=<ip> share_name=<name> [username= password=]. Unknown host → ProbeShares share_name=<name> with hosts omitted (auto search). Multiple known IPs → hosts=[...].
-- ScanNetwork = peer inventory (IP/MAC/hostname/vendor) when useful; not a substitute for ProbeShares when the ask is "find the share".
-- After ProbeShares hits (found_uncs / hosts_with_match) → EnableToolGroup setup if needed → MapNetworkDrive (do not invent mapping via net use in RunCommand unless MapNetworkDrive failed).
-Prefer specialized tools over ad-hoc shell. Never RunCommand Get-ComputerInfo (slow, huge, truncates) - use GetSystemInfo or targeted Get-CimInstance Win32_*.
+SYSTEM (light inventory): GetSystemInfo, GetProcessList/Tree, GetMemoryInfo, GetPowerInfo, GetServiceStatus, ControlService (prompt), GetInstalledSoftware, GetWindowsUpdateStatus, GetSystemUptime.
+Prefer these over Get-ComputerInfo or broad shell inventory. For LAN/shares use network group; for BSOD/events/disk/startup/kill use diag; for sfc/dism/chkdsk use repair.
+"@
+	network = @"
+NETWORK: GetNetworkInfo, GetNetConnections, ScanNetwork, ProbeShares, GetLocalShares (this PC + access), GetMappedDrives, GetPrinters (lists only).
+- Find/locate a share → ProbeShares immediately (EnableToolGroup network if needed). NEVER RunCommand for share discovery.
+- Known host → ProbeShares computer=<ip> share_name=<name> [username= password=]. Unknown → omit hosts (auto search).
+- ScanNetwork = peer inventory (IP/MAC/hostname/vendor); not a substitute for ProbeShares when the ask is find the share.
+- After hits → EnableToolGroup shares → MapNetworkDrive. Mutate shares/printers with shares group (CreateShare/RemoveShare/Map/Unmap/Add/Remove printer).
+"@
+	diag = @"
+DIAG (diagnostics): GetBSODInfo, GetEventLogs, GetDiskHealth, GetDiskSpace, GetStartupItems, GetScheduledTasks, GetDriverInfo, StopProcess (ALWAYS approval; never MiniBot/system processes), RunQuickDiagnostics (bundle).
+- BSOD: GetBSODInfo + GetEventLogs first; list dump names/sizes only — never ReadAllBytes on .dmp.
+- Persistence / "what's running weird": startup + scheduled tasks + drivers; StopProcess only if operator asked to kill.
+- Disk full / dying drive: GetDiskSpace + GetDiskHealth. Repair tools (sfc/dism/chkdsk) are in repair group.
 "@
 	repair = @"
-REPAIR: RunQuickDiagnostics for a quick bundle. RunRepairTool sfc|dism|chkdsk always prompts. BSOD: GetBSODInfo+GetEventLogs first; list dump names/sizes only - never ReadAllBytes on .dmp.
+REPAIR: RunRepairTool sfc|dism|chkdsk ALWAYS prompts. Prefer diag first for BSOD/events/disk evidence. Never dump .dmp binaries.
 "@
 	setup = @"
-SETUP (Windows tune / new-machine settings):
-- AudioVolume / DisplayBrightness / SetWindowsOption / SystemRestore / UninstallSoftware for one-off tweaks (always prompt on mutate).
-- AddLocalUser (local account; optional admin group). JoinDomain (domain + credentials; optional OU/reboot). LeaveDomain (workgroup leave; ALWAYS verifies a local admin password first via dropdown — if none/can't auth, offers create; refuse create = decline leave to prevent lockout).
-- SHARES: GetLocalShares = list shares on THIS PC + access (who has share/NTFS rights). GetMappedDrives = list letter->UNC maps on THIS PC. CreateShare = publish a folder here. MapNetworkDrive = connect to \\server\share (letter + path; pass username/password when known). Finding a remote share first is ProbeShares (system group), then MapNetworkDrive here - do not RunCommand net use unless the tool fails.
-- AddNetworkPrinter (\\server\share; optional default). CreateShare path= folder + name=: local user share; pass share_password when operator already gave it (no re-prompt); omit only if none given. SMBv1 check/ask if off. Always prompt on mutate.
-- NewMachineSetup profile=residential|business: one approval for SETTINGS + profile SOFTWARE. Shared settings (restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off). If the machine is portable, recommend re-enabling encryption after setup (especially business). Software: both 7zip/Chrome/Adobe/ADWCleaner; residential +VLC; business +GoToAssist + Avast portal. skip_software=true for settings-only. dry_run=true previews.
+SETUP (tune / new-machine): AudioVolume, DisplayBrightness, SetWindowsOption, ListWindowsOptions, SystemRestore, UninstallSoftware, Reboot, NewMachineSetup.
+- Tweaks always prompt on mutate. Reboot action=reboot|shutdown|abort; delay_sec=60 default; ALWAYS approval.
+- NewMachineSetup profile=residential|business: one approval for SETTINGS + full SOFTWARE catalog (7zip, Chrome, Adobe, ADWCleaner, VLC). Portable: re-enable encryption after setup if needed.
+- Users/domain → identity group. Map/share/printer mutate → shares group. Install apps → installers group.
+"@
+	identity = @"
+IDENTITY: AddLocalUser (optional admin=true), RemoveLocalUser username= (account only — profile folder remains), JoinDomain, LeaveDomain.
+- LeaveDomain REQUIRED local_username + local_password (chat, no popup). NEED_INPUT if missing. No local admin → AddLocalUser admin=true first.
+- Show passwords back when the operator provides them. Always prompt on mutate.
+"@
+	shares = @"
+SHARES (mutate network shares/maps/printers): MapNetworkDrive, RemoveMappedDrive, CreateShare, RemoveShare, AddNetworkPrinter, RemoveNetworkPrinter.
+- CreateShare REQUIRES path, name, access_username, access_password, everyone_full (ALWAYS ask Everyone vs specific user). Optional access_right Full|Change|Read. RemoveShare unpublishes only (folder stays). Map needs path; username ⇒ password. No cred popups — NEED_INPUT.
+- Lists are network group: GetLocalShares / GetMappedDrives / GetPrinters. Find remote → ProbeShares (network) then Map here.
+- VERIFY after mutate with operator_card. CreateShare copies UNC; show share password back. SMBv1 check if off. Always approval on mutate.
 "@
 	installers = @"
 INSTALLERS (silent download+install, temp files cleaned after each package):
@@ -5043,9 +5299,6 @@ CLIPBOARD: Clipboard action=read|write (always prompts).
 	web = @"
 WEB: MakeHttpRequest for HTTP API/status/body; BrowsePage for readable page text; GetGitHubRawFile / ListGitHubDirectory for github.com (ConvertGitHubUrl optional). Do not use MakeHttpRequest as a file downloader - enable files + DownloadFile.
 "@
-	speech = @"
-SPEECH: SpeakText short plain sentences (Windows SAPI). Operator hold-to-talk is Right-Ctrl only.
-"@
 }
 
 function Get-MBSystemPrompt {
@@ -5064,7 +5317,7 @@ function Get-MBSystemPrompt {
 	}
 	if (-not $activeSet.ContainsKey('core')) { $activeSet['core'] = $true }
 
-	$order = @('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')
+	$order = @('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web')
 	$onList = New-Object System.Collections.ArrayList
 	$offBits = New-Object System.Collections.ArrayList
 	foreach ($g in $order) {
@@ -5107,13 +5360,14 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "SetEnvironment"; description = "Set an environment variable. Process scope is immediate (no prompt). User/Machine scopes ALWAYS prompt. Use target=Process|User|Machine."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; value = @{ type = "string" }; target = @{ type = "string"; description = "Process (default) | User | Machine" } }; required = @("name","value") } } },
 	@{ type = "function"; function = @{ name = "GetSystemInfo"; description = "Basic system information as JSON (OS/CPU/RAM/IPs). Prefer over Get-ComputerInfo or broad inventory shells."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetProcessList"; description = "Top processes by CPU as JSON."; parameters = @{ type = "object"; properties = @{ limit = @{ type = "integer" } } } } },
+	@{ type = "function"; function = @{ name = "StopProcess"; description = "Stop one or more processes. ALWAYS approval. Prefer pid= from GetProcessList; or name= ProcessName (without .exe). force=true (default) uses Force. Never kills MiniBot itself or protected system processes (csrss, lsass, services, smss, wininit, winlogon, System, svchost, dwm, ...). Prefer over taskkill in RunCommand."; parameters = @{ type = "object"; properties = @{ pid = @{ type = "integer"; description = "Process id (preferred)" }; process_id = @{ type = "integer"; description = "Alias for pid" }; name = @{ type = "string"; description = "ProcessName without .exe (may match multiple)" }; force = @{ type = "boolean"; description = "Force kill (default true)" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetProcessTree"; description = "Process parent/child tree (pid, ppid, name, depth). Optional root_pid to start from one process."; parameters = @{ type = "object"; properties = @{ root_pid = @{ type = "integer"; description = "Start from this PID (0 = all roots)" }; max_depth = @{ type = "integer"; description = "Max tree depth (default 6)" }; max_nodes = @{ type = "integer"; description = "Cap nodes returned (default 200)" } } } } },
 	@{ type = "function"; function = @{ name = "GetNetConnections"; description = "TCP connections/listeners (local/remote address:port, state, pid, process). Like netstat."; parameters = @{ type = "object"; properties = @{ state = @{ type = "string"; description = "Filter e.g. Listen, Established" }; port = @{ type = "integer"; description = "Filter by local or remote port" }; max = @{ type = "integer"; description = "Max rows (default 100)" } } } } },
 	@{ type = "function"; function = @{ name = "FindFiles"; description = "Find files by name glob + metadata (modified within N days, size). For content search use SearchFiles."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Root folder (default agent CWD)" }; glob = @{ type = "string"; description = "Name filter e.g. *.ps1 (default *)" }; modified_within_days = @{ type = "integer"; description = "Only files modified in last N days (0 = no filter)" }; min_bytes = @{ type = "integer" }; max_bytes = @{ type = "integer" }; recursive = @{ type = "boolean"; description = "Recurse subfolders (default false)" }; max = @{ type = "integer"; description = "Max results (default 100)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "ReadImage"; description = "Load an image file for vision (next model reply can see it). png/jpg/gif/bmp/tif/webp. Optional maxWidth downscale for vision (default 1280). No approval."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxWidth = @{ type = "integer"; description = "Vision max width px (default 1280)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "ReadPdf"; description = "Read a PDF (cheap path first). Default page=1 only - multipage vision is expensive; only set page>1 or call again for other pages if the user needs them or page 1 is insufficient. Extracts text when clean; if empty/garbled, auto-renders that one page into vision. render=true forces vision; maxWidth downscales vision."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxChars = @{ type = "integer"; description = "Max text chars (default 50000)" }; page = @{ type = "integer"; description = "1-based page for vision render (default 1). Prefer 1 unless user needs another page." }; render = @{ type = "boolean"; description = "Force page render to vision even if text looks fine" }; autoVision = @{ type = "boolean"; description = "Auto-render when text empty/garbled (default true)" }; maxWidth = @{ type = "integer"; description = "Vision max width px (default 1280)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "Clipboard"; description = "Read or write clipboard text. Always requires approval."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; enum = @("read","write") }; text = @{ type = "string" } }; required = @("action") } } },
-	@{ type = "function"; function = @{ name = "ViewScreen"; description = "Look at the desktop and/or save a PNG. NO approval. Looking: omit save/path, then describe what you see. Screenshot file: save=true (Desktop default) or path=file|folder. After save, your reply MUST include the full path returned. monitor: primary|all|0|1|... Vision model required to describe."; parameters = @{ type = "object"; properties = @{ save = @{ type = "boolean"; description = "true = write PNG (Desktop if no path). false/omit = look only." }; path = @{ type = "string"; description = "Where to save: full file path, or folder (auto filename). Implies save. Empty + save=true → Desktop." }; monitor = @{ type = "string"; description = "primary | all | 0-based monitor index" }; x = @{ type = "integer" }; y = @{ type = "integer" }; width = @{ type = "integer" }; height = @{ type = "integer" }; maxWidth = @{ type = "integer"; description = "Vision downscale max width (default 1280); disk save is always full-res" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ViewScreen"; description = "Look at the desktop for vision (MemoryStream base64; NO file by default). NO approval. DEFAULT: omit save and path - capture stays in memory for the next model turn only. ONLY set save=true or path= when the user explicitly wants a PNG on disk. After a disk save, reply with the exact path. monitor: primary|all|0|1|... Do not save screenshots unprompted."; parameters = @{ type = "object"; properties = @{ save = @{ type = "boolean"; description = "Write PNG to disk. Default false = memory only. true without path = Desktop. Only when user asked to save." }; path = @{ type = "string"; description = "Disk save path (file or folder). Implies save. Only when user asked for a file. Omit for look-only." }; monitor = @{ type = "string"; description = "primary | all | 0-based monitor index" }; x = @{ type = "integer" }; y = @{ type = "integer" }; width = @{ type = "integer" }; height = @{ type = "integer" }; maxWidth = @{ type = "integer"; description = "Vision downscale max width (default 1280); disk save (if any) is full-res" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetBSODInfo"; description = "Recent BSOD/minidump info + related events."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetEventLogs"; description = "Recent errors/warnings + disk I/O events."; parameters = @{ type = "object"; properties = @{ hours = @{ type = "integer" } } } } },
 	@{ type = "function"; function = @{ name = "GetDiskHealth"; description = "Physical disk health + SMART counters."; parameters = @{ type = "object"; properties = @{} } } },
@@ -5123,10 +5377,12 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetMemoryInfo"; description = "RAM usage + top consumers."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetNetworkInfo"; description = "Adapters + connectivity test."; parameters = @{ type = "object"; properties = @{} } } },
-@{ type = "function"; function = @{ name = "GetLocalShares"; description = "List SMB shares published on THIS PC (not remote discovery). Read-only. Returns share name, path, and who has access: share_access / access_summary (share ACL via Get-SmbShareAccess) plus optional ntfs_access on the folder. Special shares (C$, ADMIN$, IPC$) omitted unless include_special=true. include_ntfs=false for share ACL only. For remote shares use ProbeShares; to create use CreateShare."; parameters = @{ type = "object"; properties = @{ include_special = @{ type = "boolean"; description = "Include admin/special shares ending in $ (default false)" }; include_ntfs = @{ type = "boolean"; description = "Include NTFS ACL on share path (default true)" }; max = @{ type = "integer"; description = "Max shares (default 80)" } } } } },
-@{ type = "function"; function = @{ name = "GetMappedDrives"; description = "List network drive mappings on THIS PC (letter -> UNC, status). Read-only. Combines Get-SmbMapping, PSDrive, net use. include_disconnected=false to hide Unavailable. Not for finding remote shares (ProbeShares) or mapping (MapNetworkDrive)."; parameters = @{ type = "object"; properties = @{ include_disconnected = @{ type = "boolean"; description = "Include Unavailable/Disconnected maps (default true)" } } } } },
-	@{ type = "function"; function = @{ name = "ScanNetwork"; description = "Scan the local LAN for machines and identify them (IP, MAC, hostname, MAC vendor). Harness-native (illsk1lls/IPScanner, no GUI). Discovery: active=true (default) uses fast flood-ping — Test-Connection -Count 1 -AsJob for the whole subnet at once then Wait-Job (same speed path as IPScanner). Then ARP/neighbors + SendARP MAC discovery (required for vendor OUI), reverse DNS, macvendorlookup. active=false = ARP only (quieter). Default auto primary private /24. Returns sorted hosts."; parameters = @{ type = "object"; properties = @{ subnet = @{ type = "string"; description = "Optional CIDR or prefix e.g. 192.168.1.0/24 or 192.168.1. (default auto)" }; active = @{ type = "boolean"; description = "Flood-ping subnet then ARP/MAC resolve (default true). false = neighbors only" }; resolve_mac = @{ type = "boolean"; description = "SendARP MAC discovery for IPs missing MAC (default true; required for vendors)" }; resolve_hostnames = @{ type = "boolean"; description = "Reverse DNS (default true)" }; resolve_vendors = @{ type = "boolean"; description = "MAC OUI vendor lookup (default true; needs internet + MAC)" }; timeout_ms = @{ type = "integer"; description = "Wait-Job timeout budget ms for flood (default 4000 effective floor)" }; max_hosts = @{ type = "integer"; description = "Max addresses to flood-ping (default 254, max 1022)" } }; required = @() } } },
-@{ type = "function"; function = @{ name = "ProbeShares"; description = "REQUIRED tool when the user asks to find/locate/discover a network share (or which PC has a named share). Do not use RunCommand. TARGETED: computer=IP or hosts=['IP'] only those machines. SEARCH: omit hosts = auto LAN flood then probe. Then TCP 445/139 + timed net use guess (share_name=temp or common names). Optional username/password; access-denied still means share exists. Returns found_uncs/hosts_with_match — next call MapNetworkDrive (setup group). Not for creating shares (use CreateShare)."; parameters = @{ type = "object"; properties = @{ hosts = @{ type = "array"; items = @{ type = "string" }; description = "Known host IPs (targeted). Omit for auto LAN search." }; computer = @{ type = "string"; description = "Single known host (targeted)" }; share_name = @{ type = "string"; description = "Share name to try first e.g. temp" }; share_names = @{ type = "array"; items = @{ type = "string" }; description = "Extra share names to try" }; username = @{ type = "string"; description = "Optional HOST\\share for probe" }; password = @{ type = "string"; description = "Optional password for probe" }; port_timeout_ms = @{ type = "integer"; description = "TCP timeout ms (default 300)" }; probe_timeout_sec = @{ type = "integer"; description = "net use timeout sec per guess (default 3)" }; stop_on_first_match = @{ type = "boolean"; description = "Stop after first hit (default false)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "GetLocalShares"; description = "List SMB shares published on THIS PC (not remote discovery). Read-only. Returns share name, path, and who has access: share_access / access_summary (share ACL via Get-SmbShareAccess) plus optional ntfs_access on the folder. Special shares (C$, ADMIN$, IPC$) omitted unless include_special=true. include_ntfs=false for share ACL only. For remote shares use ProbeShares; to create use CreateShare; to unpublish use RemoveShare."; parameters = @{ type = "object"; properties = @{ include_special = @{ type = "boolean"; description = "Include admin/special shares ending in $ (default false)" }; include_ntfs = @{ type = "boolean"; description = "Include NTFS ACL on share path (default true)" }; max = @{ type = "integer"; description = "Max shares (default 80)" } } } } },
+	@{ type = "function"; function = @{ name = "GetMappedDrives"; description = "List network drive mappings on THIS PC (letter -> UNC, status). Read-only. Combines Get-SmbMapping, PSDrive, net use. include_disconnected=false to hide Unavailable. Not for finding remote shares (ProbeShares) or mapping (MapNetworkDrive). To disconnect use RemoveMappedDrive (setup group)."; parameters = @{ type = "object"; properties = @{ include_disconnected = @{ type = "boolean"; description = "Include Unavailable/Disconnected maps (default true)" } } } } },
+	@{ type = "function"; function = @{ name = "GetPrinters"; description = "List printers on THIS PC (local + network connections). Read-only. Returns name, port, driver, default, shared. Use RemoveNetworkPrinter to remove; AddNetworkPrinter to add a UNC printer."; parameters = @{ type = "object"; properties = @{ include_remote = @{ type = "boolean"; description = "Include network/UNC printers (default true)" }; max = @{ type = "integer"; description = "Max rows (default 80)" } } } } },
+	@{ type = "function"; function = @{ name = "ScanNetwork"; description = "Scan the local LAN for machines and identify them (IP, MAC, hostname, MAC vendor). Harness-native LAN discovery (no GUI). Discovery: active=true (default) uses fast flood-ping — Test-Connection -Count 1 -AsJob for the whole subnet at once then Wait-Job. Then ARP/neighbors + SendARP MAC discovery (required for vendor OUI), reverse DNS, macvendorlookup. active=false = ARP only (quieter). Default auto primary private /24. Returns sorted hosts. To find which hosts export a share, call ProbeShares next (not RunCommand)."; parameters = @{ type = "object"; properties = @{ subnet = @{ type = "string"; description = "Optional CIDR or prefix e.g. 192.168.1.0/24 or 192.168.1. (default auto)" }; active = @{ type = "boolean"; description = "Flood-ping subnet then ARP/MAC resolve (default true). false = neighbors only" }; resolve_mac = @{ type = "boolean"; description = "SendARP MAC discovery for IPs missing MAC (default true; required for vendors)" }; resolve_hostnames = @{ type = "boolean"; description = "Reverse DNS (default true)" }; resolve_vendors = @{ type = "boolean"; description = "MAC OUI vendor lookup (default true; needs internet + MAC)" }; timeout_ms = @{ type = "integer"; description = "Wait-Job timeout budget ms for flood (default 4000 effective floor)" }; max_hosts = @{ type = "integer"; description = "Max addresses to flood-ping (default 254, max 1022)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ProbeShares"; description = "REQUIRED tool when the user asks to find/locate/discover a network share (or which PC has a named share). Do not use RunCommand. TARGETED: computer=IP or hosts=['IP'] only those machines. SEARCH: omit hosts = auto LAN flood then probe. Then TCP 445/139 + timed net use guess (share_name=temp or common names). Optional username/password; access-denied still means share exists. Returns found_uncs/hosts_with_match — next call MapNetworkDrive (setup group). Not for creating shares (use CreateShare)."; parameters = @{ type = "object"; properties = @{ hosts = @{ type = "array"; items = @{ type = "string" }; description = "Known host IPs (targeted). Omit for auto LAN search." }; computer = @{ type = "string"; description = "Single known host (targeted)" }; share_name = @{ type = "string"; description = "Share name to try first e.g. temp" }; share_names = @{ type = "array"; items = @{ type = "string" }; description = "Extra share names to try" }; username = @{ type = "string"; description = "Optional HOST\\share for probe" }; password = @{ type = "string"; description = "Optional password for probe" }; port_timeout_ms = @{ type = "integer"; description = "TCP timeout ms (default 300)" }; probe_timeout_sec = @{ type = "integer"; description = "net use timeout sec per guess (default 3)" }; stop_on_first_match = @{ type = "boolean"; description = "Stop after first hit (default false)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "GetWindowsUpdateStatus"; description = "Pending Windows updates (needs PSWindowsUpdate)."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetSystemUptime"; description = "Uptime and last boot."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle: BSOD, events, disk health/space, memory."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "RunRepairTool"; description = "sfc, dism, or chkdsk. ALWAYS prompts for approval."; parameters = @{ type = "object"; properties = @{ tool = @{ type = "string"; enum = @("sfc","dism","chkdsk") }; driveLetter = @{ type = "string" }; arguments = @{ type = "string" } }; required = @("tool") } } },
@@ -5160,15 +5416,21 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "ListWindowsOptions"; description = "List SetWindowsOption catalog keys, allowed values, and short descriptions (read-only)."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "SystemRestore"; description = "System Restore: action=status|enable|disable|create|list. enable/create/disable ALWAYS prompt. create optional description=."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "status|enable|disable|create|list" }; description = @{ type = "string"; description = "Restore point description when action=create" }; drive = @{ type = "string"; description = "Drive letter (default C:)" } }; required = @("action") } } },
 	@{ type = "function"; function = @{ name = "UninstallSoftware"; description = "Uninstall an installed program by display name match (Uninstall registry). Prefer exact-ish name from GetInstalledSoftware first. ALWAYS prompts. No silent force beyond QuietUninstall/msiexec when available."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Display name substring to match" }; product_code = @{ type = "string"; description = "Optional MSI product code {GUID}" } }; required = @("name") } } },
-	@{ type = "function"; function = @{ name = "AddLocalUser"; description = "Create a local Windows user. ALWAYS prompts. Optional full_name, description, admin=true (Administrators group). Password never logged in full."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; password = @{ type = "string" }; full_name = @{ type = "string" }; description = @{ type = "string" }; admin = @{ type = "boolean"; description = "Add to local Administrators (default false)" } }; required = @("username","password") } } },
+	@{ type = "function"; function = @{ name = "AddLocalUser"; description = "Create a local Windows user. ALWAYS prompts. Optional full_name, description, admin=true (Administrators group). Password is operator-visible (pass what they said; show it back in the result). To delete use RemoveLocalUser."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; password = @{ type = "string" }; full_name = @{ type = "string" }; description = @{ type = "string" }; admin = @{ type = "boolean"; description = "Add to local Administrators (default false)" } }; required = @("username","password") } } },
 	@{ type = "function"; function = @{ name = "JoinDomain"; description = "Join this PC to an Active Directory domain. ALWAYS prompts. Requires domain + domain join credentials. Optional ou= distinguished name, new_name= rename before join, reboot=true to restart after success."; parameters = @{ type = "object"; properties = @{ domain = @{ type = "string"; description = "Domain FQDN e.g. corp.example.com" }; username = @{ type = "string"; description = "Domain account authorized to join (DOMAIN\\user or user@domain)" }; password = @{ type = "string" }; ou = @{ type = "string"; description = "Optional target OU DN" }; new_name = @{ type = "string"; description = "Optional new computer name before join" }; reboot = @{ type = "boolean"; description = "Restart after successful join (default false)" } }; required = @("domain","username","password") } } },
-	@{ type = "function"; function = @{ name = "LeaveDomain"; description = "Leave the Active Directory domain (join workgroup). ALWAYS prompts. Lockout-safe: operator must verify a local admin password (dropdown of local admins) before disjoin. If no local admin or auth fails, offers to create one; if create is refused, LeaveDomain is blocked. Optional local_username/local_password skip UI only when valid. workgroup= default WORKGROUP; reboot=true optional."; parameters = @{ type = "object"; properties = @{ workgroup = @{ type = "string"; description = "Target workgroup name (default WORKGROUP)" }; reboot = @{ type = "boolean"; description = "Restart after successful leave (default false)" }; local_username = @{ type = "string"; description = "Optional local admin to verify (still must pass password check)" }; local_password = @{ type = "string"; description = "Optional local admin password" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional — if omitted or busy, auto-picks free letter D-Z (RescueMaker-style: skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. password= as given. Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M — omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "LeaveDomain"; description = "Leave the Active Directory domain (join workgroup). ALWAYS prompts. REQUIRED: local_username + local_password of a local admin that can sign in after disjoin. No UI password popup — if missing or auth fails, returns NEED_INPUT so you ASK the operator in chat. If no local admin exists, call AddLocalUser admin=true with a password the operator chooses, then LeaveDomain with those creds. workgroup= default WORKGROUP; reboot=true optional. Show the local admin password back to the operator when they provide it."; parameters = @{ type = "object"; properties = @{ workgroup = @{ type = "string"; description = "Target workgroup name (default WORKGROUP)" }; reboot = @{ type = "boolean"; description = "Restart after successful leave (default false)" }; local_username = @{ type = "string"; description = "REQUIRED local admin username" }; local_password = @{ type = "string"; description = "REQUIRED local admin password (operator-visible; no popup)" } }; required = @("local_username","local_password") } } },
+			@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional — if omitted or busy, auto-picks free letter D-Z (RescueMaker-style: skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. If username is set, password is required (no popup — NEED_INPUT if missing; ask operator in chat). Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M — omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string"; description = "Required when username set; ask operator if missing" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "RemoveMappedDrive"; description = "Disconnect a mapped network drive letter on THIS PC. ALWAYS approval. REQUIRED: letter= (e.g. Z). Call GetMappedDrives first if unknown. Does not delete remote share data. Prefer over net use /delete in RunCommand."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Drive letter e.g. Z or Z:" }; path = @{ type = "string"; description = "Optional expected UNC (for display/verify)" }; force = @{ type = "boolean"; description = "Force remove (default true)" } }; required = @("letter") } } },
 @{ type = "function"; function = @{ name = "AddNetworkPrinter"; description = "Connect a network/shared printer (\\\\server\\printer). ALWAYS prompts. Optional name= friendly name, set_default=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Printer share UNC \\\\server\\printer" }; name = @{ type = "string"; description = "Optional local display name" }; set_default = @{ type = "boolean"; description = "Set as default printer (default false)" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "CreateShare"; description = "Share any local folder over SMB (existing path OK; create only if missing and ensure_folder=true). ALWAYS approval once. Fixed local user share (non-admin). IMPORTANT: if the operator already stated a password, pass it as share_password and do not make them type it again; only omit share_password when no password was given, then the UI prompts once (cancel = abort). Checks SMBv1: if off, asks whether older devices need it and enables only if Yes. Password-protected sharing ON. ACL: Everyone Full + explicit Full for user share. Enables File/Printer Sharing + discovery + LanmanServer. Returns UNC and how-to. path= folder; name= share name."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Any local folder to share (existing or to create)" }; name = @{ type = "string"; description = "Share name (UNC tail)" }; share_password = @{ type = "string"; description = "Password for local user share. REQUIRED in the call when the operator already provided one; omit only if none was given (then operator is prompted)." }; description = @{ type = "string"; description = "Optional share comment" }; everyone_full = @{ type = "boolean"; description = "Grant Everyone Full on share+NTFS (default true)" }; ensure_network = @{ type = "boolean"; description = "Enable File and Printer Sharing (default true)" }; ensure_discovery = @{ type = "boolean"; description = "Enable Network Discovery (default true)" }; ensure_folder = @{ type = "boolean"; description = "Create path if missing (default true)" }; force = @{ type = "boolean"; description = "Replace existing share of same name (default false)" } }; required = @("path","name") } } },
-	@{ type = "function"; function = @{ name = "ListInstallers"; description = "List silent installer catalog (id, name, notes). Read-only."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "RemoveNetworkPrinter"; description = "Remove a printer from THIS PC. ALWAYS approval. REQUIRED: name= exact printer name from GetPrinters (or path= UNC). Prefer over printui in RunCommand."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Printer name from GetPrinters" }; path = @{ type = "string"; description = "Alias — UNC or name" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "RemoveLocalUser"; description = "Delete a local Windows user account. ALWAYS approval. REQUIRED: username=. Refuses built-in accounts (Administrator, Guest, ...) and the currently logged-on user. Does not delete the profile folder under C:\\Users. Prefer over net user /delete in RunCommand."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; name = @{ type = "string"; description = "Alias for username" } }; required = @("username") } } },
+	@{ type = "function"; function = @{ name = "Reboot"; description = "Schedule reboot or shutdown, or abort a pending timer. ALWAYS approval. action=reboot (default) | shutdown | abort. delay_sec=60 default (0=immediate). force=true closes apps. reason= optional message. Abort pending with action=abort. Prefer over shutdown.exe in RunCommand."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "reboot | shutdown | abort" }; delay_sec = @{ type = "integer"; description = "Seconds before reboot/shutdown (default 60, max 86400)" }; reason = @{ type = "string"; description = "Optional comment shown in shutdown UI" }; force = @{ type = "boolean"; description = "Force-close apps (default true)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "CreateShare"; description = "Share a local folder over SMB. ALWAYS approval once. REQUIRED: path, name, access_username, access_password (or share_password), everyone_full (true|false — ALWAYS ask: Everyone access or only a specific user?). If access_username exists: verifies password via local logon (does not overwrite). If missing: creates user. force_password_update=true (alias reset_password=true) only when operator wants to RESET password on existing user. Grants share+NTFS rights to that user; optionally Everyone. Optional access_right/permission = Full|Change|Read (DEFAULT Full if omitted — do not force Full when Read/Change requested). No UI popups. Show password back. SMBv1 check if off. Copies UNC."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; name = @{ type = "string" }; access_username = @{ type = "string"; description = "Local account for grant (created if missing). Not Everyone." }; access_password = @{ type = "string"; description = "Password for access_username" }; share_password = @{ type = "string"; description = "Alias for access_password" }; everyone_full = @{ type = "boolean"; description = "REQUIRED. true=also grant Everyone same access_right; false=only access_username" }; access_right = @{ type = "string"; description = "Full (default) | Change | Read — share+NTFS level" }; permission = @{ type = "string"; description = "Alias for access_right" }; force_password_update = @{ type = "boolean"; description = "true = reset existing user password to access_password (destructive; only when operator asks)" }; reset_password = @{ type = "boolean"; description = "Alias for force_password_update" }; description = @{ type = "string" }; ensure_network = @{ type = "boolean" }; ensure_discovery = @{ type = "boolean" }; ensure_folder = @{ type = "boolean" }; force = @{ type = "boolean" } }; required = @("path","name","access_username","access_password","everyone_full") } } },
+	@{ type = "function"; function = @{ name = "RemoveShare"; description = "Unpublish a local SMB share on THIS PC. ALWAYS approval. REQUIRED: name (share name from GetLocalShares). Removes the share only — does not delete the folder or local users. force=true (default) closes open files then removes. Refuses special/admin shares (C$, ADMIN$, IPC$, PRINT$). Prefer over RunCommand net share /delete."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Share name to remove (e.g. temp). UNC \\PC\\name also accepted." }; share = @{ type = "string"; description = "Alias for name" }; force = @{ type = "boolean"; description = "Force close sessions and remove (default true)" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "NewMachineSetup"; description = "Full new-machine setup. profile=residential|business (settings flavor only). ALWAYS prompts once listing SETTINGS + SOFTWARE. Settings: restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off. If portable, re-enable encryption after setup is recommended. Software (full personal catalog every time): 7zip, Chrome, Adobe Reader, ADWCleaner (runs a scan), VLC. skip_software=true for settings only. dry_run=true previews."; parameters = @{ type = "object"; properties = @{ profile = @{ type = "string"; description = "residential | business (settings notes only; software catalog is always the full personal set)" }; dry_run = @{ type = "boolean" }; timezone = @{ type = "string" }; skip_restore_point = @{ type = "boolean" }; skip_software = @{ type = "boolean" } }; required = @("profile") } } },
+	@{ type = "function"; function = @{ name = "ListInstallers"; description = "List silent installer catalog (id, name, notes). Read-only. Personal catalog: 7zip, chrome, adobe_reader, adwcleaner, vlc."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "InstallPackage"; description = "Silent download+install from the installers catalog. package=id or packages=[ids]. Follows redirects (dynamic URLs). ALWAYS prompts. Temp downloads cleaned after each package. Ids: 7zip, chrome, adobe_reader, adwcleaner (will run a scan), vlc."; parameters = @{ type = "object"; properties = @{ package = @{ type = "string"; description = "Single package id" }; packages = @{ type = "array"; items = @{ type = "string" }; description = "Multiple package ids" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently unlock one or more tool groups in a single call. Prefer multi when the task needs several: group=setup,system or groups=[setup,system]. Names: vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full (aliases: tune/newmachine->setup, install/chrome/vlc->installers, http->web, ...). Then call the real tools. Never announce."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string"; description = "One group, or comma/space-separated list e.g. setup,system,files" }; groups = @{ type = "array"; items = @{ type = "string" }; description = "Multiple groups (preferred when >1); same names as group=" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently unlock one or more tool groups in a single call. Prefer multi when the task needs several: group=network,shares or groups=[network,shares]. Names: senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full (aliases: tune/newmachine->setup, install/chrome/vlc->installers, http->web, ...). Then call the real tools. Never announce."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string"; description = "One group, or comma/space-separated list e.g. setup,system,files" }; groups = @{ type = "array"; items = @{ type = "string" }; description = "Multiple groups (preferred when >1); same names as group=" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "ListToolGroups"; description = "Dump group/tool catalog. Prefer EnableToolGroup using the MAP in the system prompt - usually no need to list first."; parameters = @{ type = "object"; properties = @{} } } }
 )
 
@@ -5179,21 +5441,30 @@ $script:MBToolCatalog = [ordered]@{
 		'RunCommand','GetWorkingDirectory','SetWorkingDirectory','GetEnvironment','SetEnvironment',
 		'EnableToolGroup','ListToolGroups'
 	)
-	vision = @(
-		'ReadImage','ReadPdf','ViewScreen'
+	senses = @(
+		'ReadImage','ReadPdf','ViewScreen','SpeakText'
 	)
 	system = @(
-		'GetSystemInfo','GetProcessList','GetProcessTree','GetMemoryInfo','GetNetworkInfo','GetLocalShares','GetMappedDrives','ScanNetwork','ProbeShares','GetNetConnections',
-		'GetDiskSpace','GetDiskHealth','GetBSODInfo','GetEventLogs','GetSystemUptime',
-		'GetServiceStatus','ControlService','GetPowerInfo','GetStartupItems',
-		'GetInstalledSoftware','GetDriverInfo','GetWindowsUpdateStatus','GetScheduledTasks'
+		'GetSystemInfo','GetProcessList','GetProcessTree','GetMemoryInfo','GetPowerInfo',
+		'GetServiceStatus','ControlService','GetInstalledSoftware','GetWindowsUpdateStatus','GetSystemUptime'
 	)
-	repair    = @('RunQuickDiagnostics','RunRepairTool')
+	network = @(
+		'GetNetworkInfo','GetNetConnections','ScanNetwork','ProbeShares','GetLocalShares','GetMappedDrives','GetPrinters'
+	)
+	diag = @(
+		'GetBSODInfo','GetEventLogs','GetDiskHealth','GetDiskSpace','GetStartupItems','GetScheduledTasks',
+		'GetDriverInfo','StopProcess','RunQuickDiagnostics'
+	)
+	repair    = @('RunRepairTool')
 	setup     = @(
 		'AudioVolume','DisplayBrightness','SetWindowsOption','ListWindowsOptions',
-		'SystemRestore','UninstallSoftware',
-		'AddLocalUser','JoinDomain','LeaveDomain','MapNetworkDrive','AddNetworkPrinter','CreateShare',
-		'NewMachineSetup'
+		'SystemRestore','UninstallSoftware','Reboot','NewMachineSetup'
+	)
+	identity  = @(
+		'AddLocalUser','RemoveLocalUser','JoinDomain','LeaveDomain'
+	)
+	shares    = @(
+		'MapNetworkDrive','RemoveMappedDrive','CreateShare','RemoveShare','AddNetworkPrinter','RemoveNetworkPrinter'
 	)
 	installers = @(
 		'ListInstallers','InstallPackage'
@@ -5204,7 +5475,7 @@ $script:MBToolCatalog = [ordered]@{
 	registry  = @('ReadRegistry','SetRegistry')
 	clipboard = @('Clipboard')
 	web       = @('MakeHttpRequest','BrowsePage','ConvertGitHubUrl','GetGitHubRawFile','ListGitHubDirectory')
-	speech    = @('SpeakText')
+
 }
 
 $script:MBToolGroupMeta = [ordered]@{
@@ -5212,21 +5483,37 @@ $script:MBToolGroupMeta = [ordered]@{
 		Label       = 'Core'
 		Description = 'Files, edits, shell, CWD, env (always on)'
 	}
-	vision = @{
-		Label       = 'Vision'
-		Description = 'ReadImage, ReadPdf, ViewScreen'
+	senses = @{
+		Label       = 'Senses'
+		Description = 'Vision (ReadImage, ReadPdf, ViewScreen) + SpeakText TTS'
 	}
 	system = @{
 		Label       = 'System'
-		Description = 'System info, process tree, ports, services, local shares/maps, ScanNetwork, ProbeShares'
+		Description = 'Light inventory: OS, processes, memory, services, software, uptime'
+	}
+	network = @{
+		Label       = 'Network'
+		Description = 'LAN scan, ProbeShares, local shares/maps, printers list, connections'
+	}
+	diag = @{
+		Label       = 'Diag'
+		Description = 'Diagnostics: BSOD, events, disk, startup/tasks/drivers, StopProcess, quick diagnostics'
 	}
 	repair = @{
 		Label       = 'Repair'
-		Description = 'Quick diagnostics, sfc, DISM, chkdsk'
+		Description = 'sfc, DISM, chkdsk (always prompts)'
 	}
 	setup = @{
 		Label       = 'Setup / Tune'
-		Description = 'Volume, brightness, Windows options, restore, uninstall, local user, domain join/leave, map drive, network printer, create share, NewMachineSetup'
+		Description = 'Volume, brightness, Windows options, restore, uninstall, reboot, NewMachineSetup'
+	}
+	identity = @{
+		Label       = 'Identity'
+		Description = 'Local users add/remove, join/leave domain'
+	}
+	shares = @{
+		Label       = 'Shares'
+		Description = 'Map/unmap drives, create/remove SMB shares, add/remove printers'
 	}
 	installers = @{
 		Label       = 'Installers'
@@ -5256,10 +5543,7 @@ $script:MBToolGroupMeta = [ordered]@{
 		Label       = 'Web / HTTP'
 		Description = 'HTTP client, page fetch, GitHub helpers'
 	}
-	speech = @{
-		Label       = 'Speech'
-		Description = 'Windows TTS (SpeakText); operator Right-Ctrl PTT via /speech'
-	}
+
 }
 
 function Initialize-MBToolGroups {
@@ -5271,7 +5555,7 @@ function Initialize-MBToolGroups {
 	$profile = [string]$script:MB.ToolProfile
 	if ([string]::IsNullOrWhiteSpace($profile)) { $profile = [string]$ToolProfile }
 	if ($profile -match '^(?i)full|all$') {
-		foreach ($g in @('vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')) {
+		foreach ($g in @('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web')) {
 			if (-not ($script:MB.ActiveToolGroups -contains $g)) {
 				[void]$script:MB.ActiveToolGroups.Add($g)
 			}
@@ -5291,7 +5575,84 @@ function Sync-MBPromptAfterToolGroups {
 }
 
 function Get-MBToolGroupOrder {
-	@('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')
+	@('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web')
+}
+
+function Add-MBUsedToolName {
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return }
+	try {
+		if ($null -eq $script:MB.UsedToolNames -or -not ($script:MB.UsedToolNames -is [hashtable])) {
+			$script:MB.UsedToolNames = @{}
+		}
+		$key = [string]$Name.Trim()
+		if ($script:MB.UsedToolNames.ContainsKey($key)) { return }
+		$script:MB.UsedToolNames[$key] = $true
+		try { Update-MBWpfToolGroupBar -Force } catch {}
+	} catch {}
+}
+
+function Get-MBToolUserTipText {
+	param([string]$Name, [string]$Description = '')
+	$n = ([string]$Name).Trim()
+	$d = ([string]$Description).Trim()
+	if ([string]::IsNullOrWhiteSpace($d)) {
+		if ($n) { return $n }
+		return ''
+	}
+	$cut = $d
+	if ($cut -match '^(.+?[.!?])(\s|$)') { $cut = $Matches[1].Trim() }
+	if ($cut.Length -gt 180) { $cut = $cut.Substring(0, 177).Trim() + '...' }
+	if ($n) { return ("{0}`n{1}" -f $n, $cut) }
+	return $cut
+}
+
+function Get-MBToolUiTips {
+	$groupTips = @{}
+	$groupLabels = @{}
+	try {
+		foreach ($key in @($script:MBToolGroupMeta.Keys)) {
+			$meta = $script:MBToolGroupMeta[$key]
+			$lab = [string](Get-MBProp $meta 'Label')
+			if ([string]::IsNullOrWhiteSpace($lab)) { $lab = [string]$key }
+			$desc = [string](Get-MBProp $meta 'Description')
+			if ([string]::IsNullOrWhiteSpace($desc)) { $desc = 'Tool group' }
+			$groupLabels[[string]$key] = $lab
+			$groupTips[[string]$key] = ("{0}`n{1}`n`nClick to list tools in this group." -f $lab, $desc)
+		}
+	} catch {}
+
+	$toolTips = @{}
+	try {
+		$toolList = @()
+		try { $toolList = @($Tools) } catch { $toolList = @() }
+		if ($toolList.Count -eq 0) {
+			try { $toolList = @($script:MBTools) } catch { $toolList = @() }
+		}
+		foreach ($entry in $toolList) {
+			if ($null -eq $entry) { continue }
+			$fn = Get-MBProp $entry 'function'
+			if ($null -eq $fn) { continue }
+			$nm = [string](Get-MBProp $fn 'name')
+			if ([string]::IsNullOrWhiteSpace($nm)) { continue }
+			$desc = [string](Get-MBProp $fn 'description')
+			$toolTips[$nm] = Get-MBToolUserTipText -Name $nm -Description $desc
+		}
+	} catch {}
+
+	# Always-present meta tools
+	if (-not $toolTips.ContainsKey('EnableToolGroup')) {
+		$toolTips['EnableToolGroup'] = "EnableToolGroup`nUnlock extra tool groups so the agent can use more capabilities."
+	}
+	if (-not $toolTips.ContainsKey('ListToolGroups')) {
+		$toolTips['ListToolGroups'] = "ListToolGroups`nShow which tool groups are available and what they contain."
+	}
+
+	return @{
+		groups = $groupTips
+		labels = $groupLabels
+		tools  = $toolTips
+	}
 }
 
 function Update-MBWpfToolGroupBar {
@@ -5314,7 +5675,16 @@ function Update-MBWpfToolGroupBar {
 		$activeList = New-Object System.Collections.ArrayList
 		foreach ($g in $order) { [void]$activeList.Add($g) }
 	}
-	$fp = (@($activeList) -join ',')
+	$usedList = New-Object System.Collections.ArrayList
+	try {
+		if ($script:MB.UsedToolNames -is [hashtable]) {
+			foreach ($u in @($script:MB.UsedToolNames.Keys)) {
+				if ($u) { [void]$usedList.Add([string]$u) }
+			}
+		}
+	} catch {}
+	$usedList = @($usedList | Sort-Object)
+	$fp = ((@($activeList) -join ',') + '|u:' + ($usedList -join ','))
 	if (-not $Force) {
 		try {
 			if ($W.ToolGroupsFp -eq $fp -and $W.ToolGroupsBuilt -and -not $W.ToolGroupsDirty) { return }
@@ -5332,6 +5702,16 @@ function Update-MBWpfToolGroupBar {
 		} catch { $toolsByGroup[$g] = @() }
 	}
 
+	# Active chips first so they stay visible on the first wrap line
+	$displayOrder = New-Object System.Collections.ArrayList
+	foreach ($g in $order) {
+		if ($activeList -contains [string]$g) { [void]$displayOrder.Add([string]$g) }
+	}
+	foreach ($g in $order) {
+		$gs = [string]$g
+		if (-not ($displayOrder -contains $gs)) { [void]$displayOrder.Add($gs) }
+	}
+
 	# Installers chip: tools, then divider, then catalog package names
 	$installerPkgs = New-Object System.Collections.ArrayList
 	try {
@@ -5343,16 +5723,27 @@ function Update-MBWpfToolGroupBar {
 			if ([string]::IsNullOrWhiteSpace($id)) { $id = [string]$k }
 			$nm = [string]$p.name
 			if ([string]::IsNullOrWhiteSpace($nm)) { $nm = $id }
-			[void]$installerPkgs.Add([pscustomobject]@{ id = $id; name = $nm })
+			$note = ''
+			try { $note = [string]$p.notes } catch { $note = '' }
+			if ([string]::IsNullOrWhiteSpace($note)) {
+				try { $note = [string]$p.note } catch { $note = '' }
+			}
+			[void]$installerPkgs.Add([pscustomobject]@{ id = $id; name = $nm; note = $note })
 		}
 	} catch {}
 
+	$tips = $null
+	try { $tips = Get-MBToolUiTips } catch { $tips = $null }
+
 	try {
 		$W.ToolGroupsData = @{
-			order              = $order
+			order              = @($displayOrder)
 			active             = @($activeList)
 			tools              = $toolsByGroup
 			installerPackages  = @($installerPkgs)
+			groupTips          = $(if ($tips) { $tips.groups } else { @{} })
+			toolTips           = $(if ($tips) { $tips.tools } else { @{} })
+			usedTools          = @($usedList)
 			fp                 = $fp
 		}
 		$W.ToolGroupsDirty = $true
@@ -5381,26 +5772,33 @@ function Resolve-MBToolGroupName {
 	if ($script:MBToolCatalog -and $script:MBToolCatalog.Contains($g)) { return $g }
 
 	$aliases = @{
-		'image' = 'vision'; 'images' = 'vision'; 'img' = 'vision'
-		'pdf' = 'vision'; 'pdfs' = 'vision'; 'screen' = 'vision'; 'screenshot' = 'vision'
-		'viewscreen' = 'vision'; 'readimage' = 'vision'; 'readpdf' = 'vision'
+		'vision' = 'senses'; 'image' = 'senses'; 'images' = 'senses'; 'img' = 'senses'
+		'pdf' = 'senses'; 'pdfs' = 'senses'; 'screen' = 'senses'; 'screenshot' = 'senses'
+		'viewscreen' = 'senses'; 'readimage' = 'senses'; 'readpdf' = 'senses'
+		'speech' = 'senses'; 'tts' = 'senses'; 'voice' = 'senses'; 'speak' = 'senses'; 'sapi' = 'senses'
+		'see' = 'senses'; 'hear' = 'senses'; 'sense' = 'senses'
 		'sys' = 'system'; 'os' = 'system'; 'process' = 'system'; 'processes' = 'system'
-		'service' = 'system'; 'services' = 'system'; 'disk' = 'system'; 'network' = 'system'
-		'port' = 'system'; 'ports' = 'system'; 'bsod' = 'system'; 'event' = 'system'
-		'events' = 'system'; 'software' = 'system'; 'driver' = 'system'; 'uptime' = 'system'
-		'lan' = 'system'; 'scannetwork' = 'system'; 'ipscan' = 'system'; 'arpscan' = 'system'
-		'probeshares' = 'system'; 'findshares' = 'system'; 'smbscan' = 'system'
-		'findshare' = 'system'; 'find_share' = 'system'; 'locateshare' = 'system'
-		'fix' = 'repair'; 'diagnostics' = 'repair'; 'diagnostic' = 'repair'
-		'dism' = 'repair'; 'sfc' = 'repair'; 'chkdsk' = 'repair'
+		'service' = 'system'; 'services' = 'system'; 'software' = 'system'; 'uptime' = 'system'
+		'inventory' = 'system'; 'memory' = 'system'; 'ram' = 'system'
+		'network' = 'network'; 'lan' = 'network'; 'scannetwork' = 'network'; 'ipscan' = 'network'; 'arpscan' = 'network'
+		'probeshares' = 'network'; 'findshares' = 'network'; 'smbscan' = 'network'
+		'findshare' = 'network'; 'find_share' = 'network'; 'locateshare' = 'network'
+		'port' = 'network'; 'ports' = 'network'; 'netstat' = 'network'
+		'localshares' = 'network'; 'mappeddrives' = 'network'; 'printers' = 'network'
+		'diag' = 'diag'; 'diagnostic' = 'diag'; 'diagnostics' = 'diag'; 'diagnose' = 'diag'
+		'forensic' = 'diag'; 'forensics' = 'diag'; 'investigate' = 'diag'
+		'bsod' = 'diag'; 'event' = 'diag'; 'events' = 'diag'; 'disk' = 'diag'
+		'startup' = 'diag'; 'scheduledtasks' = 'diag'; 'tasks' = 'diag'; 'driver' = 'diag'; 'drivers' = 'diag'
+		'stopprocess' = 'diag'; 'kill' = 'diag'; 'killprocess' = 'diag'; 'taskkill' = 'diag'
+		'fix' = 'repair'; 'dism' = 'repair'; 'sfc' = 'repair'; 'chkdsk' = 'repair'
 		'tune' = 'setup'; 'tuning' = 'setup'; 'newmachine' = 'setup'; 'newpc' = 'setup'
 		'desktop' = 'setup'; 'brightness' = 'setup'; 'volume' = 'setup'; 'audio' = 'setup'
 		'power' = 'setup'; 'uac' = 'setup'; 'restore' = 'setup'; 'uninstall' = 'setup'
-		'boot' = 'setup'; 'f8' = 'setup'; 'explorer' = 'setup'
-		'domain' = 'setup'; 'joindomain' = 'setup'; 'leavedomain' = 'setup'; 'disjoin' = 'setup'; 'unjoin' = 'setup'
-		'adduser' = 'setup'; 'localuser' = 'setup'
-		'mapdrive' = 'setup'; 'netdrive' = 'setup'; 'printer' = 'setup'; 'netprinter' = 'setup'
-		'share' = 'setup'; 'createshare' = 'setup'; 'smb' = 'setup'; 'netshare' = 'setup'
+		'boot' = 'setup'; 'f8' = 'setup'; 'explorer' = 'setup'; 'reboot' = 'setup'; 'shutdown' = 'setup'
+		'domain' = 'identity'; 'joindomain' = 'identity'; 'leavedomain' = 'identity'; 'disjoin' = 'identity'; 'unjoin' = 'identity'
+		'adduser' = 'identity'; 'localuser' = 'identity'; 'removeuser' = 'identity'; 'user' = 'identity'; 'users' = 'identity'
+		'mapdrive' = 'shares'; 'netdrive' = 'shares'; 'unmap' = 'shares'; 'printer' = 'shares'; 'netprinter' = 'shares'
+		'share' = 'shares'; 'createshare' = 'shares'; 'smb' = 'shares'; 'netshare' = 'shares'; 'removeshare' = 'shares'
 		'install' = 'installers'; 'installer' = 'installers'; 'apps' = 'installers'
 		'chrome' = 'installers'; 'vlc' = 'installers'; '7zip' = 'installers'; 'adobe' = 'installers'
 		'lab' = 'sandbox'; 'sandboxes' = 'sandbox'
@@ -5412,7 +5810,6 @@ function Resolve-MBToolGroupName {
 		'clip' = 'clipboard'; 'paste' = 'clipboard'
 		'http' = 'web'; 'https' = 'web'; 'browse' = 'web'; 'browser' = 'web'
 		'github' = 'web'; 'url' = 'web'; 'www' = 'web'; 'fetch' = 'web'
-		'tts' = 'speech'; 'voice' = 'speech'; 'speak' = 'speech'; 'sapi' = 'speech'
 	}
 	if ($aliases.ContainsKey($g)) { return [string]$aliases[$g] }
 
@@ -5448,6 +5845,7 @@ function Resolve-MBToolName {
 		'clipboard' = 'Clipboard'; 'clip' = 'Clipboard'
 		'registry' = 'ReadRegistry'; 'reg' = 'ReadRegistry'
 		'process' = 'GetProcessList'; 'processes' = 'GetProcessList'; 'ps' = 'GetProcessList'
+		'stop_process' = 'StopProcess'; 'kill_process' = 'StopProcess'; 'kill' = 'StopProcess'; 'taskkill' = 'StopProcess'
 		'service' = 'GetServiceStatus'; 'services' = 'GetServiceStatus'
 		'netstat' = 'GetNetConnections'; 'ports' = 'GetNetConnections'
 		'scan_network' = 'ScanNetwork'; 'lan_scan' = 'ScanNetwork'; 'ip_scan' = 'ScanNetwork'
@@ -5467,9 +5865,17 @@ function Resolve-MBToolName {
 		'leave_domain' = 'LeaveDomain'; 'disjoin' = 'LeaveDomain'; 'disjoin_domain' = 'LeaveDomain'
 		'unjoin' = 'LeaveDomain'; 'unjoin_domain' = 'LeaveDomain'; 'remove_domain' = 'LeaveDomain'
 		'map_drive' = 'MapNetworkDrive'; 'map_network_drive' = 'MapNetworkDrive'
+		'unmap_drive' = 'RemoveMappedDrive'; 'remove_mapped_drive' = 'RemoveMappedDrive'; 'disconnect_drive' = 'RemoveMappedDrive'
+		'unmap' = 'RemoveMappedDrive'; 'net_use_delete' = 'RemoveMappedDrive'
 		'add_printer' = 'AddNetworkPrinter'; 'network_printer' = 'AddNetworkPrinter'
+		'remove_printer' = 'RemoveNetworkPrinter'; 'delete_printer' = 'RemoveNetworkPrinter'
+		'list_printers' = 'GetPrinters'; 'get_printers' = 'GetPrinters'; 'printers' = 'GetPrinters'
+		'remove_user' = 'RemoveLocalUser'; 'delete_user' = 'RemoveLocalUser'; 'remove_local_user' = 'RemoveLocalUser'
+		'reboot' = 'Reboot'; 'restart' = 'Reboot'; 'shutdown' = 'Reboot'; 'restart_pc' = 'Reboot'
 		'create_share' = 'CreateShare'; 'make_share' = 'CreateShare'; 'network_share' = 'CreateShare'
 		'smb_share' = 'CreateShare'; 'share_folder' = 'CreateShare'
+		'remove_share' = 'RemoveShare'; 'delete_share' = 'RemoveShare'; 'unshare' = 'RemoveShare'
+		'drop_share' = 'RemoveShare'; 'stop_share' = 'RemoveShare'
 		'system_restore' = 'SystemRestore'; 'restore_point' = 'SystemRestore'
 		'list_installers' = 'ListInstallers'; 'install_package' = 'InstallPackage'; 'install_app' = 'InstallPackage'
 	}
@@ -5505,7 +5911,7 @@ function Get-MBToolEnableHint {
 	if ($grp -eq 'core') {
 		return "Tool $resolved is in core and should already be available."
 	}
-	return "Call ListToolGroups or EnableToolGroup using the MAP (vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech)."
+	return "Call ListToolGroups or EnableToolGroup using the MAP (senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web)."
 }
 
 function Get-MBActiveToolNames {
@@ -5620,7 +6026,7 @@ function Enable-MBToolGroup {
 	$tokens = @(Get-MBEnableToolGroupTokens -Group $Group -groups $groups)
 	if ($tokens.Count -eq 0) {
 		$map = ($script:MBGroupQuickMap.Keys | ForEach-Object { "$_=$($script:MBGroupQuickMap[$_])" }) -join '; '
-		return "ERROR: group or groups required. One or many: group=setup,system or groups=[setup,system]. Known: vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full. MAP: $map"
+		return "ERROR: group or groups required. One or many: group=network,shares or groups=[network,shares]. Known: senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full. MAP: $map"
 	}
 
 	# Resolve each token -> group name (or tool-name alias)
@@ -5655,7 +6061,7 @@ function Enable-MBToolGroup {
 		}
 		$known = @($script:MBToolCatalog.Keys) -join ', '
 		$bad = if ($unknown.Count -gt 0) { $unknown -join ', ' } else { ($tokens -join ', ') }
-		return "ERROR: Unknown group(s) '$bad'. Known: $known, full. Or pass a tool name (e.g. ReadPdf -> vision)."
+		return "ERROR: Unknown group(s) '$bad'. Known: $known, full. Or pass a tool name (e.g. ReadPdf -> senses)."
 	}
 
 	# full/all wins
@@ -5664,7 +6070,7 @@ function Enable-MBToolGroup {
 		if ($g -in @('all', 'full')) { $wantFull = $true; break }
 	}
 	if ($wantFull) {
-		foreach ($name in @('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech')) {
+		foreach ($name in @('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web')) {
 			if (-not ($script:MB.ActiveToolGroups -contains $name)) {
 				[void]$script:MB.ActiveToolGroups.Add($name)
 			}
@@ -5754,7 +6160,7 @@ function Get-MBToolGroupsStatus {
 		activeToolCount = $nActive
 		activeTools   = @((Get-MBActiveToolNames | Sort-Object))
 		groups        = $groups
-		hint          = "EnableToolGroup group=setup,system or groups=[setup,system] (multi ok) | vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full - enable all needed in one call"
+		hint          = "EnableToolGroup group=network,shares or groups=[diag,repair] (multi ok) | senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full - enable all needed in one call"
 	}) -Depth 6
 }
 
@@ -5785,10 +6191,10 @@ function Invoke-ReadFile {
 	)
 	if ($blockedExtensions -contains $ext) {
 		if ($ext -in @('.png','.jpg','.jpeg','.gif','.bmp','.webp','.tif','.tiff')) {
-			return "BLOCKED: '$ext' is an image - EnableToolGroup group=vision then ReadImage path=... (vision). Do not dump binary as text."
+			return "BLOCKED: '$ext' is an image - EnableToolGroup group=senses then ReadImage path=... (senses). Do not dump binary as text."
 		}
 		if ($ext -eq '.pdf') {
-			return "BLOCKED: PDF - EnableToolGroup group=vision then ReadPdf path=... (default page=1 only; auto vision if garbled; page=N only if needed)."
+			return "BLOCKED: PDF - EnableToolGroup group=senses then ReadPdf path=... (default page=1 only; auto vision if garbled; page=N only if needed)."
 		}
 		return "BLOCKED: File type '$ext' cannot be read as text."
 	}
@@ -7893,6 +8299,8 @@ function Invoke-RunCommand {
 	$timeoutMs = if ($timeout_sec -gt 0) { $timeout_sec * 1000 } else { $CommandTimeoutSec * 1000 }
 	$wd = $script:MB.WorkingDir
 
+	# Get-ComputerInfo is slow + enormous; model often treats truncated output as complete.
+	# Redirect to the fast inventory tool instead of spawning a multi-minute dump.
 	if ($shell -ne 'cmd' -and [string]$command -match '(?i)\bGet-ComputerInfo\b') {
 		try {
 			$summary = Invoke-GetSystemInfo
@@ -7906,6 +8314,8 @@ function Invoke-RunCommand {
 		}
 	}
 
+	# Never interpolate $command into expandable strings (eats $_, $$, `" , etc. in the parent).
+	# In-memory only: build script bytes → Base64 → -EncodedCommand (no temp files).
 	try {
 		if ($shell -eq "cmd") {
 			$rr = Invoke-MBProcessCapture -FileName "cmd.exe" -Arguments ('/c chcp 65001>nul & ' + $command) -WorkingDir $wd -TimeoutMs $timeoutMs
@@ -7914,6 +8324,7 @@ function Invoke-RunCommand {
 			if (-not (Test-Path -LiteralPath $psExe)) {
 				$psExe = "powershell.exe"
 			}
+			# Single-quoted pieces + concat so $ in $command is never expanded here
 			$preamble = @(
 				'try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}'
 				'try { [Console]::InputEncoding  = [System.Text.Encoding]::UTF8 } catch {}'
@@ -7923,7 +8334,7 @@ function Invoke-RunCommand {
 			$body = $preamble + "`r`n" + [string]$command + "`r`n"
 			$ms = New-Object System.IO.MemoryStream
 			try {
-				$encW = New-Object System.Text.UnicodeEncoding $false, $false
+				$encW = New-Object System.Text.UnicodeEncoding $false, $false  # UTF-16LE, no BOM
 				$bytes = $encW.GetBytes($body)
 				$ms.Write($bytes, 0, $bytes.Length)
 				$enc = [Convert]::ToBase64String($ms.ToArray())
@@ -8389,6 +8800,248 @@ function Invoke-Clipboard {
 	}
 }
 
+function Set-MBClipboardTextQuiet {
+	# System-generated convenience (UNC after CreateShare). No approval prompt.
+	param([string]$Text)
+	try {
+		if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+		Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+		[System.Windows.Forms.Clipboard]::SetText([string]$Text)
+		return $true
+	} catch {
+		return $false
+	}
+}
+
+function Get-MBOperatorCardFieldList {
+	param([object]$Fields = $null)
+	$rows = New-Object System.Collections.ArrayList
+	if ($null -eq $Fields) { return @() }
+	if ($Fields -is [hashtable] -or $Fields -is [System.Collections.IDictionary] -or $Fields -is [System.Collections.Specialized.OrderedDictionary]) {
+		foreach ($k in @($Fields.Keys)) {
+			$v = $Fields[$k]
+			if ($null -eq $v) { $v = '' }
+			elseif ($v -is [System.Collections.IEnumerable] -and -not ($v -is [string])) {
+				$v = (@($v | ForEach-Object { "$_" }) -join ', ')
+			} else { $v = [string]$v }
+			if ([string]::IsNullOrWhiteSpace($v)) { continue }
+			[void]$rows.Add([pscustomobject]@{ Key = [string]$k; Value = $v })
+		}
+	}
+	return @($rows)
+}
+
+function Format-MBOperatorCard {
+	# Markdown summary for model JSON / plain hosts (no ASCII box art).
+	param(
+		[string]$Title = 'RESULT',
+		[object]$Fields = $null,
+		[string[]]$Notes = @()
+	)
+	$sb = New-Object System.Text.StringBuilder
+	$title = ([string]$Title).Trim()
+	if (-not $title) { $title = 'Result' }
+	[void]$sb.AppendLine(('### {0}' -f $title))
+	foreach ($row in @(Get-MBOperatorCardFieldList -Fields $Fields)) {
+		[void]$sb.AppendLine(('- **{0}:** {1}' -f $row.Key, $row.Value))
+	}
+	foreach ($n in @($Notes)) {
+		if ([string]::IsNullOrWhiteSpace([string]$n)) { continue }
+		[void]$sb.AppendLine(('- {0}' -f ([string]$n).Trim()))
+	}
+	return $sb.ToString().TrimEnd()
+}
+
+function Write-MBOperatorCard {
+	# WPF: title + key/value table. Console: colored lines. Return value = markdown for tool JSON.
+	param(
+		[string]$Title = 'RESULT',
+		[object]$Fields = $null,
+		[string[]]$Notes = @()
+	)
+	$card = Format-MBOperatorCard -Title $Title -Fields $Fields -Notes $Notes
+	$title = ([string]$Title).Trim()
+	if (-not $title) { $title = 'Result' }
+	$fieldRows = @(Get-MBOperatorCardFieldList -Fields $Fields)
+	try {
+		if (Test-MBWpfActive) {
+			Write-Host ''
+			Write-MBWpfRaw -Text $title -Color Cyan -Bold -FontSize 14.5
+			$tbl = New-Object System.Collections.ArrayList
+			[void]$tbl.Add([pscustomobject]@{ IsHeader = $true; Cells = @('Field', 'Value') })
+			foreach ($row in $fieldRows) {
+				[void]$tbl.Add([pscustomobject]@{ IsHeader = $false; Cells = @([string]$row.Key, [string]$row.Value) })
+			}
+			if ($tbl.Count -gt 1) {
+				try { Write-MBMdEmitTable -Rows @($tbl) } catch {
+					foreach ($row in $fieldRows) {
+						Write-MBWpfRaw -Text ('  {0}: ' -f $row.Key) -Color DarkGray -NoNewline
+						Write-MBWpfRaw -Text ([string]$row.Value) -Color Gray
+					}
+				}
+			}
+			foreach ($n in @($Notes)) {
+				if ([string]::IsNullOrWhiteSpace([string]$n)) { continue }
+				Write-MBWpfRaw -Text ('  {0}' -f ([string]$n).Trim()) -Color DarkGray
+			}
+			Write-Host ''
+		} else {
+			Write-Host ''
+			Write-Host ("  {0}" -f $title) -ForegroundColor Cyan
+			foreach ($row in $fieldRows) {
+				Write-Host ("    {0}: " -f $row.Key) -ForegroundColor DarkGray -NoNewline
+				Write-Host ([string]$row.Value) -ForegroundColor Gray
+			}
+			foreach ($n in @($Notes)) {
+				if ([string]::IsNullOrWhiteSpace([string]$n)) { continue }
+				Write-Host ("    {0}" -f ([string]$n).Trim()) -ForegroundColor DarkGray
+			}
+			Write-Host ''
+		}
+	} catch {}
+	return $card
+}
+
+function Write-MBJobChecklist {
+	# Same-line cyan... / green OK as Write-MBSetupProgress (no double lines).
+	param(
+		[string]$Job = '',
+		[int]$Step = 0,
+		[int]$Total = 0,
+		[string]$Label = '',
+		[ValidateSet('start','ok','fail','info')]
+		[string]$Phase = 'info',
+		[string]$Detail = ''
+	)
+	$job = ([string]$Job).Trim()
+	$lab = ([string]$Label).Trim()
+	if (-not $lab) { $lab = 'step' }
+	# Title for setup progress: "CreateShare folder" style
+	$title = if ($job) { '{0}: {1}' -f $job, $lab } else { $lab }
+	if ($Phase -eq 'info') {
+		# One-shot info (no open line)
+		if ($null -eq $script:MB.SetupProgressOpenLine) { $script:MB.SetupProgressOpenLine = $false }
+		if ($script:MB.SetupProgressOpenLine) {
+			Write-Host ''
+			$script:MB.SetupProgressOpenLine = $false
+		}
+		$pfx = if ($Total -gt 0 -and $Step -gt 0) { '{0}/{1} ' -f $Step, $Total } else { '' }
+		Write-Host ("  {0}{1}" -f $pfx, $title) -ForegroundColor DarkGray
+		return
+	}
+	Write-MBSetupProgress -Phase $Phase -Index $Step -Total $Total -Title $title -Detail $Detail
+}
+
+function Test-MBLocalSharePresent {
+	param([string]$ShareName)
+	$nm = ([string]$ShareName).Trim()
+	if (-not $nm) { return @{ ok = $false; detail = 'no share name' } }
+	try {
+		if (Get-Command Get-SmbShare -ErrorAction SilentlyContinue) {
+			$s = Get-SmbShare -Name $nm -ErrorAction Stop
+			return @{
+				ok     = $true
+				name   = [string]$s.Name
+				path   = [string]$s.Path
+				detail = 'Get-SmbShare'
+			}
+		}
+	} catch {}
+	try {
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $nm) -TimeoutSec 12
+		$blob = (([string]$r.out) + ' ' + ([string]$r.err))
+		if ($r.ok -or $blob -match [regex]::Escape($nm)) {
+			return @{ ok = $true; name = $nm; path = ''; detail = 'net share' }
+		}
+	} catch {}
+	return @{ ok = $false; detail = 'share not found after create' }
+}
+
+function Test-MBMappedDrivePresent {
+	param([string]$Letter, [string]$Unc = '')
+	$L = ([string]$Letter).Trim().TrimEnd(':').ToUpperInvariant()
+	$wantUnc = ([string]$Unc).Trim()
+	if ($L -notmatch '^[A-Z]$') { return @{ ok = $false; detail = 'bad letter' } }
+	try {
+		if (Get-Command Get-SmbMapping -ErrorAction SilentlyContinue) {
+			$m = Get-SmbMapping -LocalPath "${L}:" -ErrorAction SilentlyContinue | Select-Object -First 1
+			if ($m) {
+				$remote = [string]$m.RemotePath
+				$match = $true
+				if ($wantUnc -and $remote -and ($remote.TrimEnd('\') -ne $wantUnc.TrimEnd('\'))) {
+					# still ok if mapped; note mismatch
+					$match = $false
+				}
+				return @{
+					ok     = $true
+					letter = "${L}:"
+					unc    = $remote
+					status = $(try { [string]$m.Status } catch { '' })
+					path_match = $match
+					detail = 'Get-SmbMapping'
+				}
+			}
+		}
+	} catch {}
+	try {
+		$d = Get-PSDrive -Name $L -ErrorAction SilentlyContinue
+		if ($d) {
+			$root = ''
+			try { $root = [string]$d.DisplayRoot } catch {}
+			if (-not $root) { try { $root = [string]$d.Root } catch {} }
+			return @{
+				ok     = $true
+				letter = "${L}:"
+				unc    = $root
+				status = 'OK'
+				path_match = $true
+				detail = 'Get-PSDrive'
+			}
+		}
+	} catch {}
+	try {
+		$di = New-Object System.IO.DriveInfo ("${L}:")
+		if ($di.DriveType -eq [System.IO.DriveType]::Network) {
+			return @{
+				ok     = $true
+				letter = "${L}:"
+				unc    = $wantUnc
+				status = 'Network'
+				path_match = $true
+				detail = 'DriveInfo'
+			}
+		}
+	} catch {}
+	return @{ ok = $false; letter = "${L}:"; detail = 'mapping not found after map' }
+}
+
+function Test-MBSoftwareInstalledHint {
+	param([string]$NameHint)
+	$hint = ([string]$NameHint).Trim()
+	if (-not $hint) { return @{ ok = $false; detail = 'no name' } }
+	try {
+		$paths = @(
+			'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+			'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+			'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+		)
+		foreach ($p in $paths) {
+			$hit = Get-ItemProperty $p -ErrorAction SilentlyContinue |
+				Where-Object { $_.DisplayName -and ($_.DisplayName -like "*$hint*") } |
+				Select-Object -First 1 DisplayName, DisplayVersion
+			if ($hit) {
+				return @{
+					ok      = $true
+					name    = [string]$hit.DisplayName
+					version = [string]$hit.DisplayVersion
+					detail  = 'uninstall registry'
+				}
+			}
+		}
+	} catch {}
+	return @{ ok = $false; detail = "not found in uninstall registry for *$hint*" }
+}
+
 function Get-MBUserDesktopPath {
 	$desk = [Environment]::GetFolderPath('Desktop')
 	if ([string]::IsNullOrWhiteSpace($desk)) {
@@ -8440,7 +9093,7 @@ function Resolve-MBViewScreenSavePath {
 function Invoke-ViewScreen {
 	param(
 		[string]$path = '',
-		[bool]$save = $false,
+		[object]$save = $false,
 		[string]$monitor = 'primary',
 		[int]$x = -1,
 		[int]$y = -1,
@@ -8457,7 +9110,12 @@ function Invoke-ViewScreen {
 
 	$useRegion = ($width -gt 0 -and $height -gt 0)
 	$monLabel = if ([string]::IsNullOrWhiteSpace($monitor)) { 'primary' } else { $monitor.Trim() }
-	$saveToDisk = $save -or (-not [string]::IsNullOrWhiteSpace($path))
+	# Default: MemoryStream -> base64 PendingVision only. Disk ONLY if user asked
+	# (save=true and/or a real path). Never treat string "false" as true ([bool]"false" is $true in PS).
+	$pathTrim = if ($null -eq $path) { '' } else { ([string]$path).Trim() }
+	$wantSave = Convert-MBToBool -Value $save -Default $false
+	$saveToDisk = $wantSave -or (-not [string]::IsNullOrWhiteSpace($pathTrim))
+	$path = $pathTrim
 
 	# Capture rect in physical pixels (WinForms Bounds can clip under DPI)
 	$rect = $null
@@ -8536,8 +9194,8 @@ function Invoke-ViewScreen {
 	$scaled = $null
 	$ms = $null
 	try {
-		$saveHint = if ($saveToDisk) { " → $diskPath" } else { '' }
-		Write-Host "    view $monLabel ($($rect.Width)x$($rect.Height))$saveHint" -ForegroundColor DarkGray
+		$saveHint = if ($saveToDisk) { " -> $diskPath" } else { ' [memory]' }
+		Write-Host ("    view {0} ({1}x{2}){3}" -f $monLabel, $rect.Width, $rect.Height, $saveHint) -ForegroundColor DarkGray
 		$bmp = New-Object System.Drawing.Bitmap $rect.Width, $rect.Height
 		$g = [System.Drawing.Graphics]::FromImage($bmp)
 		$g.CopyFromScreen($rect.X, $rect.Y, 0, 0, $rect.Size, [System.Drawing.CopyPixelOperation]::SourceCopy)
@@ -8718,7 +9376,7 @@ function Invoke-ReadImage {
 		$sendMime = if ($ext -in @('.jpg','.jpeg')) { 'image/jpeg' } else { 'image/png' }
 		$label = [System.IO.Path]::GetFileName($full)
 		$pv = Set-MBPendingVisionFromBitmap -Bitmap $bmp -MaxWidth $maxWidth -Label $label -SourcePath $full -Kind 'file' -Mime $sendMime
-		Write-Host ("    read image {0} ({1}x{2} → vision {3}x{4})" -f $label, $bmp.Width, $bmp.Height, $pv.Width, $pv.Height) -ForegroundColor DarkGray
+		Write-Host ("    read image {0} ({1}x{2} -> vision {3}x{4})" -f $label, $bmp.Width, $bmp.Height, $pv.Width, $pv.Height) -ForegroundColor DarkGray
 		$ux = @(
 			"IMAGE_LOADED: $full"
 			"Vision payload pending for next model reply (describe what you see)."
@@ -9829,6 +10487,28 @@ function Invoke-GetLocalShares {
 		}
 	} catch {}
 
+	$clipOk = $false
+	$clipUnc = ''
+	if ($uncHints.Count -eq 1) {
+		$clipUnc = [string]$uncHints[0]
+		$clipOk = Set-MBClipboardTextQuiet -Text $clipUnc
+	}
+
+	$summaryLines = New-Object System.Collections.ArrayList
+	foreach ($s in @($shares | Select-Object -First 12)) {
+		$acc = ''
+		try { $acc = (@($s.access_summary) -join ', ') } catch {}
+		if (-not $acc) { $acc = '(no share ACL listed)' }
+		[void]$summaryLines.Add(('{0}  {1}  access: {2}' -f $s.name, $s.path, $acc))
+	}
+	if ($shares.Count -gt 12) { [void]$summaryLines.Add(('... +{0} more' -f ($shares.Count - 12))) }
+
+	$card = Write-MBOperatorCard -Title 'LOCAL SHARES' -Fields ([ordered]@{
+		Host     = $hostName
+		Count    = $shares.Count
+		Clipboard = $(if ($clipOk) { "copied $clipUnc" } elseif ($uncHints.Count -gt 1) { 'not auto-copied (multiple UNC)' } else { 'n/a' })
+	}) -Notes @($summaryLines)
+
 	return ConvertTo-MBJson ([ordered]@{
 		ok               = $true
 		host             = $hostName
@@ -9838,6 +10518,9 @@ function Invoke-GetLocalShares {
 		share_count      = $shares.Count
 		shares           = @($shares)
 		unc_hints        = @($uncHints)
+		clipboard_unc    = [bool]$clipOk
+		clipboard_value  = $clipUnc
+		operator_card    = $card
 		note             = 'Local SMB shares on THIS PC. share_access / access_summary = who can connect over the network (share ACL). ntfs_access = folder filesystem ACL (when include_ntfs=true). Special shares (C$, ADMIN$, IPC$) hidden unless include_special=true. Create with CreateShare; map remote with MapNetworkDrive; find remote with ProbeShares.'
 	}) -Depth 8
 }
@@ -9964,18 +10647,29 @@ function Invoke-GetMappedDrives {
 		if ($l -match '^([A-Z]):') { [int][char]$Matches[1] } else { 999 }
 	})
 
+	$sum = New-Object System.Collections.ArrayList
+	foreach ($m in @($sorted | Select-Object -First 16)) {
+		[void]$sum.Add(('{0}  {1}  [{2}]' -f $m.letter, $m.unc, $m.status))
+	}
+	if ($sorted.Count -gt 16) { [void]$sum.Add(('... +{0} more' -f ($sorted.Count - 16))) }
+	$card = Write-MBOperatorCard -Title 'MAPPED DRIVES' -Fields ([ordered]@{
+		Host  = $env:COMPUTERNAME
+		Count = $sorted.Count
+	}) -Notes @($sum)
+
 	return ConvertTo-MBJson ([ordered]@{
-		ok          = $true
-		host        = $env:COMPUTERNAME
-		method      = ($methodParts -join '+')
-		map_count   = $sorted.Count
-		mappings    = $sorted
-		note        = 'Network drive letters on THIS PC (not remote share discovery). Map with MapNetworkDrive; list local published shares with GetLocalShares; find remote shares with ProbeShares.'
+		ok            = $true
+		host          = $env:COMPUTERNAME
+		method        = ($methodParts -join '+')
+		map_count     = $sorted.Count
+		mappings      = $sorted
+		operator_card = $card
+		note          = 'Network drive letters on THIS PC (not remote share discovery). Map with MapNetworkDrive; list local published shares with GetLocalShares; find remote shares with ProbeShares.'
 	}) -Depth 6
 }
 
 function Ensure-MBMacAddressResolver {
-	# SendARP MAC discovery (iphlpapi) — from IPScanner MacAddressResolver; needed for vendor OUI.
+	# SendARP MAC discovery (iphlpapi); needed for vendor OUI.
 	if ('MiniBot.Native.MBMacResolver' -as [type]) { return $true }
 	try {
 		Add-Type -TypeDefinition @"
@@ -10057,7 +10751,7 @@ function Get-MBPrimaryLanContext {
 			if ($ctx.prefix_len -lt 8 -or $ctx.prefix_len -gt 30) { $ctx.prefix_len = 24 }
 			$parts = $ctx.ip -split '\.'
 			if ($parts.Count -eq 4) {
-				# /24-style scan prefix (IPScanner style gatewayPrefix)
+				# /24-style scan prefix from local IP
 				$ctx.prefix = '{0}.{1}.{2}.' -f $parts[0], $parts[1], $parts[2]
 			}
 			if ($cfg.IPv4DefaultGateway) {
@@ -10257,7 +10951,7 @@ function Get-MBArpNeighborMap {
 }
 
 function Invoke-MBFloodPingSubnet {
-	# IPScanner Scan-Subnet speed path: Test-Connection -Count 1 -AsJob for every host, then Wait-Job / Receive-Job.
+	# Flood path: Test-Connection -Count 1 -AsJob for every host, then Wait-Job / Receive-Job.
 	# Fires the full wave at once (not throttled). Populates ARP for MAC/vendor resolution.
 	param(
 		[string[]]$Targets,
@@ -10289,7 +10983,7 @@ function Invoke-MBFloodPingSubnet {
 		} catch {
 			try { $null = Get-Job | Wait-Job -Timeout $waitSec -ErrorAction SilentlyContinue } catch {}
 		}
-		# IPScanner: Receive-Job where StatusCode -eq 0 -> Address
+		# Receive-Job where StatusCode -eq 0 -> Address
 		try {
 			$results = @(Receive-Job -Job @($jobs) -ErrorAction SilentlyContinue)
 			foreach ($row in $results) {
@@ -10454,7 +11148,7 @@ function Invoke-ScanNetwork {
 	$probed = 0
 	if ($doActive -and $range.Count -gt 0) {
 		$probed = $range.Count
-		# Flood-ping entire range (IPScanner speed): all -AsJob at once
+		# Flood-ping entire range: all -AsJob at once
 		$alive = @(Invoke-MBFloodPingSubnet -Targets $range -TimeoutMs $timeout_ms)
 		foreach ($a in $alive) { $aliveSet[[string]$a] = $true }
 		# Brief pause so ARP/neighbor table can fill after flood for SendARP/MAC
@@ -10559,12 +11253,12 @@ function Invoke-ScanNetwork {
 		with_vendor       = $withVend
 		elapsed_ms        = $sw.ElapsedMilliseconds
 		hosts             = @($hosts)
-		note              = 'Active probe uses IPScanner-style flood ping (Test-Connection -AsJob x subnet). MAC via ARP + SendARP (iphlpapi); vendors need MAC OUI. To find shares on hosts, use ProbeShares (not RunCommand Get-SmbShare/CimSession).'
+		note              = 'Active probe uses flood ping (Test-Connection -AsJob x subnet). MAC via ARP + SendARP (iphlpapi); vendors need MAC OUI. To find shares on hosts, use ProbeShares (not RunCommand Get-SmbShare/CimSession).'
 	}) -Depth 6
 }
 
 function Test-MBTcpPortOpen {
-	# IPScanner-style async TCP connect with short timeout (ms). No hang.
+	# Async TCP connect with short timeout (ms). No hang.
 	param(
 		[string]$Computer,
 		[int]$Port,
@@ -10624,9 +11318,9 @@ function Test-MBShareMapGuess {
 	$netArgs = New-Object System.Collections.ArrayList
 	[void]$netArgs.Add('use')
 	[void]$netArgs.Add($unc)
-	if ($user) {
-		[void]$netArgs.Add(('/user:' + $user))
-		# empty password still allowed as separate arg for net use
+	$userNorm = Resolve-MBWindowsAccountName -Username $user
+	if ($userNorm) {
+		[void]$netArgs.Add('/user:' + $userNorm)
 		[void]$netArgs.Add($(if ($null -eq $pass) { '' } else { $pass }))
 	}
 	[void]$netArgs.Add('/persistent:no')
@@ -10677,6 +11371,7 @@ function Test-MBShareMapGuess {
 		exit    = $exit
 		message = $msg
 		method  = 'net use probe'
+		username = $userNorm
 	}
 }
 
@@ -10846,8 +11541,14 @@ function Invoke-ProbeShares {
 	$matchedHosts = New-Object System.Collections.ArrayList
 	$openHosts = New-Object System.Collections.ArrayList
 	$foundUncs = New-Object System.Collections.ArrayList
+	$hostTotal = @($targets).Count
+	$hostIdx = 0
+	try {
+		Write-Host ("  ProbeShares: {0} host(s), candidates={1}" -f $hostTotal, ((@($candidates) -join ','))) -ForegroundColor DarkGray
+	} catch {}
 
 	foreach ($h in $targets) {
+		$hostIdx++
 		$row = [ordered]@{
 			host              = $h
 			port_445_smb2     = $false
@@ -10859,12 +11560,16 @@ function Invoke-ProbeShares {
 			best_unc          = ''
 			best_status       = ''
 		}
+		try {
+			Write-Host ("  ProbeShares {0}/{1} {2} ..." -f $hostIdx, $hostTotal, $h) -ForegroundColor DarkGray -NoNewline
+		} catch {}
 		$row.port_445_smb2 = Test-MBTcpPortOpen -Computer $h -Port 445 -TimeoutMs $port_timeout_ms
 		$row.port_139_smb1 = Test-MBTcpPortOpen -Computer $h -Port 139 -TimeoutMs $port_timeout_ms
 		$row.smb_likely = [bool]($row.port_445_smb2 -or $row.port_139_smb1)
 		if (-not $row.smb_likely) {
 			$row.best_status = 'smb_ports_closed'
 			[void]$results.Add($row)
+			try { Write-Host ' ports closed' -ForegroundColor DarkGray } catch {}
 			continue
 		}
 		$smbOpen++
@@ -10890,7 +11595,6 @@ function Invoke-ProbeShares {
 					$row.best_status = [string]$probe.status
 				}
 				[void]$foundUncs.Add([string]$probe.unc)
-				# continue trying other names on this host unless stop_on_first_match for whole scan
 			}
 		}
 		$row.found_shares = @($foundHere)
@@ -10898,15 +11602,34 @@ function Invoke-ProbeShares {
 		if ($row.share_match) {
 			$matchCount++
 			[void]$matchedHosts.Add($h)
+			try { Write-Host (" HIT {0}" -f $row.best_unc) -ForegroundColor Green } catch {}
 			if ($stopFirst) {
 				[void]$results.Add($row)
 				break
 			}
+		} else {
+			try { Write-Host ' smb open, no match' -ForegroundColor DarkGray } catch {}
 		}
 		[void]$results.Add($row)
 	}
 
 	$sw.Stop()
+	$uniqueUncs = @($foundUncs | Select-Object -Unique)
+	$notes = New-Object System.Collections.ArrayList
+	foreach ($u in @($uniqueUncs | Select-Object -First 8)) { [void]$notes.Add([string]$u) }
+	if ($uniqueUncs.Count -gt 8) { [void]$notes.Add(('... +{0} more' -f ($uniqueUncs.Count - 8))) }
+	if ($uniqueUncs.Count -eq 0) { [void]$notes.Add('No share matches. Try credentials or exact share_name.') }
+	$card = Write-MBOperatorCard -Title 'PROBE SHARES' -Fields ([ordered]@{
+		Mode       = $mode
+		Hosts      = $hostTotal
+		'SMB open' = $smbOpen
+		Matches    = $matchCount
+		Elapsed_ms = $sw.ElapsedMilliseconds
+	}) -Notes @($notes)
+	if ($uniqueUncs.Count -gt 0) {
+		try { [void](Add-MBStickyNote -Text ("ProbeShares: " + ($uniqueUncs -join ', ')) -Kind finding) } catch {}
+	}
+
 	return ConvertTo-MBJson ([ordered]@{
 		ok                = $true
 		mode              = $mode
@@ -10918,14 +11641,15 @@ function Invoke-ProbeShares {
 		share_match_count = $matchCount
 		hosts_with_smb    = @($openHosts)
 		hosts_with_match  = @($matchedHosts)
-		found_uncs        = @($foundUncs | Select-Object -Unique)
+		found_uncs        = $uniqueUncs
 		excluded_self     = @($excludedSelf | Select-Object -Unique)
 		port_timeout_ms   = $port_timeout_ms
 		probe_timeout_sec = $probe_timeout_sec
 		used_credentials  = (-not [string]::IsNullOrWhiteSpace($user))
 		elapsed_ms        = $sw.ElapsedMilliseconds
+		operator_card     = $card
 		results           = @($results)
-		note              = 'Modes: known machine → computer=IP or hosts=[IP] (only those; self IP/hostname always skipped). Unknown → omit hosts (auto LAN flood then same guess; self excluded). Port filter then timed net use \\host\share. exists_auth_required = share found, needs MapNetworkDrive + creds.'
+		note              = 'Modes: known machine -> computer=IP or hosts=[IP] (only those; self IP/hostname always skipped). Unknown -> omit hosts (auto LAN flood then same guess; self excluded). Port filter then timed net use \\host\share. exists_auth_required = share found, needs MapNetworkDrive + creds.'
 	}) -Depth 8
 }
 
@@ -12935,7 +13659,7 @@ function Invoke-ModelStreaming {
 			if ($lastError -match 'HTTP 400\b|context|too (large|long)|token|payload|invalid_request') {
 				$isPayload = $true
 			}
-			# scrub history before compact on encoding error
+			# Scrub history before compact on encoding error
 			if ($lastError -match 'ill-formed UTF-8|invalid UTF-8|parse_error\.101|invalid string:\s*ill-formed') {
 				$isUtf8Poison = $true
 				$isPayload = $true
@@ -14109,6 +14833,7 @@ function Invoke-JoinDomain {
 	}
 	try {
 		$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+		# Normalize DOMAIN\user or user@domain
 		$credUser = $user
 		if ($credUser -notmatch '[\\@]') { $credUser = "$dom\$user" }
 		$cred = New-Object System.Management.Automation.PSCredential ($credUser, $sec)
@@ -14155,14 +14880,15 @@ namespace MiniBot.Native {
       IntPtr token = IntPtr.Zero;
       try {
         string machine = Environment.MachineName;
-        // LOGON32_LOGON_NETWORK=3, INTERACTIVE=2, PROVIDER_DEFAULT=0
-        if (LogonUser(username, ".", password, 3, 0, out token)) return true;
-        if (token != IntPtr.Zero) { CloseHandle(token); token = IntPtr.Zero; }
-        if (LogonUser(username, machine, password, 3, 0, out token)) return true;
-        if (token != IntPtr.Zero) { CloseHandle(token); token = IntPtr.Zero; }
-        if (LogonUser(username, ".", password, 2, 0, out token)) return true;
-        if (token != IntPtr.Zero) { CloseHandle(token); token = IntPtr.Zero; }
-        if (LogonUser(username, machine, password, 2, 0, out token)) return true;
+        // LOGON32_LOGON_INTERACTIVE=2, NETWORK=3, BATCH=4, NETWORK_CLEARTEXT=8
+        int[] types = new int[] { 3, 2, 8, 4 };
+        string[] domains = new string[] { ".", machine, "" };
+        foreach (int t in types) {
+          foreach (string d in domains) {
+            if (token != IntPtr.Zero) { CloseHandle(token); token = IntPtr.Zero; }
+            if (LogonUser(username, d, password, t, 0, out token)) return true;
+          }
+        }
         return false;
       } finally {
         if (token != IntPtr.Zero) CloseHandle(token);
@@ -14171,6 +14897,87 @@ namespace MiniBot.Native {
   }
 }
 "@ -Language CSharp -ErrorAction Stop
+}
+
+function Clear-MBLocalUserLogonFlags {
+	# After a password set, clear flags that break immediate LogonUser / SMB auth.
+	param([string]$Username)
+	$user = ([string]$Username).Trim()
+	if ([string]::IsNullOrWhiteSpace($user)) { return }
+	try { Enable-LocalUser -Name $user -ErrorAction SilentlyContinue } catch {}
+	try { Set-LocalUser -Name $user -PasswordNeverExpires $true -ErrorAction SilentlyContinue } catch {}
+	try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/active:yes') -TimeoutSec 15 } catch {}
+	try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/passwordchg:yes') -TimeoutSec 15 } catch {}
+	try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/logonpasswordchg:no') -TimeoutSec 15 } catch {}
+	try {
+		$adsi = [ADSI]("WinNT://./$user,user")
+		try {
+			# Clear "password expired / must change at next logon"
+			$adsi.Put('PasswordExpired', 0)
+			$adsi.SetInfo()
+		} catch {}
+		try {
+			$flags = 0
+			try { $flags = [int]$adsi.UserFlags.Value } catch {
+				try { $flags = [int]$adsi.UserFlags[0] } catch { $flags = 0 }
+			}
+			# UF_DONT_EXPIRE_PASSWD=0x10000; clear UF_ACCOUNTDISABLE=0x2 and UF_PASSWORD_EXPIRED=0x800000
+			$flags = ($flags -bor 0x10000) -band (-bnot 0x2) -band (-bnot 0x800000)
+			$adsi.Put('UserFlags', $flags)
+			$adsi.SetInfo()
+		} catch {}
+	} catch {}
+}
+
+function Set-MBLocalUserPassword {
+	# Best-effort password set for a local account (elevated). Returns detail for failures.
+	param(
+		[string]$Username,
+		[string]$Password
+	)
+	$user = ([string]$Username).Trim()
+	$pass = [string]$Password
+	if ([string]::IsNullOrWhiteSpace($user)) { return @{ ok = $false; error = 'username required' } }
+	if ($null -eq $pass) { return @{ ok = $false; error = 'password required' } }
+	$errs = New-Object System.Collections.ArrayList
+	# 1) Set-LocalUser
+	if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
+		try {
+			$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+			Set-LocalUser -Name $user -Password $sec -ErrorAction Stop
+			Clear-MBLocalUserLogonFlags -Username $user
+			return @{ ok = $true; method = 'Set-LocalUser' }
+		} catch {
+			[void]$errs.Add(('Set-LocalUser: {0}' -f $_.Exception.Message))
+		}
+	}
+	# 2) net user — single raw arg line so special chars in password are quoted safely
+	try {
+		$passEsc = $pass -replace '"', '""'
+		$netLine = 'user {0} "{1}"' -f $user, $passEsc
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @($netLine) -TimeoutSec 30
+		if ($r.ok) {
+			Clear-MBLocalUserLogonFlags -Username $user
+			return @{ ok = $true; method = 'net user'; detail = (([string]$r.out) + ' ' + ([string]$r.err)).Trim() }
+		}
+		[void]$errs.Add(('net user: exit={0} {1} {2}' -f $r.exit, $r.out, $r.err))
+	} catch {
+		[void]$errs.Add(('net user: {0}' -f $_.Exception.Message))
+	}
+	# 3) ADSI WinNT
+	try {
+		$adsi = [ADSI]("WinNT://./$user,user")
+		$adsi.SetPassword($pass)
+		$adsi.SetInfo()
+		Clear-MBLocalUserLogonFlags -Username $user
+		return @{ ok = $true; method = 'ADSI' }
+	} catch {
+		[void]$errs.Add(('ADSI: {0}' -f $_.Exception.Message))
+	}
+	return @{
+		ok    = $false
+		error = ('Could not set password for local user ''{0}''. {1} (Often: password policy complexity, not elevated, or account restrictions.)' -f $user, (($errs | ForEach-Object { $_ }) -join ' | '))
+	}
 }
 
 function Get-MBLocalAdminAccounts {
@@ -14277,590 +15084,125 @@ function Test-MBLocalAdminCredential {
 	return $false
 }
 
-function New-MBLocalAdminAccountCore {
-	# Create local admin without an extra approval (caller already confirmed intent).
-	param(
-		[string]$username,
-		[string]$password,
-		[string]$full_name = ''
-	)
-	$user = ([string]$username).Trim()
-	$pass = [string]$password
-	if ([string]::IsNullOrWhiteSpace($user)) { return @{ ok = $false; error = 'username required' } }
-	if ($user -notmatch '^[A-Za-z0-9._-]{1,20}$') { return @{ ok = $false; error = 'username must be 1-20 chars [A-Za-z0-9._-]' } }
-	if ([string]::IsNullOrEmpty($pass)) { return @{ ok = $false; error = 'password required' } }
-	$fn = ([string]$full_name).Trim()
-	try {
-		$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
-		if (Get-Command Add-LocalUser -ErrorAction SilentlyContinue) {
-			try {
-				$null = Get-LocalUser -Name $user -ErrorAction Stop
-				return @{ ok = $false; error = "Local user '$user' already exists" }
-			} catch {}
-			$p = @{ Name = $user; Password = $sec; PasswordNeverExpires = $true; UserMayNotChangePassword = $false; ErrorAction = 'Stop' }
-			if ($fn) { $p['FullName'] = $fn }
-			Add-LocalUser @p | Out-Null
-			try { Add-LocalGroupMember -Group 'Administrators' -Member $user -ErrorAction Stop } catch {
-				try { net.exe localgroup Administrators $user /add 2>&1 | Out-Null } catch {}
-			}
-			return @{ ok = $true; username = $user; method = 'Add-LocalUser' }
-		}
-		$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
-		if ($chk.ok -or ($chk.out -match '(?i)User name')) {
-			return @{ ok = $false; error = "Local user '$user' already exists" }
-		}
-		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass, '/add') -TimeoutSec 30
-		if (-not $r.ok) {
-			return @{ ok = $false; error = "net user failed (exit $($r.exit)): $($r.err) $($r.out)" }
-		}
-		if ($fn) {
-			try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/comment:' + $fn) -TimeoutSec 15 } catch {}
-		}
-		$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators', $user, '/add') -TimeoutSec 15
-		return @{ ok = $true; username = $user; method = 'net user' }
-	} catch {
-		return @{ ok = $false; error = $_.Exception.Message }
-	}
-}
-
-function Show-MBCreateLocalAdminForm {
-	# STA WinForms: username + password + confirm. Cancel is safe (no double Close).
-	param([string]$Title = 'Create local administrator')
-	$rs = $null; $ps = $null
-	try {
-		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
-		$rs = [runspacefactory]::CreateRunspace()
-		$rs.ApartmentState = 'STA'
-		$rs.ThreadOptions = 'ReuseThread'
-		$rs.Open()
-		$ps = [powershell]::Create()
-		$ps.Runspace = $rs
-		[void]$ps.AddScript({
-			param($Title)
-			Add-Type -AssemblyName System.Windows.Forms
-			Add-Type -AssemblyName System.Drawing
-			$form = New-Object System.Windows.Forms.Form
-			$form.Text = $Title
-			$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-			$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-			$form.MaximizeBox = $false
-			$form.MinimizeBox = $false
-			$form.ShowInTaskbar = $false
-			$form.ClientSize = New-Object System.Drawing.Size(420, 250)
-			$form.TopMost = $true
-			$bag = @{ Cancelled = $true; Username = ''; Password = '' }
-			$lbl = New-Object System.Windows.Forms.Label
-			$lbl.Text = "Create a local admin account you can use after leaving the domain.`nWithout this, you may be locked out of the PC."
-			$lbl.Location = New-Object System.Drawing.Point(14, 12)
-			$lbl.Size = New-Object System.Drawing.Size(390, 44)
-			$form.Controls.Add($lbl)
-			$lUser = New-Object System.Windows.Forms.Label
-			$lUser.Text = 'Username'
-			$lUser.Location = New-Object System.Drawing.Point(14, 64)
-			$lUser.AutoSize = $true
-			$form.Controls.Add($lUser)
-			$tbUser = New-Object System.Windows.Forms.TextBox
-			$tbUser.Location = New-Object System.Drawing.Point(14, 82)
-			$tbUser.Width = 390
-			$tbUser.Text = 'LocalAdmin'
-			$form.Controls.Add($tbUser)
-			$lPass = New-Object System.Windows.Forms.Label
-			$lPass.Text = 'Password'
-			$lPass.Location = New-Object System.Drawing.Point(14, 112)
-			$lPass.AutoSize = $true
-			$form.Controls.Add($lPass)
-			$tbPass = New-Object System.Windows.Forms.TextBox
-			$tbPass.Location = New-Object System.Drawing.Point(14, 130)
-			$tbPass.Width = 390
-			$tbPass.UseSystemPasswordChar = $true
-			$form.Controls.Add($tbPass)
-			$lPass2 = New-Object System.Windows.Forms.Label
-			$lPass2.Text = 'Confirm password'
-			$lPass2.Location = New-Object System.Drawing.Point(14, 158)
-			$lPass2.AutoSize = $true
-			$form.Controls.Add($lPass2)
-			$tbPass2 = New-Object System.Windows.Forms.TextBox
-			$tbPass2.Location = New-Object System.Drawing.Point(14, 176)
-			$tbPass2.Width = 390
-			$tbPass2.UseSystemPasswordChar = $true
-			$form.Controls.Add($tbPass2)
-			$err = New-Object System.Windows.Forms.Label
-			$err.ForeColor = [System.Drawing.Color]::Firebrick
-			$err.Location = New-Object System.Drawing.Point(14, 202)
-			$err.Size = New-Object System.Drawing.Size(250, 36)
-			$form.Controls.Add($err)
-			$btnOk = New-Object System.Windows.Forms.Button
-			$btnOk.Text = 'Create'
-			$btnOk.Location = New-Object System.Drawing.Point(230, 208)
-			$btnOk.Width = 84
-			$btnCancel = New-Object System.Windows.Forms.Button
-			$btnCancel.Text = 'Cancel'
-			$btnCancel.Location = New-Object System.Drawing.Point(320, 208)
-			$btnCancel.Width = 84
-			# DialogResult alone closes modal — do not also call Close() (causes unhandled exceptions)
-			$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-			$form.Controls.Add($btnOk)
-			$form.Controls.Add($btnCancel)
-			$form.AcceptButton = $btnOk
-			$form.CancelButton = $btnCancel
-			$btnOk.Add_Click({
-				param($sender, $e)
-				try {
-					$u = $tbUser.Text.Trim()
-					$p1 = $tbPass.Text
-					$p2 = $tbPass2.Text
-					if ([string]::IsNullOrWhiteSpace($u)) { $err.Text = 'Username required.'; return }
-					if ($u -notmatch '^[A-Za-z0-9._-]{1,20}$') { $err.Text = 'Username: 1-20 chars A-Z 0-9 . _ -'; return }
-					if ([string]::IsNullOrEmpty($p1)) { $err.Text = 'Password required.'; return }
-					if ($p1 -cne $p2) { $err.Text = 'Passwords do not match.'; return }
-					$bag.Cancelled = $false
-					$bag.Username = $u
-					$bag.Password = $p1
-					$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-				} catch {
-					$err.Text = $_.Exception.Message
-				}
-			})
-			try {
-				[void]$form.ShowDialog()
-			} catch {}
-			return $bag
-		})
-		[void]$ps.AddArgument([string]$Title)
-		$out = $ps.Invoke()
-		if ($ps.HadErrors) {
-			# Cancel / close noise — do not throw
-			$fatal = @($ps.Streams.Error | ForEach-Object { "$_" } | Where-Object {
-				$_ -and $_ -notmatch '(?i)cancel|closed|disposed|DialogResult|ShowDialog'
-			})
-			if ($fatal.Count -gt 0) {
-				return @{ Cancelled = $true; Username = ''; Password = ''; Error = ($fatal -join '; ') }
-			}
-		}
-		if ($out -and @($out).Count -gt 0) { return @($out)[-1] }
-		return @{ Cancelled = $true; Username = ''; Password = '' }
-	} catch {
-		return @{ Cancelled = $true; Username = ''; Password = ''; Error = $_.Exception.Message }
-	} finally {
-		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
-		try { if ($ps) { $ps.Dispose() } } catch {}
-		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
-	}
-}
-
-function Show-MBSharePasswordForm {
-	# Password-only prompt for fixed local user "share". Cancel-safe.
-	param(
-		[string]$Title = 'Share user password',
-		[string]$ShareName = '',
-		[string]$FolderPath = ''
-	)
-	$rs = $null; $ps = $null
-	try {
-		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
-		$rs = [runspacefactory]::CreateRunspace()
-		$rs.ApartmentState = 'STA'
-		$rs.ThreadOptions = 'ReuseThread'
-		$rs.Open()
-		$ps = [powershell]::Create()
-		$ps.Runspace = $rs
-		[void]$ps.AddScript({
-			param($Title, $ShareName, $FolderPath)
-			Add-Type -AssemblyName System.Windows.Forms
-			Add-Type -AssemblyName System.Drawing
-			$form = New-Object System.Windows.Forms.Form
-			$form.Text = $Title
-			$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-			$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-			$form.MaximizeBox = $false
-			$form.MinimizeBox = $false
-			$form.ShowInTaskbar = $false
-			$form.ClientSize = New-Object System.Drawing.Size(420, 210)
-			$form.TopMost = $true
-			$bag = @{ Cancelled = $true; Password = '' }
-			$lbl = New-Object System.Windows.Forms.Label
-			$bits = New-Object System.Collections.ArrayList
-			[void]$bits.Add('Local account: share  (password-protected network access)')
-			if ($ShareName) { [void]$bits.Add("Share name: $ShareName") }
-			if ($FolderPath) { [void]$bits.Add("Folder: $FolderPath") }
-			[void]$bits.Add('Enter a password for the share account.')
-			$lbl.Text = ($bits -join "`n")
-			$lbl.Location = New-Object System.Drawing.Point(14, 12)
-			$lbl.Size = New-Object System.Drawing.Size(390, 62)
-			$form.Controls.Add($lbl)
-			$lPass = New-Object System.Windows.Forms.Label
-			$lPass.Text = 'Password'
-			$lPass.Location = New-Object System.Drawing.Point(14, 80)
-			$lPass.AutoSize = $true
-			$form.Controls.Add($lPass)
-			$tbPass = New-Object System.Windows.Forms.TextBox
-			$tbPass.Location = New-Object System.Drawing.Point(14, 98)
-			$tbPass.Width = 390
-			$tbPass.UseSystemPasswordChar = $true
-			$form.Controls.Add($tbPass)
-			$lPass2 = New-Object System.Windows.Forms.Label
-			$lPass2.Text = 'Confirm password'
-			$lPass2.Location = New-Object System.Drawing.Point(14, 126)
-			$lPass2.AutoSize = $true
-			$form.Controls.Add($lPass2)
-			$tbPass2 = New-Object System.Windows.Forms.TextBox
-			$tbPass2.Location = New-Object System.Drawing.Point(14, 144)
-			$tbPass2.Width = 390
-			$tbPass2.UseSystemPasswordChar = $true
-			$form.Controls.Add($tbPass2)
-			$err = New-Object System.Windows.Forms.Label
-			$err.ForeColor = [System.Drawing.Color]::Firebrick
-			$err.Location = New-Object System.Drawing.Point(14, 172)
-			$err.Size = New-Object System.Drawing.Size(250, 28)
-			$form.Controls.Add($err)
-			$btnOk = New-Object System.Windows.Forms.Button
-			$btnOk.Text = 'OK'
-			$btnOk.Location = New-Object System.Drawing.Point(230, 172)
-			$btnOk.Width = 84
-			$btnCancel = New-Object System.Windows.Forms.Button
-			$btnCancel.Text = 'Cancel'
-			$btnCancel.Location = New-Object System.Drawing.Point(320, 172)
-			$btnCancel.Width = 84
-			$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-			$form.Controls.Add($btnOk)
-			$form.Controls.Add($btnCancel)
-			$form.AcceptButton = $btnOk
-			$form.CancelButton = $btnCancel
-			$btnOk.Add_Click({
-				param($sender, $e)
-				try {
-					$p1 = $tbPass.Text
-					$p2 = $tbPass2.Text
-					if ([string]::IsNullOrEmpty($p1)) { $err.Text = 'Password required.'; return }
-					if ($p1 -cne $p2) { $err.Text = 'Passwords do not match.'; return }
-					$bag.Cancelled = $false
-					$bag.Password = $p1
-					$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-				} catch {
-					$err.Text = $_.Exception.Message
-				}
-			})
-			try { [void]$tbPass.Focus() } catch {}
-			try { [void]$form.ShowDialog() } catch {}
-			return $bag
-		})
-		[void]$ps.AddArgument([string]$Title)
-		[void]$ps.AddArgument([string]$ShareName)
-		[void]$ps.AddArgument([string]$FolderPath)
-		$out = $ps.Invoke()
-		if ($ps.HadErrors) {
-			$fatal = @($ps.Streams.Error | ForEach-Object { "$_" } | Where-Object {
-				$_ -and $_ -notmatch '(?i)cancel|closed|disposed|DialogResult|ShowDialog'
-			})
-			if ($fatal.Count -gt 0) {
-				return @{ Cancelled = $true; Password = ''; Error = ($fatal -join '; ') }
-			}
-		}
-		if ($out -and @($out).Count -gt 0) { return @($out)[-1] }
-		return @{ Cancelled = $true; Password = '' }
-	} catch {
-		return @{ Cancelled = $true; Password = ''; Error = $_.Exception.Message }
-	} finally {
-		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
-		try { if ($ps) { $ps.Dispose() } } catch {}
-		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
-	}
-}
-
 function Ensure-MBShareLocalUser {
-	# Create or update fixed local user "share" (non-admin) with the given password.
-	param([string]$Password)
-	$user = 'share'
+	# Existing user: verify password via local logon (do NOT overwrite). Missing user: create.
+	# force_password_update / reset_password = true: reset to access_password then re-verify.
+	param(
+		[string]$Username = 'share',
+		[string]$Password,
+		[object]$force_password_update = $false,
+		[object]$reset_password = $false
+	)
+	$user = ([string]$Username).Trim()
 	$pass = [string]$Password
+	if ([string]::IsNullOrWhiteSpace($user)) {
+		return @{ ok = $false; error = 'access username required' }
+	}
+	if ($user -notmatch '^[A-Za-z0-9._-]{1,20}$') {
+		return @{ ok = $false; error = 'username must be 1-20 chars [A-Za-z0-9._-]' }
+	}
 	if ([string]::IsNullOrEmpty($pass)) {
-		return @{ ok = $false; error = 'share password required' }
+		return @{ ok = $false; error = 'access password required' }
+	}
+	$forcePw = $false
+	try { $forcePw = Convert-MBToBool -Value $force_password_update -Default $false } catch {}
+	if (-not $forcePw) {
+		try { $forcePw = Convert-MBToBool -Value $reset_password -Default $false } catch {}
 	}
 	try {
 		$exists = $false
+		$enabled = $true
 		if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
-			try { $null = Get-LocalUser -Name $user -ErrorAction Stop; $exists = $true } catch { $exists = $false }
+			try {
+				$lu = Get-LocalUser -Name $user -ErrorAction Stop
+				$exists = $true
+				try { $enabled = [bool]$lu.Enabled } catch { $enabled = $true }
+			} catch { $exists = $false }
 		} else {
 			$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
 			if ($chk.ok -or ($chk.out -match '(?i)User name')) { $exists = $true }
 		}
 		if ($exists) {
-			$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
-			if (Get-Command Set-LocalUser -ErrorAction SilentlyContinue) {
-				Set-LocalUser -Name $user -Password $sec -ErrorAction Stop
-			} else {
-				$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass) -TimeoutSec 30
-				if (-not $r.ok) {
-					return @{ ok = $false; error = "Failed to set password for existing user share: $($r.err) $($r.out)" }
+			if (-not $enabled) {
+				try { Enable-LocalUser -Name $user -ErrorAction SilentlyContinue } catch {}
+				try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/active:yes') -TimeoutSec 15 } catch {}
+			}
+			# Verify password matches existing account (do not silently reset)
+			$authOk = $false
+			try { $authOk = [bool](Test-MBLocalUserCredential -Username $user -Password $pass) } catch { $authOk = $false }
+			if ($authOk) {
+				return @{
+					ok       = $true
+					username = $user
+					created  = $false
+					method   = 'verified_existing'
+					password_verified = $true
 				}
 			}
-			try { Enable-LocalUser -Name $user -ErrorAction SilentlyContinue } catch {}
-			try { Remove-LocalGroupMember -Group 'Administrators' -Member $user -ErrorAction SilentlyContinue } catch {}
-			return @{ ok = $true; username = $user; created = $false; method = 'update' }
+			if ($forcePw) {
+				$set = Set-MBLocalUserPassword -Username $user -Password $pass
+				if (-not $set.ok) {
+					return @{
+						ok         = $false
+						need_input = $true
+						missing    = @('access_password')
+						error      = [string]$set.error
+						username   = $user
+						exists     = $true
+						hint       = 'Password reset failed (policy/elevation). Try a stronger password (complexity) or ensure MiniBot is running elevated.'
+					}
+				}
+				# Settle + retry verify (LSA / SAM can lag briefly after set)
+				$auth2 = $false
+				foreach ($delayMs in @(300, 700, 1200)) {
+					try { Start-Sleep -Milliseconds $delayMs } catch {}
+					try { $auth2 = [bool](Test-MBLocalUserCredential -Username $user -Password $pass) } catch { $auth2 = $false }
+					if ($auth2) { break }
+					try { Clear-MBLocalUserLogonFlags -Username $user } catch {}
+				}
+				if (-not $auth2) {
+					# Password API reported success; logon check can still fail (policy lag / type). Proceed with warning.
+					return @{
+						ok       = $true
+						username = $user
+						created  = $false
+						method   = ('force_password_update:' + [string]$set.method)
+						password_verified = $false
+						warning  = "Password was set via $($set.method) but immediate logon verify failed. Share grants will still proceed; if map fails, re-check password or try again."
+					}
+				}
+				return @{
+					ok       = $true
+					username = $user
+					created  = $false
+					method   = ('force_password_update:' + [string]$set.method)
+					password_verified = $true
+				}
+			}
+			return @{
+				ok         = $false
+				need_input = $true
+				missing    = @('access_password')
+				error      = "Local user '$user' exists but the password does not match. Ask for the correct password, or call again with force_password_update=true (or reset_password=true) to set a new password."
+				username   = $user
+				exists     = $true
+				password_verified = $false
+			}
 		}
 		$cr = New-MBLocalShareUserCore -username $user -password $pass -full_name 'Network share access'
 		if (-not $cr.ok) { return $cr }
-		return @{ ok = $true; username = $user; created = $true; method = $cr.method }
+		try { Start-Sleep -Milliseconds 300 } catch {}
+		$authNew = $false
+		try { $authNew = [bool](Test-MBLocalUserCredential -Username $user -Password $pass) } catch { $authNew = $false }
+		return @{
+			ok       = $true
+			username = $user
+			created  = $true
+			method   = $cr.method
+			password_verified = $authNew
+		}
 	} catch {
 		return @{ ok = $false; error = $_.Exception.Message }
-	}
-}
-
-function Show-MBLocalAdminGateDialog {
-	# Dropdown of local admins + password. Actions: verified | create | cancel.
-	param(
-		[string]$DomainName = '',
-		[object[]]$Accounts = @(),
-		[string]$Hint = ''
-	)
-	$names = @()
-	$labels = @()
-	foreach ($a in @($Accounts)) {
-		$n = [string]$a.name
-		if ([string]::IsNullOrWhiteSpace($n)) { continue }
-		$names += $n
-		$en = if ($a.enabled) { '' } else { ' (disabled)' }
-		$fn = if ($a.full_name) { " — $($a.full_name)" } else { '' }
-		$labels += "$n$en$fn"
-	}
-	$rs = $null; $ps = $null
-	try {
-		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
-		$rs = [runspacefactory]::CreateRunspace()
-		$rs.ApartmentState = 'STA'
-		$rs.ThreadOptions = 'ReuseThread'
-		$rs.Open()
-		$ps = [powershell]::Create()
-		$ps.Runspace = $rs
-		[void]$ps.AddScript({
-			param($DomainName, $Names, $Labels, $Hint)
-			Add-Type -AssemblyName System.Windows.Forms
-			Add-Type -AssemblyName System.Drawing
-			$form = New-Object System.Windows.Forms.Form
-			$form.Text = 'Leave Domain — local admin required'
-			$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-			$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-			$form.MaximizeBox = $false
-			$form.MinimizeBox = $false
-			$form.ClientSize = New-Object System.Drawing.Size(460, 280)
-			$form.TopMost = $true
-			$domLine = if ($DomainName) { "Domain: $DomainName`n" } else { '' }
-			$lbl = New-Object System.Windows.Forms.Label
-			$lbl.Text = "${domLine}Before leaving the domain, prove you can sign in as a local administrator.`nAfter disjoin, only local accounts work — wrong/missing admin = lockout."
-			$lbl.Location = New-Object System.Drawing.Point(14, 10)
-			$lbl.Size = New-Object System.Drawing.Size(430, 58)
-			$form.Controls.Add($lbl)
-			$lAcct = New-Object System.Windows.Forms.Label
-			$lAcct.Text = 'Local administrator'
-			$lAcct.Location = New-Object System.Drawing.Point(14, 74)
-			$lAcct.AutoSize = $true
-			$form.Controls.Add($lAcct)
-			$combo = New-Object System.Windows.Forms.ComboBox
-			$combo.Location = New-Object System.Drawing.Point(14, 92)
-			$combo.Width = 430
-			$combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-			if ($Labels -and @($Labels).Count -gt 0) {
-				for ($i = 0; $i -lt @($Labels).Count; $i++) {
-					[void]$combo.Items.Add([string]$Labels[$i])
-				}
-				$combo.SelectedIndex = 0
-			} else {
-				[void]$combo.Items.Add('(no local admin accounts found)')
-				$combo.SelectedIndex = 0
-				$combo.Enabled = $false
-			}
-			$form.Controls.Add($combo)
-			$lPass = New-Object System.Windows.Forms.Label
-			$lPass.Text = 'Password for selected account'
-			$lPass.Location = New-Object System.Drawing.Point(14, 128)
-			$lPass.AutoSize = $true
-			$form.Controls.Add($lPass)
-			$tbPass = New-Object System.Windows.Forms.TextBox
-			$tbPass.Location = New-Object System.Drawing.Point(14, 146)
-			$tbPass.Width = 430
-			$tbPass.UseSystemPasswordChar = $true
-			$tbPass.Enabled = ($Names -and @($Names).Count -gt 0)
-			$form.Controls.Add($tbPass)
-			$status = New-Object System.Windows.Forms.Label
-			$status.ForeColor = [System.Drawing.Color]::Firebrick
-			$status.Location = New-Object System.Drawing.Point(14, 176)
-			$status.Size = New-Object System.Drawing.Size(430, 36)
-			if ($Hint) { $status.Text = [string]$Hint }
-			$form.Controls.Add($status)
-			$btnVerify = New-Object System.Windows.Forms.Button
-			$btnVerify.Text = 'Verify && continue'
-			$btnVerify.Location = New-Object System.Drawing.Point(14, 224)
-			$btnVerify.Width = 130
-			$btnVerify.Enabled = ($Names -and @($Names).Count -gt 0)
-			$btnCreate = New-Object System.Windows.Forms.Button
-			$btnCreate.Text = 'Create local admin...'
-			$btnCreate.Location = New-Object System.Drawing.Point(154, 224)
-			$btnCreate.Width = 150
-			$btnCancel = New-Object System.Windows.Forms.Button
-			$btnCancel.Text = 'Cancel leave'
-			$btnCancel.Location = New-Object System.Drawing.Point(340, 224)
-			$btnCancel.Width = 104
-			$form.Controls.Add($btnVerify)
-			$form.Controls.Add($btnCreate)
-			$form.Controls.Add($btnCancel)
-			$form.AcceptButton = $btnVerify
-			$form.CancelButton = $btnCancel
-			$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-			$result = @{ Action = 'cancel'; Username = ''; Password = '' }
-			$btnVerify.Add_Click({
-				if (-not $Names -or @($Names).Count -eq 0) {
-					$status.Text = 'No local admin to verify. Create one first.'
-					return
-				}
-				$idx = $combo.SelectedIndex
-				if ($idx -lt 0 -or $idx -ge @($Names).Count) {
-					$status.Text = 'Select a local admin account.'
-					return
-				}
-				$u = [string]$Names[$idx]
-				$p = [string]$tbPass.Text
-				if ([string]::IsNullOrEmpty($p)) {
-					$status.Text = 'Enter the password for the selected account.'
-					return
-				}
-				$result.Action = 'verify'
-				$result.Username = $u
-				$result.Password = $p
-				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-			}.GetNewClosure())
-			$btnCreate.Add_Click({
-				$result.Action = 'create'
-				$result.Username = ''
-				$result.Password = ''
-				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-			}.GetNewClosure())
-			try { [void]$form.ShowDialog() } catch {}
-			return $result
-		})
-		[void]$ps.AddArgument([string]$DomainName)
-		[void]$ps.AddArgument([object[]]$names)
-		[void]$ps.AddArgument([object[]]$labels)
-		[void]$ps.AddArgument([string]$Hint)
-		$out = $ps.Invoke()
-		if ($ps.HadErrors) {
-			$errMsgs = @($ps.Streams.Error | ForEach-Object { "$_" }) -join '; '
-			if ($errMsgs) { throw $errMsgs }
-		}
-		if ($out -and @($out).Count -gt 0) { return @($out)[-1] }
-		return @{ Action = 'cancel'; Username = ''; Password = '' }
-	} catch {
-		return @{ Action = 'cancel'; Username = ''; Password = ''; Error = $_.Exception.Message }
-	} finally {
-		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
-		try { if ($ps) { $ps.Dispose() } } catch {}
-		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
-	}
-}
-
-function Request-MBLocalAdminGateForDomainLeave {
-	# Foolproof gate: verify local admin password (dropdown) or create one; cancel = refuse leave.
-	param([string]$DomainName = '')
-	$hint = ''
-	$preferUser = ''
-	for ($round = 0; $round -lt 12; $round++) {
-		$accounts = @(Get-MBLocalAdminAccounts)
-		$enabled = @($accounts | Where-Object { $_.enabled })
-		if ($enabled.Count -eq 0 -and $accounts.Count -eq 0) {
-			$offer = Request-Confirmation -Title "LeaveDomain — no local admin" -Details @"
-No local administrator accounts were found on this PC.
-
-Leaving the domain without a known local admin password can permanently lock you out (domain logons stop working after disjoin).
-
-Create a local administrator account now?
-"@
-			if (-not $offer) {
-				return @{
-					ok     = $false
-					reason = 'No local admin accounts and create was refused. LeaveDomain blocked to prevent lockout.'
-				}
-			}
-			$created = Show-MBCreateLocalAdminForm -Title 'Create local administrator (required)'
-			if (-not $created -or $created.Cancelled) {
-				return @{
-					ok     = $false
-					reason = 'Local admin creation cancelled. LeaveDomain blocked to prevent lockout.'
-				}
-			}
-			$cr = New-MBLocalAdminAccountCore -username $created.Username -password $created.Password
-			if (-not $cr.ok) {
-				$hint = "Create failed: $($cr.error)"
-				continue
-			}
-			$preferUser = $created.Username
-			# Auto-verify with the password just set
-			if (Test-MBLocalAdminCredential -Username $created.Username -Password $created.Password) {
-				return @{
-					ok       = $true
-					Username = $created.Username
-					Password = $created.Password
-					Created  = $true
-				}
-			}
-			$hint = "Account '$($created.Username)' created but could not verify password. Try again."
-			continue
-		}
-
-		# Prefer enabled accounts in the dialog list (include disabled with label)
-		$dlg = Show-MBLocalAdminGateDialog -DomainName $DomainName -Accounts $accounts -Hint $hint
-		if (-not $dlg -or $dlg.Action -eq 'cancel') {
-			return @{
-				ok     = $false
-				reason = 'Local admin verification cancelled. LeaveDomain blocked to prevent lockout.'
-			}
-		}
-		if ($dlg.Action -eq 'create') {
-			$offer = Request-Confirmation -Title "Create local admin before leave" -Details @"
-Create a new local administrator account before leaving domain '$DomainName'?
-
-You will need this account (and its password) to sign in after the PC leaves the domain.
-"@
-			if (-not $offer) {
-				# Creating refused while existing admins may exist — return to gate, do not leave
-				$hint = 'Create declined. Verify an existing local admin, or cancel leave.'
-				continue
-			}
-			$created = Show-MBCreateLocalAdminForm -Title 'Create local administrator'
-			if (-not $created -or $created.Cancelled) {
-				$hint = 'Create cancelled. Verify an existing local admin or cancel leave.'
-				continue
-			}
-			$cr = New-MBLocalAdminAccountCore -username $created.Username -password $created.Password
-			if (-not $cr.ok) {
-				$hint = "Create failed: $($cr.error)"
-				continue
-			}
-			if (Test-MBLocalAdminCredential -Username $created.Username -Password $created.Password) {
-				return @{
-					ok       = $true
-					Username = $created.Username
-					Password = $created.Password
-					Created  = $true
-				}
-			}
-			$hint = "Created '$($created.Username)' but verification failed. Select it and enter the password."
-			continue
-		}
-		if ($dlg.Action -eq 'verify') {
-			if (Test-MBLocalAdminCredential -Username $dlg.Username -Password $dlg.Password) {
-				return @{
-					ok       = $true
-					Username = $dlg.Username
-					Password = $dlg.Password
-					Created  = $false
-				}
-			}
-			$hint = "Authentication failed for '$($dlg.Username)'. Check the password, or create a new local admin."
-			continue
-		}
-		$hint = 'Unexpected gate response. Try again.'
-	}
-	return @{
-		ok     = $false
-		reason = 'Too many failed local-admin verification attempts. LeaveDomain blocked.'
 	}
 }
 
@@ -14890,28 +15232,39 @@ function Invoke-LeaveDomain {
 	if ($reboot -is [bool]) { $doReboot = $reboot }
 	elseif ([string]$reboot -match '^(?i)1|true|yes|y|on$') { $doReboot = $true }
 
-	# Always require verified local admin (lockout safety). Optional tool args can short-circuit the UI if valid.
+	# Require local admin creds via tool args (chat). No UI credential popup.
 	$verifiedUser = ''
 	$verifiedPass = ''
 	$createdAdmin = $false
 	$lu = ([string]$local_username).Trim()
 	$lp = [string]$local_password
-	if ($lu -and -not [string]::IsNullOrEmpty($lp) -and (Test-MBLocalAdminCredential -Username $lu -Password $lp)) {
-		$verifiedUser = $lu
-		$verifiedPass = $lp
-	} else {
-		if ($lu -and -not [string]::IsNullOrEmpty($lp)) {
-			Write-MBWarn "LeaveDomain: provided local credentials failed verification; opening local-admin gate."
-		}
-		$gate = Request-MBLocalAdminGateForDomainLeave -DomainName $dom
-		if (-not $gate -or -not $gate.ok) {
-			$why = if ($gate -and $gate.reason) { [string]$gate.reason } else { 'Local admin verification failed or was cancelled.' }
-			return "BLOCKED BY USER: LeaveDomain refused — $why"
-		}
-		$verifiedUser = [string]$gate.Username
-		$verifiedPass = [string]$gate.Password
-		if ($gate.Created) { $createdAdmin = $true }
+	$adminNames = @()
+	try {
+		$adminNames = @(Get-MBLocalAdminAccounts | ForEach-Object { [string]$_.name } | Where-Object { $_ })
+	} catch { $adminNames = @() }
+	if ([string]::IsNullOrWhiteSpace($lu) -or [string]::IsNullOrEmpty($lp)) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @($(if (-not $lu) { 'local_username' }), $(if ([string]::IsNullOrEmpty($lp)) { 'local_password' }) | Where-Object { $_ })
+			message    = 'NEED_INPUT: local_username and local_password are required (local admin that can sign in after leave). Ask the operator in chat. If none exist, use AddLocalUser admin=true with a password they choose, then LeaveDomain with those credentials. Show the password back so they know what was entered.'
+			domain     = $dom
+			local_admins = @($adminNames)
+		}) -Depth 4
 	}
+	if (-not (Test-MBLocalAdminCredential -Username $lu -Password $lp)) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @('local_username', 'local_password')
+			message    = "NEED_INPUT: credentials for local admin '$lu' failed verification. Ask the operator for a valid local admin username and password (or create one with AddLocalUser admin=true), then retry LeaveDomain."
+			domain     = $dom
+			tried_user = $lu
+			local_admins = @($adminNames)
+		}) -Depth 4
+	}
+	$verifiedUser = $lu
+	$verifiedPass = $lp
 
 	$details = @"
 LEAVE DOMAIN (lockout-safe gate passed):
@@ -15114,6 +15467,17 @@ function Invoke-MapNetworkDrive {
 
 	$user = Resolve-MBWindowsAccountName -Username $username -Domain $domain
 	$pass = [string]$password
+	if ($user -and [string]::IsNullOrEmpty($pass)) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @('password')
+			message    = "NEED_INPUT: username is set ($user) but password is empty. Ask the operator in chat for the share password, then call MapNetworkDrive again with password= (show it back so they know what was used)."
+			path       = $unc
+			username   = $user
+			letter     = $(if ($let) { "${let}:" } else { '' })
+		}) -Depth 4
+	}
 	$persist = $true
 	if ($persistent -is [bool]) { $persist = $persistent }
 	elseif ([string]$persistent -match '^(?i)0|false|no|off$') { $persist = $false }
@@ -15121,7 +15485,7 @@ function Invoke-MapNetworkDrive {
 	if ($force -is [bool]) { $doForce = $force }
 	elseif ([string]$force -match '^(?i)1|true|yes|y|on$') { $doForce = $true }
 
-	$details = "Map network drive:`n  letter = ${let}:$(if ($autoLetter) { ' (auto-picked free letter; CD/DVD reserved skipped)' } else { '' })`n  path = $unc`n  username = $(if ($user) { $user } else { '(current user)' })`n  password = $(if ($user) { (Get-MBMaskedSecret $pass) } else { '(n/a)' })`n  persistent = $persist`n  force = $doForce"
+	$details = "Map network drive:`n  letter = ${let}:$(if ($autoLetter) { ' (auto-picked free letter; CD/DVD reserved skipped)' } else { '' })`n  path = $unc`n  username = $(if ($user) { $user } else { '(current user)' })`n  password = $(if ($user) { $pass } else { '(n/a)' })`n  persistent = $persist`n  force = $doForce"
 	if (-not (Request-Confirmation -Title "MapNetworkDrive requires approval" -Details $details)) {
 		return "BLOCKED BY USER: MapNetworkDrive denied."
 	}
@@ -15183,17 +15547,37 @@ function Invoke-MapNetworkDrive {
 			$method = if ($method -eq 'New-SmbMapping-failed') { 'net use (after New-SmbMapping failed)' } else { 'net use' }
 		}
 
+		$verify = $null
+		$card = ''
+		if ($ok) {
+			$verify = Test-MBMappedDrivePresent -Letter $let -Unc $unc
+			try { [void](Add-MBStickyNote -Text ("Mapped ${let}: -> $unc") -Kind finding) } catch {}
+			$card = Write-MBOperatorCard -Title 'DRIVE MAPPED' -Fields ([ordered]@{
+				Letter     = "${let}:"
+				UNC        = $unc
+				Username   = $(if ($user) { $user } else { '(current user)' })
+				Persistent = $persist
+				Method     = $method
+				Verified   = $(if ($verify.ok) { 'yes (' + $verify.detail + ')' } else { 'NO - ' + $verify.detail })
+			}) -Notes @(
+				$(if ($autoLetter) { 'Letter was auto-picked (CD/DVD reserved letters skipped).' } else { '' })
+			)
+		}
+
 		return ConvertTo-MBJson ([ordered]@{
-			ok          = $ok
-			letter      = "${let}:"
-			letter_auto = $autoLetter
-			path        = $unc
-			username    = $user
-			persistent  = $persist
-			method      = $method
-			exit        = $exit
-			out         = $out
-			err         = $err
+			ok            = $ok
+			letter        = "${let}:"
+			letter_auto   = $autoLetter
+			path          = $unc
+			username      = $user
+			persistent    = $persist
+			method        = $method
+			exit          = $exit
+			out           = $out
+			err           = $err
+			verified      = $(if ($verify) { [bool]$verify.ok } else { $false })
+			verify_detail = $(if ($verify) { [string]$verify.detail } else { '' })
+			operator_card = $card
 		})
 	} catch {
 		return "ERROR: MapNetworkDrive failed: $($_.Exception.Message)"
@@ -15263,7 +15647,7 @@ function Invoke-AddNetworkPrinter {
 }
 
 function Test-MBLocalUserCredential {
-	# Logon check only (not admin membership).
+	# Logon check only (not admin membership). LogonUser first, then local IPC$ net use (SMB path).
 	param(
 		[string]$Username,
 		[string]$Password
@@ -15271,46 +15655,31 @@ function Test-MBLocalUserCredential {
 	$user = ([string]$Username).Trim()
 	if ([string]::IsNullOrWhiteSpace($user)) { return $false }
 	if ($null -eq $Password) { return $false }
-	try { Ensure-MBLogonHelper } catch { return $false }
-	try { return [bool][MiniBot.Native.MBLogon]::ValidateLocalUser($user, [string]$Password) } catch { return $false }
-}
-
-function Get-MBLocalUserAccountNames {
-	$list = New-Object System.Collections.ArrayList
-	$seen = @{}
-	if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
-		try {
-			Get-LocalUser -ErrorAction Stop | ForEach-Object {
-				$n = [string]$_.Name
-				if ([string]::IsNullOrWhiteSpace($n)) { return }
-				if (-not $_.Enabled) { return }
-				$key = $n.ToLowerInvariant()
-				if ($seen.ContainsKey($key)) { return }
-				$seen[$key] = $true
-				[void]$list.Add($n)
-			}
-		} catch {}
-	}
-	if ($list.Count -eq 0) {
-		try {
-			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user') -TimeoutSec 15
-			$in = $false
-			foreach ($line in (([string]$r.out) -split "`r?`n")) {
-				if ($line -match '----') { $in = $true; continue }
-				if (-not $in) { continue }
-				if ($line -match '(?i)command completed') { break }
-				foreach ($tok in ($line -split '\s+')) {
-					$t = $tok.Trim()
-					if ([string]::IsNullOrWhiteSpace($t)) { continue }
-					$key = $t.ToLowerInvariant()
-					if ($seen.ContainsKey($key)) { continue }
-					$seen[$key] = $true
-					[void]$list.Add($t)
-				}
-			}
-		} catch {}
-	}
-	return @($list | Sort-Object)
+	$pass = [string]$Password
+	try { Ensure-MBLogonHelper } catch {}
+	try {
+		if ([bool][MiniBot.Native.MBLogon]::ValidateLocalUser($user, $pass)) { return $true }
+	} catch {}
+	# Fallback: network-style auth used by shares (helps when INTERACTIVE is restricted)
+	try {
+		$hostName = $env:COMPUTERNAME
+		if ([string]::IsNullOrWhiteSpace($hostName)) { $hostName = 'localhost' }
+		$ipc = ('\\{0}\IPC$' -f $hostName)
+		try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', $ipc, '/delete', '/y') -TimeoutSec 8 } catch {}
+		$passEsc = $pass -replace '"', '""'
+		$userSpec = '.\{0}' -f $user
+		$line = 'use {0} /user:{1} "{2}"' -f $ipc, $userSpec, $passEsc
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @($line) -TimeoutSec 20
+		try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', $ipc, '/delete', '/y') -TimeoutSec 8 } catch {}
+		if ($r.ok) { return $true }
+		# Bare local user form
+		try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', $ipc, '/delete', '/y') -TimeoutSec 8 } catch {}
+		$line2 = 'use {0} /user:{1} "{2}"' -f $ipc, $user, $passEsc
+		$r2 = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @($line2) -TimeoutSec 20
+		try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', $ipc, '/delete', '/y') -TimeoutSec 8 } catch {}
+		if ($r2.ok) { return $true }
+	} catch {}
+	return $false
 }
 
 function New-MBLocalShareUserCore {
@@ -15541,330 +15910,58 @@ Enable SMBv1 now?
 	}
 }
 
-function Grant-MBNtfsFullControl {
-	param(
-		[string]$Path,
-		[string]$Identity
-	)
-	# (OI)(CI)F = object+container inherit Full access (read/write/execute/delete)
-	$id = ([string]$Identity).Trim()
-	if ([string]::IsNullOrWhiteSpace($id)) { return @{ ok = $false; error = 'identity required' } }
-	$p = [string]$Path
-	$grant = '{0}:(OI)(CI)F' -f $id
-	$r = Invoke-MBSetupNative -File 'icacls.exe' -ArgumentList @($p, '/grant', $grant, '/C') -TimeoutSec 60
-	return @{ ok = $r.ok; identity = $id; exit = $r.exit; out = $r.out; err = $r.err }
+function Resolve-MBShareAccessRight {
+	# Normalize to SMB AccessRight: Full | Change | Read. Default Full when blank/unknown.
+	param([string]$Right = '')
+	$r = ([string]$Right).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($r)) { return 'Full' }
+	if ($r -match '^(full|f|modify|all)$') { return 'Full' }
+	if ($r -match '^(change|c|write|rw|readwrite|read_write|edit)$') { return 'Change' }
+	if ($r -match '^(read|r|readonly|read_only|ro)$') { return 'Read' }
+	return 'Full'
 }
 
-function Grant-MBSmbShareFullAccess {
+function Grant-MBNtfsAccess {
+	# icacls rights: F=Full, M=Modify (~Change), RX=Read+Execute
+	param(
+		[string]$Path,
+		[string]$Identity,
+		[string]$AccessRight = 'Full'
+	)
+	$id = ([string]$Identity).Trim()
+	if ([string]::IsNullOrWhiteSpace($id)) { return @{ ok = $false; error = 'identity required' } }
+	$smbRight = Resolve-MBShareAccessRight -Right $AccessRight
+	$ica = switch ($smbRight) {
+		'Change' { 'M' }
+		'Read'   { 'RX' }
+		default  { 'F' }
+	}
+	$p = [string]$Path
+	$grant = '{0}:(OI)(CI){1}' -f $id, $ica
+	$r = Invoke-MBSetupNative -File 'icacls.exe' -ArgumentList @($p, '/grant', $grant, '/C') -TimeoutSec 60
+	return @{ ok = $r.ok; identity = $id; right = $smbRight; icacls = $ica; exit = $r.exit; out = $r.out; err = $r.err }
+}
+
+function Grant-MBSmbShareAccess {
 	param(
 		[string]$ShareName,
-		[string]$Account
+		[string]$Account,
+		[string]$AccessRight = 'Full'
 	)
 	$acct = ([string]$Account).Trim()
 	$name = ([string]$ShareName).Trim()
+	$right = Resolve-MBShareAccessRight -Right $AccessRight
 	if (Get-Command Grant-SmbShareAccess -ErrorAction SilentlyContinue) {
 		try {
-			Grant-SmbShareAccess -Name $name -AccountName $acct -AccessRight Full -Force -ErrorAction Stop | Out-Null
-			return @{ ok = $true; method = 'Grant-SmbShareAccess'; account = $acct }
+			Grant-SmbShareAccess -Name $name -AccountName $acct -AccessRight $right -Force -ErrorAction Stop | Out-Null
+			return @{ ok = $true; method = 'Grant-SmbShareAccess'; account = $acct; right = $right }
 		} catch {
-			return @{ ok = $false; method = 'Grant-SmbShareAccess'; account = $acct; error = $_.Exception.Message }
+			return @{ ok = $false; method = 'Grant-SmbShareAccess'; account = $acct; right = $right; error = $_.Exception.Message }
 		}
 	}
-	$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $name, ('/GRANT:{0},FULL' -f $acct)) -TimeoutSec 30
-	return @{ ok = $r.ok; method = 'net share /GRANT'; account = $acct; exit = $r.exit; out = $r.out; err = $r.err }
-}
-
-function Show-MBShareAccessGateDialog {
-	# Multi-user access picker. Actions: verify | create | done | cancel
-	param(
-		[string[]]$LocalUsers = @(),
-		[string[]]$VerifiedUsers = @(),
-		[string]$PreferUser = '',
-		[bool]$EveryoneFull = $true,
-		[string]$Hint = '',
-		[string]$ShareLabel = ''
-	)
-	$rs = $null; $ps = $null
-	try {
-		try { Suspend-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $true } } catch {} }
-		$rs = [runspacefactory]::CreateRunspace()
-		$rs.ApartmentState = 'STA'
-		$rs.ThreadOptions = 'ReuseThread'
-		$rs.Open()
-		$ps = [powershell]::Create()
-		$ps.Runspace = $rs
-		[void]$ps.AddScript({
-			param($LocalUsers, $VerifiedUsers, $PreferUser, $EveryoneFull, $Hint, $ShareLabel)
-			Add-Type -AssemblyName System.Windows.Forms
-			Add-Type -AssemblyName System.Drawing
-			$form = New-Object System.Windows.Forms.Form
-			$form.Text = 'CreateShare - who can access'
-			$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-			$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-			$form.MaximizeBox = $false
-			$form.MinimizeBox = $false
-			$form.ClientSize = New-Object System.Drawing.Size(480, 390)
-			$form.TopMost = $true
-			$top = New-Object System.Windows.Forms.Label
-			$top.Text = "Password-protected sharing (Win10/11). Verify each account with its password.`nCurrent operator should be included (you know that password). If verify fails, create a share user."
-			if ($ShareLabel) { $top.Text = "$ShareLabel`n`n" + $top.Text }
-			$top.Location = New-Object System.Drawing.Point(14, 10)
-			$top.Size = New-Object System.Drawing.Size(450, 58)
-			$form.Controls.Add($top)
-			$cbEvery = New-Object System.Windows.Forms.CheckBox
-			$cbEvery.Text = 'Everyone = Full (read/write/execute/delete) on share + NTFS'
-			$cbEvery.Checked = [bool]$EveryoneFull
-			$cbEvery.Location = New-Object System.Drawing.Point(14, 70)
-			$cbEvery.Size = New-Object System.Drawing.Size(450, 22)
-			$form.Controls.Add($cbEvery)
-			$note = New-Object System.Windows.Forms.Label
-			$note.Text = 'Also always grant Full explicitly per verified user (Everyone alone often fails).'
-			$note.Location = New-Object System.Drawing.Point(14, 92)
-			$note.Size = New-Object System.Drawing.Size(450, 18)
-			$note.ForeColor = [System.Drawing.Color]::DimGray
-			$form.Controls.Add($note)
-			$lVer = New-Object System.Windows.Forms.Label
-			$lVer.Text = 'Verified access accounts'
-			$lVer.Location = New-Object System.Drawing.Point(14, 118)
-			$lVer.AutoSize = $true
-			$form.Controls.Add($lVer)
-			$lb = New-Object System.Windows.Forms.ListBox
-			$lb.Location = New-Object System.Drawing.Point(14, 136)
-			$lb.Size = New-Object System.Drawing.Size(450, 70)
-			foreach ($u in @($VerifiedUsers)) { if ($u) { [void]$lb.Items.Add([string]$u) } }
-			$form.Controls.Add($lb)
-			$lUser = New-Object System.Windows.Forms.Label
-			$lUser.Text = 'Local user to verify'
-			$lUser.Location = New-Object System.Drawing.Point(14, 214)
-			$lUser.AutoSize = $true
-			$form.Controls.Add($lUser)
-			$combo = New-Object System.Windows.Forms.ComboBox
-			$combo.Location = New-Object System.Drawing.Point(14, 232)
-			$combo.Width = 450
-			$combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-			$names = @($LocalUsers)
-			if ($names.Count -eq 0) { $names = @($PreferUser) | Where-Object { $_ } }
-			foreach ($n in $names) { if ($n) { [void]$combo.Items.Add([string]$n) } }
-			if ($combo.Items.Count -gt 0) {
-				$idx = 0
-				if ($PreferUser) {
-					for ($i = 0; $i -lt $combo.Items.Count; $i++) {
-						if ([string]$combo.Items[$i] -eq $PreferUser) { $idx = $i; break }
-					}
-				}
-				$combo.SelectedIndex = $idx
-			}
-			$form.Controls.Add($combo)
-			$lPass = New-Object System.Windows.Forms.Label
-			$lPass.Text = 'Password (verify this account is valid)'
-			$lPass.Location = New-Object System.Drawing.Point(14, 262)
-			$lPass.AutoSize = $true
-			$form.Controls.Add($lPass)
-			$tbPass = New-Object System.Windows.Forms.TextBox
-			$tbPass.Location = New-Object System.Drawing.Point(14, 280)
-			$tbPass.Width = 450
-			$tbPass.UseSystemPasswordChar = $true
-			$form.Controls.Add($tbPass)
-			$status = New-Object System.Windows.Forms.Label
-			$status.ForeColor = [System.Drawing.Color]::Firebrick
-			$status.Location = New-Object System.Drawing.Point(14, 308)
-			$status.Size = New-Object System.Drawing.Size(450, 32)
-			if ($Hint) { $status.Text = [string]$Hint }
-			$form.Controls.Add($status)
-			$btnVerify = New-Object System.Windows.Forms.Button
-			$btnVerify.Text = 'Verify && add'
-			$btnVerify.Location = New-Object System.Drawing.Point(14, 348)
-			$btnVerify.Width = 100
-			$btnCreate = New-Object System.Windows.Forms.Button
-			$btnCreate.Text = 'Create user...'
-			$btnCreate.Location = New-Object System.Drawing.Point(122, 348)
-			$btnCreate.Width = 100
-			$btnDone = New-Object System.Windows.Forms.Button
-			$btnDone.Text = 'Done'
-			$btnDone.Location = New-Object System.Drawing.Point(280, 348)
-			$btnDone.Width = 90
-			$btnCancel = New-Object System.Windows.Forms.Button
-			$btnCancel.Text = 'Cancel'
-			$btnCancel.Location = New-Object System.Drawing.Point(378, 348)
-			$btnCancel.Width = 86
-			$form.Controls.Add($btnVerify)
-			$form.Controls.Add($btnCreate)
-			$form.Controls.Add($btnDone)
-			$form.Controls.Add($btnCancel)
-			$form.AcceptButton = $btnVerify
-			$form.CancelButton = $btnCancel
-			$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-			$result = @{ Action = 'cancel'; Username = ''; Password = ''; EveryoneFull = [bool]$EveryoneFull; Verified = @($VerifiedUsers) }
-			$btnVerify.Add_Click({
-				if ($combo.SelectedIndex -lt 0) { $status.Text = 'Select a local user.'; return }
-				$u = [string]$combo.SelectedItem
-				$p = [string]$tbPass.Text
-				if ([string]::IsNullOrEmpty($p)) { $status.Text = 'Enter the password for the selected user.'; return }
-				$result.Action = 'verify'
-				$result.Username = $u
-				$result.Password = $p
-				$result.EveryoneFull = [bool]$cbEvery.Checked
-				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-			}.GetNewClosure())
-			$btnCreate.Add_Click({
-				$result.Action = 'create'
-				$result.Username = ''
-				$result.Password = ''
-				$result.EveryoneFull = [bool]$cbEvery.Checked
-				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-			}.GetNewClosure())
-			$btnDone.Add_Click({
-				if ($lb.Items.Count -eq 0) {
-					$status.Text = 'Verify at least one account (operator recommended), or create a share user.'
-					return
-				}
-				$result.Action = 'done'
-				$result.EveryoneFull = [bool]$cbEvery.Checked
-				$result.Verified = @($lb.Items | ForEach-Object { [string]$_ })
-				$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-			}.GetNewClosure())
-			try { [void]$form.ShowDialog() } catch {}
-			return $result
-		})
-		[void]$ps.AddArgument([object[]]@($LocalUsers))
-		[void]$ps.AddArgument([object[]]@($VerifiedUsers))
-		[void]$ps.AddArgument([string]$PreferUser)
-		[void]$ps.AddArgument([bool]$EveryoneFull)
-		[void]$ps.AddArgument([string]$Hint)
-		[void]$ps.AddArgument([string]$ShareLabel)
-		$out = $ps.Invoke()
-		if ($out -and @($out).Count -gt 0) { return @($out)[-1] }
-		return @{ Action = 'cancel' }
-	} catch {
-		return @{ Action = 'cancel'; Error = $_.Exception.Message }
-	} finally {
-		try { Resume-MBWpfForModal } catch { try { if ($script:MB.Wpf) { $script:MB.Wpf.ModalUi = $false } } catch {} }
-		try { if ($ps) { $ps.Dispose() } } catch {}
-		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
-	}
-}
-
-function Request-MBShareAccessGate {
-	# Collect verified access users (+ everyone flag). At least one user required.
-	param(
-		[string]$ShareName = '',
-		[string]$FolderPath = '',
-		[bool]$EveryoneFull = $true
-	)
-	$current = ''
-	try {
-		$current = [Environment]::UserName
-		if ($env:USERNAME) { $current = [string]$env:USERNAME }
-	} catch {}
-	$verified = New-Object System.Collections.ArrayList
-	# Store password only for newly created users we may need to report once (not all verified)
-	$createdUsers = New-Object System.Collections.ArrayList
-	$createdPass = @{}
-	$everyone = [bool]$EveryoneFull
-	$hint = "Verify the current user ($current) first if you know the password, then Done — or add more accounts."
-	$label = "Share: $ShareName`nFolder: $FolderPath"
-	for ($round = 0; $round -lt 20; $round++) {
-		$locals = @(Get-MBLocalUserAccountNames)
-		$dlg = Show-MBShareAccessGateDialog -LocalUsers $locals -VerifiedUsers @($verified) -PreferUser $current -EveryoneFull $everyone -Hint $hint -ShareLabel $label
-		if (-not $dlg -or $dlg.Action -eq 'cancel') {
-			return @{ ok = $false; reason = 'Share access setup cancelled. CreateShare blocked.' }
-		}
-		if ($null -ne $dlg.EveryoneFull) { $everyone = [bool]$dlg.EveryoneFull }
-		if ($dlg.Action -eq 'done') {
-			$final = @()
-			if ($dlg.Verified) { $final = @($dlg.Verified) }
-			elseif ($verified.Count -gt 0) { $final = @($verified) }
-			if ($final.Count -eq 0) {
-				$hint = 'Add at least one verified account before Done.'
-				continue
-			}
-			return @{
-				ok            = $true
-				Users         = @($final)
-				EveryoneFull  = $everyone
-				CreatedUsers  = @($createdUsers)
-				CreatedPass   = $createdPass
-				OperatorUser  = $current
-			}
-		}
-		if ($dlg.Action -eq 'create') {
-			$offer = Request-Confirmation -Title "Create share access user" -Details @"
-Create a new limited (non-admin) local account for network share access?
-
-Password-protected sharing requires a real username/password on the other PC.
-This account will get Full share + NTFS rights (same as other access users).
-"@
-			if (-not $offer) {
-				$hint = 'Create declined. Verify an existing local user password, or Cancel.'
-				continue
-			}
-			$created = Show-MBCreateLocalAdminForm -Title 'Create share access user (non-admin)'
-			if (-not $created -or $created.Cancelled) {
-				$hint = 'Create cancelled. Verify an existing user or Cancel share.'
-				continue
-			}
-			$cr = New-MBLocalShareUserCore -username $created.Username -password $created.Password
-			if (-not $cr.ok) {
-				$hint = "Create failed: $($cr.error)"
-				continue
-			}
-			if (-not (Test-MBLocalUserCredential -Username $created.Username -Password $created.Password)) {
-				$hint = "Created '$($created.Username)' but logon verify failed. Try again."
-				continue
-			}
-			$key = $created.Username.ToLowerInvariant()
-			$exists = $false
-			foreach ($v in @($verified)) { if ($v.ToLowerInvariant() -eq $key) { $exists = $true; break } }
-			if (-not $exists) { [void]$verified.Add($created.Username) }
-			if (-not ($createdUsers -contains $created.Username)) { [void]$createdUsers.Add($created.Username) }
-			$createdPass[$created.Username] = $created.Password
-			$hint = "Added share user '$($created.Username)'. Verify more accounts or Done."
-			continue
-		}
-		if ($dlg.Action -eq 'verify') {
-			$u = [string]$dlg.Username
-			$p = [string]$dlg.Password
-			if (-not (Test-MBLocalUserCredential -Username $u -Password $p)) {
-				$offer = Request-Confirmation -Title "Password verify failed for $u" -Details @"
-Could not authenticate local user '$u' with that password.
-
-Create a new limited share-access user instead?
-(If you refuse, you can retry another account or cancel CreateShare.)
-"@
-				if ($offer) {
-					$created = Show-MBCreateLocalAdminForm -Title 'Create share access user (non-admin)'
-					if ($created -and -not $created.Cancelled) {
-						$cr = New-MBLocalShareUserCore -username $created.Username -password $created.Password
-						if ($cr.ok -and (Test-MBLocalUserCredential -Username $created.Username -Password $created.Password)) {
-							$key = $created.Username.ToLowerInvariant()
-							$exists = $false
-							foreach ($v in @($verified)) { if ($v.ToLowerInvariant() -eq $key) { $exists = $true; break } }
-							if (-not $exists) { [void]$verified.Add($created.Username) }
-							if (-not ($createdUsers -contains $created.Username)) { [void]$createdUsers.Add($created.Username) }
-							$createdPass[$created.Username] = $created.Password
-							$hint = "Created and added '$($created.Username)'. Add more or Done."
-						} else {
-							$err = if ($cr -and $cr.error) { $cr.error } else { 'verify failed after create' }
-							$hint = "Create failed: $err"
-						}
-					} else {
-						$hint = "Verify failed for '$u'. Try another password/user, create user, or Cancel."
-					}
-				} else {
-					$hint = "Verify failed for '$u'. Fix password, pick another user, create one, or Cancel."
-				}
-				continue
-			}
-			$key = $u.ToLowerInvariant()
-			$exists = $false
-			foreach ($v in @($verified)) { if ($v.ToLowerInvariant() -eq $key) { $exists = $true; break } }
-			if (-not $exists) { [void]$verified.Add($u) }
-			$hint = "Verified '$u'. Add another account or Done."
-			continue
-		}
-		$hint = 'Unexpected response. Try again.'
-	}
-	return @{ ok = $false; reason = 'Too many attempts. CreateShare blocked.' }
+	$netRight = $right.ToUpperInvariant() # FULL | CHANGE | READ
+	$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $name, ('/GRANT:{0},{1}' -f $acct, $netRight)) -TimeoutSec 30
+	return @{ ok = $r.ok; method = 'net share /GRANT'; account = $acct; right = $right; exit = $r.exit; out = $r.out; err = $r.err }
 }
 
 function Format-MBShareAccessHowTo {
@@ -15960,9 +16057,15 @@ function Invoke-CreateShare {
 	param(
 		[string]$path,
 		[string]$name,
+		[string]$access_username = '',
+		[string]$access_password = '',
 		[string]$share_password = '',
+		[string]$access_right = '',
+		[string]$permission = '',
 		[string]$description = '',
-		[object]$everyone_full = $true,
+		[object]$everyone_full = $null,
+		[object]$force_password_update = $false,
+		[object]$reset_password = $false,
 		[object]$ensure_network = $true,
 		[object]$ensure_discovery = $true,
 		[object]$ensure_folder = $true,
@@ -15971,15 +16074,65 @@ function Invoke-CreateShare {
 	$folder = ([string]$path).Trim().Trim('"')
 	$shareName = ([string]$name).Trim()
 	$desc = ([string]$description).Trim()
-	$shareUser = 'share'
+	# Specific local user for share+NTFS grant (created if missing). Not fixed to "share".
+	$shareUser = ([string]$access_username).Trim()
+	# Password for that access account (share_password kept as alias)
+	$pass = [string]$access_password
+	if ([string]::IsNullOrEmpty($pass) -and -not [string]::IsNullOrEmpty([string]$share_password)) {
+		$pass = [string]$share_password
+	}
+	# Permission level: Full (default) | Change | Read — not forced Full if caller passes another right
+	$rightRaw = ([string]$access_right).Trim()
+	if ([string]::IsNullOrWhiteSpace($rightRaw)) { $rightRaw = ([string]$permission).Trim() }
+	$accessRight = Resolve-MBShareAccessRight -Right $rightRaw
 	if ([string]::IsNullOrWhiteSpace($folder)) { return "ERROR: path required (any local folder to share)." }
 	if ([string]::IsNullOrWhiteSpace($shareName)) { return "ERROR: name required (share name for \\\\PC\\name)." }
 	if ($shareName -notmatch '^[A-Za-z0-9][A-Za-z0-9._$-]{0,79}$') {
 		return "ERROR: share name must be 1-80 chars starting with letter/digit [A-Za-z0-9._$-]."
 	}
-	$everyoneFull = $true
-	if ($everyone_full -is [bool]) { $everyoneFull = $everyone_full }
-	elseif ([string]$everyone_full -match '^(?i)0|false|no|off$') { $everyoneFull = $false }
+
+	# everyone_full is REQUIRED (no silent default) — Windows often needs an explicit user grant
+	$missing = New-Object System.Collections.ArrayList
+	$everyoneProvided = $false
+	$everyoneFull = $false
+	if ($null -ne $everyone_full -and "$everyone_full" -ne '') {
+		$everyoneProvided = $true
+		if ($everyone_full -is [bool]) { $everyoneFull = [bool]$everyone_full }
+		elseif ([string]$everyone_full -match '^(?i)1|true|yes|y|on$') { $everyoneFull = $true }
+		elseif ([string]$everyone_full -match '^(?i)0|false|no|off$') { $everyoneFull = $false }
+		else { $everyoneProvided = $false }
+	}
+	if (-not $everyoneProvided) { [void]$missing.Add('everyone_full') }
+	if ([string]::IsNullOrWhiteSpace($shareUser)) { [void]$missing.Add('access_username') }
+	if ([string]::IsNullOrEmpty($pass)) { [void]$missing.Add('access_password') }
+	if ($missing.Count -gt 0) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @($missing)
+			message    = @'
+NEED_INPUT: CreateShare needs explicit access choice from the operator (ask in chat, no popup):
+  1) everyone_full = true|false  — ALWAYS ask: "Everyone access, or only a specific user?" (Everyone alone often fails on Win10/11; we still grant a named local user the same right.)
+  2) access_username — local account for share+NTFS grant (create if missing; e.g. share, bob, tech)
+  3) access_password (alias share_password) — password for that account; show it back to the operator
+Optional: access_right / permission = Full|Change|Read (default Full if omitted).
+Then call CreateShare with path, name, everyone_full, access_username, access_password [, access_right].
+'@
+			path = $folder
+			name = $shareName
+			access_right_default = 'Full'
+			hint = 'Recommended: everyone_full=true AND a specific access_username. Default permission is Full if not specified.'
+		}) -Depth 4
+	}
+	if ($shareUser -match '^(?i)everyone$') {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @('access_username')
+			message    = 'NEED_INPUT: access_username cannot be Everyone. Set everyone_full=true for Everyone, and pick a real local username (e.g. share) for the explicit grant.'
+		}) -Depth 4
+	}
+
 	$doNet = $true
 	if ($ensure_network -is [bool]) { $doNet = $ensure_network }
 	elseif ([string]$ensure_network -match '^(?i)0|false|no|off$') { $doNet = $false }
@@ -16007,31 +16160,21 @@ function Invoke-CreateShare {
 	try { $hostName = [System.Net.Dns]::GetHostName() } catch {}
 	if ([string]::IsNullOrWhiteSpace($hostName)) { $hostName = $env:COMPUTERNAME }
 
-	# Password for fixed local user "share" — use model-supplied password if given; prompt only when omitted
-	$pass = [string]$share_password
-	$passFromPrompt = $false
-	if ([string]::IsNullOrEmpty($pass)) {
-		$pwDlg = $null
-		try {
-			$pwDlg = Show-MBSharePasswordForm -Title 'CreateShare — password for user share' -ShareName $shareName -FolderPath $folder
-		} catch {
-			return "BLOCKED BY USER: CreateShare password prompt failed (cancelled or error): $($_.Exception.Message)"
-		}
-		if (-not $pwDlg -or $pwDlg.Cancelled -or [string]::IsNullOrEmpty([string]$pwDlg.Password)) {
-			return "BLOCKED BY USER: CreateShare cancelled (no password for local user share)."
-		}
-		$pass = [string]$pwDlg.Password
-		$passFromPrompt = $true
+	$aclNote = if ($everyoneFull) {
+		"Everyone $accessRight + explicit $accessRight for local user $shareUser (create if missing)"
+	} else {
+		"ONLY explicit $accessRight for local user $shareUser (create if missing); Everyone NOT granted"
 	}
-
 	$details = @"
 Create SMB share (password-protected):
   folder            = $folder
   share name        = $shareName
   UNC               = \\$hostName\$shareName
-  access account    = $shareUser  (create or update local non-admin user)
-  password          = $(Get-MBMaskedSecret $pass)  source=$(if ($passFromPrompt) { 'operator prompt' } else { 'tool arg' })
-  Everyone Full     = $everyoneFull  (+ explicit Full for $shareUser)
+  access username   = $shareUser  (create or update local non-admin)
+  access password   = $pass
+  access right      = $accessRight  (Full|Change|Read; default Full)
+  everyone_full     = $everyoneFull  (Everyone gets same access right when true)
+  ACL plan          = $aclNote
   ensure_folder     = $doFolder  (existing paths OK)
   ensure network    = $doNet
   ensure discovery  = $doDisc
@@ -16043,7 +16186,9 @@ Create SMB share (password-protected):
 
 	$steps = New-Object System.Collections.ArrayList
 	$aclLog = New-Object System.Collections.ArrayList
+	$chkTotal = 6
 	try {
+		Write-MBJobChecklist -Job 'CreateShare' -Step 1 -Total $chkTotal -Label 'folder' -Phase start
 		# Any existing folder is fine; only create when missing + ensure_folder
 		if (-not (Test-Path -LiteralPath $folder)) {
 			if (-not $doFolder) {
@@ -16057,13 +16202,35 @@ Create SMB share (password-protected):
 		if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
 			return "ERROR: path is not a folder: $folder"
 		}
+		Write-MBJobChecklist -Job 'CreateShare' -Step 1 -Total $chkTotal -Label 'folder' -Phase ok
 
-		$acct = Ensure-MBShareLocalUser -Password $pass
+		Write-MBJobChecklist -Job 'CreateShare' -Step 2 -Total $chkTotal -Label ("local user $shareUser") -Phase start
+		$forcePw = Convert-MBToBool -Value $force_password_update -Default $false
+		if (-not $forcePw) {
+			try { $forcePw = Convert-MBToBool -Value $reset_password -Default $false } catch {}
+		}
+		$acct = Ensure-MBShareLocalUser -Username $shareUser -Password $pass -force_password_update $forcePw -reset_password $forcePw
 		if (-not $acct.ok) {
+			Write-MBJobChecklist -Job 'CreateShare' -Step 2 -Total $chkTotal -Label ("local user $shareUser") -Phase fail
+			if ($acct.need_input -or ($acct.error -match '(?i)password does not match|exists but|Could not set password|policy')) {
+				return ConvertTo-MBJson ([ordered]@{
+					ok         = $false
+					need_input = $true
+					missing    = @('access_password')
+					message    = $(if ($acct.error) { [string]$acct.error } else { "Password for existing user '$shareUser' failed verification." })
+					username   = $shareUser
+					exists     = $true
+					hint       = 'Correct password, or force_password_update=true / reset_password=true to set a new password (must meet local password policy).'
+				}) -Depth 4
+			}
 			return "ERROR: could not prepare local user '$shareUser': $($acct.error)"
 		}
-		[void]$steps.Add(("local user $shareUser : {0}" -f $(if ($acct.created) { 'created' } else { 'password updated' })))
+		$userStep = if ($acct.created) { 'created' } elseif ($acct.method -eq 'verified_existing') { 'exists (password verified)' } elseif ("$($acct.method)" -match 'force_password') { 'password reset' } else { [string]$acct.method }
+		if ($acct.warning) { [void]$steps.Add(('WARN: {0}' -f $acct.warning)) }
+		[void]$steps.Add(("local user $shareUser : {0}" -f $userStep))
+		Write-MBJobChecklist -Job 'CreateShare' -Step 2 -Total $chkTotal -Label ("local user $shareUser") -Phase ok
 
+		Write-MBJobChecklist -Job 'CreateShare' -Step 3 -Total $chkTotal -Label 'sharing services' -Phase start
 		$pps = Enable-MBPasswordProtectedSharing
 		[void]$steps.Add(('password-protected sharing: {0}' -f (($pps.steps) -join '; ')))
 
@@ -16085,6 +16252,7 @@ Create SMB share (password-protected):
 			$fw2 = Enable-MBFirewallGroup -GroupName 'Network Discovery' -TimeoutSec 15
 			[void]$steps.Add(('firewall Network Discovery: {0}' -f $fw2.method))
 		}
+		Write-MBJobChecklist -Job 'CreateShare' -Step 3 -Total $chkTotal -Label 'sharing services' -Phase ok
 
 		$exists = $false
 		if (Get-Command Get-SmbShare -ErrorAction SilentlyContinue) {
@@ -16105,18 +16273,28 @@ Create SMB share (password-protected):
 			[void]$steps.Add("removed existing share $shareName")
 		}
 
-		$fullAccounts = New-Object System.Collections.ArrayList
-		if ($everyoneFull) { [void]$fullAccounts.Add('Everyone') }
-		[void]$fullAccounts.Add("$hostName\$shareUser")
+		# Grant access_username the chosen right (default Full). Everyone optional (same right).
+		$grantAccounts = New-Object System.Collections.ArrayList
+		if ($everyoneFull) { [void]$grantAccounts.Add('Everyone') }
+		[void]$grantAccounts.Add("$hostName\$shareUser")
+		$netGrant = $accessRight.ToUpperInvariant() # FULL|CHANGE|READ for net share
 
+		Write-MBJobChecklist -Job 'CreateShare' -Step 4 -Total $chkTotal -Label 'publish share' -Phase start
 		$shareMethod = ''
 		if (Get-Command New-SmbShare -ErrorAction SilentlyContinue) {
 			try {
 				$np = @{
 					Name        = $shareName
 					Path        = $folder
-					FullAccess  = @($fullAccounts)
 					ErrorAction = 'Stop'
+				}
+				# Map right to New-SmbShare access lists
+				if ($accessRight -eq 'Read') {
+					$np['ReadAccess'] = @($grantAccounts)
+				} elseif ($accessRight -eq 'Change') {
+					$np['ChangeAccess'] = @($grantAccounts)
+				} else {
+					$np['FullAccess'] = @($grantAccounts)
 				}
 				if ($desc) { $np['Description'] = $desc }
 				try { $np['CachingMode'] = 'None' } catch {}
@@ -16129,6 +16307,7 @@ Create SMB share (password-protected):
 					New-SmbShare @np2 | Out-Null
 					$shareMethod = 'New-SmbShare+Grant'
 				} catch {
+					Write-MBJobChecklist -Job 'CreateShare' -Step 4 -Total $chkTotal -Label 'publish share' -Phase fail
 					return "ERROR: New-SmbShare failed: $($_.Exception.Message)"
 				}
 			}
@@ -16137,48 +16316,90 @@ Create SMB share (password-protected):
 			[void]$netArgs.Add('share')
 			[void]$netArgs.Add(('{0}={1}' -f $shareName, $folder))
 			if ($desc) { [void]$netArgs.Add(('/REMARK:{0}' -f $desc)) }
-			foreach ($a in @($fullAccounts)) { [void]$netArgs.Add(('/GRANT:{0},FULL' -f $a)) }
+			foreach ($a in @($grantAccounts)) { [void]$netArgs.Add(('/GRANT:{0},{1}' -f $a, $netGrant)) }
 			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @($netArgs.ToArray()) -TimeoutSec 60
 			if (-not $r.ok) {
+				Write-MBJobChecklist -Job 'CreateShare' -Step 4 -Total $chkTotal -Label 'publish share' -Phase fail
 				return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'net share failed'; exit = $r.exit; out = $r.out; err = $r.err })
 			}
 			$shareMethod = 'net share'
 		}
-		[void]$steps.Add("share created ($shareMethod)")
+		[void]$steps.Add("share created ($shareMethod) right=$accessRight")
+		Write-MBJobChecklist -Job 'CreateShare' -Step 4 -Total $chkTotal -Label 'publish share' -Phase ok
 
+		Write-MBJobChecklist -Job 'CreateShare' -Step 5 -Total $chkTotal -Label 'access ACL' -Phase start
 		if ($everyoneFull) {
-			$g = Grant-MBSmbShareFullAccess -ShareName $shareName -Account 'Everyone'
-			[void]$aclLog.Add([ordered]@{ layer = 'share'; account = 'Everyone'; right = 'Full'; ok = $g.ok; detail = $(if ($g.error) { $g.error } else { $g.method }) })
-			$n = Grant-MBNtfsFullControl -Path $folder -Identity 'Everyone'
-			[void]$aclLog.Add([ordered]@{ layer = 'ntfs'; account = 'Everyone'; right = 'Full'; ok = $n.ok; detail = $(if ($n.err) { $n.err } else { "exit $($n.exit)" }) })
+			$g = Grant-MBSmbShareAccess -ShareName $shareName -Account 'Everyone' -AccessRight $accessRight
+			[void]$aclLog.Add([ordered]@{ layer = 'share'; account = 'Everyone'; right = $accessRight; ok = $g.ok; detail = $(if ($g.error) { $g.error } else { $g.method }) })
+			$n = Grant-MBNtfsAccess -Path $folder -Identity 'Everyone' -AccessRight $accessRight
+			[void]$aclLog.Add([ordered]@{ layer = 'ntfs'; account = 'Everyone'; right = $accessRight; ok = $n.ok; detail = $(if ($n.err) { $n.err } else { "exit $($n.exit)" }) })
 		}
+		# Explicit grant for the access user (always — Windows often needs a named principal)
+		$userShareOk = $false
 		foreach ($acct in @("$hostName\$shareUser", $shareUser, ".\$shareUser")) {
-			$g = Grant-MBSmbShareFullAccess -ShareName $shareName -Account $acct
+			$g = Grant-MBSmbShareAccess -ShareName $shareName -Account $acct -AccessRight $accessRight
 			if ($g.ok) {
-				[void]$aclLog.Add([ordered]@{ layer = 'share'; account = $acct; right = 'Full'; ok = $true; detail = $g.method })
+				[void]$aclLog.Add([ordered]@{ layer = 'share'; account = $acct; right = $accessRight; ok = $true; detail = $g.method })
+				$userShareOk = $true
 				break
+			} else {
+				[void]$aclLog.Add([ordered]@{ layer = 'share'; account = $acct; right = $accessRight; ok = $false; detail = $(if ($g.error) { $g.error } else { $g.method }) })
 			}
 		}
-		$n = Grant-MBNtfsFullControl -Path $folder -Identity $shareUser
+		$n = Grant-MBNtfsAccess -Path $folder -Identity $shareUser -AccessRight $accessRight
 		if (-not $n.ok) {
-			$n = Grant-MBNtfsFullControl -Path $folder -Identity "$hostName\$shareUser"
+			$n = Grant-MBNtfsAccess -Path $folder -Identity "$hostName\$shareUser" -AccessRight $accessRight
 		}
-		[void]$aclLog.Add([ordered]@{ layer = 'ntfs'; account = $shareUser; right = 'Full'; ok = $n.ok; detail = $(if ($n.err) { $n.err } else { "exit $($n.exit)" }) })
+		[void]$aclLog.Add([ordered]@{ layer = 'ntfs'; account = $shareUser; right = $accessRight; ok = $n.ok; detail = $(if ($n.err) { $n.err } else { "exit $($n.exit)" }) })
+		if (-not $userShareOk) {
+			[void]$steps.Add("WARN: could not grant share $accessRight to $shareUser (Everyone may still work if enabled)")
+		}
+		Write-MBJobChecklist -Job 'CreateShare' -Step 5 -Total $chkTotal -Label 'access ACL' -Phase ok
 
+		Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify + clipboard' -Phase start
 		$createdList = @()
 		$createdPass = @{}
 		if ($acct.created) {
 			$createdList = @($shareUser)
 			$createdPass[$shareUser] = $pass
 		}
+		$uncOut = "\\$hostName\$shareName"
+		$verify = Test-MBLocalSharePresent -ShareName $shareName
+		$clipOk = Set-MBClipboardTextQuiet -Text $uncOut
+		if ($verify.ok) {
+			Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify + clipboard' -Phase ok
+		} else {
+			Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify + clipboard' -Phase fail
+		}
+		try { [void](Add-MBStickyNote -Text ("Share $uncOut (user $shareUser)") -Kind finding) } catch {}
 		$how = Format-MBShareAccessHowTo -HostName $hostName -ShareName $shareName -Users @($shareUser) -CreatedUsers $createdList -CreatedPass $createdPass -EveryoneFull $everyoneFull
+		$accessSummary = @($aclLog | Where-Object { $_.ok } | ForEach-Object { '{0}/{1}={2}' -f $_.layer, $_.account, $_.right })
+		$card = Write-MBOperatorCard -Title 'SHARE CREATED' -Fields ([ordered]@{
+			UNC             = $uncOut
+			Folder          = $folder
+			'Access user'   = $shareUser
+			Password        = $pass
+			Permission      = $accessRight
+			'User created'  = [bool]$acct.created
+			Everyone        = $everyoneFull
+			Verified        = $(if ($verify.ok) { 'yes (' + $verify.detail + ')' } else { 'NO - ' + $verify.detail })
+			Clipboard       = $(if ($clipOk) { 'UNC copied' } else { 'not copied' })
+			Access          = ($accessSummary -join '; ')
+		}) -Notes @(
+			'Map with: MapNetworkDrive path=UNC username=' + $shareUser + ' password=(above)',
+			'Tell the operator the Password and Access user so they can connect from another PC.'
+		)
 		$report = [ordered]@{
 			ok                 = $true
 			path               = $folder
 			name               = $shareName
-			unc                = "\\$hostName\$shareName"
+			unc                = $uncOut
 			hostname           = $hostName
+			access_username    = $shareUser
 			access_user        = $shareUser
+			access_password    = $pass
+			share_password     = $pass
+			access_right       = $accessRight
 			share_user_created = [bool]$acct.created
 			everyone_full      = $everyoneFull
 			password_protected = $true
@@ -16186,12 +16407,16 @@ Create SMB share (password-protected):
 			method             = $shareMethod
 			steps              = @($steps)
 			acl                = @($aclLog)
+			access_summary     = @($accessSummary)
+			verified           = [bool]$verify.ok
+			verify_detail      = [string]$verify.detail
+			clipboard_unc      = [bool]$clipOk
+			operator_card      = $card
 			how_to_access      = $how
 		}
 		$json = ConvertTo-MBJson $report -Depth 8
 		return @"
-OK: share \\$hostName\$shareName -> $folder
-Connect as: $hostName\$shareUser  (password set for this share account)
+$card
 
 $how
 
@@ -16200,6 +16425,886 @@ $json
 "@
 	} catch {
 		return "ERROR: CreateShare failed: $($_.Exception.Message)"
+	}
+}
+
+function Resolve-MBLocalSharePath {
+	# Best-effort path for an existing local share name.
+	param([string]$ShareName)
+	$nm = ([string]$ShareName).Trim()
+	if (-not $nm) { return '' }
+	try {
+		if (Get-Command Get-SmbShare -ErrorAction SilentlyContinue) {
+			$s = Get-SmbShare -Name $nm -ErrorAction Stop
+			return [string]$s.Path
+		}
+	} catch {}
+	try {
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $nm) -TimeoutSec 15
+		$blob = (([string]$r.out) + "`n" + ([string]$r.err))
+		foreach ($line in ($blob -split "`r?`n")) {
+			if ($line -match '(?i)^\s*Path\s+(.+?)\s*$') { return $Matches[1].Trim() }
+			if ($line -match '(?i)^\s*Path\s*=\s*(.+?)\s*$') { return $Matches[1].Trim() }
+		}
+	} catch {}
+	return ''
+}
+
+function Test-MBIsProtectedShareName {
+	param([string]$ShareName)
+	$nm = ([string]$ShareName).Trim()
+	if ([string]::IsNullOrWhiteSpace($nm)) { return $true }
+	# Drive roots C$ D$, admin shares, IPC, PRINT$, FAX$, etc.
+	if ($nm -match '^[A-Za-z]\$$') { return $true }
+	if ($nm -match '^(?i)(IPC|ADMIN|PRINT|FAX|NETLOGON|SYSVOL)\$$') { return $true }
+	if ($nm -match '^(?i)(IPC|ADMIN|PRINT|FAX)$') { return $true }
+	return $false
+}
+
+function Invoke-RemoveShare {
+	param(
+		[string]$name = '',
+		[string]$share = '',
+		[object]$force = $true
+	)
+	$shareName = ([string]$name).Trim()
+	if ([string]::IsNullOrWhiteSpace($shareName)) { $shareName = ([string]$share).Trim() }
+	if ([string]::IsNullOrWhiteSpace($shareName)) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @('name')
+			message    = 'NEED_INPUT: RemoveShare requires name= (share name). Call GetLocalShares first if unknown.'
+		}) -Depth 4
+	}
+	# Accept UNC \\host\share or bare name
+	if ($shareName -match '^\\\\[^\\]+\\([^\\]+)\\?$') {
+		$shareName = $Matches[1]
+	} elseif ($shareName -match '[\\/]') {
+		return "ERROR: name must be the share name only (e.g. temp), or UNC \\\\PC\\temp. Not a folder path."
+	}
+	$shareName = $shareName.Trim().TrimEnd('\')
+	if (Test-MBIsProtectedShareName -ShareName $shareName) {
+		return "ERROR: refusing to remove special/admin share '$shareName' (C`$/ADMIN`$/IPC`$/PRINT`$ etc.)."
+	}
+
+	$doForce = $true
+	try { $doForce = Convert-MBToBool -Value $force -Default $true } catch {}
+
+	$hostName = $env:COMPUTERNAME
+	try { $hostName = [System.Net.Dns]::GetHostName() } catch {}
+	if ([string]::IsNullOrWhiteSpace($hostName)) { $hostName = $env:COMPUTERNAME }
+
+	$present = Test-MBLocalSharePresent -ShareName $shareName
+	if (-not $present.ok) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok      = $false
+			error   = "Share '$shareName' not found on this PC."
+			name    = $shareName
+			hint    = 'Call GetLocalShares to list local shares, then RemoveShare name=...'
+		}) -Depth 4
+	}
+	$folder = [string]$present.path
+	if ([string]::IsNullOrWhiteSpace($folder)) {
+		$folder = Resolve-MBLocalSharePath -ShareName $shareName
+	}
+	$uncOut = "\\$hostName\$shareName"
+
+	$details = @"
+Remove SMB share (unpublish only — folder stays):
+  share name     = $shareName
+  UNC            = $uncOut
+  folder         = $(if ($folder) { $folder } else { '(path unknown)' })
+  force sessions = $doForce
+"@
+	if (-not (Request-Confirmation -Title "RemoveShare requires approval" -Details $details)) {
+		return "BLOCKED BY USER: RemoveShare denied."
+	}
+
+	$steps = New-Object System.Collections.ArrayList
+	$chkTotal = 2
+	try {
+		Write-MBJobChecklist -Job 'RemoveShare' -Step 1 -Total $chkTotal -Label 'close sessions' -Phase start
+		$sessionClosed = 0
+		$fileClosed = 0
+		if ($doForce) {
+			# Close open files under this share folder only (when path known). Remove-SmbShare -Force still runs.
+			try {
+				if ($folder -and (Get-Command Get-SmbOpenFile -ErrorAction SilentlyContinue)) {
+					$folderPrefix = $folder.TrimEnd('\') + '\'
+					$files = @(Get-SmbOpenFile -ErrorAction SilentlyContinue | Where-Object {
+						try {
+							$p = [string]$_.Path
+							if ([string]::IsNullOrWhiteSpace($p)) { return $false }
+							return ($p.Equals($folder.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase) -or
+								$p.StartsWith($folderPrefix, [System.StringComparison]::OrdinalIgnoreCase))
+						} catch { return $false }
+					})
+					$touchedSessions = @{}
+					foreach ($f in $files) {
+						try {
+							Close-SmbOpenFile -FileId $f.FileId -Force -ErrorAction Stop
+							$fileClosed++
+							try {
+								$sid = [string]$f.SessionId
+								if ($sid -and -not $touchedSessions.ContainsKey($sid)) { $touchedSessions[$sid] = $true }
+							} catch {}
+						} catch {}
+					}
+					if ((Get-Command Close-SmbSession -ErrorAction SilentlyContinue) -and $touchedSessions.Count -gt 0) {
+						foreach ($sid in @($touchedSessions.Keys)) {
+							try {
+								Close-SmbSession -SessionId $sid -Force -ErrorAction Stop
+								$sessionClosed++
+							} catch {
+								try { Close-SmbSession -SessionId $sid -ErrorAction SilentlyContinue; $sessionClosed++ } catch {}
+							}
+						}
+					}
+				}
+			} catch {}
+		}
+		[void]$steps.Add(("closed open_files={0} sessions={1}" -f $fileClosed, $sessionClosed))
+		Write-MBJobChecklist -Job 'RemoveShare' -Step 1 -Total $chkTotal -Label 'close sessions' -Phase ok
+
+		Write-MBJobChecklist -Job 'RemoveShare' -Step 2 -Total $chkTotal -Label ("remove $shareName") -Phase start
+		$method = ''
+		$removeErr = ''
+		if (Get-Command Remove-SmbShare -ErrorAction SilentlyContinue) {
+			try {
+				Remove-SmbShare -Name $shareName -Force -ErrorAction Stop
+				$method = 'Remove-SmbShare'
+			} catch {
+				$removeErr = $_.Exception.Message
+			}
+		}
+		if (-not $method) {
+			try {
+				$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('share', $shareName, '/delete', '/y') -TimeoutSec 30
+				if ($r.ok) {
+					$method = 'net share /delete'
+				} else {
+					$removeErr = ("net share /delete exit={0} {1} {2}" -f $r.exit, $r.out, $r.err)
+				}
+			} catch {
+				if (-not $removeErr) { $removeErr = $_.Exception.Message }
+			}
+		}
+		if (-not $method) {
+			Write-MBJobChecklist -Job 'RemoveShare' -Step 2 -Total $chkTotal -Label ("remove $shareName") -Phase fail
+			return ConvertTo-MBJson ([ordered]@{
+				ok     = $false
+				error  = "Failed to remove share '$shareName': $removeErr"
+				name   = $shareName
+				path   = $folder
+			}) -Depth 4
+		}
+		[void]$steps.Add(("removed share via $method"))
+		try { Start-Sleep -Milliseconds 250 } catch {}
+		$still = Test-MBLocalSharePresent -ShareName $shareName
+		if ($still.ok) {
+			Write-MBJobChecklist -Job 'RemoveShare' -Step 2 -Total $chkTotal -Label ("remove $shareName") -Phase fail
+			return ConvertTo-MBJson ([ordered]@{
+				ok            = $false
+				error         = "Share remove reported success ($method) but share still present."
+				name          = $shareName
+				path          = $folder
+				verify_detail = [string]$still.detail
+			}) -Depth 4
+		}
+		Write-MBJobChecklist -Job 'RemoveShare' -Step 2 -Total $chkTotal -Label ("remove $shareName") -Phase ok
+
+		$card = Write-MBOperatorCard -Title 'SHARE REMOVED' -Fields ([ordered]@{
+			Share    = $shareName
+			UNC      = $uncOut
+			Folder   = $(if ($folder) { $folder } else { '(unknown)' })
+			Method   = $method
+			Verified = 'gone'
+		}) -Notes @(
+			'Share is unpublished; other PCs can no longer map it.',
+			'Folder left on disk (RemoveShare never deletes the folder).'
+		)
+
+		$report = [ordered]@{
+			ok              = $true
+			name            = $shareName
+			unc             = $uncOut
+			path            = $folder
+			method          = $method
+			sessions_closed = $sessionClosed
+			files_closed    = $fileClosed
+			verified        = $true
+			verify_detail   = 'share not found after remove'
+			steps           = @($steps)
+			operator_card   = $card
+		}
+		$json = ConvertTo-MBJson $report -Depth 8
+		return @"
+$card
+
+---
+$json
+"@
+	} catch {
+		return "ERROR: RemoveShare failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-RemoveMappedDrive {
+	param(
+		[string]$letter = '',
+		[string]$path = '',
+		[object]$force = $true
+	)
+	$let = ([string]$letter).Trim().TrimEnd(':').ToUpperInvariant()
+	$uncHint = ([string]$path).Trim()
+	if ($let -notmatch '^[A-Z]$') {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @('letter')
+			message    = 'NEED_INPUT: RemoveMappedDrive requires letter= (e.g. Z). Call GetMappedDrives first if unknown.'
+		}) -Depth 4
+	}
+	$doForce = $true
+	try { $doForce = Convert-MBToBool -Value $force -Default $true } catch {}
+
+	$present = Test-MBMappedDrivePresent -Letter $let -Unc $uncHint
+	if (-not $present.ok) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok     = $false
+			error  = "No network mapping found on ${let}:."
+			letter = "${let}:"
+			hint   = 'Call GetMappedDrives to list mappings.'
+		}) -Depth 4
+	}
+	$unc = [string]$present.unc
+	if ([string]::IsNullOrWhiteSpace($unc) -and $uncHint) { $unc = $uncHint }
+
+	$details = @"
+Remove mapped network drive:
+  letter = ${let}:
+  UNC    = $(if ($unc) { $unc } else { '(unknown)' })
+  force  = $doForce
+"@
+	if (-not (Request-Confirmation -Title "RemoveMappedDrive requires approval" -Details $details)) {
+		return "BLOCKED BY USER: RemoveMappedDrive denied."
+	}
+
+	try {
+		$method = ''
+		$errs = New-Object System.Collections.ArrayList
+		if (Get-Command Remove-SmbMapping -ErrorAction SilentlyContinue) {
+			try {
+				Remove-SmbMapping -LocalPath "${let}:" -Force -UpdateProfile -ErrorAction Stop
+				$method = 'Remove-SmbMapping'
+			} catch {
+				[void]$errs.Add(('Remove-SmbMapping: {0}' -f $_.Exception.Message))
+			}
+		}
+		if (-not $method) {
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', "${let}:", '/delete', '/y') -TimeoutSec 30
+			if ($r.ok) {
+				$method = 'net use /delete'
+			} else {
+				[void]$errs.Add(('net use: exit={0} {1} {2}' -f $r.exit, $r.out, $r.err))
+			}
+		}
+		try { Remove-PSDrive -Name $let -Force -PSProvider FileSystem -ErrorAction SilentlyContinue } catch {}
+		try { Start-Sleep -Milliseconds 200 } catch {}
+		$still = Test-MBMappedDrivePresent -Letter $let
+		if ($still.ok -and -not $method) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok     = $false
+				error  = "Failed to remove mapping ${let}: $(($errs | ForEach-Object { $_ }) -join ' | ')"
+				letter = "${let}:"
+				unc    = $unc
+			}) -Depth 4
+		}
+		if ($still.ok) {
+			# Method reported success but still present — try net again
+			try {
+				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', "${let}:", '/delete', '/y') -TimeoutSec 30
+			} catch {}
+			try { Start-Sleep -Milliseconds 200 } catch {}
+			$still = Test-MBMappedDrivePresent -Letter $let
+		}
+		$ok = -not $still.ok
+		$card = Write-MBOperatorCard -Title 'DRIVE UNMAPPED' -Fields ([ordered]@{
+			Letter   = "${let}:"
+			UNC      = $(if ($unc) { $unc } else { '(was mapped)' })
+			Method   = $(if ($method) { $method } else { 'attempted' })
+			Verified = $(if ($ok) { 'gone' } else { 'STILL MAPPED - ' + $still.detail })
+		}) -Notes @('Mapping removed from this PC only; remote share is unchanged.')
+
+		return ConvertTo-MBJson ([ordered]@{
+			ok            = $ok
+			letter        = "${let}:"
+			unc           = $unc
+			method        = $method
+			verified      = $ok
+			verify_detail = $(if ($ok) { 'mapping not found after remove' } else { [string]$still.detail })
+			errors        = @($errs)
+			operator_card = $card
+		}) -Depth 6
+	} catch {
+		return "ERROR: RemoveMappedDrive failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-StopProcess {
+	param(
+		# Do not name a param $pid — shadows automatic $PID
+		[object]$process_id = $null,
+		[string]$name = '',
+		[object]$force = $true
+	)
+	$procId = 0
+	try {
+		if ($null -ne $process_id -and "$process_id" -ne '') { $procId = [int](Convert-MBToInt -Value $process_id -Default 0) }
+	} catch { $procId = 0 }
+	$procName = ([string]$name).Trim()
+	if ($procName -match '\.exe$') { $procName = $procName.Substring(0, $procName.Length - 4) }
+	if ($procId -le 0 -and [string]::IsNullOrWhiteSpace($procName)) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @('pid', 'name')
+			message    = 'NEED_INPUT: StopProcess needs pid= (preferred) and/or name= process name (without .exe). Call GetProcessList first.'
+		}) -Depth 4
+	}
+	$doForce = $true
+	try { $doForce = Convert-MBToBool -Value $force -Default $true } catch {}
+
+	# Critical system processes — never kill
+	$protected = @(
+		'System', 'Idle', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass',
+		'svchost', 'Registry', 'Memory Compression', 'Secure System', 'fontdrvhost',
+		'dwm', 'LsaIso', 'SecurityHealthService'
+	)
+	$targets = New-Object System.Collections.ArrayList
+	try {
+		if ($procId -gt 0) {
+			$p = Get-Process -Id $procId -ErrorAction Stop
+			[void]$targets.Add($p)
+		} else {
+			$found = @(Get-Process -Name $procName -ErrorAction SilentlyContinue)
+			if ($found.Count -eq 0) {
+				return ConvertTo-MBJson ([ordered]@{
+					ok    = $false
+					error = "No process named '$procName' found."
+					name  = $procName
+					hint  = 'Call GetProcessList; use exact ProcessName or pid=.'
+				}) -Depth 4
+			}
+			foreach ($p in $found) { [void]$targets.Add($p) }
+		}
+	} catch {
+		return ConvertTo-MBJson ([ordered]@{
+			ok    = $false
+			error = "Process not found: $($_.Exception.Message)"
+			pid   = $procId
+			name  = $procName
+		}) -Depth 4
+	}
+
+	$selfPid = [int]$PID
+	$blocked = New-Object System.Collections.ArrayList
+	$killable = New-Object System.Collections.ArrayList
+	foreach ($p in $targets) {
+		$n = [string]$p.ProcessName
+		$id = [int]$p.Id
+		if ($id -eq $selfPid -or $id -eq 0) {
+			[void]$blocked.Add([ordered]@{ pid = $id; name = $n; reason = 'refusing to kill MiniBot / system idle' })
+			continue
+		}
+		$isProt = $false
+		foreach ($pr in $protected) {
+			if ($n -eq $pr) { $isProt = $true; break }
+		}
+		if ($isProt) {
+			[void]$blocked.Add([ordered]@{ pid = $id; name = $n; reason = 'protected system process' })
+			continue
+		}
+		[void]$killable.Add($p)
+	}
+	if ($killable.Count -eq 0) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok      = $false
+			error   = 'No safe process targets to stop.'
+			blocked = @($blocked)
+		}) -Depth 6
+	}
+
+	$lines = New-Object System.Collections.ArrayList
+	foreach ($p in $killable) {
+		[void]$lines.Add(('  pid={0} name={1} ws_mb={2}' -f $p.Id, $p.ProcessName, [math]::Round($p.WorkingSet64 / 1MB, 1)))
+	}
+	$details = "Stop process(es):`n$(($lines | ForEach-Object { $_ }) -join "`n")`n  force = $doForce"
+	if ($blocked.Count -gt 0) {
+		$details += "`n  blocked (skipped): " + (($blocked | ForEach-Object { '{0}({1})' -f $_.name, $_.pid }) -join ', ')
+	}
+	if (-not (Request-Confirmation -Title "StopProcess requires approval" -Details $details)) {
+		return "BLOCKED BY USER: StopProcess denied."
+	}
+
+	$results = New-Object System.Collections.ArrayList
+	foreach ($p in $killable) {
+		$id = [int]$p.Id
+		$n = [string]$p.ProcessName
+		try {
+			if ($doForce) {
+				Stop-Process -Id $id -Force -ErrorAction Stop
+			} else {
+				Stop-Process -Id $id -ErrorAction Stop
+			}
+			try { Start-Sleep -Milliseconds 150 } catch {}
+			$alive = $false
+			try { $null = Get-Process -Id $id -ErrorAction Stop; $alive = $true } catch { $alive = $false }
+			[void]$results.Add([ordered]@{
+				ok     = (-not $alive)
+				pid    = $id
+				name   = $n
+				method = $(if ($doForce) { 'Stop-Process -Force' } else { 'Stop-Process' })
+				verified = (-not $alive)
+			})
+		} catch {
+			# taskkill fallback (tree + force)
+			try {
+				$r = Invoke-MBSetupNative -File 'taskkill.exe' -ArgumentList @('/PID', [string]$id, '/T', '/F') -TimeoutSec 20
+				try { Start-Sleep -Milliseconds 200 } catch {}
+				$alive = $false
+				try { $null = Get-Process -Id $id -ErrorAction Stop; $alive = $true } catch { $alive = $false }
+				[void]$results.Add([ordered]@{
+					ok     = ($r.ok -or -not $alive)
+					pid    = $id
+					name   = $n
+					method = 'taskkill'
+					verified = (-not $alive)
+					detail = (([string]$r.out) + ' ' + ([string]$r.err)).Trim()
+					error  = $(if ($alive) { $_.Exception.Message } else { $null })
+				})
+			} catch {
+				[void]$results.Add([ordered]@{
+					ok    = $false
+					pid   = $id
+					name  = $n
+					error = $_.Exception.Message
+				})
+			}
+		}
+	}
+	$allOk = ($results | Where-Object { -not $_.ok }).Count -eq 0
+	$card = Write-MBOperatorCard -Title 'PROCESS STOPPED' -Fields ([ordered]@{
+		Count    = $results.Count
+		OK       = @($results | Where-Object { $_.ok }).Count
+		Targets  = (($results | ForEach-Object { '{0}({1})' -f $_.name, $_.pid }) -join ', ')
+		Verified = $(if ($allOk) { 'yes' } else { 'partial/fail' })
+	}) -Notes @('Protected system processes are never killed.')
+
+	return ConvertTo-MBJson ([ordered]@{
+		ok            = $allOk
+		results       = @($results)
+		blocked       = @($blocked)
+		operator_card = $card
+	}) -Depth 8
+}
+
+function Invoke-RemoveLocalUser {
+	param(
+		[string]$username = '',
+		[string]$name = ''
+	)
+	$user = ([string]$username).Trim()
+	if ([string]::IsNullOrWhiteSpace($user)) { $user = ([string]$name).Trim() }
+	if ([string]::IsNullOrWhiteSpace($user)) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @('username')
+			message    = 'NEED_INPUT: RemoveLocalUser requires username=.'
+		}) -Depth 4
+	}
+	if ($user -match '\\') {
+		if ($user -match '^(?<d>[^\\]+)\\(?<u>.+)$') {
+			$dom = $Matches['d']
+			$u = $Matches['u']
+			$machine = $env:COMPUTERNAME
+			if ($dom -ne '.' -and $dom -ne $machine -and $dom -ne ($machine + '$')) {
+				return "ERROR: RemoveLocalUser only removes local accounts (not domain: $user)."
+			}
+			$user = $u
+		}
+	}
+	if ($user -notmatch '^[A-Za-z0-9._-]{1,20}$') {
+		return "ERROR: username must be 1-20 chars [A-Za-z0-9._-]."
+	}
+
+	$protectedUsers = @('Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount', 'systemprofile', 'LocalService', 'NetworkService')
+	foreach ($pu in $protectedUsers) {
+		if ($user -eq $pu) {
+			return "ERROR: refusing to remove protected account '$user'."
+		}
+	}
+	$current = $env:USERNAME
+	if ($current -and ($user -eq $current)) {
+		return "ERROR: refusing to remove the currently logged-on user '$user'."
+	}
+
+	$exists = $false
+	if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+		try { $null = Get-LocalUser -Name $user -ErrorAction Stop; $exists = $true } catch { $exists = $false }
+	} else {
+		$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
+		if ($chk.ok -or (([string]$chk.out) -match '(?i)User name')) { $exists = $true }
+	}
+	if (-not $exists) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok    = $false
+			error = "Local user '$user' not found."
+			username = $user
+		}) -Depth 4
+	}
+
+	$details = "Remove local user account:`n  username = $user`n  (does not delete user profile folder)"
+	if (-not (Request-Confirmation -Title "RemoveLocalUser requires approval" -Details $details)) {
+		return "BLOCKED BY USER: RemoveLocalUser denied."
+	}
+
+	try {
+		$method = ''
+		$err = ''
+		if (Get-Command Remove-LocalUser -ErrorAction SilentlyContinue) {
+			try {
+				Remove-LocalUser -Name $user -ErrorAction Stop
+				$method = 'Remove-LocalUser'
+			} catch {
+				$err = $_.Exception.Message
+			}
+		}
+		if (-not $method) {
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/delete') -TimeoutSec 30
+			if ($r.ok) {
+				$method = 'net user /delete'
+			} else {
+				$err = ("net user /delete exit={0} {1} {2}" -f $r.exit, $r.out, $r.err)
+			}
+		}
+		if (-not $method) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok       = $false
+				error    = "Failed to remove user '$user': $err"
+				username = $user
+			}) -Depth 4
+		}
+		$still = $false
+		if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+			try { $null = Get-LocalUser -Name $user -ErrorAction Stop; $still = $true } catch { $still = $false }
+		}
+		$card = Write-MBOperatorCard -Title 'LOCAL USER REMOVED' -Fields ([ordered]@{
+			Username = $user
+			Method   = $method
+			Verified = $(if (-not $still) { 'gone' } else { 'STILL EXISTS' })
+		}) -Notes @('User profile folder under C:\Users remains (not deleted).')
+
+		return ConvertTo-MBJson ([ordered]@{
+			ok            = (-not $still)
+			username      = $user
+			method        = $method
+			verified      = (-not $still)
+			operator_card = $card
+		}) -Depth 6
+	} catch {
+		return "ERROR: RemoveLocalUser failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-Reboot {
+	param(
+		[string]$action = 'reboot',
+		[object]$delay_sec = 60,
+		[string]$reason = '',
+		[object]$force = $true
+	)
+	$act = ([string]$action).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($act)) { $act = 'reboot' }
+	if ($act -match '^(restart|reboot|r)$') { $act = 'reboot' }
+	elseif ($act -match '^(shutdown|poweroff|halt|s)$') { $act = 'shutdown' }
+	elseif ($act -match '^(abort|cancel|a)$') { $act = 'abort' }
+	else {
+		return "ERROR: action must be reboot | shutdown | abort (got '$action')."
+	}
+
+	$delay = 60
+	try { $delay = [int](Convert-MBToInt -Value $delay_sec -Default 60) } catch { $delay = 60 }
+	if ($delay -lt 0) { $delay = 0 }
+	if ($delay -gt 86400) { $delay = 86400 }
+	$doForce = $true
+	try { $doForce = Convert-MBToBool -Value $force -Default $true } catch {}
+	$why = ([string]$reason).Trim()
+	if ([string]::IsNullOrWhiteSpace($why)) {
+		$why = if ($act -eq 'shutdown') { 'MiniBot scheduled shutdown' } else { 'MiniBot scheduled reboot' }
+	}
+	# shutdown.exe /c max ~512 chars
+	if ($why.Length -gt 200) { $why = $why.Substring(0, 200) }
+
+	if ($act -eq 'abort') {
+		$details = "Abort pending shutdown/reboot on this PC."
+		if (-not (Request-Confirmation -Title "Reboot abort requires approval" -Details $details)) {
+			return "BLOCKED BY USER: Reboot abort denied."
+		}
+		try {
+			$r = Invoke-MBSetupNative -File 'shutdown.exe' -ArgumentList @('/a') -TimeoutSec 15
+			$ok = $r.ok -or (([string]$r.err + [string]$r.out) -match '(?i)no.*shutdown|was aborted|1116')
+			# exit 1116 = no shutdown in progress — treat as ok-ish
+			$blob = (([string]$r.out) + ' ' + ([string]$r.err)).Trim()
+			$card = Write-MBOperatorCard -Title 'SHUTDOWN ABORTED' -Fields ([ordered]@{
+				Action = 'abort'
+				Result = $(if ($r.ok) { 'aborted pending shutdown' } elseif ($blob -match '(?i)1116|no') { 'none was pending' } else { $blob })
+			})
+			return ConvertTo-MBJson ([ordered]@{
+				ok            = $true
+				action        = 'abort'
+				exit          = $r.exit
+				out           = $r.out
+				err           = $r.err
+				operator_card = $card
+			}) -Depth 6
+		} catch {
+			return "ERROR: Reboot abort failed: $($_.Exception.Message)"
+		}
+	}
+
+	$label = if ($act -eq 'shutdown') { 'SHUTDOWN' } else { 'REBOOT' }
+	$details = @"
+Schedule PC ${label}:
+  action    = $act
+  delay_sec = $delay  (0 = immediate)
+  force     = $doForce  (close apps)
+  reason    = $why
+  abort later with: Reboot action=abort
+"@
+	if (-not (Request-Confirmation -Title "Reboot requires approval" -Details $details)) {
+		return "BLOCKED BY USER: Reboot denied."
+	}
+
+	try {
+		$args = New-Object System.Collections.ArrayList
+		if ($act -eq 'shutdown') { [void]$args.Add('/s') } else { [void]$args.Add('/r') }
+		[void]$args.Add('/t')
+		[void]$args.Add([string]$delay)
+		if ($doForce) { [void]$args.Add('/f') }
+		[void]$args.Add('/c')
+		[void]$args.Add($why)
+		$r = Invoke-MBSetupNative -File 'shutdown.exe' -ArgumentList @($args.ToArray()) -TimeoutSec 20
+		if (-not $r.ok) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok     = $false
+				action = $act
+				error  = "shutdown.exe failed exit=$($r.exit)"
+				out    = $r.out
+				err    = $r.err
+			}) -Depth 4
+		}
+		$card = Write-MBOperatorCard -Title $label -Fields ([ordered]@{
+			Action = $act
+			Delay  = "${delay}s"
+			Force  = $doForce
+			Reason = $why
+		}) -Notes @(
+			"PC will $act in ${delay}s.",
+			'Abort with Reboot action=abort before the timer expires.'
+		)
+		return ConvertTo-MBJson ([ordered]@{
+			ok            = $true
+			action        = $act
+			delay_sec     = $delay
+			force         = $doForce
+			reason        = $why
+			method        = 'shutdown.exe'
+			operator_card = $card
+		}) -Depth 6
+	} catch {
+		return "ERROR: Reboot failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-GetPrinters {
+	param(
+		[object]$include_remote = $true,
+		[object]$max = 80
+	)
+	$incRemote = $true
+	try { $incRemote = Convert-MBToBool -Value $include_remote -Default $true } catch {}
+	$limit = 80
+	try { $limit = [int](Convert-MBToInt -Value $max -Default 80) } catch { $limit = 80 }
+	if ($limit -lt 1) { $limit = 1 }
+	if ($limit -gt 300) { $limit = 300 }
+
+	$list = New-Object System.Collections.ArrayList
+	try {
+		if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {
+			$printers = @(Get-Printer -ErrorAction Stop)
+			foreach ($p in $printers) {
+				if ($list.Count -ge $limit) { break }
+				try {
+					$type = ''
+					try { $type = [string]$p.Type } catch {}
+					$port = ''
+					try { $port = [string]$p.PortName } catch {}
+					$shared = $false
+					try { $shared = [bool]$p.Shared } catch {}
+					$default = $false
+					try { $default = [bool]$p.Default } catch {}
+					$driver = ''
+					try { $driver = [string]$p.DriverName } catch {}
+					$computer = ''
+					try { $computer = [string]$p.ComputerName } catch {}
+					if (-not $incRemote -and $port -match '^\\\\') { continue }
+					[void]$list.Add([ordered]@{
+						name         = [string]$p.Name
+						share_name   = $(try { [string]$p.ShareName } catch { '' })
+						port         = $port
+						driver       = $driver
+						type         = $type
+						shared       = $shared
+						is_default   = $default
+						computer     = $computer
+						published    = $(try { [bool]$p.Published } catch { $false })
+					})
+				} catch {}
+			}
+		} else {
+			# WMI fallback
+			$printers = @(Get-CimInstance Win32_Printer -ErrorAction Stop)
+			foreach ($p in $printers) {
+				if ($list.Count -ge $limit) { break }
+				$port = [string]$p.PortName
+				if (-not $incRemote -and $port -match '^\\\\') { continue }
+				[void]$list.Add([ordered]@{
+					name       = [string]$p.Name
+					share_name = [string]$p.ShareName
+					port       = $port
+					driver     = [string]$p.DriverName
+					type       = $(if ($p.Network) { 'Connection' } else { 'Local' })
+					shared     = [bool]$p.Shared
+					is_default = [bool]$p.Default
+					computer   = [string]$p.SystemName
+				})
+			}
+		}
+	} catch {
+		return "ERROR: GetPrinters failed: $($_.Exception.Message)"
+	}
+
+	return ConvertTo-MBJson ([ordered]@{
+		ok       = $true
+		count    = $list.Count
+		printers = @($list)
+		note     = 'Local + network printers on THIS PC. Remove with RemoveNetworkPrinter name=...'
+	}) -Depth 8
+}
+
+function Invoke-RemoveNetworkPrinter {
+	param(
+		[string]$name = '',
+		[string]$path = ''
+	)
+	$printerName = ([string]$name).Trim()
+	if ([string]::IsNullOrWhiteSpace($printerName)) { $printerName = ([string]$path).Trim() }
+	if ([string]::IsNullOrWhiteSpace($printerName)) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok         = $false
+			need_input = $true
+			missing    = @('name')
+			message    = 'NEED_INPUT: RemoveNetworkPrinter requires name= (printer name from GetPrinters) or path= UNC.'
+		}) -Depth 4
+	}
+
+	# Resolve exact name if possible
+	$resolved = $printerName
+	$found = $null
+	try {
+		if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {
+			$found = Get-Printer -Name $printerName -ErrorAction SilentlyContinue | Select-Object -First 1
+			if (-not $found) {
+				$found = Get-Printer -ErrorAction SilentlyContinue | Where-Object {
+					$_.Name -eq $printerName -or $_.Name -eq $printerName.TrimEnd('\') -or
+					($_.ShareName -and $_.ShareName -eq $printerName) -or
+					($_.PortName -and $_.PortName -eq $printerName)
+				} | Select-Object -First 1
+			}
+			if ($found) { $resolved = [string]$found.Name }
+		}
+	} catch {}
+
+	if (-not $found -and $printerName -notmatch '^\\\\' ) {
+		# still allow remove attempt by name
+	}
+
+	$details = "Remove printer:`n  name = $resolved`n  (requested: $printerName)"
+	if (-not (Request-Confirmation -Title "RemoveNetworkPrinter requires approval" -Details $details)) {
+		return "BLOCKED BY USER: RemoveNetworkPrinter denied."
+	}
+
+	try {
+		$method = ''
+		$err = ''
+		if (Get-Command Remove-Printer -ErrorAction SilentlyContinue) {
+			try {
+				Remove-Printer -Name $resolved -ErrorAction Stop
+				$method = 'Remove-Printer'
+			} catch {
+				$err = $_.Exception.Message
+			}
+		}
+		if (-not $method) {
+			$r = Invoke-MBSetupNative -File 'rundll32.exe' -ArgumentList @('printui.dll,PrintUIEntry', '/dl', '/n', $resolved) -TimeoutSec 60
+			if ($r.ok) {
+				$method = 'printui /dl'
+			} else {
+				# try UNC form
+				if ($printerName -match '^\\\\') {
+					$r2 = Invoke-MBSetupNative -File 'rundll32.exe' -ArgumentList @('printui.dll,PrintUIEntry', '/dn', '/n', $printerName) -TimeoutSec 60
+					if ($r2.ok) {
+						$method = 'printui /dn'
+					} else {
+						$err = ("printui exit={0} {1} {2}" -f $r.exit, $r.out, $r.err)
+					}
+				} else {
+					$err = ("printui exit={0} {1} {2}" -f $r.exit, $r.out, $r.err)
+				}
+			}
+		}
+		if (-not $method) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok    = $false
+				error = "Failed to remove printer '$resolved': $err"
+				name  = $resolved
+			}) -Depth 4
+		}
+		$still = $false
+		try {
+			if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {
+				$still = [bool](Get-Printer -Name $resolved -ErrorAction SilentlyContinue)
+			}
+		} catch { $still = $false }
+
+		$card = Write-MBOperatorCard -Title 'PRINTER REMOVED' -Fields ([ordered]@{
+			Name     = $resolved
+			Method   = $method
+			Verified = $(if (-not $still) { 'gone' } else { 'STILL PRESENT' })
+		})
+
+		return ConvertTo-MBJson ([ordered]@{
+			ok            = (-not $still)
+			name          = $resolved
+			method        = $method
+			verified      = (-not $still)
+			operator_card = $card
+		}) -Depth 6
+	} catch {
+		return "ERROR: RemoveNetworkPrinter failed: $($_.Exception.Message)"
 	}
 }
 
@@ -16359,16 +17464,11 @@ function Invoke-MBEnsureSevenZipForExtract {
 
 function Get-MBNewMachineSoftwareManifest {
 	param([string]$Profile)
+	# Personal catalog: install every package (no business profile split).
 	$cat = Get-MBInstallerCatalog
-	$prof = ([string]$Profile).Trim().ToLowerInvariant()
-	if ($prof -notin @('residential', 'business')) { $prof = 'residential' }
 	$list = New-Object System.Collections.ArrayList
 	foreach ($key in @($cat.Keys)) {
-		$p = $cat[$key]
-		$profiles = @($p.profiles)
-		if ($profiles -contains 'common' -or $profiles -contains $prof) {
-			[void]$list.Add($p)
-		}
+		[void]$list.Add($cat[$key])
 	}
 	return @($list)
 }
@@ -16563,20 +17663,15 @@ function Invoke-MBSetupInstallPackage {
 
 function Invoke-ListInstallers {
 	param([string]$profile = 'all')
-	$prof = ([string]$profile).Trim().ToLowerInvariant()
-	if ([string]::IsNullOrWhiteSpace($prof)) { $prof = 'all' }
 	$cat = Get-MBInstallerCatalog
 	$rows = @()
 	foreach ($key in @($cat.Keys)) {
 		$p = $cat[$key]
-		$profiles = @($p.profiles)
-		if ($prof -ne 'all' -and $profiles -notcontains $prof -and $profiles -notcontains 'common') { continue }
 		$runsScan = $false
 		try { $runsScan = [bool]$p.runs_scan } catch { $runsScan = ($p.id -eq 'adwcleaner') }
 		$rows += [ordered]@{
 			id        = [string]$p.id
 			name      = [string]$p.name
-			profiles  = $profiles
 			kind      = [string]$p.kind
 			install   = (Get-MBPackageInstallArgs -Package $p)
 			runs_scan = $runsScan
@@ -16585,9 +17680,8 @@ function Invoke-ListInstallers {
 	}
 	return ConvertTo-MBJson ([ordered]@{
 		ok       = $true
-		profile  = $prof
 		count    = $rows.Count
-		note     = 'Silent installs; temp files cleaned after each package. ADWCleaner runs a scan/clean.'
+		note     = 'Personal catalog. Silent installs; temp files cleaned after each package. ADWCleaner runs a scan/clean. NewMachineSetup installs the full catalog.'
 		packages = $rows
 	}) -Depth 6
 }
@@ -16608,7 +17702,7 @@ function Invoke-InstallPackage {
 	}
 	$ids = @($ids | Select-Object -Unique)
 	if ($ids.Count -eq 0) {
-		return "ERROR: package= or packages= required. Call ListInstallers for ids (7zip, chrome, adobe_reader, adwcleaner, vlc, gotoassist, avast_portal)."
+		return "ERROR: package= or packages= required. Call ListInstallers for ids (7zip, chrome, adobe_reader, adwcleaner, vlc)."
 	}
 
 	$cat = Get-MBInstallerCatalog
@@ -16655,9 +17749,18 @@ function Invoke-InstallPackage {
 			foreach ($k in @($r.Keys)) { $row[$k] = $r[$k] }
 			[void]$results.Add($row)
 			if ($row.ok) {
+				# Verify via uninstall registry when we have a display name
+				$v = Test-MBSoftwareInstalledHint -NameHint ([string]$pkg.name)
+				$row['verified'] = [bool]$v.ok
+				$row['verify_detail'] = [string]$v.detail
+				if ($v.ok) {
+					$row['verified_name'] = [string]$v.name
+					$row['verified_version'] = [string]$v.version
+				}
 				Write-MBSetupProgress -Phase ok -Index $idx -Total $total -Title $label -Software
 			} else {
 				$err = if ($row.error) { [string]$row.error } elseif ($row.err) { [string]$row.err } else { 'failed' }
+				$row['verified'] = $false
 				Write-MBSetupProgress -Phase fail -Index $idx -Total $total -Title $label -Detail $err -Software
 			}
 			try { Remove-MBTempPath -Path $sub } catch {}
@@ -16666,13 +17769,25 @@ function Invoke-InstallPackage {
 		try { Remove-MBTempPath -Path $workRoot } catch {}
 	}
 	$okN = @($results | Where-Object { $_.ok }).Count
-	Write-Host ("  InstallPackage done: {0}/{1} Installed" -f $okN, $total) -ForegroundColor $(if ($okN -eq $total) { 'Green' } else { 'Yellow' })
+	$verN = @($results | Where-Object { $_.verified }).Count
+	Write-Host ("  InstallPackage done: {0}/{1} Installed (verified {2})" -f $okN, $total, $verN) -ForegroundColor $(if ($okN -eq $total) { 'Green' } else { 'Yellow' })
+	$cardNotes = @($results | ForEach-Object {
+		$st = if ($_.ok) { 'OK' } else { 'FAIL' }
+		$vd = if ($_.verified) { ' verified' } elseif ($_.ok) { ' (not in registry yet)' } else { '' }
+		'{0}: {1}{2}' -f $_.id, $st, $vd
+	})
+	$card = Write-MBOperatorCard -Title 'INSTALL PACKAGE' -Fields ([ordered]@{
+		Passed   = ('{0}/{1}' -f $okN, $results.Count)
+		Verified = $verN
+	}) -Notes @($cardNotes)
 	return ConvertTo-MBJson ([ordered]@{
-		ok     = ($okN -eq $results.Count)
-		passed = $okN
-		total  = $results.Count
-		note    = 'Silent installs; downloads cleaned after each package.'
-		results = @($results)
+		ok            = ($okN -eq $results.Count)
+		passed        = $okN
+		total         = $results.Count
+		verified      = $verN
+		operator_card = $card
+		note          = 'Silent installs; downloads cleaned after each package. verified= found in uninstall registry after install.'
+		results       = @($results)
 	}) -Depth 8
 }
 
@@ -16760,12 +17875,7 @@ function Invoke-NewMachineSetup {
 	}
 
 	# Portable = form factor / use pattern, not desktop vs laptop labels.
-	# Always recommend re-enabling encryption when portable; stress it more for business.
-	$portableEncryptNote = if ($prof -eq 'business') {
-		'If this machine is portable, re-enable Device Encryption / BitLocker after setup (strongly recommended for business machines).'
-	} else {
-		'If this machine is portable, re-enable Device Encryption / BitLocker after setup.'
-	}
+	$portableEncryptNote = 'If this machine is portable, re-enable Device Encryption / BitLocker after setup.'
 
 	$software = @()
 	if (-not $skip_software) {
@@ -16819,7 +17929,7 @@ function Invoke-NewMachineSetup {
 	[void]$detailLines.Add("  $portableEncryptNote")
 	if (-not $skip_software) {
 		[void]$detailLines.Add('')
-		[void]$detailLines.Add("SOFTWARE ($prof) - silent download/install:")
+		[void]$detailLines.Add('SOFTWARE (full personal catalog) - silent download/install:')
 		foreach ($pkg in $software) {
 			$runsScan = $false
 			try { $runsScan = [bool]$pkg.runs_scan } catch { $runsScan = ($pkg.id -eq 'adwcleaner') }
@@ -16848,6 +17958,7 @@ function Invoke-NewMachineSetup {
 	$totalSteps = $steps.Count
 	$stepIdx = 0
 	Write-Host ("  NewMachineSetup profile={0}: {1} step(s), silent installers" -f $prof, $totalSteps) -ForegroundColor DarkCyan
+	Write-MBJobChecklist -Job 'NewMachineSetup' -Step 0 -Total $totalSteps -Label ("checklist ready ({0})" -f $prof) -Phase info
 
 	try {
 		foreach ($s in $steps) {
@@ -16921,11 +18032,18 @@ function Invoke-NewMachineSetup {
 		}
 	}
 	Write-Host ("  NewMachineSetup done: {0}/{1} OK" -f $okN, $totalSteps) -ForegroundColor $(if ($okN -eq $totalSteps) { 'Green' } else { 'Yellow' })
+	$card = Write-MBOperatorCard -Title 'NEW MACHINE SETUP' -Fields ([ordered]@{
+		Profile = $prof
+		Passed  = ('{0}/{1}' -f $okN, $totalSteps)
+		Software = ('{0}/{1}' -f $swOk, $swTotal)
+	}) -Notes @($doneNote)
+	try { [void](Add-MBStickyNote -Text ("NewMachineSetup $prof $okN/$totalSteps OK") -Kind finding) } catch {}
 	return ConvertTo-MBJson ([ordered]@{
 		ok             = ($okN -eq $results.Count)
 		profile        = $prof
 		passed         = $okN
 		total          = $results.Count
+		operator_card  = $card
 		software_ok    = $swOk
 		software_total = $swTotal
 		skip_software  = [bool]$skip_software
@@ -16963,7 +18081,7 @@ function Invoke-MBTool {
 			$hint = Get-MBToolEnableHint -ToolName $match
 			return "ERROR: Tool '$match' is not in the active tool list. $hint"
 		}
-		return "ERROR: Unknown tool '$Name'. Core has file/edit/shell tools. For others: EnableToolGroup using MAP (vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech) then call the real tool name. Do not invent tool names."
+		return "ERROR: Unknown tool '$Name'. Core has file/edit/shell tools. For others: EnableToolGroup using MAP (senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web) then call the real tool name. Do not invent tool names."
 	}
 
 	$guard = Test-MBToolLoopGuard -Name $Name -ArgsObj $ArgsObj
@@ -17091,6 +18209,14 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'limit') { $lim = [int](Get-MBProp $ArgsObj 'limit') }
 				Invoke-GetProcessList -limit $lim
 			}
+			"StopProcess" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'pid') { $p['process_id'] = (Get-MBProp $ArgsObj 'pid') }
+				if (Test-MBHasProp $ArgsObj 'process_id') { $p['process_id'] = (Get-MBProp $ArgsObj 'process_id') }
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Get-MBProp $ArgsObj 'force') }
+				Invoke-StopProcess @p
+			}
 			"GetProcessTree" {
 				$p = @{}
 				if (Test-MBHasProp $ArgsObj 'root_pid') { $p['root_pid'] = [int](Get-MBProp $ArgsObj 'root_pid') }
@@ -17111,7 +18237,8 @@ function Invoke-MBTool {
 			"ViewScreen" {
 				$p = @{}
 				if (Test-MBHasProp $ArgsObj 'path')     { $p['path'] = (Get-MBProp $ArgsObj 'path') }
-				if (Test-MBHasProp $ArgsObj 'save')     { $p['save'] = [bool](Get-MBProp $ArgsObj 'save') }
+				# Convert-MBToBool: [bool]"false" is $true in PS - never use [bool] cast for save
+				if (Test-MBHasProp $ArgsObj 'save')     { $p['save'] = (Convert-MBToBool -Value (Get-MBProp $ArgsObj 'save') -Default $false) }
 				if (Test-MBHasProp $ArgsObj 'monitor')  { $p['monitor'] = (Get-MBProp $ArgsObj 'monitor') }
 				if (Test-MBHasProp $ArgsObj 'x')        { $p['x'] = [int](Get-MBProp $ArgsObj 'x') }
 				if (Test-MBHasProp $ArgsObj 'y')        { $p['y'] = [int](Get-MBProp $ArgsObj 'y') }
@@ -17179,9 +18306,13 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'computer') { $p['computer'] = (Get-MBProp $ArgsObj 'computer') }
 				if (Test-MBHasProp $ArgsObj 'host') { $p['computer'] = (Get-MBProp $ArgsObj 'host') }
 				if (Test-MBHasProp $ArgsObj 'share_name') { $p['share_name'] = (Get-MBProp $ArgsObj 'share_name') }
-				if (Test-MBHasProp $ArgsObj 'list_shares') { $p['list_shares'] = (Get-MBProp $ArgsObj 'list_shares') }
+				if (Test-MBHasProp $ArgsObj 'share_names') { $p['share_names'] = (Get-MBProp $ArgsObj 'share_names') }
+				if (Test-MBHasProp $ArgsObj 'username') { $p['username'] = (Get-MBProp $ArgsObj 'username') }
+				if (Test-MBHasProp $ArgsObj 'password') { $p['password'] = (Get-MBProp $ArgsObj 'password') }
 				if (Test-MBHasProp $ArgsObj 'port_timeout_ms') { $p['port_timeout_ms'] = [int](Get-MBProp $ArgsObj 'port_timeout_ms') }
-				if (Test-MBHasProp $ArgsObj 'list_timeout_sec') { $p['list_timeout_sec'] = [int](Get-MBProp $ArgsObj 'list_timeout_sec') }
+				if (Test-MBHasProp $ArgsObj 'probe_timeout_sec') { $p['probe_timeout_sec'] = [int](Get-MBProp $ArgsObj 'probe_timeout_sec') }
+				if (Test-MBHasProp $ArgsObj 'list_timeout_sec') { $p['probe_timeout_sec'] = [int](Get-MBProp $ArgsObj 'list_timeout_sec') }
+				if (Test-MBHasProp $ArgsObj 'stop_on_first_match') { $p['stop_on_first_match'] = (Get-MBProp $ArgsObj 'stop_on_first_match') }
 				Invoke-ProbeShares @p
 			}
 			"GetWindowsUpdateStatus"  { Invoke-GetWindowsUpdateStatus }
@@ -17400,25 +18531,73 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Get-MBProp $ArgsObj 'force') }
 				Invoke-MapNetworkDrive @p
 			}
+			"RemoveMappedDrive" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'letter') { $p['letter'] = (Get-MBProp $ArgsObj 'letter') }
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Get-MBProp $ArgsObj 'force') }
+				Invoke-RemoveMappedDrive @p
+			}
 			"AddNetworkPrinter" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
 				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
 				if (Test-MBHasProp $ArgsObj 'set_default') { $p['set_default'] = (Get-MBProp $ArgsObj 'set_default') }
 				Invoke-AddNetworkPrinter @p
 			}
+			"RemoveNetworkPrinter" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				Invoke-RemoveNetworkPrinter @p
+			}
+			"GetPrinters" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'include_remote') { $p['include_remote'] = (Get-MBProp $ArgsObj 'include_remote') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				Invoke-GetPrinters @p
+			}
+			"RemoveLocalUser" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'username') { $p['username'] = (Get-MBProp $ArgsObj 'username') }
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
+				Invoke-RemoveLocalUser @p
+			}
+			"Reboot" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'action') { $p['action'] = (Get-MBProp $ArgsObj 'action') }
+				if (Test-MBHasProp $ArgsObj 'delay_sec') { $p['delay_sec'] = (Get-MBProp $ArgsObj 'delay_sec') }
+				if (Test-MBHasProp $ArgsObj 'reason') { $p['reason'] = (Get-MBProp $ArgsObj 'reason') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Get-MBProp $ArgsObj 'force') }
+				Invoke-Reboot @p
+			}
 			"CreateShare" {
 				$p = @{
 					path = (Get-MBProp $ArgsObj 'path')
 					name = (Get-MBProp $ArgsObj 'name')
 				}
+				if (Test-MBHasProp $ArgsObj 'access_username') { $p['access_username'] = (Get-MBProp $ArgsObj 'access_username') }
+				if (Test-MBHasProp $ArgsObj 'access_password') { $p['access_password'] = (Get-MBProp $ArgsObj 'access_password') }
 				if (Test-MBHasProp $ArgsObj 'share_password') { $p['share_password'] = (Get-MBProp $ArgsObj 'share_password') }
+				if (Test-MBHasProp $ArgsObj 'username') { $p['access_username'] = (Get-MBProp $ArgsObj 'username') }
+				if (Test-MBHasProp $ArgsObj 'password') { $p['access_password'] = (Get-MBProp $ArgsObj 'password') }
+				if (Test-MBHasProp $ArgsObj 'access_right') { $p['access_right'] = (Get-MBProp $ArgsObj 'access_right') }
+				if (Test-MBHasProp $ArgsObj 'permission') { $p['permission'] = (Get-MBProp $ArgsObj 'permission') }
 				if (Test-MBHasProp $ArgsObj 'description') { $p['description'] = (Get-MBProp $ArgsObj 'description') }
 				if (Test-MBHasProp $ArgsObj 'everyone_full') { $p['everyone_full'] = (Get-MBProp $ArgsObj 'everyone_full') }
+				if (Test-MBHasProp $ArgsObj 'force_password_update') { $p['force_password_update'] = (Get-MBProp $ArgsObj 'force_password_update') }
+				if (Test-MBHasProp $ArgsObj 'reset_password') { $p['reset_password'] = (Get-MBProp $ArgsObj 'reset_password') }
 				if (Test-MBHasProp $ArgsObj 'ensure_network') { $p['ensure_network'] = (Get-MBProp $ArgsObj 'ensure_network') }
 				if (Test-MBHasProp $ArgsObj 'ensure_discovery') { $p['ensure_discovery'] = (Get-MBProp $ArgsObj 'ensure_discovery') }
 				if (Test-MBHasProp $ArgsObj 'ensure_folder') { $p['ensure_folder'] = (Get-MBProp $ArgsObj 'ensure_folder') }
 				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Get-MBProp $ArgsObj 'force') }
 				Invoke-CreateShare @p
+			}
+			"RemoveShare" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'share') { $p['share'] = (Get-MBProp $ArgsObj 'share') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Get-MBProp $ArgsObj 'force') }
+				Invoke-RemoveShare @p
 			}
 			"NewMachineSetup" {
 				$p = @{ profile = (Get-MBProp $ArgsObj 'profile') }
@@ -17474,6 +18653,7 @@ function Invoke-MBTool {
 	$sw.Stop()
 	$script:MB.LastToolMs = $sw.ElapsedMilliseconds
 	$script:MB.ToolCalls++
+	try { Add-MBUsedToolName -Name $Name } catch {}
 	try { Update-MBWpfLiveChrome } catch {}
 
 	$text = if ($null -eq $result) { "" } elseif ($result -is [string]) { $result } else { ($result | Out-String).Trim() }
@@ -17784,7 +18964,7 @@ function Get-MBContextEstimate {
 		$role = [string](Get-MBProp $m 'role')
 		if (-not $role) { $role = 'other' }
 		if ($byRole.ContainsKey($role)) { $byRole[$role] += $ch } else { $byRole['other'] += $ch }
-		# Status message count excludes system/sticky (empty chat = 0)
+		# Message count excludes system/sticky
 		if ($role -ne 'system') { $chatMsgCount++ }
 		if ($role -eq 'tool') {
 			$tc = Get-MBProp $m 'content'
@@ -18021,6 +19201,7 @@ function Compact-MBHistory {
 		[switch]$Aggressive,
 		[switch]$PreferModelDigest
 	)
+	try { Sync-MBAutoCompactFromWpf } catch {}
 
 	# Compact: keep system/state; drop middle turns
 	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
@@ -18117,7 +19298,7 @@ function Compact-MBHistory {
 		content = "[Context compacted: dropped $dropped earlier messages ($digestSource digest). Sticky SESSION STATE has the digest. CWD=$($script:MB.WorkingDir)]"
 	}
 
-	# Refresh state message content after StickyExtra update
+	# Refresh state after StickyExtra update
 	$out = New-Object System.Collections.ArrayList
 	[void]$out.Add(@{ role = 'system'; content = (Get-MBSystemPrompt) })
 	[void]$out.Add(@{ role = 'system'; content = (Get-MBStickySystemContent) })
@@ -18206,6 +19387,7 @@ function Manage-MBContext {
 		[array]$Messages,
 		[switch]$ForceCompact
 	)
+	try { Sync-MBAutoCompactFromWpf } catch {}
 
 	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
 	$est = Get-MBContextEstimate -Messages $Messages
@@ -18503,7 +19685,7 @@ function Invoke-MBSpeechListen {
 		$sw = [System.Diagnostics.Stopwatch]::StartNew()
 		$lastPaint = ''
 		$cancelled = $false
-		# Debounce PTT key-down so bounce does not start a zero-length take
+		# Debounce PTT key-down
 		$armed = $false
 		$armWait = [System.Diagnostics.Stopwatch]::StartNew()
 		while ($armWait.ElapsedMilliseconds -lt 400 -and -not $armed) {
@@ -18624,8 +19806,8 @@ function Enable-MBSpeechMode {
 			return "Speech mode ON but init failed: $($script:MB.SpeechInitError)"
 		}
 		try {
-			if (-not ($script:MB.ActiveToolGroups -contains 'speech')) {
-				[void]$script:MB.ActiveToolGroups.Add('speech')
+			if (-not ($script:MB.ActiveToolGroups -contains 'senses')) {
+				[void]$script:MB.ActiveToolGroups.Add('senses')
 				try { Sync-MBPromptAfterToolGroups } catch { try { Initialize-MBToolsOverhead } catch {} }
 			}
 		} catch {}
@@ -18634,8 +19816,8 @@ function Enable-MBSpeechMode {
 		return "Speech mode ON ($dict). Hold Right-Ctrl to talk, release to stop. Typing works when RCtrl is up. Auto-speak: $auto. Tool: SpeakText."
 	} else {
 		try {
-			if ($script:MB.ActiveToolGroups -contains 'speech') {
-				[void]$script:MB.ActiveToolGroups.Remove('speech')
+			if ($script:MB.ActiveToolGroups -contains 'senses') {
+				[void]$script:MB.ActiveToolGroups.Remove('senses')
 				try { Sync-MBPromptAfterToolGroups } catch { try { Initialize-MBToolsOverhead } catch {} }
 			}
 		} catch {}
@@ -18674,9 +19856,28 @@ function Read-MBUserInput {
 		return ""
 	}
 	if ($script:MB.Wpf.ExitRequested) { return ([string][char]0x1B + 'WPF_CLOSE') }
+	try { Sync-MBCwdFromWpf } catch {}
+	# UI-injected slash commands
+	try {
+		$pend = [string]$script:MB.Wpf.PendingUiCommand
+		if (-not [string]::IsNullOrWhiteSpace($pend)) {
+			$script:MB.Wpf.PendingUiCommand = $null
+			Add-MBInputHistory -Text $pend
+			return $pend
+		}
+	} catch {}
 	try { Refresh-MBWpfStickyFromSession } catch {}
 	$result = Read-MBWpfUserInput
 	if ($null -eq $result) { $result = "" }
+	try { Sync-MBCwdFromWpf } catch {}
+	# Re-check inject while we waited for input
+	try {
+		$pend2 = [string]$script:MB.Wpf.PendingUiCommand
+		if (-not [string]::IsNullOrWhiteSpace($pend2) -and [string]::IsNullOrWhiteSpace($result)) {
+			$script:MB.Wpf.PendingUiCommand = $null
+			$result = $pend2
+		}
+	} catch {}
 	Add-MBInputHistory -Text $result
 	return $result
 }
@@ -18692,12 +19893,12 @@ function Get-MBSessionFormat {
 
 function Ensure-MBSessionScanType {
 	if ('MiniBot.SessionScan' -as [type]) { return }
-	# C# 5 scan helper only (UI is main-window overlay in PowerShell)
+	# Background thread + Join(timeout) — never call Directory.GetFiles on the WPF UI thread.
 	$code = @'
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Threading.Tasks;
+using System.Threading;
 
 namespace MiniBot
 {
@@ -18708,12 +19909,18 @@ namespace MiniBot
 			List<string[]> empty = new List<string[]>();
 			if (string.IsNullOrWhiteSpace(dir) || max < 1) return empty;
 			if (!Directory.Exists(dir)) return empty;
+			if (timeoutMs < 200) timeoutMs = 200;
+			if (timeoutMs > 15000) timeoutMs = 15000;
 			string[] files = null;
 			try
 			{
-				Task<string[]> task = Task.Factory.StartNew<string[]>(delegate { return Directory.GetFiles(dir); });
-				if (!task.Wait(timeoutMs)) return empty;
-				files = task.Result;
+				// Dedicated thread so callers (incl. UI) can time out cleanly without Task/sync-context traps.
+				Thread th = new Thread((ThreadStart)delegate {
+					try { files = Directory.GetFiles(dir); } catch { files = null; }
+				});
+				th.IsBackground = true;
+				th.Start();
+				if (!th.Join(timeoutMs)) return empty;
 			}
 			catch { return empty; }
 			if (files == null || files.Length == 0) return empty;
@@ -18814,13 +20021,14 @@ function Resume-MBWpfForModal {
 }
 
 function Get-MBSessionFileRows {
-	param([string]$Dir, [int]$Max = 400)
+	param([string]$Dir, [int]$Max = 400, [int]$TimeoutMs = 2000)
+	# Timed scan only — bare Directory.GetFiles freezes the UI on Desktop/OneDrive.
 	$rows = New-Object System.Collections.ArrayList
 	if ([string]::IsNullOrWhiteSpace($Dir)) { return @() }
 	try { Ensure-MBSessionScanType } catch {}
 	try {
 		if ('MiniBot.SessionScan' -as [type]) {
-			$found = [MiniBot.SessionScan]::ListSessions([string]$Dir, [int]$Max, 3000)
+			$found = [MiniBot.SessionScan]::ListSessions([string]$Dir, [int]$Max, [int]$TimeoutMs)
 			if ($found) {
 				foreach ($r in @($found)) {
 					if ($null -eq $r -or $r.Length -lt 6) { continue }
@@ -18829,45 +20037,7 @@ function Get-MBSessionFileRows {
 						Size = [string]$r[3]; Type = [string]$r[4]; Line = [string]$r[5]
 					})
 				}
-				return @($rows)
 			}
-		}
-	} catch {}
-	# PS fallback
-	try {
-		if (-not [System.IO.Directory]::Exists($Dir)) { return @() }
-		$all = [System.IO.Directory]::GetFiles($Dir)
-		$tmp = New-Object System.Collections.ArrayList
-		for ($i = 0; $i -lt $all.Length; $i++) {
-			$fp = [string]$all[$i]
-			$ext = [System.IO.Path]::GetExtension($fp)
-			if ([string]::IsNullOrEmpty($ext)) { continue }
-			$extL = $ext.ToLowerInvariant()
-			if ($extL -ne '.json' -and $extL -ne '.md' -and $extL -ne '.markdown') { continue }
-			try {
-				$fi = New-Object System.IO.FileInfo ($fp)
-				if (-not $fi.Exists) { continue }
-				$n = [long]$fi.Length
-				if ($n -lt 1024) { $sz = ('{0} B' -f $n) }
-				elseif ($n -lt 1048576) { $sz = ('{0:N1} KB' -f ($n / 1024.0)) }
-				else { $sz = ('{0:N1} MB' -f ($n / 1048576.0)) }
-				$type = $extL.TrimStart('.')
-				if ($type -eq 'markdown') { $type = 'md' }
-				$mod = $fi.LastWriteTime
-				$line = ('{0:yyyy-MM-dd HH:mm:ss}  |  {1}  |  {2}' -f $mod, $fi.Name, $sz)
-				[void]$tmp.Add([pscustomobject]@{
-					Name = [string]$fi.Name; Path = [string]$fi.FullName
-					Modified = $mod.ToString('yyyy-MM-dd HH:mm:ss'); Size = $sz; Type = $type
-					Line = $line; Ticks = [int64]$mod.Ticks
-				})
-			} catch {}
-		}
-		$sorted = @($tmp | Sort-Object Ticks -Descending | Select-Object -First $Max)
-		foreach ($s in $sorted) {
-			[void]$rows.Add(@{
-				Name = $s.Name; Path = $s.Path; Modified = $s.Modified
-				Size = $s.Size; Type = $s.Type; Line = $s.Line
-			})
 		}
 	} catch {}
 	return @($rows)
@@ -18882,6 +20052,7 @@ function Hide-MBSessionPickerOverlay {
 		try {
 			if ($W.SessionPickerOverlay) {
 				$W.SessionPickerOverlay.Visibility = [System.Windows.Visibility]::Collapsed
+				$W.SessionPickerOverlay.IsHitTestVisible = $false
 			}
 			if ($W.SessionPickerOk) {
 				try { $W.SessionPickerOk.IsDefault = $false } catch {}
@@ -18892,9 +20063,12 @@ function Hide-MBSessionPickerOverlay {
 		} catch {}
 	}.GetNewClosure()
 	try {
+		# Sync hide when possible so the popup cannot stick around after Save/Load.
 		if ($d.CheckAccess()) { & $hide }
-		else { [void]$d.Invoke([Action]$hide, [System.Windows.Threading.DispatcherPriority]::Normal) }
-	} catch {}
+		else { [void]$d.Invoke([Action]$hide, [System.Windows.Threading.DispatcherPriority]::Send) }
+	} catch {
+		try { [void]$d.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Send, [Action]$hide) } catch {}
+	}
 }
 
 function Show-MBSessionFilePicker {
@@ -18905,6 +20079,10 @@ function Show-MBSessionFilePicker {
 		[string]$FileName = '',
 		[string]$InitialDirectory = ''
 	)
+	# Simple model:
+	#  1) scan files on agent thread (timed C# helper — never touches UI)
+	#  2) BeginInvoke paint + show overlay (never Dispatcher.Invoke — no UI deadlock)
+	#  3) WaitOne for Save/Open/Cancel
 	$agentTitle = try { Get-MBAgentDisplayTitle } catch { '[{0}-Agent]' -f $(if ($AgentName) { $AgentName } else { 'MiniBot' }) }
 	if ([string]::IsNullOrWhiteSpace($Title)) {
 		$Title = if ($Mode -eq 'Save') { ("{0} Save session" -f $agentTitle) } else { ("{0} Load session" -f $agentTitle) }
@@ -18915,83 +20093,139 @@ function Show-MBSessionFilePicker {
 		$FileName = ("{0}-session-{1:yyyyMMdd-HHmmss}.json" -f $safe, (Get-Date))
 	}
 	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) {
-		try { $InitialDirectory = [Environment]::GetFolderPath('Desktop') } catch { $InitialDirectory = [string]$env:USERPROFILE }
+		# Prefer Documents over Desktop (OneDrive Desktop listing is a common hang source)
+		try { $InitialDirectory = [Environment]::GetFolderPath('MyDocuments') } catch { $InitialDirectory = '' }
+		if ([string]::IsNullOrWhiteSpace($InitialDirectory)) {
+			try { $InitialDirectory = [string]$env:USERPROFILE } catch { $InitialDirectory = [string]$env:TEMP }
+		}
 	}
 	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) { $InitialDirectory = [string]$env:TEMP }
 
-	# Main-window overlay path (same host as auth/confirm — no janky second window)
+	if (Test-MBWpfActive) {
+		$W = $script:MB.Wpf
+		# Re-resolve overlay if bag pointer was lost
+		if (-not $W.SessionPickerOverlay -and $W.Window) {
+			try { $W.SessionPickerOverlay = $W.Window.FindName('SessionPickerOverlay') } catch {}
+			try { if (-not $W.SessionPickerList) { $W.SessionPickerList = $W.Window.FindName('SessionPickerList') } } catch {}
+			try { if (-not $W.SessionPickerPath) { $W.SessionPickerPath = $W.Window.FindName('SessionPickerPath') } } catch {}
+			try { if (-not $W.SessionPickerName) { $W.SessionPickerName = $W.Window.FindName('SessionPickerName') } } catch {}
+			try { if (-not $W.SessionPickerOk) { $W.SessionPickerOk = $W.Window.FindName('SessionPickerOk') } } catch {}
+			try { if (-not $W.SessionPickerCancel) { $W.SessionPickerCancel = $W.Window.FindName('SessionPickerCancel') } } catch {}
+			try { if (-not $W.SessionPickerTitle) { $W.SessionPickerTitle = $W.Window.FindName('SessionPickerTitle') } } catch {}
+			try { if (-not $W.SessionPickerStatus) { $W.SessionPickerStatus = $W.Window.FindName('SessionPickerStatus') } } catch {}
+		}
+	}
 	if (Test-MBWpfActive -and $script:MB.Wpf.SessionPickerOverlay) {
 		$W = $script:MB.Wpf
+		$d = $null
+		try { $d = $W.Dispatcher } catch { $d = $null }
+		if (-not $d) { return $null }
+
 		try { Ensure-MBSessionScanType } catch {}
 		$W.SessionPickerResult = $null
 		$W.SessionPickerMode = [string]$Mode
-		$W.SessionPickerRows = New-Object System.Collections.ArrayList
 		try { [void]$W.SessionPickerWait.Reset() } catch {
 			$W.SessionPickerWait = New-Object System.Threading.ManualResetEvent $false
 		}
+
 		$modeL = [string]$Mode
 		$titleL = [string]$Title
 		$fileL = [string]$FileName
 		$initL = [string]$InitialDirectory
-		try {
-			Suspend-MBWpfForModal
-			$show = {
-				try {
-					if ($W.SessionPickerTitle) { $W.SessionPickerTitle.Text = $titleL }
-					if ($W.SessionPickerPath) { $W.SessionPickerPath.Text = $initL }
-					if ($W.SessionPickerName) {
-						$W.SessionPickerName.Text = $(if ($modeL -eq 'Save') { $fileL } else { '' })
-						$W.SessionPickerName.IsReadOnly = ($modeL -ne 'Save')
-					}
-					if ($W.SessionPickerOk) {
-						$W.SessionPickerOk.Content = $(if ($modeL -eq 'Save') { 'Save' } else { 'Open' })
-					}
-					if ($W.SessionPickerStatus) {
-						$W.SessionPickerStatus.Text = 'Sessions (newest first)'
-						try {
-							$bc = New-Object System.Windows.Media.BrushConverter
-							$W.SessionPickerStatus.Foreground = $bc.ConvertFromString('#6A6A76')
-						} catch {}
-					}
-					if ($W.SessionPickerList) {
-						$W.SessionPickerList.Items.Clear()
-						[void]$W.SessionPickerList.Items.Add('(scanning...)')
-					}
-					if ($W.SessionPickerOk) {
-						try { $W.SessionPickerOk.IsDefault = $true } catch {}
-					}
-					if ($W.SessionPickerCancel) {
-						try { $W.SessionPickerCancel.IsCancel = $true } catch {}
-					}
-					if ($W.SessionPickerOverlay) {
-						$W.SessionPickerOverlay.Visibility = [System.Windows.Visibility]::Visible
-					}
-					try { if ($W.SessionPickerPath) { [void]$W.SessionPickerPath.Focus() } } catch {}
-					# reload list
-					try {
-						if ($W.SessionPickerReload) { & $W.SessionPickerReload }
-					} catch {}
-				} catch {}
-			}.GetNewClosure()
-			$d = $W.Dispatcher
-			if ($d.CheckAccess()) { & $show }
-			else { [void]$d.Invoke([Action]$show, [System.Windows.Threading.DispatcherPriority]::Normal) }
 
-			while ($true) {
-				if ($W.ExitRequested) {
-					Hide-MBSessionPickerOverlay
-					return $null
+		# List files on agent thread (timed). UI only paints.
+		$preRows = @()
+		try { $preRows = @(Get-MBSessionFileRows -Dir $initL -Max 400 -TimeoutMs 1500) } catch { $preRows = @() }
+
+		$paint = {
+			try {
+				if ($W.SessionPickerTitle) { $W.SessionPickerTitle.Text = $titleL }
+				if ($W.SessionPickerPath) { $W.SessionPickerPath.Text = $initL }
+				if ($W.SessionPickerName) {
+					$W.SessionPickerName.Text = $(if ($modeL -eq 'Save') { $fileL } else { '' })
+					$W.SessionPickerName.IsReadOnly = ($modeL -ne 'Save')
 				}
+				if ($W.SessionPickerOk) {
+					$W.SessionPickerOk.Content = $(if ($modeL -eq 'Save') { 'Save' } else { 'Open' })
+					try { $W.SessionPickerOk.IsDefault = $true } catch {}
+				}
+				if ($W.SessionPickerCancel) {
+					try { $W.SessionPickerCancel.IsCancel = $true } catch {}
+				}
+				$W.SessionPickerRows = New-Object System.Collections.ArrayList
+				if ($W.SessionPickerList) {
+					$W.SessionPickerList.Items.Clear()
+					if (@($preRows).Count -eq 0) {
+						[void]$W.SessionPickerList.Items.Add('(none)')
+						if ($W.SessionPickerStatus) {
+							$W.SessionPickerStatus.Text = 'No .json/.md listed - type a name (or Go to rescan)'
+							try {
+								$bc = New-Object System.Windows.Media.BrushConverter
+								$W.SessionPickerStatus.Foreground = $bc.ConvertFromString('#6A6A76')
+							} catch {}
+						}
+					} else {
+						foreach ($r in @($preRows)) {
+							[void]$W.SessionPickerRows.Add($r)
+							try { [void]$W.SessionPickerList.Items.Add([string]$r.Line) } catch {
+								try { [void]$W.SessionPickerList.Items.Add([string]$r['Line']) } catch {}
+							}
+						}
+						if ($W.SessionPickerStatus) {
+							$W.SessionPickerStatus.Text = ('{0} session(s)  |  newest first' -f $W.SessionPickerRows.Count)
+							try {
+								$bc = New-Object System.Windows.Media.BrushConverter
+								$W.SessionPickerStatus.Foreground = $bc.ConvertFromString('#6A6A76')
+							} catch {}
+						}
+					}
+				}
+				# Show last so a paint error above cannot skip visibility
+				if ($W.SessionPickerOverlay) {
+					$W.SessionPickerOverlay.Visibility = [System.Windows.Visibility]::Visible
+					$W.SessionPickerOverlay.Opacity = 1.0
+					$W.SessionPickerOverlay.IsHitTestVisible = $true
+					try { [System.Windows.Controls.Panel]::SetZIndex($W.SessionPickerOverlay, 999) } catch {}
+				}
+				try { if ($W.Window) { [void]$W.Window.Activate() } } catch {}
+				try {
+					if ($modeL -eq 'Save' -and $W.SessionPickerName) {
+						[void]$W.SessionPickerName.Focus()
+						try { $W.SessionPickerName.SelectAll() } catch {}
+					} elseif ($W.SessionPickerList) {
+						[void]$W.SessionPickerList.Focus()
+					}
+				} catch {}
+			} catch {
+				try { Write-MBDebugLog -Step 'SESSION_PICKER_PAINT_FAIL' -Detail $_.Exception.Message } catch {}
+			}
+		}.GetNewClosure()
+
+		# Same pattern as Auth overlay (works): synchronous Invoke for a light paint.
+		# Scan already finished on agent thread — this Invoke is instant.
+		try {
+			if ($d.CheckAccess()) {
+				& $paint
+			} else {
+				[void]$d.Invoke([Action]$paint, [System.Windows.Threading.DispatcherPriority]::Normal)
+			}
+		} catch {
+			try { Write-MBDebugLog -Step 'SESSION_PICKER_INVOKE_FAIL' -Detail $_.Exception.Message } catch {}
+			try { & $paint } catch {}
+		}
+
+		try {
+			while ($true) {
+				if ($W.ExitRequested) { return $null }
 				if ($W.SessionPickerWait.WaitOne(50)) { break }
 			}
 			$path = $null
 			try { $path = [string]$W.SessionPickerResult } catch { $path = $null }
-			Hide-MBSessionPickerOverlay
 			if ([string]::IsNullOrWhiteSpace($path)) { return $null }
 			return $path
 		} finally {
-			try { Resume-MBWpfForModal } catch {}
 			try { Hide-MBSessionPickerOverlay } catch {}
+			try { $script:MB.Wpf.ModalUi = $false } catch {}
 		}
 	}
 
@@ -19064,28 +20298,58 @@ function Save-MBSessionJson {
 		)
 		if ($activeTools.Count -eq 0) { $activeTools = @('core') }
 	} catch { $activeTools = @('core') }
-	$payload = @{
-		version  = $Version
-		savedAt  = (Get-Date).ToString("o")
-		model    = $Model
-		baseUrl  = $BaseUrl
-		cwd      = $script:MB.WorkingDir
-		messages = $Messages
-		tools    = @($activeTools)
-		toolProfile = [string]$script:MB.ToolProfile
-		context  = @{
-			windowTokens   = $script:MB.ContextWindow
-			lastPct        = $script:MB.LastCtxPct
-			lastTokens     = $script:MB.LastCtxTokens
-			compactions    = $script:MB.CompactionCount
+	# Flatten messages first — raw ConvertTo-Json -Depth 30 on live PSObjects can peg CPU after Save.
+	$plainMsgs = New-Object System.Collections.ArrayList
+	foreach ($m in @($Messages)) {
+		if ($null -eq $m) { continue }
+		try {
+			[void]$plainMsgs.Add((Convert-MBJsonReady -Object $m -Depth 14))
+		} catch {
+			try {
+				[void]$plainMsgs.Add(@{
+					role    = [string](Get-MBProp $m 'role')
+					content = [string](Get-MBProp $m 'content')
+				})
+			} catch {}
 		}
-		sticky   = @{
-			notes    = @($script:MB.StickyNotes)
-			findings = @($script:MB.StickyFindings)
+	}
+	$payload = [ordered]@{
+		version     = [string]$Version
+		savedAt     = (Get-Date).ToString('o')
+		model       = [string]$Model
+		baseUrl     = [string]$BaseUrl
+		cwd         = [string]$script:MB.WorkingDir
+		messages    = @($plainMsgs.ToArray())
+		tools       = @($activeTools)
+		toolProfile = [string]$script:MB.ToolProfile
+		context     = [ordered]@{
+			windowTokens = [int]$script:MB.ContextWindow
+			lastPct      = $script:MB.LastCtxPct
+			lastTokens   = $script:MB.LastCtxTokens
+			compactions  = [int]$script:MB.CompactionCount
+		}
+		sticky      = [ordered]@{
+			notes    = @($script:MB.StickyNotes | ForEach-Object { [string]$_ })
+			findings = @($script:MB.StickyFindings | ForEach-Object { [string]$_ })
 			extra    = [string]$script:MB.StickyExtra
 		}
 	}
-	($payload | ConvertTo-Json -Depth 30) | Out-File -FilePath $Path -Encoding UTF8 -Force
+	$json = $null
+	try {
+		$safe = Convert-MBJsonReady -Object $payload -Depth 18
+		$json = ConvertTo-Json -InputObject $safe -Depth 16 -Compress
+	} catch {
+		try { $json = ConvertTo-MBJson $payload -Depth 12 } catch {
+			throw "Session JSON serialize failed: $($_.Exception.Message)"
+		}
+	}
+	if ([string]::IsNullOrWhiteSpace($json)) { throw 'Session JSON serialize produced empty output' }
+	$dir = [System.IO.Path]::GetDirectoryName($Path)
+	if ($dir -and -not [System.IO.Directory]::Exists($dir)) {
+		[void][System.IO.Directory]::CreateDirectory($dir)
+	}
+	$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+	[System.IO.File]::WriteAllText($Path, $json, $utf8NoBom)
 	return $Path
 }
 
@@ -19776,7 +21040,7 @@ function ConvertTo-MBWpfSafeText {
 function Get-MBWpfCtxBarColor {
 	param([string]$Level = 'ok')
 	switch -Regex ([string]$Level) {
-		'hard' { return '#F7768E' }
+		'hard' { return '#F05C5C' }
 		'soft' { return '#E0AF68' }
 		default { return '#9ECE6A' }
 	}
@@ -20837,6 +22101,253 @@ function Write-MBWpfRaw {
 	})
 }
 
+# Robot face path catalog (24x24)
+function Get-MBRobotPathCatalog {
+	if ($script:MB_RobotPathCatalog) { return $script:MB_RobotPathCatalog }
+	$script:MB_RobotPathCatalog = [ordered]@{
+		default   = 'M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z'
+		happy     = 'M22 14H21C21 10.13 17.87 7 14 7H13V5.73C13.6 5.39 14 4.74 14 4C14 2.9 13.11 2 12 2S10 2.9 10 4C10 4.74 10.4 5.39 11 5.73V7H10C6.13 7 3 10.13 3 14H2C1.45 14 1 14.45 1 15V18C1 18.55 1.45 19 2 19H3V20C3 21.11 3.9 22 5 22H19C20.11 22 21 21.11 21 20V19H22C22.55 19 23 18.55 23 18V15C23 14.45 22.55 14 22 14M9.79 16.5C9.4 15.62 8.53 15 7.5 15S5.6 15.62 5.21 16.5C5.08 16.19 5 15.86 5 15.5C5 14.12 6.12 13 7.5 13S10 14.12 10 15.5C10 15.86 9.92 16.19 9.79 16.5M18.79 16.5C18.4 15.62 17.5 15 16.5 15S14.6 15.62 14.21 16.5C14.08 16.19 14 15.86 14 15.5C14 14.12 15.12 13 16.5 13S19 14.12 19 15.5C19 15.86 18.92 16.19 18.79 16.5Z'
+		confused  = 'M20 4H18V3H20.5C20.78 3 21 3.22 21 3.5V5.5C21 5.78 20.78 6 20.5 6H20V7H19V5H20V4M19 9H20V8H19V9M17 3H16V7H17V3M23 15V18C23 18.55 22.55 19 22 19H21V20C21 21.11 20.11 22 19 22H5C3.9 22 3 21.11 3 20V19H2C1.45 19 1 18.55 1 18V15C1 14.45 1.45 14 2 14H3C3 10.13 6.13 7 10 7H11V5.73C10.4 5.39 10 4.74 10 4C10 2.9 10.9 2 12 2S14 2.9 14 4C14 4.74 13.6 5.39 13 5.73V7H14C14.34 7 14.67 7.03 15 7.08V10H19.74C20.53 11.13 21 12.5 21 14H22C22.55 14 23 14.45 23 15M10 15.5C10 14.12 8.88 13 7.5 13S5 14.12 5 15.5 6.12 18 7.5 18 10 16.88 10 15.5M19 15.5C19 14.12 17.88 13 16.5 13S14 14.12 14 15.5 15.12 18 16.5 18 19 16.88 19 15.5M17 8H16V9H17V8Z'
+		excited   = 'M22 14H21C21 10.13 17.87 7 14 7H13V5.73C13.6 5.39 14 4.74 14 4C14 2.9 13.11 2 12 2S10 2.9 10 4C10 4.74 10.4 5.39 11 5.73V7H10C6.13 7 3 10.13 3 14H2C1.45 14 1 14.45 1 15V18C1 18.55 1.45 19 2 19H3V20C3 21.11 3.9 22 5 22H19C20.11 22 21 21.11 21 20V19H22C22.55 19 23 18.55 23 18V15C23 14.45 22.55 14 22 14M8.68 17.04L7.5 15.86L6.32 17.04L5.14 15.86L7.5 13.5L9.86 15.86L8.68 17.04M17.68 17.04L16.5 15.86L15.32 17.04L14.14 15.86L16.5 13.5L18.86 15.86L17.68 17.04Z'
+		angry     = 'M22 14H21C21 10.13 17.87 7 14 7H13V5.73C13.6 5.39 14 4.74 14 4C14 2.9 13.11 2 12 2S10 2.9 10 4C10 4.74 10.4 5.39 11 5.73V7H10C6.13 7 3 10.13 3 14H2C1.45 14 1 14.45 1 15V18C1 18.55 1.45 19 2 19H3V20C3 21.11 3.9 22 5 22H19C20.11 22 21 21.11 21 20V19H22C22.55 19 23 18.55 23 18V15C23 14.45 22.55 14 22 14M7.5 18C6.12 18 5 16.88 5 15.5C5 14.68 5.4 13.96 6 13.5L9.83 16.38C9.5 17.32 8.57 18 7.5 18M16.5 18C15.43 18 14.5 17.32 14.17 16.38L18 13.5C18.6 13.96 19 14.68 19 15.5C19 16.88 17.88 18 16.5 18Z'
+		dead      = 'M22 14H21C21 10.13 17.87 7 14 7H13V5.73C13.6 5.39 14 4.74 14 4C14 2.9 13.11 2 12 2S10 2.9 10 4C10 4.74 10.4 5.39 11 5.73V7H10C6.13 7 3 10.13 3 14H2C1.45 14 1 14.45 1 15V18C1 18.55 1.45 19 2 19H3V20C3 21.11 3.9 22 5 22H19C20.11 22 21 21.11 21 20V19H22C22.55 19 23 18.55 23 18V15C23 14.45 22.55 14 22 14M9.86 16.68L8.68 17.86L7.5 16.68L6.32 17.86L5.14 16.68L6.32 15.5L5.14 14.32L6.32 13.14L7.5 14.32L8.68 13.14L9.86 14.32L8.68 15.5L9.86 16.68M18.86 16.68L17.68 17.86L16.5 16.68L15.32 17.86L14.14 16.68L15.32 15.5L14.14 14.32L15.32 13.14L16.5 14.32L17.68 13.14L18.86 14.32L17.68 15.5L18.86 16.68Z'
+		off       = 'M23 15V18C23 18.5 22.64 18.88 22.17 18.97L18.97 15.77C19 15.68 19 15.59 19 15.5C19 14.12 17.88 13 16.5 13C16.41 13 16.32 13 16.23 13.03L10.2 7H11V5.73C10.4 5.39 10 4.74 10 4C10 2.9 10.9 2 12 2S14 2.9 14 4C14 4.74 13.6 5.39 13 5.73V7H14C17.87 7 21 10.13 21 14H22C22.55 14 23 14.45 23 15M22.11 21.46L20.84 22.73L19.89 21.78C19.62 21.92 19.32 22 19 22H5C3.9 22 3 21.11 3 20V19H2C1.45 19 1 18.55 1 18V15C1 14.45 1.45 14 2 14H3C3 11.53 4.29 9.36 6.22 8.11L1.11 3L2.39 1.73L22.11 21.46M10 15.5C10 14.12 8.88 13 7.5 13S5 14.12 5 15.5 6.12 18 7.5 18 10 16.88 10 15.5M16.07 17.96L14.04 15.93C14.23 16.97 15.04 17.77 16.07 17.96Z'
+	}
+	return $script:MB_RobotPathCatalog
+}
+
+function Resolve-MBRobotMoodFromStatus {
+	param([string]$Mode = 'ready')
+	$m = ([string]$Mode).Trim().ToLowerInvariant()
+	switch -Regex ($m) {
+		'think'                  { return 'confused' }
+		'work'                   { return 'excited' }
+		'compact|autocompact'    { return 'default' }
+		'error|fail|dead'        { return 'dead' }
+		'off|offline|disconnect' { return 'off' }
+		'angry|warn'             { return 'angry' }
+		default                  { return 'happy' }
+	}
+}
+
+function Get-MBRobotGradientForMood {
+	param([string]$Mood = 'happy')
+	switch ([string]$Mood) {
+		'dead'  { return @('#D0C4C6', '#B08084', '#9A585C') }
+		'error' { return @('#D0C4C6', '#B08084', '#9A585C') }
+		default { return @('#C8C8D0', '#6A6A74', '#3A3A42') }
+	}
+}
+
+function ConvertTo-MBShellIconBitmap {
+	param($Source)
+	if (-not $Source) { return $null }
+	try {
+		$enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+		[void]$enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($Source))
+		$ms = New-Object System.IO.MemoryStream
+		try {
+			$enc.Save($ms)
+			$ms.Position = 0
+			$frame = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+				$ms,
+				[System.Windows.Media.Imaging.BitmapCreateOptions]::None,
+				[System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+			)
+			if ($frame.CanFreeze) { $frame.Freeze() }
+			return $frame
+		} finally {
+			try { $ms.Dispose() } catch {}
+		}
+	} catch {
+		try {
+			if ($Source.CanFreeze -and -not $Source.IsFrozen) { $Source.Freeze() }
+		} catch {}
+		return $Source
+	}
+}
+
+function Set-MBNativeWindowIcon {
+	param($Window, $BitmapSource)
+	if (-not $Window -or -not $BitmapSource) { return }
+	try {
+		if (-not ('MiniBot.UI.NativeIcon' -as [type])) {
+			Add-Type -Namespace MiniBot.UI -Name NativeIcon -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Auto)]
+public static extern System.IntPtr SendMessage(System.IntPtr hWnd, int Msg, System.IntPtr wParam, System.IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
+public static extern bool DestroyIcon(System.IntPtr hIcon);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
+public static extern System.IntPtr CopyIcon(System.IntPtr hIcon);
+public const int WM_SETICON = 0x0080;
+public const int ICON_SMALL = 0;
+public const int ICON_BIG = 1;
+"@ -ErrorAction Stop
+		}
+		Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+		$enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+		[void]$enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($BitmapSource))
+		$ms = New-Object System.IO.MemoryStream
+		try {
+			$enc.Save($ms)
+			$ms.Position = 0
+			$gdi = [System.Drawing.Bitmap]::FromStream($ms)
+			try {
+				$hIcon = $gdi.GetHicon()
+				try {
+					$helper = New-Object System.Windows.Interop.WindowInteropHelper($Window)
+					$hwnd = $helper.EnsureHandle()
+					if ($hwnd -ne [IntPtr]::Zero) {
+						$hSmall = [MiniBot.UI.NativeIcon]::CopyIcon($hIcon)
+						$hBig = [MiniBot.UI.NativeIcon]::CopyIcon($hIcon)
+						$prevSmall = [MiniBot.UI.NativeIcon]::SendMessage($hwnd, [MiniBot.UI.NativeIcon]::WM_SETICON, [IntPtr][MiniBot.UI.NativeIcon]::ICON_SMALL, $hSmall)
+						$prevBig = [MiniBot.UI.NativeIcon]::SendMessage($hwnd, [MiniBot.UI.NativeIcon]::WM_SETICON, [IntPtr][MiniBot.UI.NativeIcon]::ICON_BIG, $hBig)
+						if ($prevSmall -ne [IntPtr]::Zero) { try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($prevSmall) } catch {} }
+						if ($prevBig -ne [IntPtr]::Zero) { try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($prevBig) } catch {} }
+					}
+				} finally {
+					try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($hIcon) } catch {}
+				}
+			} finally {
+				try { $gdi.Dispose() } catch {}
+			}
+		} finally {
+			try { $ms.Dispose() } catch {}
+		}
+	} catch {}
+}
+
+function New-MBRobotIconBitmap {
+	param(
+		[string]$Face = 'happy',
+		[int]$Size = 64,
+		[string]$PathData = '',
+		[string[]]$Colors = @()
+	)
+	try {
+		if ($Size -lt 16) { $Size = 16 }
+		if ($Size -gt 256) { $Size = 256 }
+		$faceKey = if ([string]::IsNullOrWhiteSpace($Face)) { 'happy' } else { [string]$Face }
+		if ([string]::IsNullOrWhiteSpace($PathData)) {
+			$cat = Get-MBRobotPathCatalog
+			if (@($cat.Keys) -notcontains $faceKey) { $faceKey = 'happy' }
+			if (@($cat.Keys) -notcontains $faceKey) { $faceKey = 'default' }
+			$PathData = [string]$cat[$faceKey]
+		}
+		if ([string]::IsNullOrWhiteSpace($PathData)) { return $null }
+		if (-not $Colors -or @($Colors).Count -lt 3) {
+			$Colors = @(Get-MBRobotGradientForMood -Mood $faceKey)
+		}
+		$geom = [System.Windows.Media.Geometry]::Parse($PathData)
+		$c0 = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$Colors[0])
+		$c1 = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$Colors[1])
+		$c2 = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$Colors[2])
+		$brush = New-Object System.Windows.Media.LinearGradientBrush
+		$brush.StartPoint = New-Object System.Windows.Point(0.15, 0.0)
+		$brush.EndPoint = New-Object System.Windows.Point(0.9, 1.0)
+		[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($c0, 0.0)))
+		[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($c1, 0.48)))
+		[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($c2, 1.0)))
+		$brush.Freeze()
+		$bgCol = [System.Windows.Media.ColorConverter]::ConvertFromString('#252530')
+		$bgBrush = New-Object System.Windows.Media.SolidColorBrush($bgCol)
+		$bgBrush.Freeze()
+
+		$visual = New-Object System.Windows.Media.DrawingVisual
+		$dc = $visual.RenderOpen()
+		try {
+			$cx = [double]$Size / 2.0
+			$r = $cx - 0.5
+			$dc.DrawEllipse($bgBrush, $null, (New-Object System.Windows.Point($cx, $cx)), $r, $r)
+			$pad = [math]::Max(2.0, [double]$Size * 0.14)
+			$inner = [double]$Size - (2.0 * $pad)
+			$scale = $inner / 24.0
+			$dc.PushTransform((New-Object System.Windows.Media.TranslateTransform($pad, $pad)))
+			$dc.PushTransform((New-Object System.Windows.Media.ScaleTransform($scale, $scale)))
+			$dc.DrawGeometry($brush, $null, $geom)
+			$dc.Pop()
+			$dc.Pop()
+		} finally {
+			$dc.Close()
+		}
+		$rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(
+			[int]$Size, [int]$Size, 96, 96,
+			[System.Windows.Media.PixelFormats]::Pbgra32
+		)
+		$rtb.Render($visual)
+		return (ConvertTo-MBShellIconBitmap -Source $rtb)
+	} catch {
+		return $null
+	}
+}
+
+function Set-MBWindowRobotIcon {
+	param(
+		$Window,
+		[string]$Face = 'happy',
+		[string]$Description = 'MiniBot',
+		$Bitmap = $null
+	)
+	if (-not $Window) { return $null }
+	try {
+		$bmp = $Bitmap
+		if (-not $bmp) {
+			$bmp = New-MBRobotIconBitmap -Face $Face -Size 64
+		}
+		if (-not $bmp) { return $null }
+		$Window.Icon = $bmp
+		try {
+			if (-not $Window.TaskbarItemInfo) {
+				$Window.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
+			}
+			$Window.TaskbarItemInfo.Overlay = $bmp
+			$Window.TaskbarItemInfo.Description = $Description
+		} catch {}
+		try { Set-MBNativeWindowIcon -Window $Window -BitmapSource $bmp } catch {}
+		return $bmp
+	} catch {
+		return $null
+	}
+}
+
+function Set-MBWpfRobotMood {
+	param(
+		[string]$Mode = 'ready',
+		[switch]$Force
+	)
+	try {
+		$W = $script:MB.Wpf
+		if (-not $W) { return }
+		$sb = $null
+		try { $sb = $W.SetRobotMood } catch { $sb = $null }
+		if ($sb) {
+			$run = {
+				try { & $sb $Mode ([bool]$Force) } catch {}
+			}.GetNewClosure()
+			$d = $null
+			try { $d = $W.Dispatcher } catch {}
+			if ($d -and -not $d.CheckAccess()) {
+				try { [void]$d.BeginInvoke([Action]$run) } catch { try { & $run } catch {} }
+			} else {
+				& $run
+			}
+			return
+		}
+		if (-not $W.TitleRobotPath) { return }
+		$mood = Resolve-MBRobotMoodFromStatus -Mode $Mode
+		if (-not $Force -and [string]$W.RobotMood -eq $mood) { return }
+		$cat = Get-MBRobotPathCatalog
+		$faceKey = if (@($cat.Keys) -contains $mood) { $mood } else { 'default' }
+		$data = [string]$cat[$faceKey]
+		if (-not $W.RobotGeomCache) { $W.RobotGeomCache = @{} }
+		if (-not $W.RobotGeomCache.ContainsKey($faceKey)) {
+			$W.RobotGeomCache[$faceKey] = [System.Windows.Media.Geometry]::Parse($data)
+		}
+		$W.TitleRobotPath.Data = $W.RobotGeomCache[$faceKey]
+		$W.RobotMood = $faceKey
+	} catch {}
+}
+
 function Update-MBWpfSticky {
 	param(
 		[string]$Line1,
@@ -20869,9 +22380,8 @@ function Update-MBWpfSticky {
 	if ($PSBoundParameters.ContainsKey('PoweredBy')) { $cur.PoweredBy = ConvertTo-MBWpfSafeText -Text $PoweredBy }
 	if ($PSBoundParameters.ContainsKey('AutoCompactLine')) { $cur.AutoCompactLine = ConvertTo-MBWpfSafeText -Text $AutoCompactLine }
 	if ($PSBoundParameters.ContainsKey('Status')) {
-		# Status mode for spinner; UI timer paints glyph.
-		# Strip leading spinner/glyph junk without Unicode literals in source
-		# (PS 5.1 can mangle UTF-8 script bytes when there is no BOM).
+		# Status mode for UI spinner
+		# Strip leading non-letter status glyphs
 		$raw = [string]$Status
 		$label = $raw.Trim()
 		while ($label.Length -gt 0) {
@@ -20885,6 +22395,9 @@ function Update-MBWpfSticky {
 		if ($label -match '(?i)autocompact|compact') {
 			$mode = 'compacting'
 			$label = 'autocompacting...'
+		} elseif ($label -match '(?i)error|fail') {
+			$mode = 'error'
+			$label = 'error'
 		} elseif ($label -match '(?i)think') {
 			$mode = 'thinking'
 			$label = 'thinking...'
@@ -20897,7 +22410,7 @@ function Update-MBWpfSticky {
 		}
 		$cur.StatusMode = $mode
 		$cur.StatusLabel = $label
-		# Apply sticky status immediately; restart timer on busy transitions
+		# Apply sticky status immediately
 		try {
 			$prev = [string]$script:MB.Wpf.StatusMode
 			$script:MB.Wpf.StatusMode = $mode
@@ -20919,7 +22432,7 @@ function Update-MBWpfSticky {
 }
 
 function Sync-MBAutoApproveFromWpf {
-	# Pull click-toggle from UI bag into session (and push session → bag when not dirty).
+	# Sync auto-approve from UI toggle
 	if (-not $script:MB.Wpf) { return }
 	try {
 		if ([bool]$script:MB.Wpf.AutoApproveDirty) {
@@ -20931,27 +22444,119 @@ function Sync-MBAutoApproveFromWpf {
 	} catch {
 		try { $script:MB.Wpf.AutoApproveOn = [bool]$script:MB.AutoApprove } catch {}
 	}
+	try { Sync-MBCwdFromWpf } catch {}
+}
+
+function Sync-MBAutoCompactFromWpf {
+	# Sync AutoCompact from UI toggle
+	if (-not $script:MB.Wpf) { return }
+	try {
+		if ([bool]$script:MB.Wpf.AutoCompactDirty) {
+			$script:MB.AutoCompact = [bool]$script:MB.Wpf.AutoCompactOn
+			$script:MB.Wpf.AutoCompactDirty = $false
+		} else {
+			$script:MB.Wpf.AutoCompactOn = [bool]$script:MB.AutoCompact
+		}
+	} catch {
+		try { $script:MB.Wpf.AutoCompactOn = [bool]$script:MB.AutoCompact } catch {}
+	}
 }
 
 function Get-MBWpfLowerRightText {
 	try { Sync-MBAutoApproveFromWpf } catch {}
+	try { Sync-MBAutoCompactFromWpf } catch {}
 	$dot = [string][char]0x00B7
 	$parts = New-Object System.Collections.ArrayList
 	$n = 0
 	try { $n = [int]$script:MB.CompactionCount } catch { $n = 0 }
+	# Compaction count chip
 	if ($n -gt 0) {
-		[void]$parts.Add(("compact {0}x" -f $n))
+		[void]$parts.Add(("x{0}" -f $n))
 	}
+	$acOn = [bool]$script:MB.AutoCompact
+	[void]$parts.Add($(if ($acOn) { 'auto-compact: ON' } else { 'auto-compact: OFF' }))
 	$autoOn = [bool]$script:MB.AutoApprove
-	$auto = if ($autoOn) { 'auto-approve: ON' } else { 'auto-approve: OFF' }
-	[void]$parts.Add($auto)
+	[void]$parts.Add($(if ($autoOn) { 'auto-approve: ON' } else { 'auto-approve: OFF' }))
 	[void]$parts.Add(("tools used {0}" -f [int]$script:MB.ToolCalls))
 	return ($parts -join ("  {0}  " -f $dot))
 }
 
 function Get-MBWpfAutoCompactLine {
+	# AutoCompact status text
 	if ($script:MB.AutoCompact) { return 'AutoCompact: ON' }
 	return 'AutoCompact: OFF'
+}
+
+function Update-MBWpfWindowTitle {
+	# Update custom titlebar brand, path, and PoweredBy
+	if (-not (Test-MBWpfActive)) { return }
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
+	try {
+		$agent = if ($AgentName) { [string]$AgentName } else { 'MiniBot' }
+		$brand = "[{0}-Agent]" -f $agent
+		$path = ''
+		try { $path = Get-MBShortPath -Path $script:MB.WorkingDir -MaxLen 56 } catch { $path = [string]$script:MB.WorkingDir }
+		$alias = ''
+		try { $alias = [string]$ModelAlias } catch { $alias = '' }
+		if ([string]::IsNullOrWhiteSpace($alias)) {
+			try { $alias = [string]$W.ModelAlias } catch { $alias = '' }
+		}
+		$powered = ''
+		if (-not [string]::IsNullOrWhiteSpace($alias)) {
+			$powered = ("PoweredBy: {0}" -f $alias.Trim())
+		}
+		$dot = [string][char]0x00B7
+		$parts = New-Object System.Collections.ArrayList
+		[void]$parts.Add($brand)
+		if (-not [string]::IsNullOrWhiteSpace($path)) { [void]$parts.Add($path) }
+		if ($powered) { [void]$parts.Add($powered) }
+		$W.PendingWindowTitle = ($parts -join ("  {0}  " -f $dot))
+		$W.PendingTitleBrand = $brand
+		$W.PendingTitleBrandName = $agent
+		$W.PendingTitlePath = $(if ($path) { [string]$path } else { '' })
+		$W.PendingTitlePoweredBy = $powered
+		try { $W.CurrentCwd = [string]$script:MB.WorkingDir } catch {}
+	} catch {}
+}
+
+function Sync-MBCwdFromWpf {
+	# Apply cwd from titlebar popup
+	if (-not $script:MB.Wpf) { return }
+	try {
+		if (-not [bool]$script:MB.Wpf.CwdDirty) { return }
+		$p = [string]$script:MB.Wpf.PendingCwd
+		$script:MB.Wpf.CwdDirty = $false
+		if ([string]::IsNullOrWhiteSpace($p)) { return }
+		$p = $p.Trim().Trim('"')
+		if (-not [System.IO.Directory]::Exists($p)) {
+			try {
+				if ($script:MB.Wpf.WriteQueue) {
+					$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+						Kind = 'text'; Text = ("`n  Folder not found: {0}`n" -f $p); Color = 'Yellow'; NoNewline = $false
+						Brand = $(try { [string]$AgentName } catch { 'MiniBot' })
+					})
+				}
+			} catch {}
+			return
+		}
+		$full = [System.IO.Path]::GetFullPath($p)
+		$script:MB.WorkingDir = $full
+		try { Set-Location -LiteralPath $full } catch {}
+		try { $script:MB.Wpf.CurrentCwd = $full } catch {}
+		try {
+			if ($script:MB.Wpf.WriteQueue) {
+				$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+					Kind = 'text'; Text = ("`n  WORKING_DIR: {0}`n" -f $full); Color = 'Green'; NoNewline = $false
+					Brand = $(try { [string]$AgentName } catch { 'MiniBot' })
+				})
+			}
+		} catch {}
+		try { Update-MBWpfWindowTitle } catch {}
+		try { Refresh-MBWpfStickyFromSession } catch {}
+	} catch {
+		try { $script:MB.Wpf.CwdDirty = $false } catch {}
+	}
 }
 
 function Update-MBWpfLiveChrome {
@@ -20960,18 +22565,19 @@ function Update-MBWpfLiveChrome {
 	)
 	if (-not (Test-MBWpfActive)) { return }
 	try {
+		try { Sync-MBCwdFromWpf } catch {}
 		if ($script:MB.Wpf.NeedPathBudgetRefresh) {
 			$script:MB.Wpf.NeedPathBudgetRefresh = $false
 			try { Refresh-MBWpfStickyFromSession } catch {}
 		}
+		try { Update-MBWpfWindowTitle } catch {}
 		$now = [Environment]::TickCount
 		$last = 0
 		try { $last = [int]$script:MB.WpfLiveChromeTick } catch { $last = 0 }
 		$doCtx = $Force -or ($last -eq 0) -or ((($now - $last) -band 0x7fffffff) -ge 120)
 		$right = Get-MBWpfLowerRightText
-		$acLine = Get-MBWpfAutoCompactLine
 		if (-not $doCtx) {
-			Update-MBWpfSticky -Right $right -AutoCompactLine $acLine
+			Update-MBWpfSticky -Right $right
 			return
 		}
 		$script:MB.WpfLiveChromeTick = $now
@@ -20979,7 +22585,7 @@ function Update-MBWpfLiveChrome {
 		$pctStr = ('{0,3:P0}' -f $est.Pct).Trim()
 		$tokStr = '{0:N0}/{1:N0}' -f $est.PromptTokens, $est.UsableTokens
 		$ctxHex = Get-MBWpfCtxBarColor -Level $est.Level
-		Update-MBWpfSticky -Right $right -AutoCompactLine $acLine `
+		Update-MBWpfSticky -Right $right `
 			-CtxPct ([double]$est.Pct) -CtxColor $ctxHex -CtxPctText $pctStr -CtxTokText $tokStr
 	} catch {}
 }
@@ -20992,26 +22598,7 @@ function Refresh-MBWpfStickyFromSession {
 		$dot = [string][char]0x00B7  # middot separator
 		$pctStr = ('{0,3:P0}' -f $est.Pct).Trim()
 		$tokStr = '{0:N0}/{1:N0}' -f $est.PromptTokens, $est.UsableTokens
-		$hasAlias = -not [string]::IsNullOrWhiteSpace([string]$ModelAlias)
-		$powered = if ($hasAlias) { "PoweredBy: {0}" -f ([string]$ModelAlias).Trim() } else { '' }
-		$brand = "[{0}-Agent]" -f [string]$AgentName
-		$maxPath = 48
-		try {
-			$winW = 0.0
-			if ($script:MB.Wpf.Window) { $winW = [double]$script:MB.Wpf.Window.ActualWidth }
-			if ($winW -gt 80) {
-				$chars = [int](($winW - 40) / 7.2)
-				$reserve = $brand.Length + 5  # brand + separators
-				if ($hasAlias) { $reserve += ($powered.Length + 6) }
-				$maxPath = [math]::Max(14, $chars - $reserve)
-			} elseif ($hasAlias) {
-				$maxPath = 36
-			}
-		} catch {}
-		$path = Get-MBShortPath -Path $script:MB.WorkingDir -MaxLen $maxPath
-		$line1Rest = "  {0}  {1}" -f $dot, $path
-		$line1 = "{0}{1}" -f $brand, $line1Rest
-		$acLine = Get-MBWpfAutoCompactLine
+		try { Update-MBWpfWindowTitle } catch {}
 		$right = Get-MBWpfLowerRightText
 		if (-not $Hint) {
 			$Hint = "Enter send  {0}  Ctrl+Enter newline  {0}  Esc interrupt  {0}  /help" -f $dot
@@ -21021,9 +22608,7 @@ function Refresh-MBWpfStickyFromSession {
 			elseif ($script:MB.IsWorking) { 'working' } `
 			else { 'ready' }
 		$ctxHex = Get-MBWpfCtxBarColor -Level $est.Level
-		Update-MBWpfSticky -Line1 $line1 -BrandName ([string]$AgentName) -Line1Rest $line1Rest `
-			-Right $right -Hint $Hint -Status $st `
-			-PoweredBy $powered -AutoCompactLine $acLine `
+		Update-MBWpfSticky -Right $right -Hint $Hint -Status $st `
 			-CtxPct ([double]$est.Pct) -CtxColor $ctxHex -CtxPctText $pctStr -CtxTokText $tokStr
 		try { Update-MBWpfToolGroupBar } catch {}
 		try { $script:MB.WpfLiveChromeTick = [Environment]::TickCount } catch {}
@@ -21128,6 +22713,7 @@ function Read-MBWpfUserInput {
 				}
 				$signaled = $false
 				try { $signaled = $script:MB.Wpf.InputWait.WaitOne(20) } catch { $signaled = $false }
+				try { Sync-MBCwdFromWpf } catch {}
 				if ($signaled) {
 					if ($script:MB.Wpf.ExitRequested) {
 						Write-MBDebugLog -Step 'READ_WPF_INPUT_EXIT_AFTER_SIGNAL'
@@ -21137,7 +22723,6 @@ function Read-MBWpfUserInput {
 					$script:MB.Wpf.InputResult = $null
 					Write-MBDebugLog -Step 'READ_WPF_INPUT_RECEIVED' -Detail ("len={0}" -f $(if ($null -eq $r) { -1 } else { $r.Length }))
 					Set-MBWpfPromptEnabled -Enabled $false
-					# Same interrupt chrome as thinking/working elsewhere — never a bare "working" flash
 					try {
 						Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  model working..." -f ([char]0x00B7))
 					} catch {}
@@ -21545,6 +23130,13 @@ function Start-MBWpfHost {
 		AutoCompactOn = $(try { [bool]$script:MB.AutoCompact } catch { $true })
 		AutoApproveOn = $(try { [bool]$script:MB.AutoApprove } catch { $false })
 		AutoApproveDirty = $false
+		AutoCompactDirty = $false
+		PendingUiCommand = $null
+		PendingWindowTitle = $null
+		CurrentCwd    = $(try { [string]$script:MB.WorkingDir } catch { '' })
+		PendingCwd    = ''
+		CwdDirty      = $false
+		CwdPopup      = $null
 		LowerRightSig = ''
 		Ps            = $null
 		Runspace      = $null
@@ -21587,6 +23179,13 @@ function Start-MBWpfHost {
 		DebugLogEnabled = [bool]$(try { [bool]$script:MB.DebugLogEnabled } catch { $false })
 	})
 	$script:MB.Wpf = $wpf
+	# Shared robot path catalog for UI runspace
+	try {
+		$wpf.RobotCatalog = Get-MBRobotPathCatalog
+		$wpf.RobotGeomCache = @{}
+		$wpf.RobotMood = ''
+		$wpf.SetRobotMood = $null
+	} catch {}
 	try { Write-MBDebugLog -Step 'WPF_HOST_STARTING' -Detail $wpf.DebugLogPath } catch {}
 
 	$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
@@ -21609,18 +23208,46 @@ function Start-MBWpfHost {
 			$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="MiniBot"
         Width="980" Height="640"
         MinWidth="640" MinHeight="400"
         WindowStartupLocation="CenterScreen"
         ShowActivated="True"
         Topmost="True"
-        Background="#1A1A1E"
+        WindowStyle="None"
+        ResizeMode="CanResize"
+        AllowsTransparency="True"
+        Background="Transparent"
         Foreground="#C8C8D0"
         FontFamily="Consolas, Cascadia Mono, Courier New"
         FontSize="13">
+  <!-- Outer chrome radius -->
+  <shell:WindowChrome.WindowChrome>
+    <shell:WindowChrome CaptionHeight="36"
+                        ResizeBorderThickness="6"
+                        GlassFrameThickness="0"
+                        CornerRadius="8,8,8,8"
+                        UseAeroCaptionButtons="False"/>
+  </shell:WindowChrome.WindowChrome>
   <Window.Resources>
- <!-- Dark scrollbar (track + thumb) matching titlebar gray -->
+    <!-- NoMouseOver button template -->
+    <ControlTemplate x:Key="NoMouseOverButtonTemplate" TargetType="Button">
+      <Border Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}"
+              Padding="{TemplateBinding Padding}"
+              CornerRadius="4"
+              SnapsToDevicePixels="True">
+        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+      </Border>
+      <ControlTemplate.Triggers>
+        <Trigger Property="IsEnabled" Value="False">
+          <Setter Property="Opacity" Value="0.45"/>
+        </Trigger>
+      </ControlTemplate.Triggers>
+    </ControlTemplate>
+ <!-- Dark scrollbar -->
     <SolidColorBrush x:Key="MbScrollTrack" Color="#1A1A1E"/>
     <SolidColorBrush x:Key="MbScrollThumb" Color="#3A3A42"/>
     <SolidColorBrush x:Key="MbScrollThumbHover" Color="#52525C"/>
@@ -21689,7 +23316,7 @@ function Start-MBWpfHost {
         </Setter.Value>
       </Setter>
     </Style>
-    <!-- Login: primary (Sign in) — no system chrome, dark hover -->
+    <!-- Login primary button -->
     <Style x:Key="MbAuthPrimaryBtn" TargetType="Button">
       <Setter Property="Background" Value="#4A4A56"/>
       <Setter Property="Foreground" Value="#E0E0E8"/>
@@ -21719,7 +23346,7 @@ function Start-MBWpfHost {
         </Setter.Value>
       </Setter>
     </Style>
-    <!-- Login: secondary (Cancel) -->
+    <!-- Login secondary button -->
     <Style x:Key="MbAuthSecondaryBtn" TargetType="Button">
       <Setter Property="Background" Value="#2A2A30"/>
       <Setter Property="Foreground" Value="#C8C8D0"/>
@@ -21815,7 +23442,7 @@ function Start-MBWpfHost {
         </Trigger>
       </Style.Triggers>
     </Style>
- <!-- Dark ScrollViewer: themes the H+V scrollbar corner (default is a white square) -->
+ <!-- Dark ScrollViewer -->
     <Style TargetType="ScrollViewer">
       <Setter Property="Background" Value="Transparent"/>
       <Setter Property="Template">
@@ -21847,7 +23474,7 @@ function Start-MBWpfHost {
                          Maximum="{TemplateBinding ScrollableWidth}"
                          Value="{TemplateBinding HorizontalOffset}"
                          Visibility="{TemplateBinding ComputedHorizontalScrollBarVisibility}"/>
- <!-- H+V intersection: dark fill (default WPF corner is white) -->
+ <!-- Scrollbar corner -->
               <Rectangle Grid.Column="1" Grid.Row="1" Fill="{StaticResource MbScrollTrack}"/>
             </Grid>
           </ControlTemplate>
@@ -21855,10 +23482,172 @@ function Start-MBWpfHost {
       </Setter>
     </Style>
   </Window.Resources>
-  <Border BorderBrush="#2A2A30" BorderThickness="1" Background="#121216">
-    <Grid x:Name="RootGrid">
+  <!-- WindowRoot: chrome + full-window overlays as SIBLINGS (not inside 2-row title/body grid). -->
+  <Grid x:Name="WindowRoot">
+  <!-- Outer rounded chrome: transparent window + CornerRadius border.
+       ClipToBounds keeps content out of square corners; radius cleared when maximized. -->
+  <Border x:Name="MainChromeBorder" BorderBrush="#2A2A30" BorderThickness="1" Background="#121216"
+          CornerRadius="8" ClipToBounds="True" SnapsToDevicePixels="True">
+    <Grid x:Name="RootOuter">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="36"/>
+        <RowDefinition Height="*"/>
+      </Grid.RowDefinitions>
+ <!-- Custom titlebar -->
+      <Border x:Name="CustomTitleBar" Grid.Row="0" Background="#2A2A30" BorderBrush="#3A3A42"
+              BorderThickness="0,0,0,1" Padding="10,0,0,0" CornerRadius="8,8,0,0"
+              SnapsToDevicePixels="True">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
+            <!-- Titlebar robot -->
+            <Grid x:Name="TitleRobotHost" Width="22" Height="22" Margin="4,0,0,0"
+                  VerticalAlignment="Center" ToolTip="MiniBot"
+                  shell:WindowChrome.IsHitTestVisibleInChrome="True">
+              <Path x:Name="TitleRobotPath" Width="18" Height="18" Stretch="Uniform"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Data="M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z">
+                <Path.Fill>
+                  <LinearGradientBrush StartPoint="0.15,0" EndPoint="0.9,1">
+                    <GradientStop x:Name="TitleRobotStop0" Color="#C8C8D0" Offset="0"/>
+                    <GradientStop x:Name="TitleRobotStop1" Color="#6A6A74" Offset="0.48"/>
+                    <GradientStop x:Name="TitleRobotStop2" Color="#3A3A42" Offset="1"/>
+                  </LinearGradientBrush>
+                </Path.Fill>
+                <Path.Effect>
+                  <DropShadowEffect x:Name="TitleRobotShadow" Color="#000000" BlurRadius="3.5" ShadowDepth="1.25"
+                                    Opacity="0.72" Direction="315"/>
+                </Path.Effect>
+                <Path.RenderTransform>
+                  <TranslateTransform x:Name="TitleRobotTranslate" X="0" Y="0"/>
+                </Path.RenderTransform>
+              </Path>
+            </Grid>
+            <Ellipse x:Name="TitleDotBrand" Width="3.5" Height="3.5" Fill="#8A8A96"
+                     Margin="9,1,9,0" VerticalAlignment="Center" Opacity="0.9"
+                     SnapsToDevicePixels="False">
+              <Ellipse.Effect>
+                <DropShadowEffect Color="#000000" BlurRadius="1.5" ShadowDepth="0.5" Opacity="0.45" Direction="270"/>
+              </Ellipse.Effect>
+            </Ellipse>
+            <!-- Brand name -->
+            <StackPanel x:Name="TitleBrand" Orientation="Horizontal" VerticalAlignment="Center" MaxWidth="240">
+              <TextBlock Text="[" Foreground="#A0A0AA" FontSize="13" FontWeight="SemiBold"
+                         VerticalAlignment="Center"/>
+              <Grid VerticalAlignment="Center" MaxWidth="140">
+                <TextBlock x:Name="TitleBrandNameShadow" Text="MiniBot" Foreground="#000000"
+                           FontSize="13" FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis" MaxWidth="140"
+                           Margin="1.2,1.2,0,0" Opacity="0.9" IsHitTestVisible="False">
+                  <TextBlock.Effect>
+                    <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="0"
+                                      Opacity="0.85" Direction="0"/>
+                  </TextBlock.Effect>
+                </TextBlock>
+                <TextBlock x:Name="TitleBrandName" Text="MiniBot" Foreground="#B80F0A"
+                           FontSize="13" FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis" MaxWidth="140">
+                  <TextBlock.Effect>
+                    <DropShadowEffect Color="#FF3A1A" BlurRadius="10" ShadowDepth="0"
+                                      Opacity="0.72" Direction="0"/>
+                  </TextBlock.Effect>
+                </TextBlock>
+              </Grid>
+              <TextBlock Text="-" Foreground="#A0A0AA" FontSize="13" FontWeight="SemiBold"
+                         VerticalAlignment="Center"/>
+              <Grid VerticalAlignment="Center">
+                <TextBlock Text="Agent" Foreground="#000000" FontSize="13" FontWeight="SemiBold"
+                           Margin="1.2,1.2,0,0" Opacity="0.9" IsHitTestVisible="False">
+                  <TextBlock.Effect>
+                    <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="0"
+                                      Opacity="0.85" Direction="0"/>
+                  </TextBlock.Effect>
+                </TextBlock>
+                <TextBlock Text="Agent" Foreground="#B80F0A" FontSize="13" FontWeight="SemiBold">
+                  <TextBlock.Effect>
+                    <DropShadowEffect Color="#FF3A1A" BlurRadius="10" ShadowDepth="0"
+                                      Opacity="0.55" Direction="0"/>
+                  </TextBlock.Effect>
+                </TextBlock>
+              </Grid>
+              <TextBlock Text="]" Foreground="#A0A0AA" FontSize="13" FontWeight="SemiBold"
+                         VerticalAlignment="Center"/>
+            </StackPanel>
+            <Ellipse x:Name="TitleDotPath" Width="3.5" Height="3.5" Fill="#8A8A96"
+                     Margin="9,1,9,0" VerticalAlignment="Center" Opacity="0.9"
+                     SnapsToDevicePixels="False">
+              <Ellipse.Effect>
+                <DropShadowEffect Color="#000000" BlurRadius="1.5" ShadowDepth="0.5" Opacity="0.45" Direction="270"/>
+              </Ellipse.Effect>
+            </Ellipse>
+            <Grid VerticalAlignment="Center" MaxWidth="520">
+              <TextBlock x:Name="TitlePathShadow" Text="" Foreground="#000000" FontSize="12"
+                         VerticalAlignment="Center" Margin="1.2,1.2,0,0" Opacity="0.9"
+                         TextTrimming="CharacterEllipsis" MaxWidth="520" IsHitTestVisible="False">
+                <TextBlock.Effect>
+                  <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="0"
+                                    Opacity="0.85" Direction="0"/>
+                </TextBlock.Effect>
+              </TextBlock>
+              <TextBlock x:Name="TitlePath" Text="" Foreground="#C8C8D0" FontSize="12"
+                         VerticalAlignment="Center" Cursor="Hand"
+                         TextTrimming="CharacterEllipsis" MaxWidth="520"
+                         ToolTip="Click to change working directory"
+                         shell:WindowChrome.IsHitTestVisibleInChrome="True"/>
+            </Grid>
+          </StackPanel>
+          <Grid Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right"
+                Margin="12,0,10,0" MaxWidth="280">
+            <TextBlock x:Name="TitlePoweredByShadow" Text="" Foreground="#000000" FontSize="12"
+                       VerticalAlignment="Center" HorizontalAlignment="Right"
+                       Margin="1.2,1.2,0,0" Opacity="0.9"
+                       TextTrimming="CharacterEllipsis" MaxWidth="280" IsHitTestVisible="False">
+              <TextBlock.Effect>
+                <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="0"
+                                  Opacity="0.85" Direction="0"/>
+              </TextBlock.Effect>
+            </TextBlock>
+            <TextBlock x:Name="TitlePoweredBy" Text="" Foreground="#8A8A96" FontSize="12"
+                       VerticalAlignment="Center" HorizontalAlignment="Right"
+                       TextTrimming="CharacterEllipsis" MaxWidth="280"/>
+          </Grid>
+          <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Stretch">
+            <!-- Window buttons -->
+            <Button x:Name="TitleBtnMin" Width="46" Height="36"
+                    Background="Transparent" BorderThickness="0" Cursor="Hand"
+                    Focusable="False" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                    ToolTip="Minimize" Template="{StaticResource NoMouseOverButtonTemplate}">
+              <Path x:Name="TitleBtnMinPath" Width="10" Height="1" Stretch="Fill"
+                    Stroke="#C8C8D0" StrokeThickness="1" Data="M0,0 L10,0"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Button>
+            <Button x:Name="TitleBtnMax" Width="46" Height="36"
+                    Background="Transparent" BorderThickness="0" Cursor="Hand"
+                    Focusable="False" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                    ToolTip="Maximize" Template="{StaticResource NoMouseOverButtonTemplate}">
+              <Path x:Name="TitleBtnMaxPath" Width="10" Height="10" Stretch="Uniform"
+                    Stroke="#C8C8D0" StrokeThickness="1" Fill="Transparent"
+                    Data="M0.5,0.5 H9.5 V9.5 H0.5 Z"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Button>
+            <Button x:Name="TitleBtnClose" Width="46" Height="36"
+                    Background="Transparent" BorderThickness="0" Cursor="Hand"
+                    Focusable="False" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                    ToolTip="Close" Template="{StaticResource NoMouseOverButtonTemplate}">
+              <Path x:Name="TitleBtnClosePath" Width="10" Height="10" Stretch="Uniform"
+                    Stroke="#C8C8D0" StrokeThickness="1.15"
+                    Data="M0,0 L10,10 M10,0 L0,10"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Button>
+          </StackPanel>
+        </Grid>
+      </Border>
  <!-- Main console chrome -->
-      <Grid>
+      <Grid x:Name="RootGrid" Grid.Row="1">
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
@@ -21868,7 +23657,7 @@ function Start-MBWpfHost {
           <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
- <!-- Top sticky: brand+path left (width-clamped) - PoweredBy/AutoCompact right (no overlap) -->
+ <!-- Tool groups header -->
         <Border Grid.Row="0" Panel.ZIndex="3" Background="#2A2A30" BorderBrush="#3A3A42"
                 BorderThickness="0,0,0,0" Padding="12,8,12,6">
           <Grid>
@@ -21881,59 +23670,29 @@ function Start-MBWpfHost {
                 <ColumnDefinition Width="*" MinWidth="80"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
- <!-- Grid (not StackPanel) so TextTrimming gets a finite width and never paints over PoweredBy -->
-              <Grid Grid.Column="0" Margin="0,0,20,0">
-                <Grid.RowDefinitions>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
- <!-- Letter shadows: black copy offset behind glyphs -->
-                <Grid Grid.Row="0" Margin="0,0,0,3">
-                  <TextBlock x:Name="HdrLine1Shadow" Text="MiniBot" Foreground="#000000" FontSize="14"
-                             FontWeight="Bold" Opacity="0.65" Margin="1.5,1.5,0,0"
-                             TextTrimming="CharacterEllipsis" IsHitTestVisible="False"/>
-                  <TextBlock x:Name="HdrLine1" Text="MiniBot" Foreground="#C8C8D0" FontSize="14"
-                             TextTrimming="CharacterEllipsis"/>
-                </Grid>
-                <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Hidden"
-                              VerticalScrollBarVisibility="Disabled" Padding="0" Margin="0,1,0,0"
-                              Focusable="False">
-                  <StackPanel x:Name="HdrToolGroups" Orientation="Horizontal" VerticalAlignment="Center"/>
-                </ScrollViewer>
-              </Grid>
-              <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="4,1,0,0">
-                <!-- PoweredBy filled from -ModelAlias in code-behind; collapsed when empty -->
-                <Grid x:Name="HdrPoweredByHost" HorizontalAlignment="Right" MaxWidth="280"
-                      Visibility="Collapsed">
-                  <TextBlock x:Name="HdrPoweredByShadow" Text=""
-                             Foreground="#000000" FontSize="13" Opacity="0.65" Margin="1.5,1.5,0,0"
-                             HorizontalAlignment="Right" TextTrimming="CharacterEllipsis"
-                             IsHitTestVisible="False"/>
-                  <TextBlock x:Name="HdrPoweredBy" Text=""
-                             Foreground="#8A8A96" FontSize="13" HorizontalAlignment="Right"
-                             TextTrimming="CharacterEllipsis"/>
-                </Grid>
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
-                  <CheckBox x:Name="WordWrapToggle" Style="{StaticResource MbDarkCheckBox}"
-                            VerticalAlignment="Center" Margin="0,0,14,0"
-                            IsChecked="True" ToolTip="Wrap long log lines">
-                    <CheckBox.Content>
-                      <TextBlock x:Name="WordWrapLabel" Text="wrap" Foreground="#C8C8D0" FontSize="12"
-                                 FontFamily="Consolas, Cascadia Mono, Courier New"
-                                 VerticalAlignment="Center" Margin="0,-2,0,0"/>
-                    </CheckBox.Content>
-                  </CheckBox>
-                  <Grid>
-                    <TextBlock x:Name="HdrAutoCompactShadow" Text="AutoCompact: ON"
-                               Foreground="#000000" FontSize="12" Opacity="0.65" Margin="1.5,1.5,0,0"
-                               HorizontalAlignment="Right" IsHitTestVisible="False"/>
-                    <TextBlock x:Name="HdrAutoCompact" Text="AutoCompact: ON"
-                               Foreground="#9ECE6A" FontSize="12" HorizontalAlignment="Right"/>
-                  </Grid>
-                </StackPanel>
-              </StackPanel>
+              <!-- Two-line wrap for tool group chips; brand/path/PoweredBy live in window Title -->
+              <WrapPanel x:Name="HdrToolGroups" Grid.Column="0" Orientation="Horizontal"
+                         VerticalAlignment="Center" Margin="0,0,12,0"
+                         MaxHeight="44"/>
+              <!-- Legacy header nodes (collapsed) -->
+              <TextBlock x:Name="HdrLine1" Visibility="Collapsed"/>
+              <TextBlock x:Name="HdrLine1Shadow" Visibility="Collapsed"/>
+              <TextBlock x:Name="HdrPoweredBy" Visibility="Collapsed"/>
+              <TextBlock x:Name="HdrPoweredByShadow" Visibility="Collapsed"/>
+              <Grid x:Name="HdrPoweredByHost" Visibility="Collapsed"/>
+              <TextBlock x:Name="HdrAutoCompact" Visibility="Collapsed"/>
+              <TextBlock x:Name="HdrAutoCompactShadow" Visibility="Collapsed"/>
+              <CheckBox x:Name="WordWrapToggle" Grid.Column="1" Style="{StaticResource MbDarkCheckBox}"
+                        VerticalAlignment="Bottom" HorizontalAlignment="Right" Margin="4,0,0,0"
+                        IsChecked="True" ToolTip="Wrap long log lines">
+                <CheckBox.Content>
+                  <TextBlock x:Name="WordWrapLabel" Text="wrap" Foreground="#C8C8D0" FontSize="12"
+                             FontFamily="Consolas, Cascadia Mono, Courier New"
+                             VerticalAlignment="Center" Margin="0,-2,0,0"/>
+                </CheckBox.Content>
+              </CheckBox>
             </Grid>
- <!-- Brand accent under sticky chrome -->
+ <!-- Brand accent -->
             <Rectangle Grid.Row="1" Height="2" Margin="0,6,0,0" RadiusX="1" RadiusY="1">
               <Rectangle.Fill>
                 <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
@@ -21947,7 +23706,7 @@ function Start-MBWpfHost {
         </Border>
         <Rectangle Grid.Row="1" Height="1" Fill="#3A3A42" Panel.ZIndex="2"/>
 
- <!-- Scrollback; wrap toggled via header checkbox (left of AutoCompact) -->
+ <!-- Log -->
         <RichTextBox x:Name="LogBox" Grid.Row="2" IsReadOnly="True" IsDocumentEnabled="True"
                      IsUndoEnabled="False"
                      VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
@@ -22000,7 +23759,7 @@ function Start-MBWpfHost {
           </Grid>
         </Border>
 
- <!-- Prompt + Send/Stop -->
+ <!-- Prompt -->
         <Border Grid.Row="4" Background="#1A1A1E" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="10,8">
           <Grid>
             <Grid.ColumnDefinitions>
@@ -22009,136 +23768,239 @@ function Start-MBWpfHost {
               <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             <TextBlock Grid.Column="0" Text="> " Foreground="#8A8A96" FontSize="14" VerticalAlignment="Top" Margin="0,6,4,0"/>
-            <Border Grid.Column="1" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="4" Background="#121216" Padding="8,6" Margin="0,0,8,0">
+            <Border x:Name="PromptHost" Grid.Column="1" BorderBrush="#3A3A42" BorderThickness="1"
+                    CornerRadius="4" Background="#121216" Padding="8,6" Margin="0,0,8,0"
+                    VerticalAlignment="Stretch" MinHeight="42">
               <TextBox x:Name="PromptBox" AcceptsReturn="True" TextWrapping="Wrap"
                        MinHeight="28" MaxHeight="140" VerticalScrollBarVisibility="Auto"
                        BorderThickness="0" Background="Transparent" Foreground="#E0E0E8"
                        CaretBrush="#C8C8D0" FontFamily="Consolas, Cascadia Mono, Courier New"
                        FontSize="13" IsEnabled="True" IsReadOnly="True" Focusable="True"/>
             </Border>
-            <Button x:Name="SendBtn" Grid.Column="2" Content="Send" Width="72" MinHeight="37"
-                    VerticalAlignment="Top" Cursor="Hand" FontWeight="SemiBold" FontSize="12"
+            <Button x:Name="SendBtn" Grid.Column="2" Width="88" MinHeight="41"
+                    VerticalAlignment="Stretch" Cursor="Hand" ToolTip="Send"
+                    HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                     Background="#3A3A42" Foreground="#8A8A96" BorderBrush="#52525C" BorderThickness="1"
-                    Padding="8,6" Margin="0,2,0,0" IsEnabled="False"/>
+                    Padding="6,0" Margin="0,0,3,1" IsEnabled="False"
+                    Template="{StaticResource NoMouseOverButtonTemplate}">
+              <!-- Send icon -->
+              <Path x:Name="SendBtnPath" Width="20" Height="20" Stretch="Uniform"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Data="M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22A10,10 0 0,1 2,12A10,10 0 0,1 12,2M8,7.71V11.05L15.14,12L8,12.95V16.29L18,12L8,7.71Z">
+                <Path.Fill>
+                  <LinearGradientBrush StartPoint="0.2,0" EndPoint="0.85,1">
+                    <GradientStop x:Name="SendBtnGrad0" Color="#C0C0C8" Offset="0"/>
+                    <GradientStop x:Name="SendBtnGrad1" Color="#8A8A96" Offset="0.5"/>
+                    <GradientStop x:Name="SendBtnGrad2" Color="#5A5A66" Offset="1"/>
+                  </LinearGradientBrush>
+                </Path.Fill>
+                <Path.Effect>
+                  <DropShadowEffect x:Name="SendBtnShadow" BlurRadius="4" ShadowDepth="1.5"
+                                    Opacity="0.75" Direction="315" Color="Black"/>
+                </Path.Effect>
+              </Path>
+            </Button>
           </Grid>
         </Border>
 
- <!-- Hints below prompt -->
+ <!-- Hints -->
         <Border Grid.Row="5" Background="#16161A" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="12,4">
           <TextBlock x:Name="HintBar" Text="enter send  |  Ctrl+Enter newline  |  Esc / Stop interrupt  |  /help"
                      Foreground="#5A5A66" FontSize="11"/>
         </Border>
       </Grid>
+    </Grid>
+  </Border>
 
- <!-- Auth overlay (shown only when credentials required) -->
+ <!-- Overlays -->
       <Grid x:Name="AuthOverlay" Visibility="Collapsed" Panel.ZIndex="200">
         <Border Background="#E6121216"/>
-        <!-- Fixed card height so checkbox + error never shove buttons out of frame -->
-        <Border Width="400" HorizontalAlignment="Center" VerticalAlignment="Center"
-                Background="#1E1E24" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="8" Padding="22,18,22,14">
+        <Border Width="420" HorizontalAlignment="Center" VerticalAlignment="Center"
+                Background="#121216" BorderBrush="#2A2A30" BorderThickness="1" CornerRadius="8"
+                ClipToBounds="True" SnapsToDevicePixels="True">
           <Grid>
             <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/>
-              <RowDefinition Height="18"/>
-              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="36"/>
+              <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
-            <StackPanel Grid.Row="0">
-              <TextBlock x:Name="AuthTitle" Text="Authentication required" Foreground="#E0E0E8"
-                         FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
-              <TextBlock x:Name="AuthSubtitle" Text="" Foreground="#8A8A96" TextWrapping="Wrap"
-                         FontSize="12" Margin="0,0,0,10" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
-              <TextBlock Text="Username" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
-              <TextBox x:Name="AuthUser" Height="32" Padding="8,6" Margin="0,0,0,8"
-                       Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
-                       BorderBrush="#3A3A42" BorderThickness="1"
-                       FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"
-                       Focusable="True" IsTabStop="True" TabIndex="0"/>
-              <TextBlock Text="Password" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
-              <PasswordBox x:Name="AuthPass" Height="32" Padding="8,6" Margin="0,0,0,6"
+            <Border Grid.Row="0" Background="#2A2A30" BorderBrush="#3A3A42" BorderThickness="0,0,0,1"
+                    CornerRadius="8,8,0,0" Padding="10,0,0,0">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                  <TextBlock VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold">
+                    <Run Text="[" Foreground="#A0A0AA"/><Run Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
+                  </TextBlock>
+                  <TextBlock Text="Login" Foreground="#C8C8D0" FontSize="12" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                </StackPanel>
+                <Button x:Name="AuthTitleClose" Grid.Column="1" Width="46" Height="36"
+                        Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
+                        Template="{StaticResource NoMouseOverButtonTemplate}" ToolTip="Close">
+                  <Path Width="10" Height="10" Stretch="Uniform" Stroke="#C8C8D0" StrokeThickness="1.15"
+                        Data="M0,0 L10,10 M10,0 L0,10" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Button>
+              </Grid>
+            </Border>
+            <Border Grid.Row="1" Background="#121216" Padding="22,18,22,14">
+              <Grid>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="18"/>
+                  <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <StackPanel Grid.Row="0">
+                  <TextBlock x:Name="AuthTitle" Text="Authentication required" Foreground="#E0E0E8"
+                             FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+                  <TextBlock x:Name="AuthSubtitle" Text="" Foreground="#8A8A96" TextWrapping="Wrap"
+                             FontSize="12" Margin="0,0,0,10" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
+                  <TextBlock Text="Username" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+                  <TextBox x:Name="AuthUser" Height="32" Padding="8,6" Margin="0,0,0,8"
                            Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
                            BorderBrush="#3A3A42" BorderThickness="1"
                            FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"
-                           Focusable="True" IsTabStop="True" TabIndex="1"/>
-              <CheckBox x:Name="AuthSaveCreds" Style="{StaticResource MbDarkCheckBox}"
-                        Margin="0,0,0,0" Cursor="Hand" Focusable="True" IsTabStop="True"
-                        TabIndex="2" IsChecked="False">
-                <CheckBox.Content>
-                  <TextBlock Text="Save credentials" Foreground="#A0A0AA" FontSize="12"
-                             Margin="0,-1,0,0"/>
-                </CheckBox.Content>
-              </CheckBox>
-            </StackPanel>
-            <!-- Reserved error slot right under checkbox (no stretch gap) -->
-            <TextBlock x:Name="AuthError" Grid.Row="1" Text="" Foreground="#F7768E" FontSize="11"
-                       TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
-              <Button x:Name="AuthOk" Style="{StaticResource MbAuthPrimaryBtn}"
-                      Content="Sign in" Width="96" Height="30" Margin="0,0,8,0"
-                      IsDefault="False" TabIndex="3"/>
-              <Button x:Name="AuthCancel" Style="{StaticResource MbAuthSecondaryBtn}"
-                      Content="Cancel" Width="88" Height="30" TabIndex="4"/>
-            </StackPanel>
+                           Focusable="True" IsTabStop="True" TabIndex="0"/>
+                  <TextBlock Text="Password" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+                  <PasswordBox x:Name="AuthPass" Height="32" Padding="8,6" Margin="0,0,0,6"
+                               Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                               BorderBrush="#3A3A42" BorderThickness="1"
+                               FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"
+                               Focusable="True" IsTabStop="True" TabIndex="1"/>
+                  <CheckBox x:Name="AuthSaveCreds" Style="{StaticResource MbDarkCheckBox}"
+                            Margin="0,0,0,0" Cursor="Hand" Focusable="True" IsTabStop="True"
+                            TabIndex="2" IsChecked="False">
+                    <CheckBox.Content>
+                      <TextBlock Text="Save credentials" Foreground="#A0A0AA" FontSize="12"
+                                 Margin="0,-1,0,0"/>
+                    </CheckBox.Content>
+                  </CheckBox>
+                </StackPanel>
+                <TextBlock x:Name="AuthError" Grid.Row="1" Text="" Foreground="#F05C5C" FontSize="11"
+                           TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
+                  <Button x:Name="AuthOk" Style="{StaticResource MbAuthPrimaryBtn}"
+                          Content="Sign in" Width="96" Height="30" Margin="0,0,8,0"
+                          IsDefault="False" TabIndex="3"/>
+                  <Button x:Name="AuthCancel" Style="{StaticResource MbAuthSecondaryBtn}"
+                          Content="Cancel" Width="88" Height="30" TabIndex="4"/>
+                </StackPanel>
+              </Grid>
+            </Border>
           </Grid>
         </Border>
       </Grid>
- <!-- Confirm Yes/No overlay (above auth; credential retry / simple prompts) -->
       <Grid x:Name="ConfirmOverlay" Visibility="Collapsed" Panel.ZIndex="300">
         <Border Background="#E6121216"/>
-        <Border Width="400" HorizontalAlignment="Center" VerticalAlignment="Center"
-                Background="#1E1E24" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="8" Padding="22,18,22,16">
+        <Border Width="420" HorizontalAlignment="Center" VerticalAlignment="Center"
+                Background="#121216" BorderBrush="#2A2A30" BorderThickness="1" CornerRadius="8"
+                ClipToBounds="True" SnapsToDevicePixels="True">
           <Grid>
             <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="36"/>
+              <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
-            <TextBlock x:Name="ConfirmTitle" Text="Invalid Entry" Foreground="#E0E0E8"
-                       FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
-            <Rectangle x:Name="ConfirmAccentBar" Grid.Row="1" Height="3" Margin="0,0,0,14"
-                       RadiusX="1.5" RadiusY="1.5" Opacity="0.55">
-              <Rectangle.Fill>
-                <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
-                  <GradientStop Color="#7DCFFF" Offset="0"/>
-                  <GradientStop Color="#FFFFFF" Offset="0.5"/>
-                  <GradientStop Color="#7DCFFF" Offset="1"/>
-                </LinearGradientBrush>
-              </Rectangle.Fill>
-            </Rectangle>
-            <TextBlock x:Name="ConfirmPrompt" Grid.Row="2" Text="" Foreground="#C8C8D0"
-                       FontSize="13" TextWrapping="Wrap" Margin="0,0,0,18" LineHeight="20"/>
-            <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
-              <Button x:Name="ConfirmYes" Style="{StaticResource MbAuthPrimaryBtn}"
-                      Content="Yes" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0"
-                      IsDefault="True" TabIndex="0"/>
-              <Button x:Name="ConfirmNo" Style="{StaticResource MbAuthSecondaryBtn}"
-                      Content="No" MinWidth="88" Height="30" Padding="16,0"
-                      IsCancel="True" TabIndex="1"/>
-            </StackPanel>
+            <Border Grid.Row="0" Background="#2A2A30" BorderBrush="#3A3A42" BorderThickness="0,0,0,1"
+                    CornerRadius="8,8,0,0" Padding="10,0,0,0">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                  <TextBlock VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold">
+                    <Run Text="[" Foreground="#A0A0AA"/><Run Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
+                  </TextBlock>
+                  <TextBlock Text="Confirm" Foreground="#C8C8D0" FontSize="12" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                </StackPanel>
+                <Button x:Name="ConfirmTitleClose" Grid.Column="1" Width="46" Height="36"
+                        Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
+                        Template="{StaticResource NoMouseOverButtonTemplate}" ToolTip="Close">
+                  <Path Width="10" Height="10" Stretch="Uniform" Stroke="#C8C8D0" StrokeThickness="1.15"
+                        Data="M0,0 L10,10 M10,0 L0,10" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Button>
+              </Grid>
+            </Border>
+            <Border Grid.Row="1" Background="#121216" Padding="22,18,22,16">
+              <Grid>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock x:Name="ConfirmTitle" Text="Invalid Entry" Foreground="#E0E0E8"
+                           FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+                <Rectangle x:Name="ConfirmAccentBar" Grid.Row="1" Height="3" Margin="0,0,0,14"
+                           RadiusX="1.5" RadiusY="1.5" Opacity="0.55">
+                  <Rectangle.Fill>
+                    <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                      <GradientStop Color="#7DCFFF" Offset="0"/>
+                      <GradientStop Color="#FFFFFF" Offset="0.5"/>
+                      <GradientStop Color="#7DCFFF" Offset="1"/>
+                    </LinearGradientBrush>
+                  </Rectangle.Fill>
+                </Rectangle>
+                <TextBlock x:Name="ConfirmPrompt" Grid.Row="2" Text="" Foreground="#C8C8D0"
+                           FontSize="13" TextWrapping="Wrap" Margin="0,0,0,18" LineHeight="20"/>
+                <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+                  <Button x:Name="ConfirmYes" Style="{StaticResource MbAuthPrimaryBtn}"
+                          Content="Yes" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0"
+                          IsDefault="True" TabIndex="0"/>
+                  <Button x:Name="ConfirmNo" Style="{StaticResource MbAuthSecondaryBtn}"
+                          Content="No" MinWidth="88" Height="30" Padding="16,0"
+                          IsCancel="True" TabIndex="1"/>
+                </StackPanel>
+              </Grid>
+            </Border>
           </Grid>
         </Border>
       </Grid>
 
- <!-- Session load/save picker overlay (invisible until /load /save) -->
       <Grid x:Name="SessionPickerOverlay" Visibility="Collapsed" Panel.ZIndex="250">
         <Border Background="#E6121216"/>
-        <Border Width="720" Height="480" MinWidth="480" MinHeight="320"
-                MaxWidth="920" MaxHeight="620"
+        <Border Width="720" Height="500" MinWidth="480" MinHeight="340"
+                MaxWidth="920" MaxHeight="640"
                 HorizontalAlignment="Center" VerticalAlignment="Center"
-                Background="#1E1E24" BorderBrush="#3A3A42" BorderThickness="1"
-                CornerRadius="8" Padding="16,14,16,14">
+                Background="#121216" BorderBrush="#2A2A30" BorderThickness="1"
+                CornerRadius="8" ClipToBounds="True" SnapsToDevicePixels="True">
           <Grid>
             <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="36"/>
+              <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Border Grid.Row="0" Background="#2A2A30" BorderBrush="#3A3A42" BorderThickness="0,0,0,1"
+                    CornerRadius="8,8,0,0" Padding="10,0,0,0">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                  <TextBlock VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold">
+                    <Run Text="[" Foreground="#A0A0AA"/><Run Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
+                  </TextBlock>
+                  <TextBlock x:Name="SessionPickerTitle" Text="Load session" Foreground="#C8C8D0" FontSize="12"
+                             Margin="12,0,0,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="420"/>
+                </StackPanel>
+                <Button x:Name="SessionPickerTitleClose" Grid.Column="1" Width="46" Height="36"
+                        Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
+                        Template="{StaticResource NoMouseOverButtonTemplate}" ToolTip="Close">
+                  <Path Width="10" Height="10" Stretch="Uniform" Stroke="#C8C8D0" StrokeThickness="1.15"
+                        Data="M0,0 L10,10 M10,0 L0,10" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Button>
+              </Grid>
+            </Border>
+            <Grid Grid.Row="1" Margin="16,14,16,14">
+            <Grid.RowDefinitions>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="*"/>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
-            <TextBlock x:Name="SessionPickerTitle" Grid.Row="0" Text="Load session"
-                       Foreground="#E0E0E8" FontSize="16" FontWeight="Bold" Margin="0,0,0,10"/>
-            <DockPanel Grid.Row="1" Margin="0,0,0,8" LastChildFill="True">
+            <DockPanel Grid.Row="0" Margin="0,0,0,8" LastChildFill="True">
               <Button x:Name="SessionPickerBrowse" Style="{StaticResource MbAuthSecondaryBtn}"
                       Content="Browse..." MinWidth="84" Height="30" Margin="6,0,0,0"
                       DockPanel.Dock="Right" Padding="10,0"/>
@@ -22153,9 +24015,9 @@ function Start-MBWpfHost {
                        BorderBrush="#3A3A42" BorderThickness="1" VerticalContentAlignment="Center"
                        FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
             </DockPanel>
-            <TextBlock x:Name="SessionPickerStatus" Grid.Row="2" Text="Sessions (newest first)"
+            <TextBlock x:Name="SessionPickerStatus" Grid.Row="1" Text="Sessions (newest first)"
                        Foreground="#6A6A76" FontSize="11" Margin="0,0,0,6"/>
-            <ListBox x:Name="SessionPickerList" Grid.Row="3"
+            <ListBox x:Name="SessionPickerList" Grid.Row="2"
                      Background="#121216" Foreground="#C8C8D0" BorderBrush="#3A3A42"
                      BorderThickness="1" FontFamily="Consolas, Cascadia Mono, Courier New"
                      FontSize="12" Padding="2"
@@ -22182,7 +24044,7 @@ function Start-MBWpfHost {
                 </Style>
               </ListBox.Resources>
             </ListBox>
-            <DockPanel Grid.Row="4" Margin="0,10,0,10" LastChildFill="True">
+            <DockPanel Grid.Row="3" Margin="0,10,0,10" LastChildFill="True">
               <TextBlock Text="File name:  " Foreground="#8A8A96" VerticalAlignment="Center"
                          DockPanel.Dock="Left"/>
               <TextBox x:Name="SessionPickerName" Height="30" Padding="8,5"
@@ -22190,8 +24052,7 @@ function Start-MBWpfHost {
                        BorderBrush="#3A3A42" BorderThickness="1" VerticalContentAlignment="Center"
                        FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
             </DockPanel>
-            <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
-              <!-- IsDefault/IsCancel set only while overlay is visible (avoid fighting auth/main) -->
+            <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
               <Button x:Name="SessionPickerOk" Style="{StaticResource MbAuthPrimaryBtn}"
                       Content="Open" MinWidth="96" Height="30" Padding="16,0" Margin="0,0,8,0"
                       IsDefault="False"/>
@@ -22199,11 +24060,11 @@ function Start-MBWpfHost {
                       Content="Cancel" MinWidth="88" Height="30" Padding="16,0"
                       IsCancel="False"/>
             </StackPanel>
+            </Grid>
           </Grid>
         </Border>
       </Grid>
-    </Grid>
-  </Border>
+  </Grid>
 </Window>
 '@
 			$reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
@@ -22212,6 +24073,43 @@ function Start-MBWpfHost {
 			$W.Log = $window.FindName('LogBox')
 			$W.Prompt = $window.FindName('PromptBox')
 			$W.SendBtn = $window.FindName('SendBtn')
+			$W.SendBtnPath = $window.FindName('SendBtnPath')
+			$W.SendBtnGrad0 = $window.FindName('SendBtnGrad0')
+			$W.SendBtnGrad1 = $window.FindName('SendBtnGrad1')
+			$W.SendBtnGrad2 = $window.FindName('SendBtnGrad2')
+			$W.SendBtnShadow = $window.FindName('SendBtnShadow')
+			if ((-not $W.SendBtnGrad0 -or -not $W.SendBtnGrad1 -or -not $W.SendBtnGrad2) -and $W.SendBtnPath) {
+				try {
+					$sf = $W.SendBtnPath.Fill
+					if ($sf -is [System.Windows.Media.LinearGradientBrush] -and $sf.GradientStops.Count -ge 3) {
+						$W.SendBtnGrad0 = $sf.GradientStops[0]
+						$W.SendBtnGrad1 = $sf.GradientStops[1]
+						$W.SendBtnGrad2 = $sf.GradientStops[2]
+					}
+				} catch {}
+			}
+			if ($W.SendBtnPath) {
+				try { $W.SendBtnPath.RenderTransform = [System.Windows.Media.Transform]::Identity } catch {}
+				if (-not $W.SendBtnShadow) {
+					try {
+						if ($W.SendBtnPath.Effect -is [System.Windows.Media.Effects.DropShadowEffect]) {
+							$W.SendBtnShadow = $W.SendBtnPath.Effect
+						} else {
+							$fx = New-Object System.Windows.Media.Effects.DropShadowEffect
+							$fx.BlurRadius = 4
+							$fx.ShadowDepth = 1.5
+							$fx.Opacity = 0.75
+							$fx.Direction = 315
+							$fx.Color = [System.Windows.Media.Colors]::Black
+							$W.SendBtnPath.Effect = $fx
+							$W.SendBtnShadow = $fx
+						}
+					} catch {}
+				}
+			}
+			# Send and stop path geometry
+			$W.SendGeomData = 'M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22A10,10 0 0,1 2,12A10,10 0 0,1 12,2M8,7.71V11.05L15.14,12L8,12.95V16.29L18,12L8,7.71Z'
+			$W.StopGeomData = 'M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22A10,10 0 0,1 2,12A10,10 0 0,1 12,2M9,9H15V15H9V9Z'
 			$W.HdrLine1 = $window.FindName('HdrLine1')
 			$W.HdrLine1Shadow = $window.FindName('HdrLine1Shadow')
 			$W.HdrLine2 = $null
@@ -22224,6 +24122,573 @@ function Start-MBWpfHost {
 			$W.HdrPoweredBy = $window.FindName('HdrPoweredBy')
 			$W.HdrPoweredByShadow = $window.FindName('HdrPoweredByShadow')
 			$W.HdrPoweredByHost = $window.FindName('HdrPoweredByHost')
+			$W.CustomTitleBar = $window.FindName('CustomTitleBar')
+			$W.TitleRobotHost = $window.FindName('TitleRobotHost')
+			$W.TitleRobotPath = $window.FindName('TitleRobotPath')
+			$W.TitleRobotStop0 = $window.FindName('TitleRobotStop0')
+			$W.TitleRobotStop1 = $window.FindName('TitleRobotStop1')
+			$W.TitleRobotStop2 = $window.FindName('TitleRobotStop2')
+			$W.TitleRobotShadow = $window.FindName('TitleRobotShadow')
+			$W.TitleRobotTranslate = $window.FindName('TitleRobotTranslate')
+			# Resolve gradient/effect refs if FindName missed them
+			if ((-not $W.TitleRobotStop0 -or -not $W.TitleRobotStop1 -or -not $W.TitleRobotStop2) -and $W.TitleRobotPath) {
+				try {
+					$rb = $W.TitleRobotPath.Fill
+					if ($rb -is [System.Windows.Media.LinearGradientBrush] -and $rb.GradientStops.Count -ge 3) {
+						$W.TitleRobotStop0 = $rb.GradientStops[0]
+						$W.TitleRobotStop1 = $rb.GradientStops[1]
+						$W.TitleRobotStop2 = $rb.GradientStops[2]
+					}
+				} catch {}
+			}
+			if (-not $W.TitleRobotShadow -and $W.TitleRobotPath) {
+				try { $W.TitleRobotShadow = $W.TitleRobotPath.Effect } catch {}
+			}
+			if (-not $W.TitleRobotTranslate -and $W.TitleRobotPath) {
+				try {
+					$rt = $W.TitleRobotPath.RenderTransform
+					if ($rt -is [System.Windows.Media.TranslateTransform]) {
+						$W.TitleRobotTranslate = $rt
+					} else {
+						$tt = New-Object System.Windows.Media.TranslateTransform(0, 0)
+						$W.TitleRobotPath.RenderTransform = $tt
+						$W.TitleRobotTranslate = $tt
+					}
+				} catch {}
+			}
+			if (-not $W.RobotGeomCache) { $W.RobotGeomCache = @{} }
+			$W.RobotMood = ''
+			$W.RobotErrorBounceOn = $false
+			$W.RobotErrorStoryboard = $null
+			$W.StopRobotErrorBounce = {
+				try {
+					if ($W.RobotErrorStoryboard) {
+						try { $W.RobotErrorStoryboard.Stop() } catch {}
+						try { $W.RobotErrorStoryboard.Children.Clear() } catch {}
+						$W.RobotErrorStoryboard = $null
+					}
+					if ($W.TitleRobotTranslate) {
+						try { $W.TitleRobotTranslate.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $null) } catch {}
+						$W.TitleRobotTranslate.Y = 0
+						$W.TitleRobotTranslate.X = 0
+					}
+					if ($W.TitleRobotShadow) {
+						try {
+							$W.TitleRobotShadow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::ShadowDepthProperty, $null)
+							$W.TitleRobotShadow.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::BlurRadiusProperty, $null)
+						} catch {}
+						try {
+							$W.TitleRobotShadow.ShadowDepth = 1.25
+							$W.TitleRobotShadow.BlurRadius = 3.5
+						} catch {}
+					}
+					$W.RobotErrorBounceOn = $false
+				} catch {}
+			}.GetNewClosure()
+			$W.StartRobotErrorBounce = {
+				try {
+					if ([bool]$W.RobotErrorBounceOn -and $W.RobotErrorStoryboard) { return }
+					if (-not $W.TitleRobotPath) { return }
+					if (-not $W.TitleRobotTranslate) {
+						$tt = New-Object System.Windows.Media.TranslateTransform(0, 0)
+						$W.TitleRobotPath.RenderTransform = $tt
+						$W.TitleRobotTranslate = $tt
+					}
+					if (-not $W.TitleRobotShadow) {
+						try { $W.TitleRobotShadow = $W.TitleRobotPath.Effect } catch {}
+					}
+					try {
+						if ($W.RobotErrorStoryboard) {
+							try { $W.RobotErrorStoryboard.Stop() } catch {}
+							$W.RobotErrorStoryboard = $null
+						}
+						if ($W.TitleRobotTranslate) {
+							try { $W.TitleRobotTranslate.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $null) } catch {}
+							$W.TitleRobotTranslate.Y = 0
+						}
+					} catch {}
+
+					$addKf = {
+						param($anim, $ms, $val)
+						$frame = New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame
+						$frame.KeyTime = [System.Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromMilliseconds($ms))
+						$frame.Value = [double]$val
+						[void]$anim.KeyFrames.Add($frame)
+					}
+					$cycleMs = 1350
+					$yAnim = New-Object System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+					$yAnim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds($cycleMs))
+					& $addKf $yAnim 0 0
+					& $addKf $yAnim 120 -3
+					& $addKf $yAnim 240 0
+					& $addKf $yAnim 360 -3
+					& $addKf $yAnim 480 0
+					& $addKf $yAnim $cycleMs 0
+
+					$depthAnim = New-Object System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+					$depthAnim.Duration = $yAnim.Duration
+					& $addKf $depthAnim 0 1.25
+					& $addKf $depthAnim 120 3.0
+					& $addKf $depthAnim 240 1.25
+					& $addKf $depthAnim 360 3.0
+					& $addKf $depthAnim 480 1.25
+					& $addKf $depthAnim $cycleMs 1.25
+
+					$blurAnim = New-Object System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+					$blurAnim.Duration = $yAnim.Duration
+					& $addKf $blurAnim 0 3.5
+					& $addKf $blurAnim 120 5.0
+					& $addKf $blurAnim 240 3.5
+					& $addKf $blurAnim 360 5.0
+					& $addKf $blurAnim 480 3.5
+					& $addKf $blurAnim $cycleMs 3.5
+
+					$story = New-Object System.Windows.Media.Animation.Storyboard
+					$story.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+					[System.Windows.Media.Animation.Storyboard]::SetTarget($yAnim, $W.TitleRobotTranslate)
+					[System.Windows.Media.Animation.Storyboard]::SetTargetProperty($yAnim, (New-Object System.Windows.PropertyPath([System.Windows.Media.TranslateTransform]::YProperty)))
+					[void]$story.Children.Add($yAnim)
+					if ($W.TitleRobotShadow) {
+						[System.Windows.Media.Animation.Storyboard]::SetTarget($depthAnim, $W.TitleRobotShadow)
+						[System.Windows.Media.Animation.Storyboard]::SetTargetProperty($depthAnim, (New-Object System.Windows.PropertyPath([System.Windows.Media.Effects.DropShadowEffect]::ShadowDepthProperty)))
+						[void]$story.Children.Add($depthAnim)
+						[System.Windows.Media.Animation.Storyboard]::SetTarget($blurAnim, $W.TitleRobotShadow)
+						[System.Windows.Media.Animation.Storyboard]::SetTargetProperty($blurAnim, (New-Object System.Windows.PropertyPath([System.Windows.Media.Effects.DropShadowEffect]::BlurRadiusProperty)))
+						[void]$story.Children.Add($blurAnim)
+					}
+					$W.RobotErrorStoryboard = $story
+					$story.Begin()
+					$W.RobotErrorBounceOn = $true
+				} catch {
+					try { $W.RobotErrorBounceOn = $false } catch {}
+				}
+			}.GetNewClosure()
+			# Apply robot face and gradient for status
+			$W.SetRobotMood = {
+				param([string]$Mode = 'ready', [bool]$Force = $false)
+				try {
+					if (-not $W.TitleRobotPath) { return }
+					$m = ([string]$Mode).Trim().ToLowerInvariant()
+					$face = 'happy'
+					$isError = $false
+					if ($m -match 'error|fail|dead') { $face = 'dead'; $isError = $true }
+					elseif ($m -match 'think') { $face = 'confused' }
+					elseif ($m -match 'work') { $face = 'excited' }
+					elseif ($m -match 'compact|autocompact') { $face = 'default' }
+					elseif ($m -match 'off|offline|disconnect') { $face = 'off' }
+					elseif ($m -match 'angry|warn') { $face = 'angry' }
+					elseif ($m -match 'happy|success') { $face = 'happy' }
+					elseif ($m -match 'default|neutral|normal') { $face = 'default' }
+					if (-not $Force -and [string]$W.RobotMood -eq $face -and [bool]$W.RobotErrorBounceOn -eq $isError) { return }
+
+					$cat = $W.RobotCatalog
+					if (-not $cat) { return }
+					$faceKey = if (@($cat.Keys) -contains $face) { $face } else { 'default' }
+					$data = [string]$cat[$faceKey]
+					if ([string]::IsNullOrWhiteSpace($data)) { return }
+					if (-not $W.RobotGeomCache) { $W.RobotGeomCache = @{} }
+					if (-not $W.RobotGeomCache.ContainsKey($faceKey)) {
+						$W.RobotGeomCache[$faceKey] = [System.Windows.Media.Geometry]::Parse($data)
+					}
+					$W.TitleRobotPath.Data = $W.RobotGeomCache[$faceKey]
+					$W.RobotMood = $faceKey
+
+					$cols = if ($isError) {
+						@('#D0C4C6', '#B08084', '#9A585C')
+					} else {
+						@('#C8C8D0', '#6A6A74', '#3A3A42')
+					}
+					$stops = @($W.TitleRobotStop0, $W.TitleRobotStop1, $W.TitleRobotStop2)
+					for ($si = 0; $si -lt 3; $si++) {
+						if (-not $stops[$si]) { continue }
+						try {
+							$stops[$si].Color = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$cols[$si])
+						} catch {}
+					}
+					$tip = switch ($faceKey) {
+						'confused' { 'thinking' }
+						'excited'  { 'working' }
+						'default'  { 'compacting' }
+						'dead'     { 'error' }
+						'off'      { 'offline' }
+						'angry'    { 'warning' }
+						default    { 'ready' }
+					}
+					$tipFull = 'MiniBot' + [string][char]0x00A0 + [string][char]0x00B7 + [string][char]0x00A0 + $tip
+					if ($W.TitleRobotHost) { $W.TitleRobotHost.ToolTip = $tipFull }
+					elseif ($W.TitleRobotPath) { $W.TitleRobotPath.ToolTip = $tipFull }
+					if ($isError) {
+						try { if ($W.StartRobotErrorBounce) { & $W.StartRobotErrorBounce } } catch {}
+					} else {
+						try { if ($W.StopRobotErrorBounce) { & $W.StopRobotErrorBounce } } catch {}
+					}
+					# Sync taskbar icon with robot face
+					try {
+						if ($W.ApplyWindowRobotIcon) { & $W.ApplyWindowRobotIcon $faceKey }
+					} catch {}
+				} catch {}
+			}.GetNewClosure()
+			try { & $W.SetRobotMood 'ready' $true } catch {}
+			$W.TitleDotBrand = $window.FindName('TitleDotBrand')
+			$W.TitleDotPath = $window.FindName('TitleDotPath')
+			$W.TitleBrand = $window.FindName('TitleBrand')
+			$W.TitleBrandName = $window.FindName('TitleBrandName')
+			$W.TitleBrandNameShadow = $window.FindName('TitleBrandNameShadow')
+			$W.TitlePath = $window.FindName('TitlePath')
+			$W.TitlePathShadow = $window.FindName('TitlePathShadow')
+			$W.TitlePoweredBy = $window.FindName('TitlePoweredBy')
+			$W.TitlePoweredByShadow = $window.FindName('TitlePoweredByShadow')
+			$W.TitleBtnMin = $window.FindName('TitleBtnMin')
+			$W.TitleBtnMax = $window.FindName('TitleBtnMax')
+			$W.TitleBtnClose = $window.FindName('TitleBtnClose')
+			$W.TitleBtnMinPath = $window.FindName('TitleBtnMinPath')
+			$W.TitleBtnMaxPath = $window.FindName('TitleBtnMaxPath')
+			$W.TitleBtnClosePath = $window.FindName('TitleBtnClosePath')
+			# Maximize to work area (not WindowState.Maximized)
+			$W.IsWorkAreaMaximized = $false
+			$W.RestoreBounds = $null
+			$W.MaxGeom = 'M0.5,0.5 H9.5 V9.5 H0.5 Z'
+			$W.RestoreGeom = 'M0,3 H7.5 V10.5 H0 Z M3,0 H10.5 V7.5'
+			# Titlebar window buttons
+			try {
+				$getWorkAreaForWindow = {
+					param($win)
+					try {
+						Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+						$helper = New-Object System.Windows.Interop.WindowInteropHelper($win)
+						$hwnd = $helper.Handle
+						$scr = $null
+						if ($hwnd -ne [IntPtr]::Zero) {
+							$scr = [System.Windows.Forms.Screen]::FromHandle($hwnd)
+						} else {
+							$cx = [int]($win.Left + ($win.Width / 2.0))
+							$cy = [int]($win.Top + ($win.Height / 2.0))
+							$scr = [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point($cx, $cy)))
+						}
+						$wa = $scr.WorkingArea
+						$src = [System.Windows.PresentationSource]::FromVisual($win)
+						if ($src -and $src.CompositionTarget) {
+							$t = $src.CompositionTarget.TransformFromDevice
+							$p1 = $t.Transform((New-Object System.Windows.Point($wa.Left, $wa.Top)))
+							$p2 = $t.Transform((New-Object System.Windows.Point(($wa.Left + $wa.Width), ($wa.Top + $wa.Height))))
+							return @{ Left = [double]$p1.X; Top = [double]$p1.Y; Width = [double]($p2.X - $p1.X); Height = [double]($p2.Y - $p1.Y) }
+						}
+						return @{ Left = [double]$wa.Left; Top = [double]$wa.Top; Width = [double]$wa.Width; Height = [double]$wa.Height }
+					} catch {
+						$r = [System.Windows.SystemParameters]::WorkArea
+						return @{ Left = [double]$r.Left; Top = [double]$r.Top; Width = [double]$r.Width; Height = [double]$r.Height }
+					}
+				}.GetNewClosure()
+				$W.GetWorkAreaForWindow = $getWorkAreaForWindow
+				$setMaxIcon = {
+					param([bool]$isMax)
+					try {
+						if ($W.TitleBtnMaxPath) {
+							$g = if ($isMax) { $W.RestoreGeom } else { $W.MaxGeom }
+							$W.TitleBtnMaxPath.Data = [System.Windows.Media.Geometry]::Parse([string]$g)
+						}
+						if ($W.TitleBtnMax) {
+							$W.TitleBtnMax.ToolTip = if ($isMax) { 'Restore' } else { 'Maximize' }
+						}
+					} catch {}
+				}.GetNewClosure()
+				$W.SetMaxIcon = $setMaxIcon
+				$toggleWorkAreaMax = {
+					try {
+						if ($W.IsWorkAreaMaximized) {
+							$rb = $W.RestoreBounds
+							if ($rb) {
+								$window.Left = [double]$rb.Left
+								$window.Top = [double]$rb.Top
+								$window.Width = [double]$rb.Width
+								$window.Height = [double]$rb.Height
+							}
+							$W.IsWorkAreaMaximized = $false
+							& $setMaxIcon $false
+						} else {
+							$W.RestoreBounds = @{
+								Left = [double]$window.Left
+								Top = [double]$window.Top
+								Width = [double]$window.Width
+								Height = [double]$window.Height
+							}
+							try { $window.WindowState = [System.Windows.WindowState]::Normal } catch {}
+							$wa = & $getWorkAreaForWindow $window
+							$window.Left = [double]$wa.Left
+							$window.Top = [double]$wa.Top
+							$window.Width = [Math]::Max(200.0, [double]$wa.Width)
+							$window.Height = [Math]::Max(150.0, [double]$wa.Height)
+							$W.IsWorkAreaMaximized = $true
+							& $setMaxIcon $true
+						}
+						try {
+							if ($W.ApplyWindowChromeCorners) { & $W.ApplyWindowChromeCorners $window $W }
+						} catch {}
+					} catch {}
+				}.GetNewClosure()
+				$W.ToggleWorkAreaMax = $toggleWorkAreaMax
+				# Hover: exit red, min/max lighter grey (NoMouseOver — Background only)
+				$bcTitle = New-Object System.Windows.Media.BrushConverter
+				$hoverGrey = $bcTitle.ConvertFromString('#3A3A42')
+				$hoverRed = $bcTitle.ConvertFromString('#E81123')
+				$hoverClear = [System.Windows.Media.Brushes]::Transparent
+				if ($W.TitleBtnMin) {
+					$W.TitleBtnMin.add_MouseEnter({
+						try { $W.TitleBtnMin.Background = $hoverGrey } catch {}
+					}.GetNewClosure())
+					$W.TitleBtnMin.add_MouseLeave({
+						try { $W.TitleBtnMin.Background = $hoverClear } catch {}
+					}.GetNewClosure())
+					$W.TitleBtnMin.add_Click({
+						try { $window.WindowState = [System.Windows.WindowState]::Minimized } catch {}
+					}.GetNewClosure())
+				}
+				if ($W.TitleBtnMax) {
+					$W.TitleBtnMax.add_MouseEnter({
+						try { $W.TitleBtnMax.Background = $hoverGrey } catch {}
+					}.GetNewClosure())
+					$W.TitleBtnMax.add_MouseLeave({
+						try { $W.TitleBtnMax.Background = $hoverClear } catch {}
+					}.GetNewClosure())
+					$W.TitleBtnMax.add_Click({
+						try { & $toggleWorkAreaMax } catch {}
+					}.GetNewClosure())
+				}
+				if ($W.TitleBtnClose) {
+					$W.TitleBtnClose.add_MouseEnter({
+						try { $W.TitleBtnClose.Background = $hoverRed } catch {}
+					}.GetNewClosure())
+					$W.TitleBtnClose.add_MouseLeave({
+						try { $W.TitleBtnClose.Background = $hoverClear } catch {}
+					}.GetNewClosure())
+					$W.TitleBtnClose.add_Click({
+						try { $window.Close() } catch {}
+					}.GetNewClosure())
+				}
+				# Double-click titlebar maximizes to work area
+				if ($W.CustomTitleBar) {
+					$W.CustomTitleBar.add_MouseLeftButtonDown({
+						param($s, $e)
+						try {
+							if ($e.ClickCount -eq 2) { & $toggleWorkAreaMax }
+						} catch {}
+					}.GetNewClosure())
+				}
+				# Title path: cwd editor popup
+				try {
+					if ($W.TitlePath) {
+						if (-not $W.BrushCache) { $W.BrushCache = @{} }
+						$bcCwd = New-Object System.Windows.Media.BrushConverter
+						$cwdHexes = @('#121216', '#1E1E24', '#2A2A30', '#3A3A42', '#E0E0E8', '#C8C8D0', '#6A6A76', '#F05C5C', '#7DCFFF', '#4A4A56', '#5C5C6A', '#3A3A48', '#363640', '#5A5A66', '#222228')
+						foreach ($hx in $cwdHexes) {
+							if (-not $W.BrushCache.ContainsKey($hx)) {
+								try { $W.BrushCache[$hx] = $bcCwd.ConvertFromString($hx) } catch {}
+							}
+						}
+						$cwdPopup = New-Object System.Windows.Controls.Primitives.Popup
+						$cwdPopup.StaysOpen = $true
+						$cwdPopup.AllowsTransparency = $true
+						$cwdPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+						$cwdPopup.PlacementTarget = $W.TitlePath
+						$cwdPopup.HorizontalOffset = 0
+						$cwdPopup.VerticalOffset = 4
+						$cwdShell = New-Object System.Windows.Controls.Border
+						$cwdShell.Background = $W.BrushCache['#121216']
+						$cwdShell.BorderBrush = $W.BrushCache['#2A2A30']
+						$cwdShell.BorderThickness = New-Object System.Windows.Thickness(1)
+						$cwdShell.CornerRadius = New-Object System.Windows.CornerRadius(8)
+						$cwdShell.Padding = New-Object System.Windows.Thickness(12, 10, 12, 10)
+						$cwdShell.MinWidth = 420
+						$cwdShell.MaxWidth = 640
+						$cwdShell.SnapsToDevicePixels = $true
+						$cwdRoot = New-Object System.Windows.Controls.StackPanel
+						$cwdRoot.Orientation = [System.Windows.Controls.Orientation]::Vertical
+						$cwdLabel = New-Object System.Windows.Controls.TextBlock
+						$cwdLabel.Text = 'Working directory'
+						$cwdLabel.Foreground = $W.BrushCache['#C8C8D0']
+						$cwdLabel.FontSize = 12
+						$cwdLabel.FontWeight = [System.Windows.FontWeights]::SemiBold
+						$cwdLabel.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+						$cwdRow = New-Object System.Windows.Controls.DockPanel
+						$cwdRow.LastChildFill = $true
+						$cwdRow.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
+						$cwdGo = New-Object System.Windows.Controls.Button
+						$cwdGo.Content = 'Go'
+						$cwdGo.MinWidth = 52
+						$cwdGo.Height = 30
+						$cwdGo.Margin = New-Object System.Windows.Thickness(6, 0, 0, 0)
+						$cwdGo.Padding = New-Object System.Windows.Thickness(10, 0, 10, 0)
+						$cwdGo.Cursor = [System.Windows.Input.Cursors]::Hand
+						$cwdGo.Focusable = $true
+						$cwdGo.Background = $W.BrushCache['#2A2A30']
+						$cwdGo.Foreground = $W.BrushCache['#C8C8D0']
+						$cwdGo.BorderBrush = $W.BrushCache['#3A3A42']
+						$cwdGo.BorderThickness = New-Object System.Windows.Thickness(1)
+						try {
+							$cwdGo.Template = [System.Windows.Markup.XamlReader]::Parse(@'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+  <Border x:Name="Bd" Background="{TemplateBinding Background}"
+          BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}"
+          CornerRadius="4" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="Bd" Property="Background" Value="#363640"/>
+      <Setter TargetName="Bd" Property="BorderBrush" Value="#5A5A66"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="Bd" Property="Background" Value="#222228"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@)
+						} catch {}
+						[System.Windows.Controls.DockPanel]::SetDock($cwdGo, [System.Windows.Controls.Dock]::Right)
+						$cwdBox = New-Object System.Windows.Controls.TextBox
+						$cwdBox.Height = 30
+						$cwdBox.Padding = New-Object System.Windows.Thickness(8, 5, 8, 5)
+						$cwdBox.Background = $W.BrushCache['#121216']
+						$cwdBox.Foreground = $W.BrushCache['#E0E0E8']
+						$cwdBox.CaretBrush = $W.BrushCache['#C8C8D0']
+						$cwdBox.BorderBrush = $W.BrushCache['#3A3A42']
+						$cwdBox.BorderThickness = New-Object System.Windows.Thickness(1)
+						$cwdBox.VerticalContentAlignment = [System.Windows.VerticalAlignment]::Center
+						try {
+							$cwdBox.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas, Cascadia Mono, Courier New')
+						} catch {}
+						$cwdBox.FontSize = 13
+						[void]$cwdRow.Children.Add($cwdGo)
+						[void]$cwdRow.Children.Add($cwdBox)
+						$cwdStatus = New-Object System.Windows.Controls.TextBlock
+						$cwdStatus.Text = 'Enter a folder path, then Go'
+						$cwdStatus.Foreground = $W.BrushCache['#6A6A76']
+						$cwdStatus.FontSize = 11
+						$cwdStatus.TextWrapping = [System.Windows.TextWrapping]::Wrap
+						[void]$cwdRoot.Children.Add($cwdLabel)
+						[void]$cwdRoot.Children.Add($cwdRow)
+						[void]$cwdRoot.Children.Add($cwdStatus)
+						$cwdShell.Child = $cwdRoot
+						$cwdPopup.Child = $cwdShell
+						$W.CwdPopup = $cwdPopup
+						$W.CwdPopupBox = $cwdBox
+						$W.CwdPopupGo = $cwdGo
+						$W.CwdPopupStatus = $cwdStatus
+						$openCwdPopup = {
+							try {
+								$cur = ''
+								try { $cur = [string]$W.CurrentCwd } catch {}
+								if ([string]::IsNullOrWhiteSpace($cur)) {
+									try { $cur = [string]$W.TitlePath.Text } catch {}
+								}
+								if ([string]::IsNullOrWhiteSpace($cur)) {
+									try { $cur = [Environment]::CurrentDirectory } catch { $cur = '' }
+								}
+								$W.CwdPopupBox.Text = $cur
+								$W.CwdPopupStatus.Text = 'Enter a folder path, then Go'
+								try { $W.CwdPopupStatus.Foreground = $W.BrushCache['#6A6A76'] } catch {}
+								$W.CwdPopup.PlacementTarget = $W.TitlePath
+								$W.CwdPopup.IsOpen = $true
+								try {
+									[void]$W.CwdPopupBox.Focus()
+									$W.CwdPopupBox.SelectAll()
+								} catch {}
+							} catch {}
+						}.GetNewClosure()
+						$closeCwdPopup = {
+							try { if ($W.CwdPopup) { $W.CwdPopup.IsOpen = $false } } catch {}
+						}.GetNewClosure()
+						$applyCwdGo = {
+							try {
+								$dir = ([string]$W.CwdPopupBox.Text).Trim().Trim('"')
+								if ([string]::IsNullOrWhiteSpace($dir)) {
+									$W.CwdPopupStatus.Text = 'Enter a folder path first.'
+									try { $W.CwdPopupStatus.Foreground = $W.BrushCache['#F05C5C'] } catch {}
+									return
+								}
+								$exists = $false
+								try { $exists = [System.IO.Directory]::Exists($dir) } catch { $exists = $false }
+								if (-not $exists) {
+									$W.CwdPopupStatus.Text = 'Folder not found - check the path and try again.'
+									try { $W.CwdPopupStatus.Foreground = $W.BrushCache['#F05C5C'] } catch {}
+									return
+								}
+								$full = $dir
+								try { $full = [System.IO.Path]::GetFullPath($dir) } catch { $full = $dir }
+								$W.CwdPopupBox.Text = $full
+								$W.PendingCwd = $full
+								$W.CurrentCwd = $full
+								$W.CwdDirty = $true
+								# Optimistic title path (short)
+								$disp = $full
+								if ($disp.Length -gt 56) { $disp = '...' + $disp.Substring($disp.Length - 53) }
+								$W.PendingTitlePath = $disp
+								try { $W.TitlePath.Text = $disp } catch {}
+								try { if ($W.TitlePathShadow) { $W.TitlePathShadow.Text = $disp } } catch {}
+								$W.CwdPopupStatus.Text = ('Working directory set: {0}' -f $full)
+								try { $W.CwdPopupStatus.Foreground = $W.BrushCache['#7DCFFF'] } catch {}
+								try { $W.CwdPopup.IsOpen = $false } catch {}
+							} catch {}
+						}.GetNewClosure()
+						$W.OpenCwdPopup = $openCwdPopup
+						$W.CloseCwdPopup = $closeCwdPopup
+						$W.ApplyCwdGo = $applyCwdGo
+						$cwdGo.add_Click({
+							param($s, $e)
+							try { & $applyCwdGo } catch {}
+						}.GetNewClosure())
+						$cwdBox.add_KeyDown({
+							param($s, $e)
+							try {
+								if ($e.Key -eq 'Return') {
+									$e.Handled = $true
+									& $applyCwdGo
+								} elseif ($e.Key -eq 'Escape') {
+									$e.Handled = $true
+									& $closeCwdPopup
+								}
+							} catch {}
+						}.GetNewClosure())
+						$W.TitlePath.add_MouseLeftButtonUp({
+							param($s, $e)
+							try {
+								if ($null -ne $e) { $e.Handled = $true }
+								if ($W.CwdPopup -and [bool]$W.CwdPopup.IsOpen) {
+									& $closeCwdPopup
+								} else {
+									& $openCwdPopup
+								}
+							} catch {}
+						}.GetNewClosure())
+						$W.TitlePath.add_MouseLeftButtonDown({
+							param($s, $e)
+							try { if ($null -ne $e) { $e.Handled = $true } } catch {}
+						}.GetNewClosure())
+						# Click outside closes cwd popup
+						if ($W.Window -and -not $W.CwdPopupOutsideHooked) {
+							$W.CwdPopupOutsideHooked = $true
+							$W.Window.add_PreviewMouseDown({
+								param($s, $e)
+								try {
+									if (-not $W.CwdPopup -or -not [bool]$W.CwdPopup.IsOpen) { return }
+									$src = $null
+									try { $src = $e.OriginalSource } catch {}
+									$keep = $false
+									try {
+										$vis = $src
+										while ($null -ne $vis) {
+											if ($vis -eq $W.TitlePath -or $vis -eq $W.CwdPopup.Child) { $keep = $true; break }
+											try { $vis = [System.Windows.Media.VisualTreeHelper]::GetParent($vis) } catch { break }
+										}
+									} catch {}
+									if (-not $keep) { $W.CwdPopup.IsOpen = $false }
+								} catch {}
+							}.GetNewClosure())
+						}
+					}
+				} catch {}
+			} catch {}
 			$W.HdrAutoCompact = $window.FindName('HdrAutoCompact')
 			$W.HdrAutoCompactShadow = $window.FindName('HdrAutoCompactShadow')
 			$W.HdrLeft = $W.HdrLine1
@@ -22257,15 +24722,18 @@ function Start-MBWpfHost {
 			$W.AuthError = $window.FindName('AuthError')
 			$W.AuthOk = $window.FindName('AuthOk')
 			$W.AuthCancel = $window.FindName('AuthCancel')
+			$W.AuthTitleClose = $window.FindName('AuthTitleClose')
 			$W.AuthSaveCreds = $window.FindName('AuthSaveCreds')
 			$W.ConfirmOverlay = $window.FindName('ConfirmOverlay')
 			$W.ConfirmTitle = $window.FindName('ConfirmTitle')
 			$W.ConfirmPrompt = $window.FindName('ConfirmPrompt')
 			$W.ConfirmYes = $window.FindName('ConfirmYes')
 			$W.ConfirmNo = $window.FindName('ConfirmNo')
+			$W.ConfirmTitleClose = $window.FindName('ConfirmTitleClose')
 			$W.ConfirmAccentBar = $window.FindName('ConfirmAccentBar')
 			$W.SessionPickerOverlay = $window.FindName('SessionPickerOverlay')
 			$W.SessionPickerTitle = $window.FindName('SessionPickerTitle')
+			$W.SessionPickerTitleClose = $window.FindName('SessionPickerTitleClose')
 			$W.SessionPickerPath = $window.FindName('SessionPickerPath')
 			$W.SessionPickerGo = $window.FindName('SessionPickerGo')
 			$W.SessionPickerUp = $window.FindName('SessionPickerUp')
@@ -22276,17 +24744,60 @@ function Start-MBWpfHost {
 			$W.SessionPickerOk = $window.FindName('SessionPickerOk')
 			$W.SessionPickerCancel = $window.FindName('SessionPickerCancel')
 			$W.SessionPickerRows = New-Object System.Collections.ArrayList
+			# Titlebar close button hover
+			try {
+				$bcDlg = New-Object System.Windows.Media.BrushConverter
+				$hoverRed = $bcDlg.ConvertFromString('#E81123')
+				$hoverClear = [System.Windows.Media.Brushes]::Transparent
+				$wireDlgCloseHover = {
+					param($btn)
+					if (-not $btn) { return }
+					$btn.add_MouseEnter({
+						try { $btn.Background = $hoverRed } catch {}
+					}.GetNewClosure())
+					$btn.add_MouseLeave({
+						try { $btn.Background = $hoverClear } catch {}
+					}.GetNewClosure())
+				}.GetNewClosure()
+				& $wireDlgCloseHover $W.AuthTitleClose
+				& $wireDlgCloseHover $W.ConfirmTitleClose
+				& $wireDlgCloseHover $W.SessionPickerTitleClose
+			} catch {}
 
 			
-			# Session picker overlay (load/save) — same UI thread as host
+			# Session picker overlay
 			try {
 			$sessionPickerReload = {
+				# Folder scan off UI thread
 				try {
 					$list = $W.SessionPickerList
 					$pathBox = $W.SessionPickerPath
 					$status = $W.SessionPickerStatus
 					if (-not $list -or -not $pathBox) { return }
 					$dir = ([string]$pathBox.Text).Trim().Trim('"')
+					if ([string]::IsNullOrWhiteSpace($dir)) {
+						if ($status) {
+							$status.Text = 'Enter a folder path first.'
+							try {
+								$bc = New-Object System.Windows.Media.BrushConverter
+								$status.Foreground = $bc.ConvertFromString('#F05C5C')
+							} catch {}
+						}
+						return
+					}
+					# Require existing folder path
+					$exists = $false
+					try { $exists = [System.IO.Directory]::Exists($dir) } catch { $exists = $false }
+					if (-not $exists) {
+						if ($status) {
+							$status.Text = 'Folder not found - check the path and try again.'
+							try {
+								$bc = New-Object System.Windows.Media.BrushConverter
+								$status.Foreground = $bc.ConvertFromString('#F05C5C')
+							} catch {}
+						}
+						return
+					}
 					$pathBox.Text = $dir
 					$list.Items.Clear()
 					$W.SessionPickerRows = New-Object System.Collections.ArrayList
@@ -22298,83 +24809,118 @@ function Start-MBWpfHost {
 							$status.Foreground = $bc.ConvertFromString('#6A6A76')
 						} catch {}
 					}
-					$found = @()
+					try { Ensure-MBSessionScanType } catch {}
+					$gen = 0
+					try { $gen = [int]$W.SessionPickerScanGen + 1 } catch { $gen = 1 }
+					$W.SessionPickerScanGen = $gen
+					$dirCopy = $dir
+					$genCopy = $gen
+					$rs = $null
+					$ps = $null
 					try {
-						# Prefer process-wide C# scanner if loaded
-						if ('MiniBot.SessionScan' -as [type]) {
-							$raw = [MiniBot.SessionScan]::ListSessions($dir, 400, 3000)
-							if ($raw) {
-								foreach ($r in @($raw)) {
-									if ($null -eq $r -or $r.Length -lt 6) { continue }
-									[void]$W.SessionPickerRows.Add(@{
-										Name = [string]$r[0]; Path = [string]$r[1]; Modified = [string]$r[2]
-										Size = [string]$r[3]; Type = [string]$r[4]; Line = [string]$r[5]
-									})
-								}
+						$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+						$rs.Open()
+						$ps = [powershell]::Create()
+						$ps.Runspace = $rs
+						[void]$ps.AddScript({
+							param([string]$Dir, [int]$Max, [int]$TimeoutMs)
+							if (-not ('MiniBot.SessionScan' -as [type])) { return @() }
+							$raw = [MiniBot.SessionScan]::ListSessions($Dir, $Max, $TimeoutMs)
+							if (-not $raw) { return @() }
+							$out = New-Object System.Collections.ArrayList
+							foreach ($r in @($raw)) {
+								if ($null -eq $r -or $r.Length -lt 6) { continue }
+								[void]$out.Add(@{
+									Name = [string]$r[0]; Path = [string]$r[1]; Modified = [string]$r[2]
+									Size = [string]$r[3]; Type = [string]$r[4]; Line = [string]$r[5]
+								})
 							}
+							return @($out)
+						}).AddArgument($dirCopy).AddArgument(400).AddArgument(1500)
+						$async = $ps.BeginInvoke()
+						$timer = New-Object System.Windows.Threading.DispatcherTimer
+						$timer.Interval = [TimeSpan]::FromMilliseconds(50)
+						$timer.Tag = @{
+							Async = $async; PS = $ps; RS = $rs; Gen = $genCopy; Dir = $dirCopy
 						}
-					} catch {}
-					if ($W.SessionPickerRows.Count -eq 0) {
-						try {
-							if ([System.IO.Directory]::Exists($dir)) {
-								$all = [System.IO.Directory]::GetFiles($dir)
-								$tmp = New-Object System.Collections.ArrayList
-								for ($i = 0; $i -lt $all.Length; $i++) {
-									$fp = [string]$all[$i]
-									$ext = [System.IO.Path]::GetExtension($fp)
-									if ([string]::IsNullOrEmpty($ext)) { continue }
-									$extL = $ext.ToLowerInvariant()
-									if ($extL -ne '.json' -and $extL -ne '.md' -and $extL -ne '.markdown') { continue }
-									try {
-										$fi = New-Object System.IO.FileInfo ($fp)
-										if (-not $fi.Exists) { continue }
-										$n = [long]$fi.Length
-										if ($n -lt 1024) { $sz = ('{0} B' -f $n) }
-										elseif ($n -lt 1048576) { $sz = ('{0:N1} KB' -f ($n / 1024.0)) }
-										else { $sz = ('{0:N1} MB' -f ($n / 1048576.0)) }
-										$type = $extL.TrimStart('.')
-										if ($type -eq 'markdown') { $type = 'md' }
-										$mod = $fi.LastWriteTime
-										$line = ('{0:yyyy-MM-dd HH:mm:ss}  |  {1}  |  {2}' -f $mod, $fi.Name, $sz)
-										[void]$tmp.Add([pscustomobject]@{
-											Name = [string]$fi.Name; Path = [string]$fi.FullName
-											Modified = $mod.ToString('yyyy-MM-dd HH:mm:ss'); Size = $sz
-											Type = $type; Line = $line; Ticks = [int64]$mod.Ticks
-										})
-									} catch {}
+						$timer.add_Tick({
+							param($s, $e)
+							try {
+								$tag = $s.Tag
+								if (-not $tag -or -not $tag.Async) { try { $s.Stop() } catch {}; return }
+								if (-not $tag.Async.IsCompleted) { return }
+								try { $s.Stop() } catch {}
+								$rows = @()
+								try {
+									$out = $tag.PS.EndInvoke($tag.Async)
+									if ($out) { $rows = @($out) }
+								} catch { $rows = @() }
+								try { $tag.PS.Dispose() } catch {}
+								try { $tag.RS.Close(); $tag.RS.Dispose() } catch {}
+								$curGen = 0
+								try { $curGen = [int]$W.SessionPickerScanGen } catch {}
+								if ($curGen -ne [int]$tag.Gen) { return }
+								$curDir = ''
+								try { $curDir = ([string]$W.SessionPickerPath.Text).Trim().Trim('"') } catch {}
+								if ($curDir -and $tag.Dir -and ($curDir -ne [string]$tag.Dir)) { return }
+								if (-not $W.SessionPickerList) { return }
+								$W.SessionPickerRows = New-Object System.Collections.ArrayList
+								$W.SessionPickerList.Items.Clear()
+								if ($rows.Count -eq 0) {
+									[void]$W.SessionPickerList.Items.Add('(none)')
+									if ($W.SessionPickerStatus) {
+										$W.SessionPickerStatus.Text = 'No .json/.md here - type a name and Save/Open'
+										try {
+											$bc = New-Object System.Windows.Media.BrushConverter
+											$W.SessionPickerStatus.Foreground = $bc.ConvertFromString('#6A6A76')
+										} catch {}
+									}
+								} else {
+									foreach ($row in $rows) {
+										[void]$W.SessionPickerRows.Add($row)
+										[void]$W.SessionPickerList.Items.Add([string]$row.Line)
+									}
+									if ($W.SessionPickerStatus) {
+										$W.SessionPickerStatus.Text = ('{0} session(s)  |  newest first' -f $W.SessionPickerRows.Count)
+										try {
+											$bc = New-Object System.Windows.Media.BrushConverter
+											$W.SessionPickerStatus.Foreground = $bc.ConvertFromString('#6A6A76')
+										} catch {}
+									}
 								}
-								foreach ($s in @($tmp | Sort-Object Ticks -Descending | Select-Object -First 400)) {
-									[void]$W.SessionPickerRows.Add(@{
-										Name = $s.Name; Path = $s.Path; Modified = $s.Modified
-										Size = $s.Size; Type = $s.Type; Line = $s.Line
-									})
-								}
+							} catch {
+								try {
+									if ($W.SessionPickerList) {
+										$W.SessionPickerList.Items.Clear()
+										[void]$W.SessionPickerList.Items.Add('(scan failed)')
+									}
+								} catch {}
 							}
+						}.GetNewClosure())
+						$timer.Start()
+					} catch {
+						try { if ($ps) { $ps.Dispose() } } catch {}
+						try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
+						try {
+							$list.Items.Clear()
+							[void]$list.Items.Add('(scan failed)')
 						} catch {}
 					}
-					$list.Items.Clear()
-					if ($W.SessionPickerRows.Count -eq 0) {
-						if ($status) { $status.Text = 'No .json / .md sessions here (or scan timed out)' }
-						[void]$list.Items.Add('(none)')
-					} else {
-						if ($status) {
-							$status.Text = ('{0} session(s)  |  newest first  |  date | name | size' -f $W.SessionPickerRows.Count)
-						}
-						foreach ($row in $W.SessionPickerRows) {
-							[void]$list.Items.Add([string]$row.Line)
-						}
-					}
-				} catch {
-					try {
-						if ($W.SessionPickerList) {
-							$W.SessionPickerList.Items.Clear()
-							[void]$W.SessionPickerList.Items.Add('(scan failed)')
-						}
-					} catch {}
-				}
+				} catch {}
 			}.GetNewClosure()
 			$W.SessionPickerReload = $sessionPickerReload
 
+			# Dismiss picker UI before agent continues
+			$sessionPickerDismissUi = {
+				try {
+					if ($W.SessionPickerOverlay) {
+						$W.SessionPickerOverlay.Visibility = [System.Windows.Visibility]::Collapsed
+						$W.SessionPickerOverlay.IsHitTestVisible = $false
+					}
+					if ($W.SessionPickerOk) { try { $W.SessionPickerOk.IsDefault = $false } catch {} }
+					if ($W.SessionPickerCancel) { try { $W.SessionPickerCancel.IsCancel = $false } catch {} }
+				} catch {}
+			}.GetNewClosure()
 			$sessionPickerAccept = {
 				try {
 					$mode = [string]$W.SessionPickerMode
@@ -22397,10 +24943,10 @@ function Start-MBWpfHost {
 						try { $dir = ([string]$W.SessionPickerPath.Text).Trim() } catch {}
 						$p = [System.IO.Path]::Combine($dir, $nm)
 						if ([System.IO.File]::Exists($p)) {
+							# Avoid owned MessageBox on borderless host
 							$r = [System.Windows.MessageBox]::Show(
-								$W.Window,
-								('Overwrite?' + [Environment]::NewLine + [Environment]::NewLine + $p),
-								([string]$W.SessionPickerTitle.Text),
+								('Overwrite existing file?' + [Environment]::NewLine + [Environment]::NewLine + $p),
+								'Save session',
 								[System.Windows.MessageBoxButton]::YesNo,
 								[System.Windows.MessageBoxImage]::Warning
 							)
@@ -22415,6 +24961,8 @@ function Start-MBWpfHost {
 						if ([string]::IsNullOrWhiteSpace($p) -or -not [System.IO.File]::Exists($p)) { return }
 					}
 					$W.SessionPickerResult = $p
+					# Dismiss overlay before save continues
+					& $sessionPickerDismissUi
 					try { [void]$W.SessionPickerWait.Set() } catch {}
 				} catch {}
 			}.GetNewClosure()
@@ -22481,6 +25029,14 @@ function Start-MBWpfHost {
 			if ($W.SessionPickerCancel) {
 				$W.SessionPickerCancel.add_Click({
 					$W.SessionPickerResult = $null
+					try { & $sessionPickerDismissUi } catch {}
+					try { [void]$W.SessionPickerWait.Set() } catch {}
+				}.GetNewClosure())
+			}
+			if ($W.SessionPickerTitleClose) {
+				$W.SessionPickerTitleClose.add_Click({
+					$W.SessionPickerResult = $null
+					try { & $sessionPickerDismissUi } catch {}
 					try { [void]$W.SessionPickerWait.Set() } catch {}
 				}.GetNewClosure())
 			}
@@ -22489,141 +25045,171 @@ function Start-MBWpfHost {
 			}
 
 			$W.Dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
-			$window.Title = ("MiniBot v{0}" -f $W.Version)
+			try {
+				$bootTitle = "[{0}-Agent]" -f $(if ($W.AgentName) { [string]$W.AgentName } else { 'MiniBot' })
+				if ($W.ModelAlias) {
+					$sep = ("  {0}  " -f [string][char]0x00B7)
+					$bootTitle = ("{0}{1}PoweredBy: {2}" -f $bootTitle, $sep, ([string]$W.ModelAlias).Trim())
+				}
+				$window.Title = $bootTitle
+			} catch {
+				$window.Title = ("MiniBot v{0}" -f $W.Version)
+			}
+			# Window and taskbar robot icon
 			try {
 				$appId = 'MiniBot-Agent'
 				try { if ($W.AgentName) { $appId = ("{0}-Agent" -f $W.AgentName) } } catch {}
-				if (-not ('MiniBot.UI.IconExtractor' -as [type])) {
+				$W.AppId = $appId
+				if (-not $W.RobotIconCache) { $W.RobotIconCache = @{} }
+				$W.ToShellIcon = {
+					param($Source)
+					if (-not $Source) { return $null }
 					try {
-						Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
-						Add-Type -AssemblyName PresentationCore -ErrorAction SilentlyContinue
-						Add-Type -AssemblyName WindowsBase -ErrorAction SilentlyContinue
-						$iconCode = @'
-using System;
-using System.Runtime.InteropServices;
-using System.Windows.Interop;
-using System.Windows.Media.Imaging;
-using System.Windows;
-
-namespace MiniBot.UI
-{
-    public static class IconExtractor
-    {
-        [DllImport("Shell32.dll", EntryPoint = "ExtractIconExW", CharSet = CharSet.Unicode, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
-        private static extern int ExtractIconEx(string sFile, int iIndex, out IntPtr piLargeVersion, out IntPtr piSmallVersion, int amountIcons);
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool DestroyIcon(IntPtr hIcon);
-        public static BitmapSource ExtractBitmapSource(string file, int number, bool largeIcon)
-        {
-            IntPtr large = IntPtr.Zero, small = IntPtr.Zero;
-            ExtractIconEx(file, number, out large, out small, 1);
-            IntPtr use = largeIcon ? large : small;
-            IntPtr other = largeIcon ? small : large;
-            try
-            {
-                if (use == IntPtr.Zero) return null;
-                BitmapSource bmp = Imaging.CreateBitmapSourceFromHIcon(use, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
-                if (bmp != null && bmp.CanFreeze) bmp.Freeze();
-                return bmp;
-            }
-            catch { return null; }
-            finally
-            {
-                if (use != IntPtr.Zero) DestroyIcon(use);
-                if (other != IntPtr.Zero) DestroyIcon(other);
-            }
-        }
-    }
-}
-'@
-						$refs = @()
-						foreach ($name in @('PresentationCore', 'WindowsBase', 'PresentationFramework', 'System.Xaml')) {
-							try {
-								$a = [Reflection.Assembly]::LoadWithPartialName($name)
-								if ($a -and $a.Location) { $refs += $a.Location }
-							} catch {}
-						}
-						if ($refs.Count -gt 0) {
-							Add-Type -TypeDefinition $iconCode -ReferencedAssemblies $refs -ErrorAction Stop
-						} else {
-							Add-Type -TypeDefinition $iconCode -ErrorAction Stop
-						}
-					} catch {}
-				}
-				if ('MiniBot.UI.IconExtractor' -as [type]) {
-					$sys = $env:SystemRoot
-					if ([string]::IsNullOrWhiteSpace($sys)) { $sys = 'C:\Windows' }
-					$iconFile = Join-Path $sys 'System32\compstui.dll'
-					$bitmapSource = [MiniBot.UI.IconExtractor]::ExtractBitmapSource($iconFile, 11, $true)
-					if (-not $bitmapSource) {
-						$bitmapSource = [MiniBot.UI.IconExtractor]::ExtractBitmapSource($iconFile, 11, $false)
-					}
-					if ($bitmapSource) {
-						$window.Icon = $bitmapSource
+						$enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+						[void]$enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($Source))
+						$ms = New-Object System.IO.MemoryStream
 						try {
-							# TaskbarItemInfo.Overlay: show titlebar icon on the taskbar button
-							if (-not $window.TaskbarItemInfo) {
-								$window.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
-							}
-							$window.TaskbarItemInfo.Overlay = $bitmapSource
-							$window.TaskbarItemInfo.Description = $appId
-						} catch {}
-					}
-				}
+							$enc.Save($ms)
+							$ms.Position = 0
+							$frame = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+								$ms,
+								[System.Windows.Media.Imaging.BitmapCreateOptions]::None,
+								[System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+							)
+							if ($frame.CanFreeze) { $frame.Freeze() }
+							return $frame
+						} finally { try { $ms.Dispose() } catch {} }
+					} catch { return $Source }
+				}.GetNewClosure()
+				$W.SetNativeWindowIcon = {
+					param($Window, $BitmapSource)
+					if (-not $Window -or -not $BitmapSource) { return }
+					try {
+						if (-not ('MiniBot.UI.NativeIcon' -as [type])) {
+							Add-Type -Namespace MiniBot.UI -Name NativeIcon -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Auto)]
+public static extern System.IntPtr SendMessage(System.IntPtr hWnd, int Msg, System.IntPtr wParam, System.IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
+public static extern bool DestroyIcon(System.IntPtr hIcon);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)]
+public static extern System.IntPtr CopyIcon(System.IntPtr hIcon);
+public const int WM_SETICON = 0x0080;
+public const int ICON_SMALL = 0;
+public const int ICON_BIG = 1;
+"@ -ErrorAction Stop
+						}
+						Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+						$enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+						[void]$enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($BitmapSource))
+						$ms = New-Object System.IO.MemoryStream
+						try {
+							$enc.Save($ms)
+							$ms.Position = 0
+							$gdi = [System.Drawing.Bitmap]::FromStream($ms)
+							try {
+								$hIcon = $gdi.GetHicon()
+								try {
+									$helper = New-Object System.Windows.Interop.WindowInteropHelper($Window)
+									$hwnd = $helper.EnsureHandle()
+									if ($hwnd -ne [IntPtr]::Zero) {
+										$hSmall = [MiniBot.UI.NativeIcon]::CopyIcon($hIcon)
+										$hBig = [MiniBot.UI.NativeIcon]::CopyIcon($hIcon)
+										$prevSmall = [MiniBot.UI.NativeIcon]::SendMessage($hwnd, [MiniBot.UI.NativeIcon]::WM_SETICON, [IntPtr][MiniBot.UI.NativeIcon]::ICON_SMALL, $hSmall)
+										$prevBig = [MiniBot.UI.NativeIcon]::SendMessage($hwnd, [MiniBot.UI.NativeIcon]::WM_SETICON, [IntPtr][MiniBot.UI.NativeIcon]::ICON_BIG, $hBig)
+										if ($prevSmall -ne [IntPtr]::Zero) { try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($prevSmall) } catch {} }
+										if ($prevBig -ne [IntPtr]::Zero) { try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($prevBig) } catch {} }
+									}
+								} finally { try { [void][MiniBot.UI.NativeIcon]::DestroyIcon($hIcon) } catch {} }
+							} finally { try { $gdi.Dispose() } catch {} }
+						} finally { try { $ms.Dispose() } catch {} }
+					} catch {}
+				}.GetNewClosure()
+				$W.RenderRobotIcon = {
+					param([string]$Face = 'happy', [int]$Size = 64)
+					try {
+						if ($Size -lt 16) { $Size = 16 }
+						$cat = $W.RobotCatalog
+						$faceKey = if ($cat -and (@($cat.Keys) -contains $Face)) { $Face } else { 'happy' }
+						if ($cat -and (@($cat.Keys) -notcontains $faceKey)) { $faceKey = 'default' }
+						$data = if ($cat) { [string]$cat[$faceKey] } else { '' }
+						if ([string]::IsNullOrWhiteSpace($data)) { return $null }
+						$cols = if ($faceKey -eq 'dead' -or $faceKey -eq 'error') {
+							@('#D0C4C6', '#B08084', '#9A585C')
+						} else {
+							@('#C8C8D0', '#6A6A74', '#3A3A42')
+						}
+						$geom = [System.Windows.Media.Geometry]::Parse($data)
+						$brush = New-Object System.Windows.Media.LinearGradientBrush
+						$brush.StartPoint = New-Object System.Windows.Point(0.15, 0.0)
+						$brush.EndPoint = New-Object System.Windows.Point(0.9, 1.0)
+						for ($ci = 0; $ci -lt 3; $ci++) {
+							$off = @(0.0, 0.48, 1.0)[$ci]
+							$col = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$cols[$ci])
+							[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($col, $off)))
+						}
+						$brush.Freeze()
+						$bgBrush = New-Object System.Windows.Media.SolidColorBrush(([System.Windows.Media.ColorConverter]::ConvertFromString('#252530')))
+						$bgBrush.Freeze()
+						$visual = New-Object System.Windows.Media.DrawingVisual
+						$dc = $visual.RenderOpen()
+						try {
+							$cx = [double]$Size / 2.0
+							$dc.DrawEllipse($bgBrush, $null, (New-Object System.Windows.Point($cx, $cx)), ($cx - 0.5), ($cx - 0.5))
+							$pad = [math]::Max(2.0, [double]$Size * 0.14)
+							$inner = [double]$Size - (2.0 * $pad)
+							$scale = $inner / 24.0
+							$dc.PushTransform((New-Object System.Windows.Media.TranslateTransform($pad, $pad)))
+							$dc.PushTransform((New-Object System.Windows.Media.ScaleTransform($scale, $scale)))
+							$dc.DrawGeometry($brush, $null, $geom)
+							$dc.Pop(); $dc.Pop()
+						} finally { $dc.Close() }
+						$rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap(
+							[int]$Size, [int]$Size, 96, 96,
+							[System.Windows.Media.PixelFormats]::Pbgra32
+						)
+						$rtb.Render($visual)
+						if ($W.ToShellIcon) { return (& $W.ToShellIcon $rtb) }
+						if ($rtb.CanFreeze) { $rtb.Freeze() }
+						return $rtb
+					} catch { return $null }
+				}.GetNewClosure()
+				$W.ApplyWindowRobotIcon = {
+					param([string]$Face = 'happy')
+					try {
+						if (-not $W.Window) { return }
+						$faceKey = if ([string]::IsNullOrWhiteSpace($Face)) { 'happy' } else { [string]$Face }
+						if (-not $W.RobotIconCache) { $W.RobotIconCache = @{} }
+						if (-not $W.RobotIconCache.ContainsKey($faceKey)) {
+							$bmpNew = $null
+							if ($W.RenderRobotIcon) { $bmpNew = & $W.RenderRobotIcon $faceKey 64 }
+							if ($bmpNew) { $W.RobotIconCache[$faceKey] = $bmpNew }
+						}
+						$bmp = $null
+						try { $bmp = $W.RobotIconCache[$faceKey] } catch {}
+						if (-not $bmp) { return }
+						$W.Window.Icon = $bmp
+						if (-not $W.Window.TaskbarItemInfo) {
+							$W.Window.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
+						}
+						$W.Window.TaskbarItemInfo.Overlay = $bmp
+						$W.Window.TaskbarItemInfo.Description = $(if ($W.AppId) { [string]$W.AppId } else { 'MiniBot' })
+						if ($W.SetNativeWindowIcon) { & $W.SetNativeWindowIcon $W.Window $bmp }
+					} catch {}
+				}.GetNewClosure()
+				try { & $W.ApplyWindowRobotIcon 'happy' } catch {}
+				try {
+					$window.add_SourceInitialized({
+						try { if ($W.ApplyWindowRobotIcon) { & $W.ApplyWindowRobotIcon $(if ($W.RobotMood) { [string]$W.RobotMood } else { 'happy' }) } } catch {}
+					}.GetNewClosure())
+				} catch {}
 			} catch {}
 
+			# Collapse unused sticky header nodes
 			try {
-				if ($W.HdrPoweredBy) {
-					$al = [string]$W.ModelAlias
-					if ([string]::IsNullOrWhiteSpace($al)) {
-						try { $W.HdrPoweredBy.Inlines.Clear() } catch {}
-						$W.HdrPoweredBy.Text = ''
-						$W.HdrPoweredBy.Visibility = [System.Windows.Visibility]::Collapsed
-						if ($W.HdrPoweredByShadow) {
-							$W.HdrPoweredByShadow.Text = ''
-							$W.HdrPoweredByShadow.Visibility = [System.Windows.Visibility]::Collapsed
-						}
-						if ($W.HdrPoweredByHost) {
-							$W.HdrPoweredByHost.Visibility = [System.Windows.Visibility]::Collapsed
-						}
-					} else {
-						$alias = $al.Trim()
-						$pb0 = ("PoweredBy: {0}" -f $alias)
-						try {
-							$bc0 = New-Object System.Windows.Media.BrushConverter
-							$muteBr = $bc0.ConvertFromString('#8A8A96')
-							$accBr = $bc0.ConvertFromString('#BB9AF7')
-							$W.HdrPoweredBy.Inlines.Clear()
-							$r1 = New-Object System.Windows.Documents.Run ('PoweredBy: ')
-							$r1.Foreground = $muteBr
-							$r2 = New-Object System.Windows.Documents.Run ($alias)
-							$r2.Foreground = $accBr
-							$r2.FontWeight = [System.Windows.FontWeights]::SemiBold
-							[void]$W.HdrPoweredBy.Inlines.Add($r1)
-							[void]$W.HdrPoweredBy.Inlines.Add($r2)
-						} catch {
-							$W.HdrPoweredBy.Text = $pb0
-						}
-						$W.HdrPoweredBy.Visibility = [System.Windows.Visibility]::Visible
-						if ($W.HdrPoweredByShadow) {
-							$W.HdrPoweredByShadow.Text = $pb0
-							$W.HdrPoweredByShadow.Visibility = [System.Windows.Visibility]::Visible
-						}
-						if ($W.HdrPoweredByHost) {
-							$W.HdrPoweredByHost.Visibility = [System.Windows.Visibility]::Visible
-						}
+				foreach ($el in @($W.HdrPoweredBy, $W.HdrPoweredByShadow, $W.HdrPoweredByHost, $W.HdrLine1, $W.HdrLine1Shadow, $W.HdrAutoCompact, $W.HdrAutoCompactShadow)) {
+					if ($el) {
+						try { $el.Visibility = [System.Windows.Visibility]::Collapsed } catch {}
 					}
-				}
-				if ($W.HdrAutoCompact) {
-					$acOn = $true
-					try { $acOn = [bool]$W.AutoCompactOn } catch {}
-					$ac0 = $(if ($acOn) { 'AutoCompact: ON' } else { 'AutoCompact: OFF' })
-					$W.HdrAutoCompact.Text = $ac0
-					if ($W.HdrAutoCompactShadow) { $W.HdrAutoCompactShadow.Text = $ac0 }
-					try {
-						$bc = New-Object System.Windows.Media.BrushConverter
-						$W.HdrAutoCompact.Foreground = $bc.ConvertFromString($(if ($acOn) { '#9ECE6A' } else { '#F7768E' }))
-					} catch {}
 				}
 			} catch {}
 
@@ -22777,7 +25363,53 @@ namespace MiniBot.UI
 				try { & $onWrapChanged $null $null } catch {}
 			}
 
-			# Dark title bar (DWM immersive dark mode)
+			# Dark chrome + corner policy (rounded border; kill Win11 DWM rounding)
+			$applyWindowChromeCorners = {
+				param($win, $bag)
+				try {
+					# Use work-area maximize flag (not WindowState.Maximized)
+					$maximized = $false
+					try { $maximized = [bool]$bag.IsWorkAreaMaximized } catch { $maximized = $false }
+					$r = if ($maximized) { 0.0 } else { 8.0 }
+					$main = $null
+					try { $main = $bag.MainChromeBorder } catch { $main = $null }
+					if (-not $main) { try { $main = $win.FindName('MainChromeBorder') } catch {} }
+					$title = $null
+					try { $title = $bag.CustomTitleBar } catch { $title = $null }
+					if (-not $title) { try { $title = $win.FindName('CustomTitleBar') } catch {} }
+					if ($main) {
+						$main.CornerRadius = New-Object System.Windows.CornerRadius($r)
+						# Maximized: flush to work area (no transparent gap around rounded mask)
+						if ($maximized) {
+							$main.Margin = New-Object System.Windows.Thickness(0)
+							$main.BorderThickness = New-Object System.Windows.Thickness(0)
+						} else {
+							$main.Margin = New-Object System.Windows.Thickness(0)
+							$main.BorderThickness = New-Object System.Windows.Thickness(1)
+						}
+					}
+					if ($title) {
+						if ($maximized) {
+							$title.CornerRadius = New-Object System.Windows.CornerRadius(0)
+						} else {
+							$title.CornerRadius = New-Object System.Windows.CornerRadius($r, $r, 0, 0)
+						}
+					}
+					# Keep WindowChrome radius in sync
+					try {
+						$chrome = [System.Windows.Shell.WindowChrome]::GetWindowChrome($win)
+						if ($chrome) {
+							if ($maximized) {
+								$chrome.CornerRadius = New-Object System.Windows.CornerRadius(0)
+								$chrome.CaptionHeight = 36
+							} else {
+								$chrome.CornerRadius = New-Object System.Windows.CornerRadius($r)
+								$chrome.CaptionHeight = 36
+							}
+						}
+					} catch {}
+				} catch {}
+			}.GetNewClosure()
 			$applyDarkTitle = {
 				param($win)
 				try {
@@ -22794,20 +25426,45 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					# DWMWA_USE_IMMERSIVE_DARK_MODE: 20 (20H1+), 19 (older)
 					[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 20, [ref]$useDark, 4)
 					[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 19, [ref]$useDark, 4)
+					# DWMWA_WINDOW_CORNER_PREFERENCE (33): 1 = DWMWCP_DONOTROUND
+					# We draw our own CornerRadius border; OS rounding leaves ugly square fill.
+					try {
+						$noRound = 1
+						[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 33, [ref]$noRound, 4)
+					} catch {}
 					# DWMWA_CAPTION_COLOR (35); COLORREF 0x00BBGGRR = #2A2A30
 					try {
 						$caption = 0x00302A2A
 						[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 35, [ref]$caption, 4)
 					} catch {}
+					# DWMWA_BORDER_COLOR (34) match chrome
+					try {
+						$border = 0x00302A2A
+						[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 34, [ref]$border, 4)
+					} catch {}
 				} catch {}
 			}.GetNewClosure()
+			try {
+				$W.MainChromeBorder = $window.FindName('MainChromeBorder')
+				$W.ApplyWindowChromeCorners = $applyWindowChromeCorners
+			} catch {}
 			$window.add_SourceInitialized({
 				param($s, $e)
 				try { & $applyDarkTitle $s } catch {}
+				try { & $applyWindowChromeCorners $s $W } catch {}
 			}.GetNewClosure())
 			$window.add_Loaded({
 				param($s, $e)
 				try { & $applyDarkTitle $s } catch {}
+				try { & $applyWindowChromeCorners $s $W } catch {}
+			}.GetNewClosure())
+			$window.add_StateChanged({
+				param($s, $e)
+				try { & $applyWindowChromeCorners $s $W } catch {}
+				# Max icon is driven by IsWorkAreaMaximized (not WindowState.Maximized)
+				try {
+					if ($W.SetMaxIcon) { & $W.SetMaxIcon ([bool]$W.IsWorkAreaMaximized) }
+				} catch {}
 			}.GetNewClosure())
 			$window.add_SizeChanged({
 				param($s, $e)
@@ -22870,8 +25527,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					} catch {}
 				}
 			}.GetNewClosure())
-			$W.AuthCancel.add_Click({
-				param($s,$e)
+			$doAuthCancel = {
 				try {
 					$W.SoftClose = $false
 					$W.CloseKind = 'user_x'
@@ -22886,7 +25542,17 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					try { $W.AuthPass.Password = '' } catch {}
 					[void]$W.CredWait.Set()
 				} catch {}
+			}.GetNewClosure()
+			$W.AuthCancel.add_Click({
+				param($s,$e)
+				try { & $doAuthCancel } catch {}
 			}.GetNewClosure())
+			if ($W.AuthTitleClose) {
+				$W.AuthTitleClose.add_Click({
+					param($s,$e)
+					try { & $doAuthCancel } catch {}
+				}.GetNewClosure())
+			}
 			$W.AuthPass.add_KeyDown({
 				param($s,$e)
 				try {
@@ -22916,17 +25582,26 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					} catch {}
 				}.GetNewClosure())
 			}
+			$doConfirmNo = {
+				try {
+					$W.ConfirmResult = $false
+					if ($W.ConfirmOverlay) {
+						$W.ConfirmOverlay.Visibility = [System.Windows.Visibility]::Collapsed
+					}
+					if ($W.ConfirmYes) { $W.ConfirmYes.IsDefault = $false }
+					[void]$W.ConfirmWait.Set()
+				} catch {}
+			}.GetNewClosure()
 			if ($W.ConfirmNo) {
 				$W.ConfirmNo.add_Click({
 					param($s, $e)
-					try {
-						$W.ConfirmResult = $false
-						if ($W.ConfirmOverlay) {
-							$W.ConfirmOverlay.Visibility = [System.Windows.Visibility]::Collapsed
-						}
-						if ($W.ConfirmYes) { $W.ConfirmYes.IsDefault = $false }
-						[void]$W.ConfirmWait.Set()
-					} catch {}
+					try { & $doConfirmNo } catch {}
+				}.GetNewClosure())
+			}
+			if ($W.ConfirmTitleClose) {
+				$W.ConfirmTitleClose.add_Click({
+					param($s, $e)
+					try { & $doConfirmNo } catch {}
 				}.GetNewClosure())
 			}
 
@@ -23367,7 +26042,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				variable    = '#E0AF68'
 				operator    = '#89DDFF'
 				punctuation = '#8A8A96'
-				tag         = '#F7768E'
+				tag         = '#F05C5C'
 				attribute   = '#E0AF68'
 				builtin     = '#7AA2F7'
 				property    = '#7DCFFF'
@@ -23379,6 +26054,12 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				param($rtb, [string]$plain, [string]$lang, $conv, $brushCache, $monoFont)
 				if ($null -eq $rtb) { return }
 				try {
+					# Trim trailing newlines for code display
+					if ($null -eq $plain) { $plain = '' }
+					while ($plain.Length -gt 0 -and ($plain.EndsWith("`r`n") -or $plain.EndsWith("`n") -or $plain.EndsWith("`r"))) {
+						if ($plain.EndsWith("`r`n")) { $plain = $plain.Substring(0, $plain.Length - 2) }
+						else { $plain = $plain.Substring(0, $plain.Length - 1) }
+					}
 					$norm = & $synNormLang $lang
 					$tokens = & $synTokenize $plain $norm
 					$doc = New-Object System.Windows.Documents.FlowDocument
@@ -23664,7 +26345,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							}
 						} catch {}
 
-						# Chat turn header: brand + right-anchored timestamp
+						# Chat turn header
 						if ($kind -eq 'chat-turn') {
 							try {
 								& $trimTrailingEmptyParas
@@ -23816,7 +26497,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$brushCache = $null
 								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
 								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
-								foreach ($hx in @('#1A1A1E', '#252530', '#3A3A42', '#7DCFFF', '#8A8A96', '#C8C8D0', '#2A2A30', '#7AA2F7', '#BB9AF7', '#9ECE6A', '#FF9E64', '#E0AF68', '#89DDFF', '#F7768E', '#6A6A76')) {
+								foreach ($hx in @('#1A1A1E', '#252530', '#3A3A42', '#7DCFFF', '#8A8A96', '#C8C8D0', '#2A2A30', '#7AA2F7', '#BB9AF7', '#9ECE6A', '#FF9E64', '#E0AF68', '#89DDFF', '#F05C5C', '#6A6A76')) {
 									if (-not $brushCache.ContainsKey($hx)) {
 										$brushCache[$hx] = $conv.ConvertFromString($hx)
 									}
@@ -24098,7 +26779,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									if (-not $brushCache.ContainsKey($hx)) {
 										$brushCache[$hx] = $conv.ConvertFromString($hx)
 									}
-									# Spacer paragraph = blank line above stamp
+									# Timing stamp spacing
 									$doc.Blocks.Add((& $newPara))
 									$tb = New-Object System.Windows.Controls.TextBlock
 									$tb.Text = $tline
@@ -24106,7 +26787,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$tb.FontFamily = $W.MonoFont
 									$tb.FontSize = 10
 									$tb.FontStyle = [System.Windows.FontStyles]::Italic
-									$tb.Margin = New-Object System.Windows.Thickness(5, 0, 0, 10)
+									$tb.Margin = New-Object System.Windows.Thickness(5, -7, 0, 10)
 									$tb.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
 									$tb.TextWrapping = [System.Windows.TextWrapping]::Wrap
 									$buc = New-Object System.Windows.Documents.BlockUIContainer ($tb)
@@ -24171,7 +26852,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								try { if ($item.Color) { $cName = [string]$item.Color } } catch {}
 								# Map console color names to theme hex
 								$ruleHex = switch -Regex ($cName) {
-									'^(?i)red|darkred$' { '#F7768E' }
+									'^(?i)red|darkred$' { '#F05C5C' }
 									'^(?i)yellow|darkyellow$' { '#E0AF68' }
 									'^(?i)green|darkgreen$' { '#9ECE6A' }
 									'^(?i)cyan|darkcyan|blue|darkblue$' { '#7DCFFF' }
@@ -24179,7 +26860,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									'^(?i)white$' { '#E8E8F0' }
 									default { '#BB9AF7' }
 								}
-								if ($kind -eq 'approval-banner') { $ruleHex = '#F7768E' }
+								if ($kind -eq 'approval-banner') { $ruleHex = '#F05C5C' }
 								$brushCache = $null
 								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
 								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
@@ -24255,7 +26936,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							try {
 								& $trimTrailingEmptyParas
 								$yesHex = '#9ECE6A'
-								$noHex = '#F7768E'
+								$noHex = '#F05C5C'
 								$allHex = '#E0AF68'
 								$chipBgHex = '#2A2A30'
 								$borderHex = '#3A3A42'
@@ -24666,7 +27347,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									"  $label  $sizeTxt"
 								}
 
-								$fgHex = if ($phase -eq 'fail') { '#F7768E' } elseif ($phase -eq 'done') { '#9ECE6A' } else { '#EEEEEE' }
+								$fgHex = if ($phase -eq 'fail') { '#F05C5C' } elseif ($phase -eq 'done') { '#9ECE6A' } else { '#EEEEEE' }
 								$barHex = '#9ECE6A'
 								$trackHex = '#333333'
 								try {
@@ -24677,7 +27358,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$bc = $null
 								try { $bc = $W['BrushCache'] } catch { try { $bc = $W.BrushCache } catch { $bc = @{} } }
 								if ($null -eq $bc) { $bc = @{} }
-								foreach ($hx in @($fgHex, $barHex, $trackHex, '#C0CAF5', '#9ECE6A', '#F7768E', '#EEEEEE')) {
+								foreach ($hx in @($fgHex, $barHex, $trackHex, '#C0CAF5', '#9ECE6A', '#F05C5C', '#EEEEEE')) {
 									if (-not $bc.ContainsKey($hx)) {
 										try { $bc[$hx] = $conv.ConvertFromString($hx) } catch {}
 									}
@@ -25005,10 +27686,92 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							if ($W.SyncMdStretch) { & $W.SyncMdStretch $rtb $W }
 						} catch {}
 					}
+					# Apply custom titlebar text
+					try {
+						$pt0 = [string]$W.PendingWindowTitle
+						if (-not [string]::IsNullOrWhiteSpace($pt0) -and $W.Window) {
+							if ([string]$W.Window.Title -ne $pt0) { $W.Window.Title = $pt0 }
+						}
+						$bn = [string]$W.PendingTitleBrandName
+						if ($W.TitleBrandName -and -not [string]::IsNullOrWhiteSpace($bn)) {
+							if ([string]$W.TitleBrandName.Text -ne $bn) {
+								$W.TitleBrandName.Text = $bn
+								try {
+									if ($W.TitleBrandNameShadow) { $W.TitleBrandNameShadow.Text = $bn }
+								} catch {}
+							}
+						}
+						$pp = [string]$W.PendingTitlePath
+						if ($W.TitlePath -and $null -ne $W.PendingTitlePath) {
+							# Skip path update while cwd editor is open
+							$cwdOpen = $false
+							try { $cwdOpen = [bool]($W.CwdPopup -and $W.CwdPopup.IsOpen) } catch {}
+							if (-not $cwdOpen -and [string]$W.TitlePath.Text -ne $pp) {
+								$W.TitlePath.Text = $pp
+								try { if ($W.TitlePathShadow) { $W.TitlePathShadow.Text = $pp } } catch {}
+							}
+							# Hide path separator when empty
+							try {
+								if ($W.TitleDotPath) {
+									$W.TitleDotPath.Visibility = $(if ([string]::IsNullOrWhiteSpace($pp)) {
+										[System.Windows.Visibility]::Collapsed
+									} else {
+										[System.Windows.Visibility]::Visible
+									})
+								}
+								if ($W.TitlePathShadow) {
+									$W.TitlePathShadow.Visibility = $(if ([string]::IsNullOrWhiteSpace($pp)) {
+										[System.Windows.Visibility]::Collapsed
+									} else {
+										[System.Windows.Visibility]::Visible
+									})
+								}
+							} catch {}
+						}
+						$pw = [string]$W.PendingTitlePoweredBy
+						if ($W.TitlePoweredBy) {
+							if ([string]::IsNullOrWhiteSpace($pw)) {
+								$W.TitlePoweredBy.Text = ''
+								$W.TitlePoweredBy.Visibility = [System.Windows.Visibility]::Collapsed
+								try {
+									if ($W.TitlePoweredByShadow) {
+										$W.TitlePoweredByShadow.Text = ''
+										$W.TitlePoweredByShadow.Visibility = [System.Windows.Visibility]::Collapsed
+									}
+								} catch {}
+							} else {
+								try {
+									if ($W.TitlePoweredByShadow) {
+										$W.TitlePoweredByShadow.Text = $pw
+										$W.TitlePoweredByShadow.Visibility = [System.Windows.Visibility]::Visible
+									}
+								} catch {}
+								# muted prefix + accent alias
+								try {
+									$m = [regex]::Match($pw, '^(PoweredBy:\s*)(.+)$')
+									if ($m.Success) {
+										if (-not $W.BrushCache.ContainsKey('#8A8A96')) { $W.BrushCache['#8A8A96'] = $conv.ConvertFromString('#8A8A96') }
+										if (-not $W.BrushCache.ContainsKey('#BB9AF7')) { $W.BrushCache['#BB9AF7'] = $conv.ConvertFromString('#BB9AF7') }
+										$W.TitlePoweredBy.Inlines.Clear()
+										$r1 = New-Object System.Windows.Documents.Run ($m.Groups[1].Value)
+										$r1.Foreground = $W.BrushCache['#8A8A96']
+										$r2 = New-Object System.Windows.Documents.Run ($m.Groups[2].Value)
+										$r2.Foreground = $W.BrushCache['#BB9AF7']
+										$r2.FontWeight = [System.Windows.FontWeights]::SemiBold
+										[void]$W.TitlePoweredBy.Inlines.Add($r1)
+										[void]$W.TitlePoweredBy.Inlines.Add($r2)
+									} else {
+										$W.TitlePoweredBy.Text = $pw
+									}
+								} catch { $W.TitlePoweredBy.Text = $pw }
+								$W.TitlePoweredBy.Visibility = [System.Windows.Visibility]::Visible
+							}
+						}
+					} catch {}
 					$pend = $W.PendingSticky
 					if ($pend) {
 						$W.PendingSticky = $null
-						if ($W.HdrLine1) {
+						if ($W.HdrLine1 -and $W.HdrLine1.Visibility -ne [System.Windows.Visibility]::Collapsed) {
 							$shadowPlain = $null
 							if ($null -ne $pend.BrandName) {
 								try {
@@ -25061,80 +27824,23 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								try { $W.HdrLine1Shadow.Text = $shadowPlain } catch {}
 							}
 						}
-						if ($null -ne $pend.PoweredBy -and $W.HdrPoweredBy) {
-							$pb = [string]$pend.PoweredBy
-							if ([string]::IsNullOrWhiteSpace($pb)) {
-								try { $W.HdrPoweredBy.Inlines.Clear() } catch {}
-								$W.HdrPoweredBy.Text = ''
-								$W.HdrPoweredBy.Visibility = [System.Windows.Visibility]::Collapsed
-								if ($W.HdrPoweredByShadow) {
-									$W.HdrPoweredByShadow.Text = ''
-									$W.HdrPoweredByShadow.Visibility = [System.Windows.Visibility]::Collapsed
-								}
-								if ($W.HdrPoweredByHost) {
-									$W.HdrPoweredByHost.Visibility = [System.Windows.Visibility]::Collapsed
-								}
-							} else {
-								# PoweredBy sticky: muted prefix + ModelAlias
-								$painted = $false
-								try {
-									$m = [regex]::Match($pb, '^(PoweredBy:\s*)(.+)$')
-									if ($m.Success) {
-										$muteHex = '#8A8A96'
-										$accHex  = '#BB9AF7'
-										foreach ($hx in @($muteHex, $accHex)) {
-											if (-not $W.BrushCache.ContainsKey($hx)) {
-												$W.BrushCache[$hx] = $conv.ConvertFromString($hx)
-											}
-										}
-										$W.HdrPoweredBy.Inlines.Clear()
-										$r1 = New-Object System.Windows.Documents.Run ($m.Groups[1].Value)
-										$r1.Foreground = $W.BrushCache[$muteHex]
-										$r2 = New-Object System.Windows.Documents.Run ($m.Groups[2].Value)
-										$r2.Foreground = $W.BrushCache[$accHex]
-										$r2.FontWeight = [System.Windows.FontWeights]::SemiBold
-										[void]$W.HdrPoweredBy.Inlines.Add($r1)
-										[void]$W.HdrPoweredBy.Inlines.Add($r2)
-										$painted = $true
-									}
-								} catch { $painted = $false }
-								if (-not $painted) { $W.HdrPoweredBy.Text = $pb }
-								$W.HdrPoweredBy.Visibility = [System.Windows.Visibility]::Visible
-								if ($W.HdrPoweredByShadow) {
-									$W.HdrPoweredByShadow.Text = $pb
-									$W.HdrPoweredByShadow.Visibility = [System.Windows.Visibility]::Visible
-								}
-								if ($W.HdrPoweredByHost) {
-									$W.HdrPoweredByHost.Visibility = [System.Windows.Visibility]::Visible
-								}
-							}
-						}
-						if ($null -ne $pend.AutoCompactLine -and $W.HdrAutoCompact) {
-							$ac = [string]$pend.AutoCompactLine
-							$W.HdrAutoCompact.Text = $ac
-							if ($W.HdrAutoCompactShadow) { try { $W.HdrAutoCompactShadow.Text = $ac } catch {} }
-							try {
-								$acOn = ($ac -match '(?i)\bON\b')
-								$hex = if ($acOn) { '#9ECE6A' } else { '#F7768E' }
-								if (-not $W.BrushCache.ContainsKey($hex)) {
-									$W.BrushCache[$hex] = $conv.ConvertFromString($hex)
-								}
-								$W.HdrAutoCompact.Foreground = $W.BrushCache[$hex]
-							} catch {}
-						}
-						# Lower status: compact · auto-approve [OFF|ON] toggle · tools used
+						# Lower status bar layout
 						if ($null -ne $pend.Right -and ($W.LowerRight -or $W.HdrRight)) {
 							$lr = if ($W.LowerRight) { $W.LowerRight } else { $W.HdrRight }
 							$txt = [string]$pend.Right
 							try {
 								$grayHex = '#8A8A96'
-								$onHex = '#FF9E64'    # orange when auto-approve ON
-								$offHex = '#9ECE6A'   # green when OFF
+								# Auto-approve: ON orange, OFF green (existing)
+								$aaOnHex = '#FF9E64'
+								$aaOffHex = '#9ECE6A'
+								# AutoCompact toggle colors
+								$acOnHex = '#9ECE6A'
+								$acOffHex = '#FF9E64'
 								$chipBgHex = '#2A2A30'
 								$chipBorderHex = '#3A3A42'
-								$activeBgOn = '#3D2E22'   # warm dim when ON selected
-								$activeBgOff = '#2A3328'  # cool dim when OFF selected
-								foreach ($hx in @($grayHex, $onHex, $offHex, $chipBgHex, $chipBorderHex, $activeBgOn, $activeBgOff)) {
+								$activeBgWarm = '#3D2E22'   # warm dim (orange side)
+								$activeBgCool = '#2A3328'  # cool dim (green side)
+								foreach ($hx in @($grayHex, $aaOnHex, $aaOffHex, $acOnHex, $acOffHex, $chipBgHex, $chipBorderHex, $activeBgWarm, $activeBgCool)) {
 									if (-not $W.BrushCache.ContainsKey($hx)) {
 										$W.BrushCache[$hx] = $conv.ConvertFromString($hx)
 									}
@@ -25143,11 +27849,16 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								try { $autoOn = [bool]$W.AutoApproveOn } catch {
 									$autoOn = ($txt -match 'auto-approve:\s*ON')
 								}
+								$acOn = $true
+								try { $acOn = [bool]$W.AutoCompactOn } catch {
+									$acOn = ($txt -match 'auto-compact:\s*ON')
+								}
 								$compactPart = ''
 								$toolsPart = ''
-								if ($txt -match '(compact\s+\d+x)') { $compactPart = $Matches[1] }
+								if ($txt -match '(x\d+)') { $compactPart = $Matches[1] }
+								elseif ($txt -match '(compact\s+\d+x)') { $compactPart = $Matches[1] }
 								if ($txt -match '(tools used\s+\d+)') { $toolsPart = $Matches[1] }
-								$sig = ('{0}|{1}|{2}' -f $compactPart, $(if ($autoOn) { 'ON' } else { 'OFF' }), $toolsPart)
+								$sig = ('{0}|ac={1}|aa={2}|{3}' -f $compactPart, $(if ($acOn) { 'ON' } else { 'OFF' }), $(if ($autoOn) { 'ON' } else { 'OFF' }), $toolsPart)
 								$isPanel = $false
 								try { $isPanel = ($lr -is [System.Windows.Controls.Panel]) } catch { $isPanel = $false }
 								if ($isPanel) {
@@ -25170,28 +27881,6 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											if ($mono) { try { $tb.FontFamily = $mono } catch {} }
 											[void]$lr.Children.Add($tb)
 										}
-										if ($compactPart) {
-											& $addMuted $compactPart
-											& $addMuted ("  {0}  " -f $dot)
-										}
-										& $addMuted 'auto-approve '
-										# Segmented OFF | ON toggle
-										$outer = New-Object System.Windows.Controls.Border
-										$outer.Background = $W.BrushCache[$chipBgHex]
-										$outer.BorderBrush = $W.BrushCache[$chipBorderHex]
-										$outer.BorderThickness = New-Object System.Windows.Thickness(1)
-										$outer.CornerRadius = New-Object System.Windows.CornerRadius(4)
-										$outer.Padding = New-Object System.Windows.Thickness(1)
-										$outer.Margin = New-Object System.Windows.Thickness(2, 0, 2, 0)
-										$outer.Cursor = [System.Windows.Input.Cursors]::Hand
-										$outer.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-										$outer.ToolTip = $(if ($autoOn) {
-											'Auto-approve is ON - click to require confirmation again'
-										} else {
-											'Auto-approve is OFF - click to skip confirmation prompts'
-										})
-										$seg = New-Object System.Windows.Controls.StackPanel
-										$seg.Orientation = [System.Windows.Controls.Orientation]::Horizontal
 										$mkSeg = {
 											param([string]$label, [bool]$active, [string]$activeFg, [string]$activeBg)
 											$b = New-Object System.Windows.Controls.Border
@@ -25220,103 +27909,340 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											$b.Child = $t
 											return $b
 										}
-										$offSeg = & $mkSeg 'OFF' (-not $autoOn) $offHex $activeBgOff
-										$onSeg = & $mkSeg 'ON' $autoOn $onHex $activeBgOn
-										$W.AutoApproveOffSeg = $offSeg
-										$W.AutoApproveOnSeg = $onSeg
-										[void]$seg.Children.Add($offSeg)
-										[void]$seg.Children.Add($onSeg)
-										# Visual layer (not hit-test) under full-area invisible click surface
-										$seg.IsHitTestVisible = $false
-										$layer = New-Object System.Windows.Controls.Grid
-										[void]$layer.Children.Add($seg)
-										$hitBtn = New-Object System.Windows.Controls.Button
-										$hitBtn.Opacity = 0.01
-										$hitBtn.Background = [System.Windows.Media.Brushes]::Transparent
-										$hitBtn.BorderThickness = New-Object System.Windows.Thickness(0)
-										$hitBtn.Padding = New-Object System.Windows.Thickness(0)
-										$hitBtn.Margin = New-Object System.Windows.Thickness(0)
-										$hitBtn.Cursor = [System.Windows.Input.Cursors]::Hand
-										$hitBtn.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
-										$hitBtn.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
-										$hitBtn.Focusable = $false
-										$hitBtn.IsTabStop = $false
-										try {
-											$hitBtn.Template = [System.Windows.Markup.XamlReader]::Parse(
-												'<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="Transparent"/></ControlTemplate>'
+										$applyToggleLook = {
+											param(
+												$offSeg, $onSeg, $hitBtn,
+												[bool]$isOn,
+												[string]$onFg, [string]$offFg,
+												[string]$onBg, [string]$offBg,
+												[string]$tipOn, [string]$tipOff
 											)
-										} catch {}
-										$hitBtn.ToolTip = $(if ($autoOn) {
-											'Auto-approve is ON - click to require confirmation again'
-										} else {
-											'Auto-approve is OFF - click to skip confirmation prompts'
-										})
-										$W.AutoApproveToggleTip = $hitBtn
-										[void]$layer.Children.Add($hitBtn)
-										$outer.Child = $layer
-										$outer.IsHitTestVisible = $true
-										$applySegLook = {
-											param([bool]$isOn)
 											try {
-												$offB = $W.AutoApproveOffSeg
-												$onB = $W.AutoApproveOnSeg
-												if ($offB) {
-													$offB.Background = $(if (-not $isOn) { $W.BrushCache['#2A3328'] } else { [System.Windows.Media.Brushes]::Transparent })
-													if ($offB.Child) {
-														$offB.Child.Foreground = $(if (-not $isOn) { $W.BrushCache['#9ECE6A'] } else { $W.BrushCache['#8A8A96'] })
-														$offB.Child.Opacity = $(if (-not $isOn) { 1.0 } else { 0.55 })
+												if ($offSeg) {
+													$offSeg.Background = $(if (-not $isOn) { $W.BrushCache[$offBg] } else { [System.Windows.Media.Brushes]::Transparent })
+													if ($offSeg.Child) {
+														$offSeg.Child.Foreground = $(if (-not $isOn) { $W.BrushCache[$offFg] } else { $W.BrushCache[$grayHex] })
+														$offSeg.Child.Opacity = $(if (-not $isOn) { 1.0 } else { 0.55 })
 													}
 												}
-												if ($onB) {
-													$onB.Background = $(if ($isOn) { $W.BrushCache['#3D2E22'] } else { [System.Windows.Media.Brushes]::Transparent })
-													if ($onB.Child) {
-														$onB.Child.Foreground = $(if ($isOn) { $W.BrushCache['#FF9E64'] } else { $W.BrushCache['#8A8A96'] })
-														$onB.Child.Opacity = $(if ($isOn) { 1.0 } else { 0.55 })
+												if ($onSeg) {
+													$onSeg.Background = $(if ($isOn) { $W.BrushCache[$onBg] } else { [System.Windows.Media.Brushes]::Transparent })
+													if ($onSeg.Child) {
+														$onSeg.Child.Foreground = $(if ($isOn) { $W.BrushCache[$onFg] } else { $W.BrushCache[$grayHex] })
+														$onSeg.Child.Opacity = $(if ($isOn) { 1.0 } else { 0.55 })
 													}
 												}
-												if ($W.AutoApproveToggleTip) {
-													$W.AutoApproveToggleTip.ToolTip = $(if ($isOn) {
-														'Auto-approve is ON - click to require confirmation again'
-													} else {
-														'Auto-approve is OFF - click to skip confirmation prompts'
+												$tip = if ($isOn) { $tipOn } else { $tipOff }
+												if ($hitBtn) { try { $hitBtn.ToolTip = $tip } catch {} }
+											} catch {}
+										}.GetNewClosure()
+										$mkToggle = {
+											param(
+												[bool]$isOn,
+												[string]$onFg, [string]$offFg,
+												[string]$onBg, [string]$offBg,
+												[string]$tipOn, [string]$tipOff,
+												[scriptblock]$onClick
+											)
+											$outer = New-Object System.Windows.Controls.Border
+											$outer.Background = $W.BrushCache[$chipBgHex]
+											$outer.BorderBrush = $W.BrushCache[$chipBorderHex]
+											$outer.BorderThickness = New-Object System.Windows.Thickness(1)
+											$outer.CornerRadius = New-Object System.Windows.CornerRadius(4)
+											$outer.Padding = New-Object System.Windows.Thickness(1)
+											$outer.Margin = New-Object System.Windows.Thickness(2, 0, 2, 0)
+											$outer.Cursor = [System.Windows.Input.Cursors]::Hand
+											$outer.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+											$outer.ToolTip = $(if ($isOn) { $tipOn } else { $tipOff })
+											$seg = New-Object System.Windows.Controls.StackPanel
+											$seg.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+											$offSeg = & $mkSeg 'OFF' (-not $isOn) $offFg $offBg
+											$onSeg = & $mkSeg 'ON' $isOn $onFg $onBg
+											$seg.IsHitTestVisible = $false
+											[void]$seg.Children.Add($offSeg)
+											[void]$seg.Children.Add($onSeg)
+											$layer = New-Object System.Windows.Controls.Grid
+											[void]$layer.Children.Add($seg)
+											$hitBtn = New-Object System.Windows.Controls.Button
+											$hitBtn.Background = [System.Windows.Media.Brushes]::Transparent
+											$hitBtn.BorderThickness = New-Object System.Windows.Thickness(0)
+											$hitBtn.Padding = New-Object System.Windows.Thickness(0)
+											$hitBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+											$hitBtn.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+											$hitBtn.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
+											$hitBtn.Focusable = $false
+											$hitBtn.IsTabStop = $false
+											# NoMouseOver (same idea as Send): no IsMouseOver chrome; hover paints outer via code
+											try {
+												$hitBtn.Template = [System.Windows.Markup.XamlReader]::Parse(
+													'<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="Transparent"/></ControlTemplate>'
+												)
+											} catch {}
+											$hitBtn.ToolTip = $(if ($isOn) { $tipOn } else { $tipOff })
+											[void]$layer.Children.Add($hitBtn)
+											$outer.Child = $layer
+											# Chip hover colors
+											$baseChipBg = $W.BrushCache[$chipBgHex]
+											$hoverChipBg = $null
+											try {
+												if (-not $W.BrushCache.ContainsKey('#3A3A42')) {
+													$W.BrushCache['#3A3A42'] = $conv.ConvertFromString('#3A3A42')
+												}
+												$hoverChipBg = $W.BrushCache['#3A3A42']
+											} catch { $hoverChipBg = $baseChipBg }
+											$hitBtn.add_MouseEnter({
+												try { $outer.Background = $hoverChipBg } catch {}
+											}.GetNewClosure())
+											$hitBtn.add_MouseLeave({
+												try { $outer.Background = $baseChipBg } catch {}
+											}.GetNewClosure())
+											$hitBtn.add_Click($onClick)
+											return @{ Outer = $outer; Off = $offSeg; On = $onSeg; Hit = $hitBtn }
+										}
+										# Compaction count chip
+										$compactOrangeHex = '#E0AF68'
+										if (-not $W.BrushCache.ContainsKey($compactOrangeHex)) {
+											try { $W.BrushCache[$compactOrangeHex] = $conv.ConvertFromString($compactOrangeHex) } catch {}
+										}
+										if ($compactPart) {
+											$cpTb = New-Object System.Windows.Controls.TextBlock
+											$cpTb.Text = $compactPart
+											$cpTb.Foreground = $W.BrushCache[$compactOrangeHex]
+											$cpTb.FontSize = 12
+											$cpTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+											if ($mono) { try { $cpTb.FontFamily = $mono } catch {} }
+											try { $cpTb.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+											$W.CompactCountTb = $cpTb
+											[void]$lr.Children.Add($cpTb)
+											& $addMuted ("  {0}  " -f $dot)
+										} else {
+											$W.CompactCountTb = $null
+										}
+										# AutoCompact label and toggle
+										$acLabel = New-Object System.Windows.Controls.TextBlock
+										$acLabel.Text = 'auto-compact '
+										$acLabel.Foreground = $W.BrushCache[$grayHex]
+										$acLabel.FontSize = 12
+										$acLabel.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$acLabel.Cursor = [System.Windows.Input.Cursors]::Hand
+										$acLabel.ToolTip = 'Click for Compact Now'
+										if ($mono) { try { $acLabel.FontFamily = $mono } catch {} }
+										$W.AcLabel = $acLabel
+										$W.AcLabelGrayHex = $grayHex
+										$W.AcLabelFlashHex = $compactOrangeHex
+										# Popup + real Button (NOT MenuItem) so system menu brushes cannot appear.
+										# Compact Now button hover
+										$acMenuBgHex = '#1E1E24'
+										$acMenuFgHex = '#C8C8D0'
+										$acMenuBorderHex = '#3A3A42'
+										$acHoverBgHex = '#243D2A'
+										$acHoverBdHex = '#9ECE6A'
+										$acHoverFgHex = '#C3E6A0'
+										foreach ($hx in @($acMenuBgHex, $acMenuFgHex, $acMenuBorderHex, $acHoverBgHex, $acHoverBdHex, $acHoverFgHex)) {
+											if (-not $W.BrushCache.ContainsKey($hx)) {
+												try { $W.BrushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+											}
+										}
+										$acPopup = New-Object System.Windows.Controls.Primitives.Popup
+										# Compact Now popup stays open until dismissed
+										$acPopup.StaysOpen = $true
+										$acPopup.AllowsTransparency = $true
+										$acPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+										$acPopup.PlacementTarget = $acLabel
+										$acPopup.HorizontalOffset = -2
+										$acPopup.VerticalOffset = -9
+										$acPopupShell = New-Object System.Windows.Controls.Border
+										$acPopupShell.Background = $W.BrushCache[$acMenuBgHex]
+										$acPopupShell.BorderBrush = $W.BrushCache[$acMenuBorderHex]
+										$acPopupShell.BorderThickness = New-Object System.Windows.Thickness(1)
+										$acPopupShell.Padding = New-Object System.Windows.Thickness(2)
+										$acPopupShell.CornerRadius = New-Object System.Windows.CornerRadius(0)
+										$acPopupShell.SnapsToDevicePixels = $true
+										$btnCompact = New-Object System.Windows.Controls.Button
+										$btnCompact.Content = 'Compact Now'
+										$btnCompact.Cursor = [System.Windows.Input.Cursors]::Hand
+										$btnCompact.FontSize = 12
+										$btnCompact.Padding = New-Object System.Windows.Thickness(12, 6, 12, 6)
+										$btnCompact.BorderThickness = New-Object System.Windows.Thickness(1)
+										$btnCompact.Background = $W.BrushCache[$acMenuBgHex]
+										$btnCompact.BorderBrush = $W.BrushCache[$acMenuBgHex]
+										$btnCompact.Foreground = $W.BrushCache[$acMenuFgHex]
+										$btnCompact.Focusable = $false
+										try {
+											$btnCompact.Template = [System.Windows.Markup.XamlReader]::Parse(@'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+  <Border Background="{TemplateBinding Background}"
+          BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}"
+          Padding="{TemplateBinding Padding}"
+          CornerRadius="4"
+          SnapsToDevicePixels="True">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+</ControlTemplate>
+'@)
+										} catch {}
+										$btnCompact.add_MouseEnter({
+											try {
+												$btnCompact.Background = $W.BrushCache['#243D2A']
+												$btnCompact.BorderBrush = $W.BrushCache['#9ECE6A']
+												$btnCompact.Foreground = $W.BrushCache['#C3E6A0']
+											} catch {}
+										}.GetNewClosure())
+										$btnCompact.add_MouseLeave({
+											try {
+												$btnCompact.Background = $W.BrushCache['#1E1E24']
+												$btnCompact.BorderBrush = $W.BrushCache['#1E1E24']
+												$btnCompact.Foreground = $W.BrushCache['#C8C8D0']
+											} catch {}
+										}.GetNewClosure())
+										$btnCompact.add_Click({
+											param($s, $e)
+											try {
+												try { $acPopup.IsOpen = $false } catch {}
+												$injected = $false
+												try {
+													if ([bool]$W.PromptArmed) {
+														$W.PendingUiCommand = $null
+														$W.InputResult = '/compact'
+														[void]$W.InputWait.Set()
+														$W.PromptArmed = $false
+														$injected = $true
+													}
+												} catch {}
+												if (-not $injected) { $W.PendingUiCommand = '/compact' }
+												if ($W.WriteQueue) {
+													$W.WriteQueue.Enqueue([pscustomobject]@{
+														Kind = 'text'; Text = "`n  Compact Now requested...`n"; Color = 'Cyan'; NoNewline = $false
+														Brand = $(try { [string]$W.AgentName } catch { 'MiniBot' })
 													})
 												}
 											} catch {}
-										}.GetNewClosure()
-										# Whole control = one toggle (invisible full-area button).
-										$toggleClick = {
+										}.GetNewClosure())
+										$acPopupShell.Child = $btnCompact
+										$acPopup.Child = $acPopupShell
+										$W.AcCompactPopup = $acPopup
+										# Toggle Compact Now popup
+										$acLabel.add_MouseLeftButtonUp({
 											param($s, $e)
 											try {
-												if ($null -ne $e) {
-													try { $e.Handled = $true } catch {}
-												}
-												# Debounce double delivery
+												if ($null -ne $e) { $e.Handled = $true }
+												$acPopup.PlacementTarget = $acLabel
+												$acPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+												$acPopup.HorizontalOffset = -2
+												$acPopup.VerticalOffset = -9
+												$acPopup.IsOpen = -not [bool]$acPopup.IsOpen
+											} catch {}
+										}.GetNewClosure())
+										# Click outside closes popup
+										try {
+											if ($W.Window -and -not $W.AcPopupOutsideHooked) {
+												$W.AcPopupOutsideHooked = $true
+												$W.Window.add_PreviewMouseDown({
+													param($s, $e)
+													try {
+														if (-not $W.AcCompactPopup -or -not [bool]$W.AcCompactPopup.IsOpen) { return }
+														$src = $null
+														try { $src = $e.OriginalSource } catch {}
+														# Keep open if click is on label or inside popup
+														$keep = $false
+														try {
+															$vis = $src
+															while ($null -ne $vis) {
+																if ($vis -eq $W.AcLabel -or $vis -eq $W.AcCompactPopup.Child) { $keep = $true; break }
+																try { $vis = [System.Windows.Media.VisualTreeHelper]::GetParent($vis) } catch { break }
+															}
+														} catch {}
+														if (-not $keep) { $W.AcCompactPopup.IsOpen = $false }
+													} catch {}
+												}.GetNewClosure())
+											}
+										} catch {}
+										[void]$lr.Children.Add($acLabel)
+										# Colors for applyToggleLook (stored for click handlers)
+										$W.AcOnFg = $acOnHex; $W.AcOffFg = $acOffHex
+										$W.AcOnBg = $activeBgCool; $W.AcOffBg = $activeBgWarm
+										$W.AcTipOn = 'Auto-compact is ON - click to disable automatic compaction'
+										$W.AcTipOff = 'Auto-compact is OFF - click to enable automatic compaction'
+										$W.AaOnFg = $aaOnHex; $W.AaOffFg = $aaOffHex
+										$W.AaOnBg = $activeBgWarm; $W.AaOffBg = $activeBgCool
+										$W.AaTipOn = 'Auto-approve is ON - click to require confirmation again'
+										$W.AaTipOff = 'Auto-approve is OFF - click to skip confirmation prompts'
+										$acClick = {
+											param($s, $e)
+											try {
+												if ($null -ne $e) { try { $e.Handled = $true } catch {} }
+												$now = [Environment]::TickCount
+												$last = 0
+												try { $last = [int]$W.AutoCompactClickTick } catch { $last = 0 }
+												if ($last -ne 0 -and ((($now - $last) -band 0x7fffffff) -lt 280)) { return }
+												$W.AutoCompactClickTick = $now
+												$cur = $false
+												try { $cur = [bool]$W.AutoCompactOn } catch { $cur = $false }
+												$nxt = -not $cur
+												$W.AutoCompactOn = $nxt
+												$W.AutoCompactDirty = $true
+												# Immediate UI update
+												try {
+													& $applyToggleLook $W.AutoCompactOffSeg $W.AutoCompactOnSeg $W.AutoCompactToggleTip `
+														$nxt $W.AcOnFg $W.AcOffFg $W.AcOnBg $W.AcOffBg $W.AcTipOn $W.AcTipOff
+												} catch {}
+												# Keep sig in sync so next paint does not thrash
+												try {
+													$cp = ''; $tp = ''
+													if ($txt -match '(x\d+)') { $cp = $Matches[1] }
+													if ($txt -match '(tools used\s+\d+)') { $tp = $Matches[1] }
+													$aa = $false; try { $aa = [bool]$W.AutoApproveOn } catch {}
+													$W.LowerRightSig = ('{0}|ac={1}|aa={2}|{3}' -f $cp, $(if ($nxt) { 'ON' } else { 'OFF' }), $(if ($aa) { 'ON' } else { 'OFF' }), $tp)
+												} catch {}
+												try {
+													$msg = if ($nxt) { "`n  Auto-compact ON - context will trim automatically.`n" } else { "`n  Auto-compact OFF - context will not auto-trim.`n" }
+													$col = if ($nxt) { 'Green' } else { 'DarkYellow' }
+													if ($W.WriteQueue) {
+														$W.WriteQueue.Enqueue([pscustomobject]@{
+															Kind = 'text'; Text = $msg; Color = $col; NoNewline = $false
+															Brand = $(try { [string]$W.AgentName } catch { 'MiniBot' })
+														})
+													}
+												} catch {}
+											} catch {}
+										}.GetNewClosure()
+										# ON green / OFF orange
+										$acTog = & $mkToggle $acOn $acOnHex $acOffHex $activeBgCool $activeBgWarm `
+											$W.AcTipOn $W.AcTipOff $acClick
+										$W.AutoCompactOffSeg = $acTog.Off
+										$W.AutoCompactOnSeg = $acTog.On
+										$W.AutoCompactToggleTip = $acTog.Hit
+										[void]$lr.Children.Add($acTog.Outer)
+										& $addMuted ("  {0}  " -f $dot)
+										# auto-approve
+										& $addMuted 'auto-approve '
+										$aaClick = {
+											param($s, $e)
+											try {
+												if ($null -ne $e) { try { $e.Handled = $true } catch {} }
 												$now = [Environment]::TickCount
 												$last = 0
 												try { $last = [int]$W.AutoApproveClickTick } catch { $last = 0 }
 												if ($last -ne 0 -and ((($now - $last) -band 0x7fffffff) -lt 280)) { return }
 												$W.AutoApproveClickTick = $now
-
 												$cur = $false
 												try { $cur = [bool]$W.AutoApproveOn } catch { $cur = $false }
 												$nxt = -not $cur
-
 												$W.AutoApproveOn = $nxt
 												$W.AutoApproveDirty = $true
-												# Keep sig in sync so next chrome paint does not thrash
 												try {
-													$cp = ''
-													$tp = ''
-													try {
-														$rt = [string]$W.PendingSticky.Right
-														if ($rt -match '(compact\s+\d+x)') { $cp = $Matches[1] }
-														if ($rt -match '(tools used\s+\d+)') { $tp = $Matches[1] }
-													} catch {}
-													$W.LowerRightSig = ('{0}|{1}|{2}' -f $cp, $(if ($nxt) { 'ON' } else { 'OFF' }), $tp)
-												} catch { $W.LowerRightSig = '' }
-												try { & $applySegLook $nxt } catch {}
+													& $applyToggleLook $W.AutoApproveOffSeg $W.AutoApproveOnSeg $W.AutoApproveToggleTip `
+														$nxt $W.AaOnFg $W.AaOffFg $W.AaOnBg $W.AaOffBg $W.AaTipOn $W.AaTipOff
+												} catch {}
 												try {
-													# Blank line above + below for clean console spacing
+													$cp = ''; $tp = ''
+													if ($txt -match '(x\d+)') { $cp = $Matches[1] }
+													if ($txt -match '(tools used\s+\d+)') { $tp = $Matches[1] }
+													$ac = $true; try { $ac = [bool]$W.AutoCompactOn } catch {}
+													$W.LowerRightSig = ('{0}|ac={1}|aa={2}|{3}' -f $cp, $(if ($ac) { 'ON' } else { 'OFF' }), $(if ($nxt) { 'ON' } else { 'OFF' }), $tp)
+												} catch {}
+												try {
 													$msg = if ($nxt) {
 														"`n  Auto-approve ON - modifying actions will not prompt.`n"
 													} else {
@@ -25325,46 +28251,29 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 													$col = if ($nxt) { 'DarkYellow' } else { 'Green' }
 													if ($W.WriteQueue) {
 														$W.WriteQueue.Enqueue([pscustomobject]@{
-															Kind      = 'text'
-															Text      = $msg
-															Color     = $col
-															NoNewline = $false
-															Brand     = $(try { [string]$W.AgentName } catch { 'MiniBot' })
+															Kind = 'text'; Text = $msg; Color = $col; NoNewline = $false
+															Brand = $(try { [string]$W.AgentName } catch { 'MiniBot' })
 														})
 													}
 												} catch {}
 											} catch {}
 										}.GetNewClosure()
-										$hitBtn.add_Click($toggleClick)
-										[void]$lr.Children.Add($outer)
+										# ON orange / OFF green
+										$aaTog = & $mkToggle $autoOn $aaOnHex $aaOffHex $activeBgWarm $activeBgCool `
+											$W.AaTipOn $W.AaTipOff $aaClick
+										$W.AutoApproveOffSeg = $aaTog.Off
+										$W.AutoApproveOnSeg = $aaTog.On
+										$W.AutoApproveToggleTip = $aaTog.Hit
+										[void]$lr.Children.Add($aaTog.Outer)
 										if ($toolsPart) {
 											& $addMuted ("  {0}  " -f $dot)
 											& $addMuted $toolsPart
 										}
 									}
 								} else {
-									# Fallback TextBlock path
 									try {
-										$lr.Inlines.Clear()
-										$addRun = {
-											param([string]$t, [string]$hex)
-											if ([string]::IsNullOrEmpty($t)) { return }
-											$run = New-Object System.Windows.Documents.Run ($t)
-											$run.Foreground = $W.BrushCache[$hex]
-											[void]$lr.Inlines.Add($run)
-										}
-										if ($txt -match '(?s)^(.*)(auto-approve:\s*)(ON|OFF)(.*)$') {
-											& $addRun $Matches[1] $grayHex
-											& $addRun $Matches[2] $grayHex
-											$valHex = if ($Matches[3] -eq 'ON') { $onHex } else { $offHex }
-											& $addRun $Matches[3] $valHex
-											& $addRun $Matches[4] $grayHex
-										} else {
-											& $addRun $txt $grayHex
-										}
-									} catch {
-										try { $lr.Text = $txt } catch {}
-									}
+										if ($lr -is [System.Windows.Controls.TextBlock]) { $lr.Text = $txt }
+									} catch {}
 								}
 							} catch {
 								try {
@@ -25383,6 +28292,11 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$W.StatusBusySince = [Environment]::TickCount
 							} elseif (-not $nb) {
 								$W.StatusBusySince = 0
+							}
+							if ($oldMode -ne $newMode) {
+								try {
+									if ($W.SetRobotMood) { & $W.SetRobotMood $newMode $false }
+								} catch {}
 							}
 						}
 						if ($null -ne $pend.StatusLabel) { $W.StatusLabel = [string]$pend.StatusLabel }
@@ -25436,13 +28350,21 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							try { $fpIn = [string]$td.fp } catch {}
 							$installerPkgs = @()
 							try { $installerPkgs = @($td.installerPackages) } catch { $installerPkgs = @() }
+							$groupTipsMap = @{}
+							$toolTipsMap = @{}
+							try { $groupTipsMap = $td.groupTips } catch { $groupTipsMap = @{} }
+							try { $toolTipsMap = $td.toolTips } catch { $toolTipsMap = @{} }
+							if ($null -eq $groupTipsMap) { $groupTipsMap = @{} }
+							if ($null -eq $toolTipsMap) { $toolTipsMap = @{} }
 							$limeHex = '#9ECE6A'
 							$grayHex = '#8A8A96'
 							$chipBgHex = '#3A3A42'
 							$menuBgHex = '#1E1E24'
 							$menuFgHex = '#C8C8D0'
+							$tipBgHex = '#1A1A1E'
+							$tipBdHex = '#3A3A42'
 							$sepHex = '#3A3A42'
-							foreach ($hx in @($limeHex, $grayHex, $chipBgHex, $menuBgHex, $menuFgHex, $sepHex)) {
+							foreach ($hx in @($limeHex, $grayHex, $chipBgHex, $menuBgHex, $menuFgHex, $tipBgHex, $tipBdHex, $sepHex)) {
 								if (-not $W.BrushCache.ContainsKey($hx)) {
 									try { $W.BrushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
 								}
@@ -25452,32 +28374,48 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							$chipBg = $W.BrushCache[$chipBgHex]
 							$menuBg = $W.BrushCache[$menuBgHex]
 							$menuFg = $W.BrushCache[$menuFgHex]
+							$tipBg = $W.BrushCache[$tipBgHex]
+							$tipBd = $W.BrushCache[$tipBdHex]
 							$sepB = $W.BrushCache[$sepHex]
-							$dot = [string][char]0x00B7
-							$first = $true
 							$mono = $null
 							try { $mono = $W.MonoFont } catch {}
+							$mkThemedTip = {
+								param([string]$text)
+								if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+								try {
+									$tip = New-Object System.Windows.Controls.ToolTip
+									$tip.Background = $tipBg
+									$tip.Foreground = $menuFg
+									$tip.BorderBrush = $tipBd
+									$tip.BorderThickness = New-Object System.Windows.Thickness(1)
+									$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
+									$tip.HasDropShadow = $true
+									try {
+										$tip.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Mouse
+									} catch {}
+									$ttb = New-Object System.Windows.Controls.TextBlock
+									$ttb.Text = [string]$text
+									$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+									$ttb.MaxWidth = 340
+									$ttb.Foreground = $menuFg
+									$ttb.FontSize = 12
+									$ttb.LineHeight = 16
+									if ($mono) { try { $ttb.FontFamily = $mono } catch {} }
+									$tip.Content = $ttb
+									return $tip
+								} catch {
+									return [string]$text
+								}
+							}.GetNewClosure()
 							foreach ($g in $order) {
 								if ([string]::IsNullOrWhiteSpace([string]$g)) { continue }
-								if (-not $first) {
-									$sep = New-Object System.Windows.Controls.TextBlock
-									$sep.Text = $dot
-									$sep.Foreground = $grayB
-									$sep.FontSize = 10
-									$sep.Margin = New-Object System.Windows.Thickness(2, 0, 2, 0)
-									$sep.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-									$sep.Opacity = 0.8
-									if ($mono) { try { $sep.FontFamily = $mono } catch {} }
-									[void]$panel.Children.Add($sep)
-								}
-								$first = $false
 								$on = $false
 								try { $on = ($activeArr -contains [string]$g) } catch { $on = $false }
 								$border = New-Object System.Windows.Controls.Border
 								$border.Background = $chipBg
 								$border.CornerRadius = New-Object System.Windows.CornerRadius(3)
 								$border.Padding = New-Object System.Windows.Thickness(5, 1, 5, 1)
-								$border.Margin = New-Object System.Windows.Thickness(0)
+								$border.Margin = New-Object System.Windows.Thickness(0, 2, 4, 2)
 								$border.Cursor = [System.Windows.Input.Cursors]::Hand
 								$border.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
 								$border.SnapsToDevicePixels = $true
@@ -25490,7 +28428,37 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								if ($on) {
 									try { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
 								}
+								try {
+									$ds = New-Object System.Windows.Media.Effects.DropShadowEffect
+									$ds.Color = [System.Windows.Media.Colors]::Black
+									$ds.BlurRadius = 3.2
+									$ds.ShadowDepth = 1.15
+									$ds.Opacity = 0.9
+									$ds.Direction = 315
+									$tb.Effect = $ds
+								} catch {}
 								$border.Child = $tb
+								$gTip = ''
+								try {
+									if ($groupTipsMap -is [hashtable] -and $groupTipsMap.ContainsKey([string]$g)) {
+										$gTip = [string]$groupTipsMap[[string]$g]
+									} elseif ($groupTipsMap.Contains([string]$g)) {
+										$gTip = [string]$groupTipsMap[[string]$g]
+									}
+								} catch { $gTip = '' }
+								if ([string]::IsNullOrWhiteSpace($gTip)) {
+									$st = if ($on) { 'Active' } else { 'Inactive' }
+									$gTip = ("{0}`nTool group ({1}).`n`nClick to list tools." -f [string]$g, $st)
+								} else {
+									$st = if ($on) { 'Active' } else { 'Inactive' }
+									if ($gTip -notmatch '(?i)active|inactive|enabled') {
+										$gTip = ("{0}`n`nStatus: {1}" -f $gTip.TrimEnd(), $st)
+									}
+								}
+								try {
+									$tipObj = & $mkThemedTip $gTip
+									if ($null -ne $tipObj) { $border.ToolTip = $tipObj }
+								} catch {}
 								$tools = @()
 								try {
 									if ($toolsMap -is [hashtable] -and $toolsMap.ContainsKey([string]$g)) {
@@ -25506,7 +28474,6 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$cm.BorderBrush = $chipBg
 									$cm.BorderThickness = New-Object System.Windows.Thickness(1)
 									$cm.Padding = New-Object System.Windows.Thickness(2)
-									# Override system menu brushes (kills default white chrome)
 									if ($null -eq $cm.Resources) {
 										$cm.Resources = New-Object System.Windows.ResourceDictionary
 									}
@@ -25516,7 +28483,6 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									try { $cm.Resources[[System.Windows.SystemColors]::MenuTextBrushKey] = $menuFg } catch {}
 									try { $cm.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = $chipBg } catch {}
 									try { $cm.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = $menuFg } catch {}
-									# Flat menu shell (no left icon/check gutter column)
 									try {
 										$cmTplXaml = @'
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ContextMenu">
@@ -25532,13 +28498,11 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$cmTpl = [Windows.Markup.XamlReader]::Parse($cmTplXaml)
 										if ($null -ne $cmTpl) { $cm.Template = $cmTpl }
 									} catch {}
-									# MenuItem without icon column (that white bar)
 									try {
 										$miStyle = New-Object System.Windows.Style ([System.Windows.Controls.MenuItem])
 										$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::BackgroundProperty, $menuBg)))
 										$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::BorderThicknessProperty, (New-Object System.Windows.Thickness(0)))))
 										$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::PaddingProperty, (New-Object System.Windows.Thickness(10, 5, 14, 5)))))
-										# Menu items stay enabled so WPF does not force disabled grey
 										$miTplXaml = @'
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="MenuItem">
   <Border x:Name="Bd" Background="{TemplateBinding Background}"
@@ -25562,32 +28526,117 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$cm.Resources[[System.Windows.Controls.MenuItem]] = $miStyle
 									} catch {}
 								} catch {}
-								# Dropdown text color matches chip active/inactive state
 								$itemFg = $(if ($on) { $limeB } else { $grayB })
-								$addToolItem = {
-									param([string]$header, $fgBrush, $bgBrush, [string]$tip = '')
-									$mi = New-Object System.Windows.Controls.MenuItem
-									$mi.Header = $header
-									# Enabled + IsHitTestVisible=false so color is not system-disabled grey
-									$mi.IsEnabled = $true
-									$mi.IsHitTestVisible = $false
-									$mi.Focusable = $false
-									try { $mi.Foreground = $fgBrush } catch {}
-									try { $mi.Background = $bgBrush } catch {}
-									try { $mi.SetValue([System.Windows.Documents.TextElement]::ForegroundProperty, $fgBrush) } catch {}
-									if (-not [string]::IsNullOrWhiteSpace($tip)) {
-										try { $mi.ToolTip = $tip } catch {}
+								$usedSet = @{}
+								try {
+									foreach ($u in @($td.usedTools)) {
+										if ($u) { $usedSet[[string]$u] = $true }
 									}
+								} catch {}
+								$usedLimeHex = '#B8F07A'
+								if (-not $W.BrushCache.ContainsKey($usedLimeHex)) {
+									try { $W.BrushCache[$usedLimeHex] = $conv.ConvertFromString($usedLimeHex) } catch {}
+								}
+								$usedLimeB = $W.BrushCache[$usedLimeHex]
+								if (-not $usedLimeB) { $usedLimeB = $limeB }
+								$addToolItem = {
+									param([string]$header, $fgBrush, $bgBrush, [string]$tip = '', [bool]$wasUsed = $false)
+									$mi = New-Object System.Windows.Controls.MenuItem
+									$mi.IsEnabled = $true
+									$mi.IsHitTestVisible = $true
+									$mi.Focusable = $false
+									try { $mi.StaysOpenOnClick = $true } catch {}
+									$useFg = $fgBrush
+									if ($wasUsed -and $usedLimeB) { $useFg = $usedLimeB }
+									try { $mi.Background = $bgBrush } catch {}
+									try { $mi.Foreground = $useFg } catch {}
+									$hdrHost = New-Object System.Windows.Controls.Grid
+									$hdrTb = New-Object System.Windows.Controls.TextBlock
+									$hdrTb.Text = [string]$header
+									$hdrTb.Foreground = $useFg
+									$hdrTb.FontSize = 12
+									$hdrTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+									if ($mono) { try { $hdrTb.FontFamily = $mono } catch {} }
+									if ($wasUsed) {
+										$back = New-Object System.Windows.Controls.TextBlock
+										$back.Text = [string]$header
+										$back.Foreground = [System.Windows.Media.Brushes]::White
+										$back.FontSize = 12
+										$back.Opacity = 0.55
+										$back.Margin = New-Object System.Windows.Thickness(0)
+										$back.IsHitTestVisible = $false
+										$back.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										if ($mono) { try { $back.FontFamily = $mono } catch {} }
+										try { $back.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+										[void]$hdrHost.Children.Add($back)
+										try { $hdrTb.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+									}
+									[void]$hdrHost.Children.Add($hdrTb)
+									try { $mi.SetValue([System.Windows.Documents.TextElement]::ForegroundProperty, $useFg) } catch {}
+									if (-not [string]::IsNullOrWhiteSpace($tip)) {
+										try {
+											$tipObj = & $mkThemedTip $tip
+											if ($null -eq $tipObj) { $tipObj = [string]$tip }
+											$hdrHost.ToolTip = $tipObj
+											$mi.ToolTip = $tipObj
+											try {
+												[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($hdrHost, 350)
+												[System.Windows.Controls.ToolTipService]::SetShowDuration($hdrHost, 25000)
+												[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($mi, 350)
+												[System.Windows.Controls.ToolTipService]::SetShowDuration($mi, 25000)
+											} catch {}
+										} catch {
+											try { $hdrHost.ToolTip = [string]$tip; $mi.ToolTip = [string]$tip } catch {}
+										}
+									}
+									$mi.Header = $hdrHost
+									try {
+										$mi.add_PreviewMouseLeftButtonDown({
+											param($s, $e)
+											try { if ($null -ne $e) { $e.Handled = $true } } catch {}
+										})
+									} catch {}
+									try {
+										$mi.add_Click({
+											param($s, $e)
+											try { if ($null -ne $e) { $e.Handled = $true } } catch {}
+										})
+									} catch {}
 									return $mi
 								}.GetNewClosure()
 								if ($tools.Count -eq 0) {
-									[void]$cm.Items.Add((& $addToolItem '(no tools)' $itemFg $menuBg ''))
+									[void]$cm.Items.Add((& $addToolItem '(no tools)' $itemFg $menuBg 'No tools listed for this group.' $false))
 								} else {
 									foreach ($tn in $tools) {
-										[void]$cm.Items.Add((& $addToolItem ([string]$tn) $itemFg $menuBg ''))
+										$tName = [string]$tn
+										$tTip = ''
+										try {
+											if ($toolTipsMap -is [hashtable] -and $toolTipsMap.ContainsKey($tName)) {
+												$tTip = [string]$toolTipsMap[$tName]
+											} elseif ($toolTipsMap.Contains($tName)) {
+												$tTip = [string]$toolTipsMap[$tName]
+											}
+										} catch { $tTip = '' }
+										if ([string]::IsNullOrWhiteSpace($tTip)) { $tTip = $tName }
+										$wasUsed = $false
+										try {
+											if ($usedSet.ContainsKey($tName)) { $wasUsed = $true }
+											elseif ($usedSet.ContainsKey($tName.ToLowerInvariant())) { $wasUsed = $true }
+											else {
+												foreach ($uk in @($usedSet.Keys)) {
+													if ([string]::Equals([string]$uk, $tName, [StringComparison]::OrdinalIgnoreCase)) {
+														$wasUsed = $true
+														break
+													}
+												}
+											}
+										} catch { $wasUsed = $false }
+										if ($wasUsed -and $tTip -notmatch '(?i)used this session') {
+											$tTip = ("{0}`n`nUsed this session." -f $tTip.TrimEnd())
+										}
+										[void]$cm.Items.Add((& $addToolItem $tName $itemFg $menuBg $tTip $wasUsed))
 									}
 								}
-								# Installers menu: dark divider then catalog package names
 								if ([string]$g -eq 'installers' -and $installerPkgs.Count -gt 0) {
 									# Custom dark divider (default Separator is too light on dark theme)
 									try {
@@ -25620,11 +28669,20 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										if ($null -eq $pkg) { continue }
 										$pid = ''
 										$pnm = ''
+										$pnote = ''
 										try { $pid = [string]$pkg.id } catch {}
 										try { $pnm = [string]$pkg.name } catch {}
+										try { $pnote = [string]$pkg.note } catch {}
 										if ([string]::IsNullOrWhiteSpace($pnm)) { $pnm = $pid }
 										if ([string]::IsNullOrWhiteSpace($pnm)) { continue }
-										[void]$cm.Items.Add((& $addToolItem $pnm $itemFg $menuBg $pid))
+										$pkgTip = ("{0}`nSilent installer package." -f $pnm)
+										if (-not [string]::IsNullOrWhiteSpace($pid) -and $pid -ne $pnm) {
+											$pkgTip = ("{0}`nId: {1}`nSilent installer package." -f $pnm, $pid)
+										}
+										if (-not [string]::IsNullOrWhiteSpace($pnote)) {
+											$pkgTip = ("{0}`n{1}" -f $pkgTip, $pnote.Trim())
+										}
+										[void]$cm.Items.Add((& $addToolItem $pnm $itemFg $menuBg $pkgTip))
 									}
 								}
 								try {
@@ -25637,7 +28695,6 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								# Explicit open/closed flag (WPF closes menu before click handlers)
 								$chipState = [pscustomobject]@{ Group = [string]$g; Open = $false }
 								$border.Tag = $chipState
-								$border.ToolTip = $(if ($on) { "Active · $g" } else { "Inactive · $g" })
 								$null = $cm.Add_Closed({
 									try { $chipState.Open = $false } catch {}
 									try {
@@ -25791,16 +28848,22 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								'thinking'    { 'thinking...' }
 								'working'     { 'working...' }
 								'compacting'  { 'autocompacting...' }
+								'error'       { 'error' }
 								default       { 'ready' }
 							}
 						} else {
 							if ($mode -eq 'thinking' -and $label -notmatch '\.\.\.$') { $label = 'thinking...' }
 							elseif ($mode -eq 'working' -and $label -notmatch '\.\.\.$') { $label = 'working...' }
 							elseif ($mode -eq 'compacting' -and $label -notmatch '\.\.\.$') { $label = 'autocompacting...' }
+							elseif ($mode -eq 'error') { $label = 'error' }
 						}
+						# Sync titlebar robot with status
+						try {
+							if ($W.SetRobotMood) { & $W.SetRobotMood $mode $false }
+						} catch {}
 						$busy = ($mode -eq 'thinking' -or $mode -eq 'working' -or $mode -eq 'compacting')
 						$now = [Environment]::TickCount
-						# status band layout by mode (ready / busy / compacting)
+						# Status band layout by mode
 						$labelMinW = 0.0
 						$timerW = 0.0
 						$dotRight = 0.0
@@ -25900,6 +28963,29 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								}
 								$W.StatusDot.Foreground = $bcSpin[$busyHex]
 							} catch {}
+							# Flash AutoCompact label while compacting
+							try {
+								if ($W.AcLabel) {
+									$flash = ($mode -eq 'compacting')
+									$hx = if ($flash) {
+										if ($W.AcLabelFlashHex) { [string]$W.AcLabelFlashHex } else { '#E0AF68' }
+									} else {
+										if ($W.AcLabelGrayHex) { [string]$W.AcLabelGrayHex } else { '#8A8A96' }
+									}
+									$bcSpin = $null
+									try { $bcSpin = $W['BrushCache'] } catch { try { $bcSpin = $W.BrushCache } catch {} }
+									if ($null -eq $bcSpin) { $bcSpin = @{}; try { $W['BrushCache'] = $bcSpin } catch {} }
+									if (-not $bcSpin.ContainsKey($hx)) {
+										$bcSpin[$hx] = $conv.ConvertFromString($hx)
+									}
+									$W.AcLabel.Foreground = $bcSpin[$hx]
+									if ($flash) {
+										try { $W.AcLabel.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+									} else {
+										try { $W.AcLabel.FontWeight = [System.Windows.FontWeights]::Normal } catch {}
+									}
+								}
+							} catch {}
 						} else {
 							$W.SpinIdx = 0
 							$W.StatusBusySince = 0
@@ -25916,6 +29002,20 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$bcSpin[$okHex] = $conv.ConvertFromString($okHex)
 								}
 								$W.StatusDot.Foreground = $bcSpin[$okHex]
+							} catch {}
+							# Restore AutoCompact label color
+							try {
+								if ($W.AcLabel) {
+									$hx = if ($W.AcLabelGrayHex) { [string]$W.AcLabelGrayHex } else { '#8A8A96' }
+									$bcSpin = $null
+									try { $bcSpin = $W['BrushCache'] } catch { try { $bcSpin = $W.BrushCache } catch {} }
+									if ($null -eq $bcSpin) { $bcSpin = @{}; try { $W['BrushCache'] = $bcSpin } catch {} }
+									if (-not $bcSpin.ContainsKey($hx)) {
+										$bcSpin[$hx] = $conv.ConvertFromString($hx)
+									}
+									$W.AcLabel.Foreground = $bcSpin[$hx]
+									try { $W.AcLabel.FontWeight = [System.Windows.FontWeights]::Normal } catch {}
+								}
 							} catch {}
 						}
 					}
@@ -25940,27 +29040,107 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				$W.Prompt.Focusable = $true
 			}
 
+			# Send/Stop button chrome
+			# Send/Stop hover colors
+			$W.SendBtnHovering = $false
+			$setSendBtnIconGrad = {
+				param([string[]]$Cols)
+				try {
+					$stops = @($W.SendBtnGrad0, $W.SendBtnGrad1, $W.SendBtnGrad2)
+					for ($i = 0; $i -lt 3; $i++) {
+						if (-not $stops[$i]) { continue }
+						$hex = [string]$Cols[$i]
+						if ([string]::IsNullOrWhiteSpace($hex)) { continue }
+						if (-not $hex.StartsWith('#')) { $hex = '#' + $hex }
+						try {
+							$stops[$i].Color = [System.Windows.Media.ColorConverter]::ConvertFromString($hex)
+						} catch {}
+					}
+				} catch {}
+			}.GetNewClosure()
+			$W.SetSendBtnIconGrad = $setSendBtnIconGrad
+			$applySendBtnLook = {
+				param([bool]$forceBase)
+				try {
+					$btn = $W.SendBtn
+					if (-not $btn) { return }
+					$bc = New-Object System.Windows.Media.BrushConverter
+					$hover = $false
+					if (-not $forceBase) {
+						try { $hover = [bool]$W.SendBtnHovering } catch { $hover = $false }
+					}
+					$mode = 'stop'
+					try { $mode = [string]$W.SendMode } catch {}
+					if ($hover -and $btn.IsEnabled) {
+						if ($mode -eq 'send') {
+							$btn.Background = $bc.ConvertFromString('#243D2A')
+							$btn.BorderBrush = $bc.ConvertFromString('#9ECE6A')
+							$btn.Foreground = $bc.ConvertFromString('#C3E6A0')
+							if ($W.SetSendBtnIconGrad) {
+								& $W.SetSendBtnIconGrad @('#D0D0D8', '#9A9AA6', '#6A6A76')
+							}
+						} else {
+							$btn.Background = $bc.ConvertFromString('#4A2C2C')
+							$btn.BorderBrush = $bc.ConvertFromString('#FF8585')
+							$btn.Foreground = $bc.ConvertFromString('#FFAAAA')
+							if ($W.SetSendBtnIconGrad) {
+								& $W.SetSendBtnIconGrad @('#FFD0D0', '#FF8585', '#F05C5C')
+							}
+						}
+					} else {
+						$bg = [string]$W.SendBtnBaseBg
+						$bd = [string]$W.SendBtnBaseBorder
+						$fg = [string]$W.SendBtnBaseFg
+						if ([string]::IsNullOrWhiteSpace($bg)) { $bg = '#3A3A42' }
+						if ([string]::IsNullOrWhiteSpace($bd)) { $bd = '#52525C' }
+						if ([string]::IsNullOrWhiteSpace($fg)) { $fg = '#8A8A96' }
+						$btn.Background = $bc.ConvertFromString($bg)
+						$btn.BorderBrush = $bc.ConvertFromString($bd)
+						$btn.Foreground = $bc.ConvertFromString($fg)
+						if ($mode -eq 'send') {
+							if ($W.SetSendBtnIconGrad) {
+								& $W.SetSendBtnIconGrad @('#C0C0C8', '#8A8A96', '#5A5A66')
+							}
+						} else {
+							if ($W.SetSendBtnIconGrad) {
+								& $W.SetSendBtnIconGrad @('#FFAAAA', '#F05C5C', '#C04040')
+							}
+						}
+					}
+				} catch {}
+			}.GetNewClosure()
+			$W.ApplySendBtnLook = $applySendBtnLook
 			$syncSendBtn = {
 				param([bool]$armed)
 				try {
 					$btn = $W.SendBtn
 					if (-not $btn) { return }
-					$bc = New-Object System.Windows.Media.BrushConverter
 					if ($armed) {
 						$W.SendMode = 'send'
-						$btn.Content = 'Send'
+						$btn.ToolTip = 'Send'
 						$btn.IsEnabled = $true
-						$btn.Background = $bc.ConvertFromString('#4A4A56')
-						$btn.Foreground = $bc.ConvertFromString('#E0E0E8')
-						$btn.BorderBrush = $bc.ConvertFromString('#6A6A76')
+						$W.SendBtnBaseBg = '#4A4A56'
+						$W.SendBtnBaseFg = '#E0E0E8'
+						$W.SendBtnBaseBorder = '#6A6A76'
+						try {
+							if ($W.SendBtnPath -and $W.SendGeomData) {
+								$W.SendBtnPath.Data = [System.Windows.Media.Geometry]::Parse([string]$W.SendGeomData)
+							}
+						} catch {}
 					} else {
 						$W.SendMode = 'stop'
-						$btn.Content = 'Stop'
+						$btn.ToolTip = 'Stop'
 						$btn.IsEnabled = $true
-						$btn.Background = $bc.ConvertFromString('#3D2A2A')
-						$btn.Foreground = $bc.ConvertFromString('#F7768E')
-						$btn.BorderBrush = $bc.ConvertFromString('#F7768E')
+						$W.SendBtnBaseBg = '#3D2626'
+						$W.SendBtnBaseFg = '#F05C5C'
+						$W.SendBtnBaseBorder = '#F05C5C'
+						try {
+							if ($W.SendBtnPath -and $W.StopGeomData) {
+								$W.SendBtnPath.Data = [System.Windows.Media.Geometry]::Parse([string]$W.StopGeomData)
+							}
+						} catch {}
 					}
+					& $applySendBtnLook $false
 				} catch {}
 			}.GetNewClosure()
 			$W.SyncSendBtn = $syncSendBtn
@@ -25997,6 +29177,18 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 			}.GetNewClosure()
 
 			if ($W.SendBtn) {
+				$W.SendBtn.add_MouseEnter({
+					try {
+						$W.SendBtnHovering = $true
+						if ($W.ApplySendBtnLook) { & $W.ApplySendBtnLook $false }
+					} catch {}
+				}.GetNewClosure())
+				$W.SendBtn.add_MouseLeave({
+					try {
+						$W.SendBtnHovering = $false
+						if ($W.ApplySendBtnLook) { & $W.ApplySendBtnLook $true }
+					} catch {}
+				}.GetNewClosure())
 				$W.SendBtn.add_Click({
 					param($s, $e)
 					try {
@@ -26484,11 +29676,11 @@ function Start-LocalAgent {
 					}
 					if ($arg) {
 						$g = $arg.Trim().ToLowerInvariant()
-						if ($g -in @('core','vision','system','repair','setup','installers','sandbox','files','packages','registry','clipboard','web','speech','full','all')) {
+						if ($g -in @('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web','full','all')) {
 							$msg = Enable-MBToolGroup -Group $g
 							Write-MBOk $msg
 						} else {
-							Write-MBWarn "Usage: /tools [core|vision|system|repair|setup|installers|sandbox|files|packages|registry|clipboard|web|speech|full|list]"
+							Write-MBWarn "Usage: /tools [core|senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full|list]"
 						}
 						Write-Host ""
 						continue
@@ -26580,7 +29772,7 @@ function Start-LocalAgent {
 						Write-Host "  Record      : hold Right-Ctrl to talk, release to stop (PTT)" -ForegroundColor Gray
 						Write-Host "  Typing      : works anytime Right-Ctrl is not held (Left-Ctrl+Enter still multi-line)" -ForegroundColor DarkGray
 						Write-Host "  Status shows on the input line (● REC …). Esc cancels mid-PTT." -ForegroundColor Gray
-						Write-Host "  Model tool  : SpeakText (group speech; enabled with /speech on)" -ForegroundColor Gray
+						Write-Host "  Model tool  : SpeakText (group senses; enabled with /speech on)" -ForegroundColor Gray
 						if ($script:MB.SpeechInitError) {
 							Write-Host ("  Last error  : {0}" -f $script:MB.SpeechInitError) -ForegroundColor DarkYellow
 						}
@@ -26833,7 +30025,7 @@ function Start-LocalAgent {
 				$script:MB.AgentTurns++
 				Write-MBDebugLog -Step 'TURN_MODEL_ITER' -Detail ("turn={0}" -f $turn)
 
-				# Re-sync sticky state + budget check before every model call
+				# Sync sticky state and budget before model call
 				try {
 					$script:Messages = @(Manage-MBContext -Messages $script:Messages)
 				} catch {
