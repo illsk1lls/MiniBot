@@ -1,4 +1,4 @@
-# MiniBot-R
+# MiniBot
 
 **MiniBot v2.20.0** — Windows PowerShell 5.1 agent client for **OpenAI-compatible** local model servers (llama.cpp, etc.).
 
