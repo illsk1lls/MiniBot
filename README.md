@@ -213,7 +213,7 @@ Enable via agent (`EnableToolGroup`) or `/tools <group>`.
   - `skip_software=true` = settings only.  
   - `dry_run=true` = preview.
 
-Edit URLs/flags in `$script:MBInstallerCatalog` near the top of `MiniBot-R.ps1`.
+Edit URLs/flags in `$script:MBInstallerCatalog` near the top of `MiniBot.ps1`.
 
 ---
 
