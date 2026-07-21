@@ -6,9 +6,6 @@
 
 Chat in a dark WPF UI. The agent can edit files, run commands, diagnose the PC, manage shares/maps, install a **personal** software catalog, and more — with **approval prompts** before mutating actions.
 
-| File | Role |
-|------|------|
-| `MiniBot-R.ps1` | Release build (this doc) — personal installers, no business catalog packages |
 | `MiniBot.ps1` | Full/dev dual-agent tree (may include residential/business installer profiles) |
 
 ---
@@ -216,8 +213,7 @@ Enable via agent (`EnableToolGroup`) or `/tools <group>`.
 | `vlc` | VLC media player (silent) |
 
 - **`ListInstallers`** / **`InstallPackage`** — always prompt before install.
-- **`NewMachineSetup`** — one approval for Windows **settings** + the **full software catalog** above (not a residential-vs-business software split).  
-  - `profile=residential|business` still accepted for **settings flavor / notes** only.  
+- **`NewMachineSetup`** — one approval for Windows **settings** + the **full software catalog**
   - `skip_software=true` = settings only.  
   - `dry_run=true` = preview.
 
