@@ -6,8 +6,6 @@
 
 Chat in a dark WPF UI. The agent can edit files, run commands, diagnose the PC, manage shares/maps, install a **personal** software catalog, and more — with **approval prompts** before mutating actions.
 
-| `MiniBot.ps1` | Full/dev dual-agent tree (may include residential/business installer profiles) |
-
 ---
 
 ## What you need
