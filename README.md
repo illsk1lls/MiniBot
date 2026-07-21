@@ -26,10 +26,10 @@ Chat in a dark WPF UI. The agent can edit files, run commands, diagnose the PC, 
 
 ```powershell
 # Basic
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\MiniBot-R.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\MiniBot.ps1"
 
 # Point at your server + display brand
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\MiniBot-R.ps1" `
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\MiniBot.ps1" `
   -BaseUrl "http://127.0.0.1:8080" `
   -Model "your-model-or-alias.gguf" `
   -ModelAlias "HomeLab" `
