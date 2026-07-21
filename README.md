@@ -266,21 +266,21 @@ Edit URLs/flags in `$script:MBInstallerCatalog` near the top of `MiniBot-R.ps1`.
 
 ```powershell
 # Local server, visible console
-powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot-R.ps1 `
+powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
   -BaseUrl "http://127.0.0.1:8080" `
   -Model "MyModel.gguf" `
   -ModelAlias "Shop-PC" `
   -HideConsole:$false
 
 # Store login, all tool groups, speech
-powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot-R.ps1 `
+powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
   -StoreCredentials:$true `
   -ToolProfile full `
   -SpeechEnabled:$true
 
 # Wipe stored creds then run
 $env:clear = '1'
-powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot-R.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1
 ```
 
 ---
