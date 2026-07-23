@@ -1,10 +1,10 @@
-﻿<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
+<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
 @START /MIN "" POWERSHELL -nop -w hidden -c "iex ([io.file]::ReadAllText('%~f0'))">nul&EXIT
 #>
 
 <#
 .SYNOPSIS
-	MiniBot v2.20.0 - Mini Repair-Bot (Or whatever you want it to be!)
+	MiniBot v2.30.0 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -14,37 +14,42 @@
 #>
 
 param(
-	# Endpoint + Port
+	# --- Primary OpenAI-compatible API (llama.cpp / main host) ---
+	# Prefer …/v1 when the server is OpenAI-compat (vLLM, Unsloth Studio). llama.cpp often uses bare :8080.
 	[string]$BaseUrl = "http://127.0.0.1:8080",
-	# Model Name (or actual llama.cpp alias)
-	[string]$Model = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-I-Balanced.gguf",
-	# This is NOT the real model alias entry. Enter your server name here for `PoweredBy: YourServerName` on the top right of the window, this `Alias` is for MiniBot display only
-	[string]$ModelAlias = "YourServerName",
-	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.20.0",
+	# Optional preferred model id. Leave empty to auto-pick from /models (single model)
+	[string]$Model = "",
+	# Optional n_ctx fallback. 0 = use server /props + /models only. Set / -ContextWindowTokens if needed.
+	[int]$ContextWindowTokens = 0,
+	# Optional display override. Leave empty to use the live server model id.
+	# Max completion tokens. 0 = auto (n_ctx/8 from server). Set a value or pass -MaxTokens to lock.
+	[int]$MaxTokens = 0,
+	[string]$ModelAlias = "",
+	# Primary HTTP auth Bearer key (NOT chat prompt text). Use "none" to skip.
+	# Examples: -ApiKey 'sk-…'   |   Unsloth: sk-unsloth-…   |   vLLM: value from --api-key
+	# If you log in with NPM Basic for the primary llama.cpp host, leave this "none" unless the app itself needs Bearer.
 	[string]$ApiKey = "none",
-	# Max completion tokens per model request (also reserved out of n_ctx for the prompt budget)
-	[int]$MaxTokens = 32768,
 	[double]$Temperature = 0.15,
-	[int]$MaxToolResultChars = 10000,
-	[int]$MaxHistoryMessages = 48,
-	[int]$CommandTimeoutSec = 360,
-	[int]$ContextWindowTokens = 262144,
-	[double]$ContextSoftPct = 0.72,
-	[double]$ContextHardPct = 0.88,
-	[bool]$AutoCompactEnabled = $true,
-	# Optional model summary on compact (else extractive)
-	[bool]$ModelCompactEnabled = $true,
 	[int]$MaxTurns = 30,
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
-	[int]$MaxReplyContinues = 8,
+	[int]$MaxReplyContinues = 5,
+	[string]$AgentName = "MiniBot",
+	[string]$Version = "2.30.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
 	# Speak final assistant text via SAPI when speech is on
 	[bool]$SpeechAutoReply = $true,
-	# Also set by env store=1 when the param is omitted - HOLD CAPPS-LOCK DURING LAUNCH TO CLEAR STORED CREDS
+	# Also set by env store=1 when the param is omitted - HOLD CAPS-LOCK DURING LAUNCH TO CLEAR STORED CREDS
 	[bool]$StoreCredentials = $false,
+	[int]$MaxToolResultChars = 10000,
+	[int]$MaxHistoryMessages = 48,
+	[int]$CommandTimeoutSec = 360,
+	[double]$ContextSoftPct = 0.72,
+	[double]$ContextHardPct = 0.88,
+	[bool]$AutoCompactEnabled = $true,
+	# Optional model summary on compact (else extractive)
+	[bool]$ModelCompactEnabled = $true,
 	# Tool surface: core (default, progressive) | full (all groups enabled)
 	[ValidateSet('core','full')]
 	[string]$ToolProfile = "core",
@@ -54,6 +59,56 @@ param(
 	# Hide attached console / Windows Terminal host window (PS1 and irm|iex). CMD hybrid line is separate (START /MIN -w hidden).
 	[bool]$HideConsole = $true
 )
+
+# =============================================================================
+# Multi-model / multi-endpoint (optional hardcode; UI: PoweredBy → + Add endpoint)
+# =============================================================================
+# Extra endpoints: each base can use apikey | npm | none independently.
+#   apikey → Bearer from MBExtraApiKeys
+#   npm    → same session NPM Basic as the primary host
+#   none   → no Authorization header
+# Prefer …/v1 for vLLM / Unsloth Studio. Bare host:port is fine for many llama.cpp builds.
+# Runtime UI: PoweredBy → + Add endpoint → Auth mode. Do not commit real secrets.
+#
+# --- llama.cpp + NPM (same reverse proxy / NPM Basic as primary) ---
+#   $script:MBExtraApiBases = @('https://llama.example.com')
+#   $script:MBExtraApiAuth  = @{ 'https://llama.example.com' = 'npm' }
+#
+# --- llama.cpp + none (open LAN, no Authorization) ---
+#   $script:MBExtraApiBases = @('http://127.0.0.1:8081')
+#   $script:MBExtraApiAuth  = @{ 'http://127.0.0.1:8081' = 'none' }
+#
+# --- llama.cpp + apikey (Bearer) ---
+#   $script:MBExtraApiBases = @('http://127.0.0.1:8081')
+#   $script:MBExtraApiAuth  = @{ 'http://127.0.0.1:8081' = 'apikey' }
+#   $script:MBExtraApiKeys  = @{ 'http://127.0.0.1:8081' = 'sk-your-key' }
+#
+# --- Unsloth Studio + apikey ---
+#   $script:MBExtraApiBases = @('http://192.168.1.106:8888/v1')
+#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.106:8888/v1' = 'apikey' }
+#   $script:MBExtraApiKeys  = @{ 'http://192.168.1.106:8888/v1' = 'sk-unsloth-xxxxxxxx' }
+#
+# --- vLLM + none (open LAN) ---
+#   $script:MBExtraApiBases = @('http://192.168.1.50:8000/v1')
+#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.50:8000/v1' = 'none' }
+#
+# --- vLLM + apikey (--api-key / OpenAI-compat Bearer) ---
+#   $script:MBExtraApiBases = @('http://192.168.1.50:8000/v1')
+#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.50:8000/v1' = 'apikey' }
+#   $script:MBExtraApiKeys  = @{ 'http://192.168.1.50:8000/v1' = 'token-abc123' }
+# =============================================================================
+
+# Extra OpenAI-compatible API bases (in addition to -BaseUrl). Uncomment / edit to hardcode.
+$script:MBExtraApiBases = @(
+)
+
+# Per-base auth mode: 'apikey' | 'npm' | 'none'
+$script:MBExtraApiAuth = @{
+}
+
+# Per-base Bearer keys when auth mode is 'apikey'
+$script:MBExtraApiKeys = @{
+}
 
 # Console hide (PS param -HideConsole). CMD users: edit the hybrid @START line at top of file.
 $solo = $true
@@ -121,10 +176,9 @@ public static class Win32 {
 	} catch {}
 }
 
-# Installer catalog — edit url / file / install / zip_entry here.
-# kind: exe | msi | zip_msi | open_url
-# install: raw flags after payload (not split). Empty = none.
-# interactive: show UI (ADWCleaner). NewMachineSetup installs every package in this catalog.
+# Installer catalog (release): personal software only. kind: exe | msi | zip_msi | open_url
+# install: raw flags after payload. interactive: show UI (ADWCleaner).
+# NewMachineSetup installs every package in this catalog (profile is settings flavor only).
 $script:MBInstallerCatalog = [ordered]@{
 	'7zip' = [ordered]@{
 		id        = '7zip'
@@ -143,7 +197,7 @@ $script:MBInstallerCatalog = [ordered]@{
 		kind      = 'zip_msi'
 		zip_entry = 'GoogleChromeStandaloneEnterprise64.msi'
 		install   = '/qn /norestart'
-		note      = 'Zip → MSI; silent /qn'
+		note      = 'Zip to MSI; silent /qn'
 	}
 	'adobe_reader' = [ordered]@{
 		id        = 'adobe_reader'
@@ -206,7 +260,7 @@ function Get-MBElevationLaunchArgs {
 	$hide = $true
 	try { $hide = [bool]$script:MB_HideConsole } catch { $hide = $true }
 	if ($hide) {
-		# Match -HideConsole:$true — avoid console flash while the elevated process parses.
+		# Match -HideConsole:$true - avoid console flash while the elevated process parses.
 		$psArgs = "$psArgs -WindowStyle Hidden"
 	}
 	$path = $script:MB_LaunchScriptPath
@@ -397,12 +451,29 @@ namespace MB.Launch {
 	}
 } catch {}
 
+# Prefer a sane CWD: elevated "Run as admin" often starts in C:\Windows\System32,
+# which wrongly turns relative paths like Users\Owner\... into System32\Users\...
+$__mbWd = $null
+try { $__mbWd = (Get-Location).Path } catch { $__mbWd = $null }
+if ([string]::IsNullOrWhiteSpace($__mbWd)) { $__mbWd = $env:SystemRoot }
+try {
+	$__mbWdLow = $__mbWd.ToLowerInvariant()
+	if ($__mbWdLow -match '\\windows(\\system32)?$' -or $__mbWdLow -match '\\system32$') {
+		$__mbHome = $env:USERPROFILE
+		if (-not $__mbHome) { try { $__mbHome = [Environment]::GetFolderPath('UserProfile') } catch {} }
+		if ($__mbHome -and (Test-Path -LiteralPath $__mbHome)) {
+			$__mbWd = $__mbHome
+			try { Set-Location -LiteralPath $__mbHome } catch {}
+		}
+	}
+} catch {}
+
 $script:MB = @{
 	AutoApprove        = [bool]$AutoApproveEnabled
 	Interrupt          = $false
 	IsThinking         = $false
 	ModeSwitch         = $false
-	WorkingDir         = (Get-Location).Path
+	WorkingDir         = $__mbWd
 	SessionStart       = Get-Date
 	UserTurns          = 0
 	AgentTurns         = 0
@@ -425,7 +496,7 @@ $script:MB = @{
 	ActiveReader       = $null
 	TaskApiBase        = $(if ($TaskApiBase) { [string]$TaskApiBase } else { '' })
 	LastAbortMs        = 0
-	ContextWindow      = [int]$ContextWindowTokens
+	ContextWindow      = $(if ([int]$ContextWindowTokens -gt 0) { [int]$ContextWindowTokens } else { 0 })
 	ContextSoftPct     = [double]$ContextSoftPct
 	ContextHardPct     = [double]$ContextHardPct
 	AutoCompact        = [bool]$AutoCompactEnabled
@@ -475,6 +546,8 @@ $script:MB = @{
 	SandboxRoot        = $null
 	SandboxId          = $null
 	SandboxLast        = $null
+	# Child process PIDs (sandbox / RunCommand) - killed as a tree on timeout, Esc, or exit
+	ChildProcessIds    = New-Object System.Collections.ArrayList
 	# Session temp paths (install/pdf/setup/sandbox); cleared as we go and on exit
 	TempTracked        = New-Object System.Collections.ArrayList
 	SpeechEnabled      = $false
@@ -488,12 +561,42 @@ $script:MB = @{
 	HostUi             = 'wpf'
 	Wpf                = $null
 	ResolvedApiBase    = $null
+	# Launch primary API (llama.cpp / NPM). Extra endpoints (vLLM, Unsloth, …) never inherit this auth.
+	PrimaryApiBase     = $(try { Normalize-MBApiBase -Url ([string]$BaseUrl) } catch { [string]$BaseUrl })
+	ActiveModel        = $(try { [string]$Model } catch { '' })
+	ActiveModelBase    = $null
+	ActiveModelKey     = ''
+	RemoteModels       = @()
+	RemoteModelEntries = @()
+	ExtraApiBases      = @()
+	# Per-endpoint Bearer keys (normalized base URL -> api key string). vLLM --api-key, Unsloth sk-unsloth-…, etc.
+	ExtraApiKeys       = @{}
+	# Per-endpoint auth mode: 'npm' | 'apikey' | 'none' (HTTP Authorization only — never prompt text)
+	ExtraApiAuth       = @{}
+	RemoteModelsTick   = 0
+	ContextSource      = $(if ([int]$ContextWindowTokens -gt 0) { 'config' } else { 'server' })
+	ServerInfo         = $null      # last props/meta snapshot for active endpoint
+	# True when -MaxTokens was passed or a non-zero default was filled in (do not auto-scale to n_ctx/8)
+	MaxTokensUserBound = $(try {
+		if ($null -ne $PSBoundParameters -and $PSBoundParameters.ContainsKey('MaxTokens')) { $true }
+		elseif ([int]$MaxTokens -gt 0) { $true }
+		else { $false }
+	} catch { $false })
+	# True when -ContextWindowTokens was passed or a non-zero default was filled in
+	ContextWindowUserBound = $(try {
+		if ($null -ne $PSBoundParameters -and $PSBoundParameters.ContainsKey('ContextWindowTokens')) { $true }
+		elseif ([int]$ContextWindowTokens -gt 0) { $true }
+		else { $false }
+	} catch { $false })
+	BannerShown        = $false
+	BannerModelLast    = ''
 	SessionEnding      = $false
 	DebugLogPath       = $null
 	DebugLogEnabled    = $false
 	DebugSeq           = 0
 	LoginSession       = $null
 }
+# Extra bases seeded after Normalize-MBApiBase is defined (see Initialize-MBExtraApiBases)
 
 # Debug log: -DebugLog or env debug=1 (off by default)
 try {
@@ -867,21 +970,135 @@ function Write-MBDebugLog {
 }
 
 
-function Get-MBApiBaseUrl {
-	try {
-		if ($script:MB -and $script:MB.ResolvedApiBase) {
-			$rb = [string]$script:MB.ResolvedApiBase
-			if (-not [string]::IsNullOrWhiteSpace($rb)) { return $rb.TrimEnd('/') }
-		}
-	} catch {}
-	$u = [string]$BaseUrl
-	if ([string]::IsNullOrWhiteSpace($u)) { return 'http://127.0.0.1:8080' }
+function Normalize-MBApiBase {
+	param([string]$Url)
+	$u = [string]$Url
+	if ([string]::IsNullOrWhiteSpace($u)) { return '' }
 	$u = $u.Trim()
+	if ($u -notmatch '^(?i)https?://') {
+		# host:port or host → assume http
+		if ($u -match '^\d+$') { $u = "http://127.0.0.1:$u" }
+		else { $u = "http://$u" }
+	}
 	while ($u.EndsWith('/')) { $u = $u.Substring(0, $u.Length - 1) }
 	$u = $u -replace '/chat/completions\s*$', '' -replace '/models\s*$', ''
 	$u = $u -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
 	while ($u.EndsWith('/')) { $u = $u.Substring(0, $u.Length - 1) }
 	return $u
+}
+
+function Get-MBApiBaseUrl {
+	try {
+		$ab = [string]$script:MB.ActiveModelBase
+		if (-not [string]::IsNullOrWhiteSpace($ab)) { return (Normalize-MBApiBase -Url $ab) }
+	} catch {}
+	try {
+		if ($script:MB -and $script:MB.ResolvedApiBase) {
+			$rb = [string]$script:MB.ResolvedApiBase
+			if (-not [string]::IsNullOrWhiteSpace($rb)) { return (Normalize-MBApiBase -Url $rb) }
+		}
+	} catch {}
+	$u = Normalize-MBApiBase -Url ([string]$BaseUrl)
+	if ([string]::IsNullOrWhiteSpace($u)) { return 'http://127.0.0.1:8080' }
+	return $u
+}
+
+function Get-MBShortHostLabel {
+	param([string]$Base)
+	try {
+		$u = [uri](Normalize-MBApiBase -Url $Base)
+		$port = $u.Port
+		if (($u.Scheme -eq 'http' -and $port -eq 80) -or ($u.Scheme -eq 'https' -and $port -eq 443)) {
+			return $u.Host
+		}
+		return ("{0}:{1}" -f $u.Host, $port)
+	} catch {
+		$b = Normalize-MBApiBase -Url $Base
+		return $b
+	}
+}
+
+function Initialize-MBExtraApiBases {
+	try {
+		if ($null -eq $script:MB) { return }
+		try {
+			$script:MB.PrimaryApiBase = Normalize-MBApiBase -Url ([string](Get-Variable -Name BaseUrl -Scope Script -ValueOnly -ErrorAction SilentlyContinue))
+		} catch {
+			try { $script:MB.PrimaryApiBase = Normalize-MBApiBase -Url ([string]$script:MB.PrimaryApiBase) } catch {}
+		}
+		$seed = New-Object System.Collections.ArrayList
+		# Keep any already-added runtime extras
+		try {
+			foreach ($x in @($script:MB.ExtraApiBases)) {
+				$n = Normalize-MBApiBase -Url ([string]$x)
+				if ($n -and -not ($seed | Where-Object { [string]::Equals($_, $n, [StringComparison]::OrdinalIgnoreCase) })) {
+					[void]$seed.Add($n)
+				}
+			}
+		} catch {}
+		foreach ($x in @($script:MBExtraApiBases)) {
+			$n = Normalize-MBApiBase -Url ([string]$x)
+			if ($n -and -not ($seed | Where-Object { [string]::Equals($_, $n, [StringComparison]::OrdinalIgnoreCase) })) {
+				[void]$seed.Add($n)
+			}
+		}
+		$script:MB.ExtraApiBases = @($seed)
+
+		# Seed per-base Bearer keys from $script:MBExtraApiKeys (top-of-script examples)
+		try {
+			$map = $null
+			try { $map = $script:MBExtraApiKeys } catch { $map = $null }
+			if ($map -is [hashtable]) {
+				foreach ($k in @($map.Keys)) {
+					$bn = Normalize-MBApiBase -Url ([string]$k)
+					$kv = [string]$map[$k]
+					if ($bn -and (Test-MBApiKeyUsable -Key $kv)) {
+						Set-MBApiKeyForBase -BaseUrl $bn -ApiKeyValue $kv
+					}
+				}
+			}
+		} catch {}
+
+		# Seed per-base auth mode from $script:MBExtraApiAuth ('apikey'|'npm'|'none')
+		try {
+			$am = $null
+			try { $am = $script:MBExtraApiAuth } catch { $am = $null }
+			if ($am -is [hashtable]) {
+				foreach ($k in @($am.Keys)) {
+					$bn = Normalize-MBApiBase -Url ([string]$k)
+					$mode = ([string]$am[$k]).Trim().ToLowerInvariant()
+					if (-not $bn) { continue }
+					if ($mode -eq 'basic') { $mode = 'npm' }
+					if ($mode -in @('bearer', 'key')) { $mode = 'apikey' }
+					if ($mode -in @('npm', 'apikey', 'none')) {
+						Set-MBApiAuthModeForBase -BaseUrl $bn -Mode $mode
+					}
+				}
+			}
+		} catch {}
+	} catch {
+		try { if ($null -eq $script:MB.ExtraApiBases) { $script:MB.ExtraApiBases = @() } } catch {}
+	}
+}
+
+function Get-MBConfiguredApiBases {
+	try { Initialize-MBExtraApiBases } catch {}
+	$out = New-Object System.Collections.ArrayList
+	$add = {
+		param([string]$raw)
+		$n = Normalize-MBApiBase -Url $raw
+		if ([string]::IsNullOrWhiteSpace($n)) { return }
+		foreach ($x in @($out)) {
+			if ([string]::Equals($x, $n, [StringComparison]::OrdinalIgnoreCase)) { return }
+		}
+		[void]$out.Add($n)
+	}
+	try { & $add ([string]$BaseUrl) } catch {}
+	try {
+		foreach ($x in @($script:MB.ExtraApiBases)) { & $add ([string]$x) }
+	} catch {}
+	if ($out.Count -eq 0) { [void]$out.Add('http://127.0.0.1:8080') }
+	return @($out)
 }
 
 function Get-MBDeepErrorMessage {
@@ -970,6 +1187,10 @@ namespace MiniBot.Core {
 		}
 
 		public static volatile bool CancelRequested = false;
+		// Host can set this each wait tick (e.g. WPF Esc / window close). Keeps long runs interruptible.
+		public static volatile bool ExternalCancel = false;
+		public static volatile int ActiveChildPid = 0;
+		const int MaxCaptureChars = 1500000;
 
 		public class RunResult {
 			public int ExitCode;
@@ -978,6 +1199,45 @@ namespace MiniBot.Core {
 			public long ElapsedMs;
 			public bool TimedOut;
 			public bool Cancelled;
+			public int Pid;
+		}
+
+		// Kill process and all descendants (PS sandbox often leaves grandchild powershell.exe alive).
+		public static void KillProcessTree(int pid) {
+			if (pid <= 0) return;
+			try {
+				var psi = new ProcessStartInfo {
+					FileName = "taskkill.exe",
+					Arguments = "/F /T /PID " + pid,
+					UseShellExecute = false,
+					CreateNoWindow = true,
+					RedirectStandardOutput = true,
+					RedirectStandardError = true
+				};
+				using (var tk = Process.Start(psi)) {
+					if (tk != null) tk.WaitForExit(8000);
+				}
+			} catch {
+				try {
+					using (var p = Process.GetProcessById(pid)) {
+						p.Kill();
+						p.WaitForExit(3000);
+					}
+				} catch {}
+			}
+		}
+
+		static void AppendCapped(StringBuilder sb, string line) {
+			if (line == null || sb == null) return;
+			lock (sb) {
+				if (sb.Length >= MaxCaptureChars) return;
+				int room = MaxCaptureChars - sb.Length;
+				if (line.Length + 2 > room) {
+					if (room > 32) sb.Append(line.Substring(0, room - 32)).Append("\n...[output capped]...\n");
+					return;
+				}
+				sb.AppendLine(line);
+			}
 		}
 
 		public static RunResult RunProcess(string fileName, string arguments, string workingDir, int timeoutMs) {
@@ -999,16 +1259,19 @@ namespace MiniBot.Core {
 
 			var sbOut = new StringBuilder();
 			var sbErr = new StringBuilder();
+			int pid = 0;
 
 			using (var proc = new Process()) {
 				proc.StartInfo = psi;
 				proc.EnableRaisingEvents = false;
-				proc.OutputDataReceived += (s, e) => { if (e.Data != null) lock (sbOut) sbOut.AppendLine(e.Data); };
-				proc.ErrorDataReceived  += (s, e) => { if (e.Data != null) lock (sbErr) sbErr.AppendLine(e.Data); };
+				proc.OutputDataReceived += (s, e) => { if (e.Data != null) AppendCapped(sbOut, e.Data); };
+				proc.ErrorDataReceived  += (s, e) => { if (e.Data != null) AppendCapped(sbErr, e.Data); };
 
 				try {
 					CancelRequested = false;
+					ExternalCancel = false;
 					proc.Start();
+					try { pid = proc.Id; result.Pid = pid; ActiveChildPid = pid; } catch { pid = 0; }
 					proc.BeginOutputReadLine();
 					proc.BeginErrorReadLine();
 
@@ -1020,14 +1283,16 @@ namespace MiniBot.Core {
 							}
 						} catch {}
 
-						if (CancelRequested) {
-							try { proc.Kill(); } catch {}
+						if (CancelRequested || ExternalCancel) {
+							try { KillProcessTree(pid > 0 ? pid : proc.Id); } catch { try { proc.Kill(); } catch {} }
 							result.Cancelled = true;
+							try { proc.WaitForExit(5000); } catch {}
 							break;
 						}
 						if (timeoutMs > 0 && sw.ElapsedMilliseconds > timeoutMs) {
-							try { proc.Kill(); } catch {}
+							try { KillProcessTree(pid > 0 ? pid : proc.Id); } catch { try { proc.Kill(); } catch {} }
 							result.TimedOut = true;
+							try { proc.WaitForExit(5000); } catch {}
 							break;
 						}
 						Thread.Sleep(40);
@@ -1036,9 +1301,14 @@ namespace MiniBot.Core {
 					if (!result.Cancelled && !result.TimedOut) {
 						proc.WaitForExit(2000);
 						try { result.ExitCode = proc.ExitCode; } catch { result.ExitCode = -1; }
+					} else if (proc.HasExited) {
+						try { result.ExitCode = proc.ExitCode; } catch { result.ExitCode = -1; }
 					}
 				} catch (Exception ex) {
 					sbErr.AppendLine(ex.Message);
+					if (pid > 0) { try { KillProcessTree(pid); } catch {} }
+				} finally {
+					if (ActiveChildPid == pid) ActiveChildPid = 0;
 				}
 			}
 
@@ -1219,10 +1489,10 @@ namespace MiniBot.Core {
 		public long ElapsedMs;
 	}
 
-	/// 
+	/// <summary>
 	/// Directory size via FindFirstFileExW + FIND_FIRST_EX_LARGE_FETCH,
 	/// FindExInfoBasic (no short names), skip reparse points, parallel top-level walks.
-	/// 
+	/// </summary>
 	public static class DiskWalk {
 		public static volatile bool CancelRequested = false;
 
@@ -1285,7 +1555,7 @@ namespace MiniBot.Core {
 			return false;
 		}
 
-		/// Sum file bytes under path. deep=false: immediate children files only.
+		/// <summary>Sum file bytes under path. deep=false: immediate children files only.</summary>
 		public static FolderSizeInfo Measure(string path, bool deep, int timeoutMs) {
 			CancelRequested = false;
 			var sw = Stopwatch.StartNew();
@@ -1315,9 +1585,9 @@ namespace MiniBot.Core {
 			return info;
 		}
 
-		/// 
+		/// <summary>
 		/// Size each top-level subdirectory under root (parallel), return largest first.
-		/// 
+		/// </summary>
 		public static FolderSizeInfo[] TopFolders(string root, int maxResults, bool deep, int timeoutMs, int maxChildren) {
 			CancelRequested = false;
 			var sw = Stopwatch.StartNew();
@@ -1806,7 +2076,7 @@ function Write-MBReplyStatus {
 	)
 	$hint = if ($null -ne $Hint) { ([string]$Hint).Trim() } else { '' }
 	$logDetail = $title
-	if ($metaBits.Count -gt 0) { $logDetail += ' | ' + ($metaBits -join ' · ') }
+	if ($metaBits.Count -gt 0) { $logDetail += ' | ' + ($metaBits -join ' . ') }
 	if ($hint.Length -gt 0) { $logDetail += ' | ' + $hint }
 	try { Write-MBDebugLog -Step 'REPLY_STATUS' -Detail $logDetail } catch {}
 
@@ -1910,20 +2180,1069 @@ function Get-MBShortPath {
 	return '...' + $p.Substring($p.Length - $keep)
 }
 
-function Get-MBDisplayModel {
-	if (-not [string]::IsNullOrWhiteSpace([string]$ModelAlias)) {
-		return [string]$ModelAlias
+function Get-MBActiveModel {
+	try { Sync-MBActiveModelFromWpf } catch {}
+	$m = ''
+	try { $m = [string]$script:MB.ActiveModel } catch { $m = '' }
+	if (-not [string]::IsNullOrWhiteSpace($m) -and $m -ne 'Select Model') {
+		if (Test-MBLooksLikeModelPath -S $m) { return '' }
+		return $m
 	}
-	return [string]$Model
+	$entries = @()
+	try { $entries = @($script:MB.RemoteModelEntries) } catch { $entries = @() }
+	if ($entries.Count -eq 1) {
+		try {
+			Set-MBActiveModel -Id ([string]$entries[0].Id) -Base ([string]$entries[0].Base) -Key ([string]$entries[0].Key) -Quiet
+			return [string]$entries[0].Id
+		} catch { return [string]$entries[0].Id }
+	}
+	if ($entries.Count -gt 1) { return '' }
+	$remote = @()
+	try { $remote = @($script:MB.RemoteModels) } catch { $remote = @() }
+	if ($remote.Count -eq 1) {
+		$r0 = [string]$remote[0]
+		if (-not (Test-MBLooksLikeModelPath -S $r0)) { return $r0 }
+		return ''
+	}
+	if ($remote.Count -gt 1) { return '' }
+	try { $m = [string]$Model } catch { $m = '' }
+	if (Test-MBLooksLikeModelPath -S $m) { return '' }
+	return $m
+}
+
+function Format-MBParamCount {
+	param([object]$N)
+	try {
+		$v = [double]$N
+		if ($v -le 0) { return '' }
+		if ($v -ge 1e12) { return ('{0:N1}T' -f ($v / 1e12)) }
+		if ($v -ge 1e9)  { return ('{0:N1}B' -f ($v / 1e9)) }
+		if ($v -ge 1e6)  { return ('{0:N1}M' -f ($v / 1e6)) }
+		if ($v -ge 1e3)  { return ('{0:N1}K' -f ($v / 1e3)) }
+		return ('{0:N0}' -f $v)
+	} catch { return '' }
+}
+
+function Format-MBByteSize {
+	param([object]$N)
+	try {
+		$v = [double]$N
+		if ($v -le 0) { return '' }
+		if ($v -ge 1GB) { return ('{0:N1} GB' -f ($v / 1GB)) }
+		if ($v -ge 1MB) { return ('{0:N0} MB' -f ($v / 1MB)) }
+		return ('{0:N0} B' -f $v)
+	} catch { return '' }
+}
+
+function Test-MBLooksLikeModelPath {
+	# True only for filesystem-looking model paths from llama.cpp (not HF/Unsloth ids).
+	# Unsloth/HF ids look like: unsloth/Qwen3.5-4B-MTP-GGUF  (slash is org/repo, not a path)
+	param([string]$S)
+	if ([string]::IsNullOrWhiteSpace($S)) { return $true }
+	$t = $S.Trim()
+	# Windows drive / UNC / any backslash path
+	if ($t -match '^[A-Za-z]:[\\/]') { return $true }
+	if ($t -match '^\\\\') { return $true }
+	if ($t -match '\\') { return $true }
+	# Absolute or relative filesystem paths
+	if ($t -match '^/') { return $true }
+	if ($t -match '^\.\.?/') { return $true }
+	# Real .gguf file names (Unsloth ids use -GGUF suffix without a dot)
+	if ($t -match '(?i)\.gguf$') { return $true }
+	if ($t -match '(?i)\.(bin|safetensors|ggml|pt|pth|onnx)$') { return $true }
+	return $false
+}
+
+function Get-MBPreferredModelAlias {
+	# Prefer intentional API id/alias; never model_path / filesystem names
+	param($Row, [string]$PropsAlias = '')
+	$cands = New-Object System.Collections.ArrayList
+	if (-not [string]::IsNullOrWhiteSpace($PropsAlias)) { [void]$cands.Add($PropsAlias.Trim()) }
+	if ($null -ne $Row) {
+		try { if ($Row.id) { [void]$cands.Add(([string]$Row.id).Trim()) } } catch {}
+		try {
+			foreach ($a in @($Row.aliases)) {
+				if ($a) { [void]$cands.Add(([string]$a).Trim()) }
+			}
+		} catch {}
+		try { if ($Row.name) { [void]$cands.Add(([string]$Row.name).Trim()) } } catch {}
+		try { if ($Row.model) { [void]$cands.Add(([string]$Row.model).Trim()) } } catch {}
+	}
+	foreach ($c in $cands) {
+		if ([string]::IsNullOrWhiteSpace($c)) { continue }
+		if (Test-MBLooksLikeModelPath -S $c) { continue }
+		return $c
+	}
+	# Last resort: if every candidate was filtered, still accept a non-path HF-style id
+	# (org/name) from row.id — Unsloth Studio returns these as the real model id.
+	try {
+		if ($null -ne $Row -and $Row.id) {
+			$fallback = ([string]$Row.id).Trim()
+			if (-not [string]::IsNullOrWhiteSpace($fallback) -and -not (Test-MBLooksLikeModelPath -S $fallback)) {
+				return $fallback
+			}
+		}
+	} catch {}
+	return ''
+}
+
+function Get-MBServerPropsFromBase {
+	# llama.cpp GET /props (not under /v1)
+	param(
+		[string]$BaseUrl = '',
+		[string]$Username = '',
+		[string]$Password = '',
+		[string]$BearerToken = '',
+		[int]$TimeoutSeconds = 8
+	)
+	$raw = Normalize-MBApiBase -Url $BaseUrl
+	if ([string]::IsNullOrWhiteSpace($raw)) {
+		return @{ Ok = $false }
+	}
+	# Prefer non-/v1 root for /props
+	$roots = New-Object System.Collections.ArrayList
+	if ($raw -match '/v1$') {
+		[void]$roots.Add(($raw -replace '/v1$', ''))
+		[void]$roots.Add($raw)
+	} else {
+		[void]$roots.Add($raw)
+		[void]$roots.Add($raw + '/v1')
+	}
+	$user = [string]$Username
+	$pass = [string]$Password
+	# Per-endpoint auth only (NPM on primary; Bearer on extras; never bleed primary NPM onto vLLM)
+	$headers = @{}
+	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $BearerToken
+	if ($auth) {
+		$headers['Authorization'] = $auth
+	} elseif ($user -and $pass) {
+		$credBytes = [System.Text.Encoding]::UTF8.GetBytes("${user}:${pass}")
+		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
+	}
+	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+	$prev = $Global:ProgressPreference
+	$Global:ProgressPreference = 'SilentlyContinue'
+	try {
+		foreach ($root in $roots) {
+			if ([string]::IsNullOrWhiteSpace($root)) { continue }
+			try {
+				$resp = Invoke-WebRequest -Uri "$root/props" -Method GET -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
+				if ([int]$resp.StatusCode -ne 200) { continue }
+				$body = [string]$resp.Content
+				if ($body.TrimStart().StartsWith('<')) { continue }
+				$obj = $body | ConvertFrom-Json -ErrorAction Stop
+				$nCtx = 0
+				try { $nCtx = [int]$obj.default_generation_settings.n_ctx } catch { $nCtx = 0 }
+				if ($nCtx -le 0) {
+					try { $nCtx = [int]$obj.n_ctx } catch { $nCtx = 0 }
+				}
+				$alias = ''
+				try { $alias = [string]$obj.model_alias } catch { $alias = '' }
+				if (Test-MBLooksLikeModelPath -S $alias) { $alias = '' }
+				$vision = $false
+				$audio = $false
+				try { $vision = [bool]$obj.modalities.vision } catch {}
+				try { $audio = [bool]$obj.modalities.audio } catch {}
+				$slots = 0
+				try { $slots = [int]$obj.total_slots } catch { $slots = 0 }
+				return @{
+					Ok          = $true
+					Base        = $root
+					NCtx        = $nCtx
+					ModelAlias  = $alias
+					Vision      = $vision
+					Audio       = $audio
+					TotalSlots  = $slots
+					# path kept internally only - never shown / never used as model id
+					ModelPath   = $(try { [string]$obj.model_path } catch { '' })
+					IsSleeping  = $(try { [bool]$obj.is_sleeping } catch { $false })
+					BuildInfo   = $(try { [string]$obj.build_info } catch { '' })
+				}
+			} catch {
+				continue
+			}
+		}
+	} finally {
+		$Global:ProgressPreference = $prev
+	}
+	return @{ Ok = $false }
+}
+
+function Get-MBDefaultMaxTokens {
+	# Default max response tokens = 1/8 of total context window (server-reported preferred)
+	param([int]$NCtx = 0)
+	if ($NCtx -le 0) {
+		try { $NCtx = [int]$script:MB.ContextWindow } catch { $NCtx = 0 }
+	}
+	if ($NCtx -le 0) {
+		# Only honor -ContextWindowTokens / filled-in fallback when set
+		try {
+			if ([bool]$script:MB.ContextWindowUserBound -and [int]$ContextWindowTokens -gt 0) {
+				$NCtx = [int]$ContextWindowTokens
+			}
+		} catch {}
+	}
+	if ($NCtx -le 0) {
+		# No context known yet - small safe floor until /props reports n_ctx
+		return 1024
+	}
+	$v = [int][math]::Floor($NCtx / 8)
+	if ($v -lt 1024) { $v = 1024 }
+	return $v
+}
+
+function Get-MBEffectiveMaxTokens {
+	# User-locked MaxTokens, else current/auto value (n_ctx/8)
+	$mt = 0
+	try { $mt = [int]$MaxTokens } catch { $mt = 0 }
+	if ($mt -gt 0) { return $mt }
+	return (Get-MBDefaultMaxTokens)
+}
+
+function Apply-MBServerContextWindow {
+	param([int]$NCtx, [string]$Source = 'server')
+	if ($NCtx -le 0) { return $false }
+	$script:MB.ContextWindow = [int]$NCtx
+	$script:MB.ContextSource = [string]$Source
+	# Auto max_out = n_ctx/8 unless the user locked -MaxTokens
+	$userBound = $false
+	try { $userBound = [bool]$script:MB.MaxTokensUserBound } catch { $userBound = $false }
+	if (-not $userBound) {
+		$def = Get-MBDefaultMaxTokens -NCtx $NCtx
+		try { $script:MaxTokens = [int]$def } catch {}
+		try { Set-Variable -Name MaxTokens -Scope Script -Value ([int]$def) -Force -ErrorAction SilentlyContinue } catch {}
+		try { $MaxTokens = [int]$def } catch {}
+	}
+	return $true
+}
+
+function Write-MBBannerModelLine {
+	# Host -> Model -> Abilities (banner text). Reloads when model OR endpoint changes.
+	param([switch]$Force)
+	try {
+		$m = Get-MBActiveModel
+		if ([string]::IsNullOrWhiteSpace($m) -or $m -eq 'Select Model') { return }
+		$track = ''
+		try {
+			$k = [string]$script:MB.ActiveModelKey
+			$b = [string]$script:MB.ActiveModelBase
+			$track = if ($k) { $k } elseif ($b) { '{0}|{1}' -f $m, $b } else { $m }
+		} catch { $track = $m }
+		$last = ''
+		try { $last = [string]$script:MB.BannerModelLast } catch { $last = '' }
+		if (-not $Force -and $last -eq $track) { return }
+		$hostLab = ''
+		$baseShow = ''
+		try {
+			$b = [string]$script:MB.ActiveModelBase
+			if (-not $b) { $b = Get-MBApiBaseUrl }
+			$baseShow = Normalize-MBApiBase -Url $b
+			$hostLab = Get-MBShortHostLabel -Base $b
+		} catch {}
+		$show = Get-MBShortModel -MaxLen 64
+		$info = $null
+		try { $info = $script:MB.ServerInfo } catch { $info = $null }
+		# Prefer entry meta for this model
+		$ent = $null
+		try {
+			$k = [string]$script:MB.ActiveModelKey
+			if ($k) { $ent = @($script:MB.RemoteModelEntries | Where-Object { $_.Key -eq $k } | Select-Object -First 1) }
+			if (-not $ent) { $ent = @($script:MB.RemoteModelEntries | Where-Object { $_.Id -eq $m } | Select-Object -First 1) }
+		} catch {}
+		$nParams = 0
+		$vision = $false
+		$audio = $false
+		$slots = 0
+		if ($ent) {
+			try { if ($ent.NParams -gt 0) { $nParams = [double]$ent.NParams } } catch {}
+			try { $vision = [bool]$ent.Vision } catch {}
+		}
+		if ($info) {
+			try { $vision = [bool]$info.Vision } catch {}
+			try { $audio = [bool]$info.Audio } catch {}
+			try { if ([int]$info.TotalSlots -gt 0) { $slots = [int]$info.TotalSlots } } catch {}
+		}
+		$hostLine = if ($baseShow) { $baseShow } else { [string]$BaseUrl }
+		if ($hostLab -and $script:MB.RemoteModelEntries -and @($script:MB.RemoteModelEntries).Count -gt 1) {
+			$hostLine = ("{0}  ({1})" -f $hostLine, $hostLab)
+		}
+		# Connection banner text (append Host/Model/Abilities — does not clear the log)
+		Write-MBKV 'Host' $hostLine -ValueColor Gray
+		Write-MBKV 'Model' $show -ValueColor Magenta
+		$capBits = New-Object System.Collections.ArrayList
+		if ($vision) { [void]$capBits.Add('vision') }
+		if ($audio) { [void]$capBits.Add('audio') }
+		if ($slots -eq 1) {
+			[void]$capBits.Add('logical (1)')
+		} elseif ($slots -gt 1) {
+			[void]$capBits.Add(('synchronous ({0})' -f $slots))
+		}
+		$ps = Format-MBParamCount -N $nParams
+		if ($ps) { [void]$capBits.Add(('{0} params' -f $ps)) }
+		if ($capBits.Count -gt 0) {
+			Write-MBKVJoined -Key 'Abilities' -Parts @($capBits.ToArray()) -ValueColor DarkCyan -SepColor DarkGray
+		}
+		$script:MB.BannerModelLast = $track
+	} catch {}
+}
+
+function Set-MBActiveModel {
+	param(
+		[string]$Id,
+		[string]$Base = '',
+		[string]$Key = '',
+		[switch]$Quiet,
+		[switch]$FromUi,
+		# Banner divider verbage: 'added' | 'switched' (empty = auto switched when UI changes)
+		[string]$BannerKind = ''
+	)
+	$id = ([string]$Id).Trim()
+	if ([string]::IsNullOrWhiteSpace($id) -or $id -eq 'Select Model') { return }
+	$prev = ''
+	try { $prev = [string]$script:MB.ActiveModel } catch { $prev = '' }
+	$baseN = Normalize-MBApiBase -Url $Base
+	$keyN = ([string]$Key).Trim()
+	if ([string]::IsNullOrWhiteSpace($keyN) -or [string]::IsNullOrWhiteSpace($baseN)) {
+		try {
+			foreach ($e in @($script:MB.RemoteModelEntries)) {
+				if ($keyN -and [string]$e.Key -eq $keyN) {
+					$id = [string]$e.Id
+					$baseN = Normalize-MBApiBase -Url ([string]$e.Base)
+					$keyN = [string]$e.Key
+					break
+				}
+				if (-not $keyN -and [string]$e.Id -eq $id) {
+					if ([string]::IsNullOrWhiteSpace($baseN) -or [string]::Equals($baseN, (Normalize-MBApiBase -Url ([string]$e.Base)), [StringComparison]::OrdinalIgnoreCase)) {
+						$baseN = Normalize-MBApiBase -Url ([string]$e.Base)
+						$keyN = [string]$e.Key
+						break
+					}
+				}
+			}
+		} catch {}
+	}
+	if ([string]::IsNullOrWhiteSpace($baseN)) {
+		try { $baseN = Normalize-MBApiBase -Url ([string]$script:MB.ActiveModelBase) } catch {}
+	}
+	if ([string]::IsNullOrWhiteSpace($baseN)) {
+		try { $baseN = Normalize-MBApiBase -Url ([string]$BaseUrl) } catch {}
+	}
+	if ([string]::IsNullOrWhiteSpace($keyN)) {
+		$keyN = if ($baseN) { "{0}|{1}" -f $id, $baseN } else { $id }
+	}
+	$prevKey = ''
+	try { $prevKey = [string]$script:MB.ActiveModelKey } catch { $prevKey = '' }
+	$same = ($prev -eq $id)
+	try {
+		if ($same -and $prevKey -eq $keyN) { return }
+	} catch {}
+	$endpointChanged = ($prevKey -ne $keyN)
+
+	# Never prompt to save session on model/endpoint switch (that re-entered via ModelDirty
+	# / menu rebuild and looped the file picker). Use /save when the user wants a snapshot.
+
+	$script:MB.ActiveModel = $id
+	$script:MB.ActiveModelBase = $baseN
+	$script:MB.ActiveModelKey = $keyN
+	$script:MB.ResolvedApiBase = $baseN
+	try { $script:Model = $id } catch {}
+	try { Set-Variable -Name Model -Scope Script -Value $id -ErrorAction SilentlyContinue } catch {}
+	# Refresh n_ctx / caps + connection info for THIS endpoint (always re-check on select)
+	try {
+		$entN = 0
+		foreach ($e in @($script:MB.RemoteModelEntries)) {
+			if ($e.Key -eq $keyN -or ($e.Id -eq $id -and $e.Base -eq $baseN)) {
+				if ([int]$e.NCtx -gt 0) { $entN = [int]$e.NCtx }
+				break
+			}
+		}
+		if ($entN -gt 0) { [void](Apply-MBServerContextWindow -NCtx $entN -Source 'server') }
+		$p = Get-MBServerPropsFromBase -BaseUrl $baseN
+		if ($p -and $p.Ok) {
+			$script:MB.ServerInfo = $p
+			if ([int]$p.NCtx -gt 0) { [void](Apply-MBServerContextWindow -NCtx ([int]$p.NCtx) -Source 'server') }
+		} else {
+			# Still stamp host from base so banner text has the right endpoint
+			try {
+				$script:MB.ServerInfo = @{
+					Ok = $true
+					Base = $baseN
+					NCtx = $entN
+					Vision = $false
+					Audio = $false
+					TotalSlots = 0
+				}
+			} catch {}
+		}
+	} catch {}
+	if ($script:MB.Wpf) {
+		try {
+			$script:MB.Wpf.ActiveModel = $id
+			$script:MB.Wpf.ActiveModelBase = $baseN
+			$script:MB.Wpf.ActiveModelKey = $keyN
+			$script:MB.Wpf.ModelDirty = $false
+			$script:MB.Wpf.ContextWindow = [int]$script:MB.ContextWindow
+			$script:MB.Wpf.ContextSource = [string]$script:MB.ContextSource
+			# Update picker labels without forcing a full menu rebuild every select
+			# (RemoteModelsSeq rebuild was re-dirtying Model and looping UI handlers).
+			try {
+				$script:MB.Wpf.RemoteModels = @($script:MB.RemoteModels)
+				$script:MB.Wpf.RemoteModelEntries = @($script:MB.RemoteModelEntries)
+			} catch {}
+		} catch {}
+	}
+	try { Update-MBWpfWindowTitle } catch {}
+	# Vision ability may change with model - refresh senses tool gating in the UI / active list
+	try { Update-MBWpfToolGroupBar -Force } catch {}
+	# Full banner when PoweredBy selection changes (UI switch / endpoint add). Quiet = internal rebind only.
+	if (-not $Quiet -and [bool]$script:MB.BannerShown) {
+		try {
+			if ($FromUi -or $endpointChanged -or -not $script:MB.BannerModelLast) {
+				# Divider always reads "model switched" (Added status is separate when adding)
+				Show-MBActiveEndpointBanner -WithDivider -DividerLabel 'model switched' -IncludeTypeHint
+			}
+		} catch {
+			try { Write-MBBannerModelLine -Force } catch {}
+		}
+	}
+}
+
+function Sync-MBActiveModelFromWpf {
+	if (-not $script:MB.Wpf) { return }
+	try {
+		# Keep NPM creds mirrored so Add-endpoint (STA) can test NPM Basic mode
+		try {
+			$script:MB.Wpf.NpmUser = [string]$script:MB.NpmUser
+			$script:MB.Wpf.NpmPass = [string]$script:MB.NpmPass
+		} catch {}
+		# Pull per-endpoint API keys + auth modes set from the Add endpoint dialog
+		try {
+			$uk = $null
+			try { $uk = $script:MB.Wpf.ExtraApiKeys } catch {}
+			if ($null -eq $uk) { try { $uk = $script:MB.Wpf['ExtraApiKeys'] } catch {} }
+			if ($uk -is [hashtable]) {
+				if ($null -eq $script:MB.ExtraApiKeys -or -not ($script:MB.ExtraApiKeys -is [hashtable])) {
+					$script:MB.ExtraApiKeys = @{}
+				}
+				foreach ($k in @($uk.Keys)) {
+					if ($k -and $uk[$k]) { $script:MB.ExtraApiKeys[[string]$k] = [string]$uk[$k] }
+				}
+			}
+		} catch {}
+		try {
+			$ua = $null
+			try { $ua = $script:MB.Wpf.ExtraApiAuth } catch {}
+			if ($null -eq $ua) { try { $ua = $script:MB.Wpf['ExtraApiAuth'] } catch {} }
+			if ($ua -is [hashtable]) {
+				if ($null -eq $script:MB.ExtraApiAuth -or -not ($script:MB.ExtraApiAuth -is [hashtable])) {
+					$script:MB.ExtraApiAuth = @{}
+				}
+				foreach ($k in @($ua.Keys)) {
+					if ($k -and $ua[$k]) { $script:MB.ExtraApiAuth[[string]$k] = [string]$ua[$k] }
+				}
+			}
+		} catch {}
+		# Pending extra endpoint from UI (+ Add)
+		if ([bool]$script:MB.Wpf.PendingAddBaseDirty) {
+			$addUrl = [string]$script:MB.Wpf.PendingAddBaseUrl
+			$addKey = ''
+			$addMode = 'apikey'
+			try { $addKey = [string]$script:MB.Wpf.PendingAddBaseApiKey } catch { $addKey = '' }
+			try { $addMode = [string]$script:MB.Wpf.PendingAddBaseAuthMode } catch { $addMode = 'apikey' }
+			$script:MB.Wpf.PendingAddBaseDirty = $false
+			$script:MB.Wpf.PendingAddBaseUrl = ''
+			try { $script:MB.Wpf.PendingAddBaseApiKey = '' } catch {}
+			try { $script:MB.Wpf.PendingAddBaseAuthMode = '' } catch {}
+			# Merge UI list of bases into main before re-test (dialog may have already appended)
+			try {
+				$ub = @($script:MB.Wpf.ExtraApiBases)
+				if ($ub.Count -gt 0) {
+					$merged = New-Object System.Collections.ArrayList
+					foreach ($x in @($script:MB.ExtraApiBases)) {
+						$xn = Normalize-MBApiBase -Url ([string]$x)
+						if ($xn -and -not ($merged | Where-Object { [string]::Equals($_, $xn, [StringComparison]::OrdinalIgnoreCase) })) {
+							[void]$merged.Add($xn)
+						}
+					}
+					foreach ($x in $ub) {
+						$xn = Normalize-MBApiBase -Url ([string]$x)
+						if ($xn -and -not ($merged | Where-Object { [string]::Equals($_, $xn, [StringComparison]::OrdinalIgnoreCase) })) {
+							[void]$merged.Add($xn)
+						}
+					}
+					$script:MB.ExtraApiBases = @($merged)
+				}
+			} catch {}
+			$res = @{ Ok = $false; Message = 'No URL' }
+			if (-not [string]::IsNullOrWhiteSpace($addUrl)) {
+				try {
+					$res = Add-MBApiBaseEndpoint -Url $addUrl -BearerToken $addKey -AuthMode $addMode
+				} catch {
+					$res = @{ Ok = $false; Message = $_.Exception.Message }
+				}
+			}
+			try { $script:MB.Wpf.PendingAddBaseResult = $res } catch {}
+			if ($res -and [bool]$res.Ok) {
+				try {
+					$newBase = Normalize-MBApiBase -Url ([string]$res.Base)
+					if (-not $newBase) { $newBase = Normalize-MBApiBase -Url $addUrl }
+					# Prefer first model on the newly added endpoint
+					$pick = $null
+					try {
+						$pick = @(
+							$script:MB.RemoteModelEntries |
+								Where-Object {
+									$eb = Normalize-MBApiBase -Url ([string]$_.Base)
+									[string]::Equals($eb, $newBase, [StringComparison]::OrdinalIgnoreCase)
+								} |
+								Select-Object -First 1
+						) | Select-Object -First 1
+					} catch { $pick = $null }
+					if (-not $pick -and $res.Models -and @($res.Models).Count -gt 0) {
+						$mid = [string](@($res.Models)[0])
+						$pick = [pscustomobject]@{
+							Id   = $mid
+							Base = $newBase
+							Key  = ('{0}|{1}' -f $mid, $newBase)
+						}
+						# Ensure entry exists even if refresh only returned primary (auth race)
+						try {
+							$have = $false
+							$nk = [string]$pick.Key
+							foreach ($e in @($script:MB.RemoteModelEntries)) {
+								if ([string]$e.Key -eq $nk) { $have = $true; break }
+							}
+							if (-not $have) {
+								$hostLab = Get-MBShortHostLabel -Base $newBase
+								$lab = "{0}  @  {1}" -f $mid, $hostLab
+								$script:MB.RemoteModelEntries = @(
+									@($script:MB.RemoteModelEntries) + @(
+										[pscustomobject]@{
+											Key = $nk; Id = $mid; Base = $newBase
+											Host = $hostLab; Label = $lab
+											NCtx = 0; NCtxTrain = 0; NParams = 0; Size = 0; Vision = $false
+										}
+									)
+								)
+								if ($script:MB.RemoteModels -notcontains $mid) {
+									$script:MB.RemoteModels = @($script:MB.RemoteModels) + @($mid)
+								}
+								if ($script:MB.Wpf) {
+									$script:MB.Wpf.RemoteModelEntries = @($script:MB.RemoteModelEntries)
+									$script:MB.Wpf.RemoteModels = @($script:MB.RemoteModels)
+									$script:MB.Wpf.RemoteModelsSeq = (Get-Date).Ticks
+								}
+							}
+						} catch {}
+					}
+					# Brief "Added" status (blank line after only); host is on the next banner Host line
+					if ($res.Message) {
+						try {
+							Write-MBOk ([string]$res.Message)
+							Write-Host ''
+						} catch {}
+					}
+					if ($pick) {
+						# Populates PoweredBy + "model switched" divider + banner + Connected
+						Set-MBActiveModel -Id ([string]$pick.Id) -Base ([string]$pick.Base) -Key ([string]$pick.Key) -FromUi -BannerKind 'switched'
+					} else {
+						try {
+							Show-MBActiveEndpointBanner -WithDivider -DividerLabel 'model switched' -IncludeTypeHint
+						} catch {
+							try { Write-MBBannerModelLine -Force } catch {}
+						}
+					}
+					try { Update-MBWpfWindowTitle } catch {}
+				} catch {}
+			} elseif ($res -and $res.Message) {
+				try { Write-MBWarn ([string]$res.Message) } catch {}
+			}
+		}
+		if ([bool]$script:MB.Wpf.ModelDirty) {
+			$pick = [string]$script:MB.Wpf.ActiveModel
+			$pickBase = ''
+			$pickKey = ''
+			try { $pickBase = [string]$script:MB.Wpf.ActiveModelBase } catch {}
+			try { $pickKey = [string]$script:MB.Wpf.ActiveModelKey } catch {}
+			if (-not [string]::IsNullOrWhiteSpace($pick) -and $pick -ne 'Select Model') {
+				# PoweredBy menu pick → "model switched" divider (add path sets BannerKind=added itself)
+				Set-MBActiveModel -Id $pick -Base $pickBase -Key $pickKey -FromUi -BannerKind 'switched'
+			}
+			$script:MB.Wpf.ModelDirty = $false
+		} else {
+			try { $script:MB.Wpf.ActiveModel = [string]$script:MB.ActiveModel } catch {}
+			try { $script:MB.Wpf.ActiveModelBase = [string]$script:MB.ActiveModelBase } catch {}
+			try { $script:MB.Wpf.ActiveModelKey = [string]$script:MB.ActiveModelKey } catch {}
+		}
+	} catch {}
+}
+
+function Get-MBRemoteModelsFromBase {
+	# Probe one OpenAI-compat base (llama.cpp / Unsloth / vLLM / …)
+	# → @{ Ok; Base; Models=@(id strings); Entries=@(rich); Props }
+	param(
+		[string]$BaseUrl = '',
+		[string]$Username = '',
+		[string]$Password = '',
+		[string]$BearerToken = '',
+		[int]$TimeoutSeconds = 8
+	)
+	$raw = Normalize-MBApiBase -Url $BaseUrl
+	if ([string]::IsNullOrWhiteSpace($raw)) { return @{ Ok = $false; Base = ''; Models = @(); Entries = @(); Props = $null } }
+
+	$bases = New-Object System.Collections.Generic.List[string]
+	# Prefer /v1 first for vLLM / Unsloth / OpenAI-compat; still try bare root for llama.cpp
+	if ($raw -match '/v1$') {
+		[void]$bases.Add($raw)
+		$root = $raw -replace '/v1$', ''
+		if ($root -and -not $bases.Contains($root)) { [void]$bases.Add($root) }
+	} else {
+		[void]$bases.Add($raw + '/v1')
+		[void]$bases.Add($raw)
+	}
+
+	$user = [string]$Username
+	$pass = [string]$Password
+	# Per-endpoint auth only — extras do not inherit primary llama.cpp NPM
+	$headers = @{}
+	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $BearerToken
+	if ($auth) {
+		$headers['Authorization'] = $auth
+	} elseif ($user -and $pass) {
+		$credBytes = [System.Text.Encoding]::UTF8.GetBytes("${user}:${pass}")
+		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
+	}
+
+	$props = Get-MBServerPropsFromBase -BaseUrl $raw -Username $Username -Password $Password -BearerToken $BearerToken -TimeoutSeconds $TimeoutSeconds
+
+	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+	$OriginalProgressPreference = $Global:ProgressPreference
+	$Global:ProgressPreference = 'SilentlyContinue'
+	try {
+		foreach ($base in $bases) {
+			$url = "$base/models"
+			try {
+				$response = Invoke-WebRequest -Uri $url -Method GET -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
+				if ([int]$response.StatusCode -ne 200) { continue }
+				if (-not (Test-MBModelsApiResponse -Response $response)) { continue }
+				$body = [string]$response.Content
+				$obj = $body | ConvertFrom-Json -ErrorAction Stop
+				$rows = New-Object System.Collections.ArrayList
+				if ($obj.data) {
+					foreach ($row in @($obj.data)) { [void]$rows.Add($row) }
+				} elseif ($obj.models) {
+					foreach ($row in @($obj.models)) { [void]$rows.Add($row) }
+				} elseif ($obj -is [System.Array]) {
+					foreach ($row in @($obj)) { [void]$rows.Add($row) }
+				} elseif ($obj.id -or $obj.model -or $obj.name) {
+					[void]$rows.Add($obj)
+				}
+				$ids = New-Object System.Collections.ArrayList
+				$entries = New-Object System.Collections.ArrayList
+				$propsAlias = ''
+				if ($props -and $props.Ok) { $propsAlias = [string]$props.ModelAlias }
+				foreach ($row in $rows) {
+					$id = ''
+					if ($row -is [string]) {
+						if (-not (Test-MBLooksLikeModelPath -S $row)) { $id = $row.Trim() }
+					} else {
+						$id = Get-MBPreferredModelAlias -Row $row -PropsAlias $propsAlias
+					}
+					if ([string]::IsNullOrWhiteSpace($id)) { continue }
+					if ($ids -contains $id) { continue }
+					[void]$ids.Add($id)
+					$nCtx = 0; $nCtxTrain = 0; $nParams = 0; $sizeB = 0
+					try { if ($row.meta.n_ctx) { $nCtx = [int]$row.meta.n_ctx } } catch {}
+					try { if ($row.meta.n_ctx_train) { $nCtxTrain = [int]$row.meta.n_ctx_train } } catch {}
+					try { if ($row.meta.n_params) { $nParams = [double]$row.meta.n_params } } catch {}
+					try { if ($row.meta.size) { $sizeB = [double]$row.meta.size } } catch {}
+					# Unsloth Studio / OpenAI-compat fields (top-level, not under meta)
+					try { if ($nCtx -le 0 -and $row.context_length) { $nCtx = [int]$row.context_length } } catch {}
+					try { if ($nCtx -le 0 -and $row.max_context_length) { $nCtx = [int]$row.max_context_length } } catch {}
+					# Do not map native_context_length → NCtxTrain (would show a misleading "train" banner field)
+					# vLLM OpenAI server: max_model_len on model card
+					try { if ($nCtx -le 0 -and $row.max_model_len) { $nCtx = [int]$row.max_model_len } } catch {}
+					try {
+						if ($nCtx -le 0 -and $row.PSObject.Properties['max_model_len']) {
+							$nCtx = [int]$row.PSObject.Properties['max_model_len'].Value
+						}
+					} catch {}
+					$vision = $false
+					if ($props -and $props.Ok) {
+						try { $vision = [bool]$props.Vision } catch {}
+						if ($nCtx -le 0 -and [int]$props.NCtx -gt 0) { $nCtx = [int]$props.NCtx }
+					}
+					try {
+						$caps = @($row.capabilities)
+						if ($caps -contains 'multimodal' -or $caps -contains 'vision') { $vision = $true }
+					} catch {}
+					try {
+						# Some OpenAI-compat servers advertise modalities as array/object
+						$mods = $row.modalities
+						if ($mods) {
+							if ($mods -is [System.Array] -and ($mods -contains 'vision' -or $mods -contains 'image')) { $vision = $true }
+							else {
+								try { if ($mods.vision -or $mods.image) { $vision = $true } } catch {}
+							}
+						}
+					} catch {}
+					[void]$entries.Add([pscustomobject]@{
+						Id        = $id
+						NCtx      = $nCtx
+						NCtxTrain = $nCtxTrain
+						NParams   = $nParams
+						Size      = $sizeB
+						Vision    = $vision
+					})
+				}
+				# Props-only alias if /models empty but props has alias
+				if ($ids.Count -eq 0 -and $props -and $props.Ok -and $props.ModelAlias) {
+					$pa = [string]$props.ModelAlias
+					if (-not (Test-MBLooksLikeModelPath -S $pa)) {
+						[void]$ids.Add($pa)
+						[void]$entries.Add([pscustomobject]@{
+							Id = $pa; NCtx = [int]$props.NCtx; NCtxTrain = 0
+							NParams = 0; Size = 0; Vision = [bool]$props.Vision
+						})
+					}
+				}
+				if ($ids.Count -gt 0) {
+					return @{
+						Ok      = $true
+						Base    = [string]$base
+						Models  = @($ids)
+						Entries = @($entries)
+						Props   = $props
+					}
+				}
+			} catch {
+				continue
+			}
+		}
+	} finally {
+		$Global:ProgressPreference = $OriginalProgressPreference
+	}
+	# props-only fallback
+	if ($props -and $props.Ok -and $props.ModelAlias -and -not (Test-MBLooksLikeModelPath -S ([string]$props.ModelAlias))) {
+		$pa = [string]$props.ModelAlias
+		return @{
+			Ok = $true
+			Base = $(if ($props.Base) { [string]$props.Base } else { $raw })
+			Models = @($pa)
+			Entries = @([pscustomobject]@{
+				Id = $pa; NCtx = [int]$props.NCtx; NCtxTrain = 0
+				NParams = 0; Size = 0; Vision = [bool]$props.Vision
+			})
+			Props = $props
+		}
+	}
+	return @{ Ok = $false; Base = $raw; Models = @(); Entries = @(); Props = $props }
+}
+
+function Get-MBRemoteModelList {
+	# Compat: ids from primary base only
+	param(
+		[string]$BaseUrl = '',
+		[string]$Username = '',
+		[string]$Password = '',
+		[int]$TimeoutSeconds = 8
+	)
+	$r = Get-MBRemoteModelsFromBase -BaseUrl $BaseUrl -Username $Username -Password $Password -TimeoutSeconds $TimeoutSeconds
+	if ($r.Ok) {
+		try { $script:MB.ResolvedApiBase = [string]$r.Base } catch {}
+		return @($r.Models)
+	}
+	return @()
+}
+
+function Add-MBApiBaseEndpoint {
+	# Test connection + /models; on success append to ExtraApiBases and refresh
+	param(
+		[string]$Url,
+		[string]$BearerToken = '',
+		[ValidateSet('npm', 'apikey', 'none', '')]
+		[string]$AuthMode = '',
+		[int]$TimeoutSeconds = 8
+	)
+	$n = Normalize-MBApiBase -Url $Url
+	if ([string]::IsNullOrWhiteSpace($n)) {
+		return @{ Ok = $false; Message = 'Enter a URL or host:port (e.g. http://host:8000/v1 for vLLM, http://host:8888/v1 for Unsloth, or llama.cpp :8081)' }
+	}
+	# Resolve auth mode for this add
+	$mode = ([string]$AuthMode).Trim().ToLowerInvariant()
+	if ($mode -notin @('npm', 'apikey', 'none')) {
+		if (Test-MBApiKeyUsable -Key $BearerToken) { $mode = 'apikey' }
+		else { $mode = 'none' }
+	}
+	# Stash mode before probes so Get-MBAuthHeaderValue can use it
+	Set-MBApiAuthModeForBase -BaseUrl $n -Mode $mode
+	if ($mode -eq 'apikey' -and (Test-MBApiKeyUsable -Key $BearerToken)) {
+		Set-MBApiKeyForBase -BaseUrl $n -ApiKeyValue $BearerToken
+	}
+
+	$testParams = @{
+		BaseUrl        = $n
+		TimeoutSeconds = $TimeoutSeconds
+	}
+	if ($mode -eq 'apikey' -and (Test-MBApiKeyUsable -Key $BearerToken)) {
+		$testParams['BearerToken'] = $BearerToken
+	} elseif ($mode -eq 'npm') {
+		try {
+			if ($script:MB.NpmUser -and $script:MB.NpmPass) {
+				$testParams['Username'] = [string]$script:MB.NpmUser
+				$testParams['Password'] = [string]$script:MB.NpmPass
+			} else {
+				return @{ Ok = $false; Message = 'NPM auth selected but no session NPM credentials (log in first).' }
+			}
+		} catch {
+			return @{ Ok = $false; Message = 'NPM auth selected but no session NPM credentials (log in first).' }
+		}
+	}
+	$conn = Test-ModelConnection @testParams
+	if (-not $conn.Success) {
+		$msg = if ($conn.Message) { [string]$conn.Message } else { 'Connection failed' }
+		return @{ Ok = $false; Message = $msg }
+	}
+	$probeBearer = ''
+	if ($mode -eq 'apikey') { $probeBearer = $BearerToken }
+	$probe = Get-MBRemoteModelsFromBase -BaseUrl $n -BearerToken $probeBearer -TimeoutSeconds $TimeoutSeconds
+	if (-not $probe.Ok -or @($probe.Models).Count -eq 0) {
+		$hint = switch ($mode) {
+			'npm' { "Connected via NPM Basic but no models at $n/models (check proxy path ends at OpenAI /v1)." }
+			'apikey' {
+				if (Test-MBApiKeyUsable -Key $BearerToken) {
+					"Connected to $n but no usable model ids (check GET /v1/models — load a model on Unsloth/vLLM)."
+				} else {
+					"Connected but no models — for API key mode enter a Bearer key (Unsloth sk-unsloth-…, vLLM --api-key), or use open server with auth=Basic (None)."
+				}
+			}
+			default { "Connected but no models at $n/models. Try …/v1, or pick NPM / API key auth if the host is protected." }
+		}
+		return @{ Ok = $false; Message = $hint }
+	}
+	$resolved = if ($probe.Base) { [string]$probe.Base } else { $n }
+	$cur = New-Object System.Collections.ArrayList
+	try {
+		foreach ($x in @($script:MB.ExtraApiBases)) {
+			$xn = Normalize-MBApiBase -Url ([string]$x)
+			if ($xn -and -not ($cur | Where-Object { [string]::Equals($_, $xn, [StringComparison]::OrdinalIgnoreCase) })) {
+				[void]$cur.Add($xn)
+			}
+		}
+	} catch {}
+	$primary = Normalize-MBApiBase -Url ([string]$BaseUrl)
+	if ([string]::Equals($resolved, $primary, [StringComparison]::OrdinalIgnoreCase)) {
+		Set-MBApiAuthModeForBase -BaseUrl $resolved -Mode $mode
+		if ($mode -eq 'apikey' -and (Test-MBApiKeyUsable -Key $BearerToken)) {
+			Set-MBApiKeyForBase -BaseUrl $resolved -ApiKeyValue $BearerToken
+		}
+		return @{ Ok = $false; Message = 'That is already the primary -BaseUrl endpoint (auth mode saved for primary).' }
+	}
+	if (-not ($cur | Where-Object { [string]::Equals($_, $resolved, [StringComparison]::OrdinalIgnoreCase) })) {
+		[void]$cur.Add($resolved)
+	}
+	$script:MB.ExtraApiBases = @($cur)
+	Set-MBApiAuthModeForBase -BaseUrl $resolved -Mode $mode
+	if ($mode -eq 'apikey' -and (Test-MBApiKeyUsable -Key $BearerToken)) {
+		Set-MBApiKeyForBase -BaseUrl $resolved -ApiKeyValue $BearerToken
+	}
+	$null = Refresh-MBRemoteModels -Force
+	$modeLabel = Format-MBAuthDisplayLabel -Mode $mode -BaseUrl $resolved
+	# No host/IP in status — Host line on the banner already shows the endpoint
+	return @{
+		Ok      = $true
+		Base    = $resolved
+		Models  = @($probe.Models)
+		AuthMode = $mode
+		Message = ("Added {0} model(s) (auth: {1})" -f @($probe.Models).Count, $modeLabel)
+	}
+}
+
+function Refresh-MBRemoteModels {
+	param([switch]$Force)
+	try {
+		$now = [Environment]::TickCount
+		if (-not $Force) {
+			$last = 0
+			try { $last = [int]$script:MB.RemoteModelsTick } catch { $last = 0 }
+			if ($last -ne 0 -and ([math]::Abs($now - $last) -lt 15000)) {
+				return @($script:MB.RemoteModels)
+			}
+		}
+		$apiBases = @(Get-MBConfiguredApiBases)
+		$entries = New-Object System.Collections.ArrayList
+		$idsOnly = New-Object System.Collections.ArrayList
+		$multiEndpoint = ($apiBases.Count -gt 1)
+		$bestProps = $null
+		$bestNCtx = 0
+		foreach ($b in $apiBases) {
+			$r = Get-MBRemoteModelsFromBase -BaseUrl $b
+			if (-not $r.Ok) { continue }
+			$resolved = [string]$r.Base
+			$hostLab = Get-MBShortHostLabel -Base $resolved
+			if ($r.Props -and $r.Props.Ok) {
+				if (-not $bestProps) { $bestProps = $r.Props }
+				if ([int]$r.Props.NCtx -gt $bestNCtx) { $bestNCtx = [int]$r.Props.NCtx; $bestProps = $r.Props }
+			}
+			$rich = @()
+			try { $rich = @($r.Entries) } catch { $rich = @() }
+			if ($rich.Count -eq 0) {
+				foreach ($mid in @($r.Models)) {
+					$rich += [pscustomobject]@{ Id = [string]$mid; NCtx = 0; NCtxTrain = 0; NParams = 0; Size = 0; Vision = $false }
+				}
+			}
+			foreach ($re in $rich) {
+				$id = [string]$re.Id
+				if ([string]::IsNullOrWhiteSpace($id)) { continue }
+				if (Test-MBLooksLikeModelPath -S $id) { continue }
+				$key = "{0}|{1}" -f $id, $resolved
+				$label = if ($multiEndpoint) { "{0}  @  {1}" -f $id, $hostLab } else { $id }
+				$nCtx = 0; $nCtxTrain = 0; $nParams = 0; $sizeB = 0; $vision = $false
+				try { $nCtx = [int]$re.NCtx } catch {}
+				try { $nCtxTrain = [int]$re.NCtxTrain } catch {}
+				try { $nParams = [double]$re.NParams } catch {}
+				try { $sizeB = [double]$re.Size } catch {}
+				try { $vision = [bool]$re.Vision } catch {}
+				if ($nCtx -le 0 -and $r.Props -and $r.Props.Ok -and [int]$r.Props.NCtx -gt 0) {
+					$nCtx = [int]$r.Props.NCtx
+				}
+				if ($nCtx -gt $bestNCtx) { $bestNCtx = $nCtx }
+				[void]$entries.Add([pscustomobject]@{
+					Key       = $key
+					Id        = $id
+					Base      = $resolved
+					Host      = $hostLab
+					Label     = $label
+					NCtx      = $nCtx
+					NCtxTrain = $nCtxTrain
+					NParams   = $nParams
+					Size      = $sizeB
+					Vision    = $vision
+				})
+				if ($idsOnly -notcontains $id) { [void]$idsOnly.Add($id) }
+			}
+		}
+		$script:MB.RemoteModelEntries = @($entries)
+		$script:MB.RemoteModels = @($idsOnly)
+		$script:MB.RemoteModelsTick = $now
+
+		# Apply n_ctx from server (props or model meta); config only if user set -ContextWindowTokens / filled default
+		if ($bestNCtx -gt 0) {
+			[void](Apply-MBServerContextWindow -NCtx $bestNCtx -Source 'server')
+		} else {
+			try {
+				$ctxBound = $false
+				try { $ctxBound = [bool]$script:MB.ContextWindowUserBound } catch {}
+				if ($ctxBound -and [int]$ContextWindowTokens -gt 0) {
+					[void](Apply-MBServerContextWindow -NCtx ([int]$ContextWindowTokens) -Source 'config')
+				}
+			} catch {}
+		}
+		if ($bestProps -and $bestProps.Ok) {
+			$script:MB.ServerInfo = $bestProps
+		}
+
+		$active = ''
+		$activeKey = ''
+		try { $active = [string]$script:MB.ActiveModel } catch { $active = '' }
+		try { $activeKey = [string]$script:MB.ActiveModelKey } catch { $activeKey = '' }
+		# Drop stale path-like active model names
+		if ($active -and (Test-MBLooksLikeModelPath -S $active)) { $active = ''; $activeKey = '' }
+		$match = $null
+		if ($activeKey) {
+			$match = @($entries | Where-Object { $_.Key -eq $activeKey } | Select-Object -First 1)
+		}
+		if (-not $match -and $active) {
+			$match = @($entries | Where-Object { $_.Id -eq $active } | Select-Object -First 1)
+		}
+		if (-not $match) {
+			$launch = ''
+			try { $launch = [string]$Model } catch { $launch = '' }
+			if ($launch -and -not (Test-MBLooksLikeModelPath -S $launch)) {
+				$match = @($entries | Where-Object { $_.Id -eq $launch } | Select-Object -First 1)
+			}
+		}
+		if ($entries.Count -eq 1) {
+			Set-MBActiveModel -Id $entries[0].Id -Base $entries[0].Base -Key $entries[0].Key -Quiet
+			if ($entries[0].NCtx -gt 0) {
+				[void](Apply-MBServerContextWindow -NCtx ([int]$entries[0].NCtx) -Source 'server')
+			}
+			# ServerInfo for the selected endpoint
+			try {
+				$p = Get-MBServerPropsFromBase -BaseUrl ([string]$entries[0].Base)
+				if ($p -and $p.Ok) { $script:MB.ServerInfo = $p }
+			} catch {}
+		} elseif ($match) {
+			Set-MBActiveModel -Id $match.Id -Base $match.Base -Key $match.Key -Quiet
+			if ($match.NCtx -gt 0) {
+				[void](Apply-MBServerContextWindow -NCtx ([int]$match.NCtx) -Source 'server')
+			}
+			try {
+				$p = Get-MBServerPropsFromBase -BaseUrl ([string]$match.Base)
+				if ($p -and $p.Ok) { $script:MB.ServerInfo = $p }
+			} catch {}
+		} elseif ($entries.Count -gt 1) {
+			$script:MB.ActiveModel = ''
+			$script:MB.ActiveModelKey = ''
+			if ($script:MB.Wpf) {
+				try {
+					$script:MB.Wpf.ActiveModel = ''
+					$script:MB.Wpf.ActiveModelKey = ''
+					$script:MB.Wpf.ModelDirty = $false
+				} catch {}
+			}
+		} elseif ($entries.Count -eq 0) {
+			# leave launch -Model as fallback only if not a path
+		}
+
+		if ($script:MB.Wpf) {
+			try {
+				$script:MB.Wpf.RemoteModels = @($idsOnly)
+				$script:MB.Wpf.RemoteModelEntries = @($entries)
+				$script:MB.Wpf.RemoteModelsSeq = (Get-Date).Ticks
+				$script:MB.Wpf.ExtraApiBases = @($script:MB.ExtraApiBases)
+				try {
+					if ($script:MB.ExtraApiKeys -is [hashtable]) {
+						$script:MB.Wpf.ExtraApiKeys = $script:MB.ExtraApiKeys
+					}
+				} catch {}
+				try {
+					if ($script:MB.ExtraApiAuth -is [hashtable]) {
+						$script:MB.Wpf.ExtraApiAuth = $script:MB.ExtraApiAuth
+					}
+				} catch {}
+				$script:MB.Wpf.ContextWindow = [int]$script:MB.ContextWindow
+				$script:MB.Wpf.ContextSource = [string]$script:MB.ContextSource
+			} catch {}
+		}
+		return @($idsOnly)
+	} catch {
+		return @()
+	}
+}
+
+function Get-MBDisplayModel {
+	$active = Get-MBActiveModel
+	if (-not [string]::IsNullOrWhiteSpace($active)) { return $active }
+	# Optional -ModelAlias / -Model only when the user filled them in
+	try {
+		if (-not [string]::IsNullOrWhiteSpace([string]$ModelAlias)) { return [string]$ModelAlias }
+	} catch {}
+	try {
+		if (-not [string]::IsNullOrWhiteSpace([string]$Model)) { return [string]$Model }
+	} catch {}
+	return ''
 }
 
 function Get-MBShortModel {
 	param([int]$MaxLen = 36)
 	$m = Get-MBDisplayModel
+	if ([string]::IsNullOrWhiteSpace($m)) { return 'Select Model' }
 	if ($m.Length -le $MaxLen) { return $m }
 	$m2 = $m -replace '\.gguf$',''
 	if ($m2.Length -le $MaxLen) { return $m2 }
-	return $m2.Substring(0, $MaxLen - 3) + '...'
+	$take = [math]::Max(1, $MaxLen - 3)
+	return $m2.Substring(0, $take) + '...'
 }
 
 function Get-MBContextBar {
@@ -2002,6 +3321,48 @@ function Write-MBKV {
 		return
 	}
 	Write-Host ('  {0}: {1}' -f $Key, $Value) -ForegroundColor $ValueColor
+}
+
+function Get-MBBannerSep {
+	$dot = [string](Get-MBGlyph 'dot')
+	return ("  {0}  " -f $dot)
+}
+
+function Write-MBKVJoined {
+	param(
+		[string]$Key,
+		[string[]]$Parts,
+		[ConsoleColor]$ValueColor = [ConsoleColor]::Gray,
+		[ConsoleColor]$SepColor = [ConsoleColor]::DarkGray,
+		[int]$KeyWidth = 14,
+		[double]$FontSize = 13.5
+	)
+	$bits = @()
+	foreach ($p in @($Parts)) {
+		if (-not [string]::IsNullOrWhiteSpace([string]$p)) { $bits += [string]$p }
+	}
+	if ($bits.Count -eq 0) { return }
+	$sep = Get-MBBannerSep
+	$kw = [math]::Max(8, [int]$KeyWidth)
+	$k = ([string]$Key).PadRight($kw)
+	if (Test-MBWpfActive) {
+		Write-MBWpfRaw -Text ('  {0}' -f $k) -Color DarkGray -NoNewline -FontSize $FontSize
+		for ($i = 0; $i -lt $bits.Count; $i++) {
+			if ($i -gt 0) {
+				Write-MBWpfRaw -Text $sep -Color $SepColor -NoNewline -FontSize $FontSize
+			}
+			$last = ($i -eq ($bits.Count - 1))
+			Write-MBWpfRaw -Text $bits[$i] -Color $ValueColor -NoNewline:(-not $last) -FontSize $FontSize
+		}
+		return
+	}
+	Write-Host ('  {0}: ' -f $Key) -NoNewline -ForegroundColor DarkGray
+	for ($i = 0; $i -lt $bits.Count; $i++) {
+		if ($i -gt 0) { Write-Host $sep -NoNewline -ForegroundColor $SepColor }
+		$last = ($i -eq ($bits.Count - 1))
+		if ($last) { Write-Host $bits[$i] -ForegroundColor $ValueColor }
+		else { Write-Host $bits[$i] -NoNewline -ForegroundColor $ValueColor }
+	}
 }
 
 function Show-MBWorkingHint {
@@ -2132,9 +3493,10 @@ function Clear-MBWorkingState {
 }
 
 function Show-MBBanner {
-	$dot = [string](Get-MBGlyph 'dot')
 	$effBudget = Get-MBEffectivePromptBudget
 	$ac = if ($script:MB.AutoCompact) { 'ON' } else { 'OFF' }
+	# Match lower-bar auto-compact switch: ON green, OFF orange
+	$acColor = if ($script:MB.AutoCompact) { [ConsoleColor]::Green } else { [ConsoleColor]::DarkYellow }
 	$autoVal = if ($script:MB.AutoApprove) {
 		'ON  (modifying actions auto-run)'
 	} else {
@@ -2144,15 +3506,158 @@ function Show-MBBanner {
 	$autoColor = if ($script:MB.AutoApprove) { [ConsoleColor]::DarkYellow } else { [ConsoleColor]::Green }
 
 	Write-Host ''
-	Write-MBKV 'Model' (Get-MBShortModel -MaxLen 64) -ValueColor Magenta
-	Write-MBKV 'Host'  ([string]$BaseUrl) -ValueColor Gray
+	# Host / Model / Abilities from Write-MBBannerModelLine (after autodect)
+	$script:MB.BannerShown = $true
+	try { Write-MBBannerModelLine -Force } catch {
+		# Fallback host only if model not ready yet
+		try { Write-MBKV 'Host' ([string]$BaseUrl) -ValueColor Gray } catch {}
+	}
+	# Context: n_ctx cyan; separators + usable/soft/auto-compact grey; ON/OFF matches prompt switch
+	# (No "train" segment — Unsloth/vLLM native_context_length is not shown as train.)
+	$ctxSrc = 'config'
+	try { $ctxSrc = [string]$script:MB.ContextSource } catch {}
+	$nCtx = [int]$script:MB.ContextWindow
+	$ctxHead = ("n_ctx {0:N0} ({1})" -f $nCtx, $ctxSrc)
+	$sep = Get-MBBannerSep
+	# Build as parts so every middot is its own gray write (not baked into cyan)
+	$ctxParts = New-Object System.Collections.ArrayList
+	[void]$ctxParts.Add(@{ T = $ctxHead; C = [ConsoleColor]::Cyan })
+	[void]$ctxParts.Add(@{ T = ("usable ~{0:N0}" -f $effBudget); C = [ConsoleColor]::DarkGray })
+	[void]$ctxParts.Add(@{ T = ("soft {0:P0}/{1:P0}" -f $script:MB.ContextSoftPct, $script:MB.ContextHardPct); C = [ConsoleColor]::DarkGray })
+	[void]$ctxParts.Add(@{ T = 'auto-compact:'; C = [ConsoleColor]::DarkGray })
+	$kw = 14
+	$kPad = 'Context'.PadRight($kw)
+	if (Test-MBWpfActive) {
+		Write-MBWpfRaw -Text ('  {0}' -f $kPad) -Color DarkGray -NoNewline -FontSize 13.5
+		for ($i = 0; $i -lt $ctxParts.Count; $i++) {
+			if ($i -gt 0) {
+				Write-MBWpfRaw -Text $sep -Color DarkGray -NoNewline -FontSize 13.5
+			}
+			Write-MBWpfRaw -Text ([string]$ctxParts[$i].T) -Color $ctxParts[$i].C -NoNewline -FontSize 13.5
+		}
+		# space before ON/OFF (no middot - status belongs to auto-compact label)
+		Write-MBWpfRaw -Text ' ' -Color DarkGray -NoNewline -FontSize 13.5
+		Write-MBWpfRaw -Text $ac -Color $acColor -FontSize 13.5
+	} else {
+		Write-Host ('  {0}: ' -f 'Context') -NoNewline -ForegroundColor DarkGray
+		for ($i = 0; $i -lt $ctxParts.Count; $i++) {
+			if ($i -gt 0) { Write-Host $sep -NoNewline -ForegroundColor DarkGray }
+			Write-Host ([string]$ctxParts[$i].T) -NoNewline -ForegroundColor $ctxParts[$i].C
+		}
+		Write-Host ' ' -NoNewline -ForegroundColor DarkGray
+		Write-Host $ac -ForegroundColor $acColor
+	}
 	Write-MBKV 'WorkingDir'  ([string]$script:MB.WorkingDir) -ValueColor Cyan
-	Write-MBKV 'Budget' ("n_ctx ~{0:N0}  {1}  usable ~{2:N0} tok  {1}  soft {3:P0}/{4:P0}  {1}  autocompact {5}" -f `
-		$script:MB.ContextWindow, $dot, $effBudget, $script:MB.ContextSoftPct, $script:MB.ContextHardPct, $ac) -ValueColor Gray
 	Write-MBKV 'auto-approve' $autoVal -ValueColor $autoColor
 	Write-Host ''
-	Write-Host ("  Type a task below  {0}  /help for commands  {0}  exit to quit" -f $dot) -ForegroundColor DarkGray
-	Write-Host ''
+	# "Type a task" is printed after Connected / native helpers (see Write-MBConnectionTail)
+}
+
+function Write-MBConnectionTail {
+	# Connected line + optional native helpers + "Type a task" footer
+	param(
+		[string]$AuthType = '',
+		[int]$ElapsedMs = -1,
+		[string]$BaseUrl = '',
+		[switch]$IncludeNativeHelpers,
+		[switch]$IncludeTypeHint
+	)
+	$base = ([string]$BaseUrl).Trim()
+	if ([string]::IsNullOrWhiteSpace($base)) {
+		try { $base = Get-MBApiBaseUrl } catch { $base = '' }
+	}
+	$authLabel = ([string]$AuthType).Trim()
+	$ms = [int]$ElapsedMs
+	if ([string]::IsNullOrWhiteSpace($authLabel) -or $ms -lt 0) {
+		try {
+			$sw = [System.Diagnostics.Stopwatch]::StartNew()
+			$probe = $null
+			if (-not [string]::IsNullOrWhiteSpace($base)) {
+				$probe = Test-ModelConnection -BaseUrl $base -TimeoutSeconds 6
+			}
+			if ($probe -and $null -ne $probe.ElapsedMs) {
+				$ms = [int]$probe.ElapsedMs
+			} else {
+				try { $sw.Stop() } catch {}
+				$ms = [int]$sw.ElapsedMilliseconds
+			}
+			if ([string]::IsNullOrWhiteSpace($authLabel)) {
+				if ($probe -and $probe.AuthType) {
+					$authLabel = [string]$probe.AuthType
+				} else {
+					$authLabel = Format-MBAuthDisplayLabel -BaseUrl $base -Short
+				}
+			}
+		} catch {
+			if ($ms -lt 0) { $ms = 0 }
+			if ([string]::IsNullOrWhiteSpace($authLabel)) {
+				try { $authLabel = Format-MBAuthDisplayLabel -BaseUrl $base -Short } catch { $authLabel = 'Basic' }
+			}
+		}
+	}
+	if ([string]::IsNullOrWhiteSpace($authLabel)) { $authLabel = 'Basic' }
+	if ($ms -lt 0) { $ms = 0 }
+	# No host/IP here — Host line already shows the endpoint
+	Write-MBOk ("Connected ({0}, {1} ms)" -f $authLabel, $ms)
+
+	if ($IncludeNativeHelpers) {
+		$nativeBits = New-Object System.Collections.ArrayList
+		if ($script:HasNative) {
+			[void]$nativeBits.Add('ProcHelper')
+			[void]$nativeBits.Add('HTML extract')
+		}
+		if ($script:HasCredMan) { [void]$nativeBits.Add('CredMan') }
+		if ($script:HasDiskWalk) { [void]$nativeBits.Add('DiskWalk') }
+		if ($script:HasDpiScreen) { [void]$nativeBits.Add('VisionHelper') }
+		if ($nativeBits.Count -gt 0) {
+			Write-MBInfo ("Native helpers loaded ({0})" -f ($nativeBits -join ', '))
+		}
+		if ($script:MB.SpeechEnabled -and (Test-MBSpeechUiOk)) {
+			$dict = if ($script:MB.SpeechEngine) { 'PTT+TTS' } elseif ($script:MB.SpeechReady) { 'TTS only' } else { 'init failed' }
+			Write-MBInfo ("Speech: ON ({0}) - hold Right-Ctrl to talk" -f $dict)
+			if ($script:MB.SpeechInitError) { Write-MBWarn $script:MB.SpeechInitError }
+		}
+	}
+	if ($IncludeTypeHint) {
+		try {
+			$sep = Get-MBBannerSep
+			Write-Host ''
+			Write-Host ("  Type a task below{0}/help for commands{0}exit to quit" -f $sep) -ForegroundColor DarkGray
+			Write-Host ''
+		} catch {}
+	}
+}
+
+function Show-MBActiveEndpointBanner {
+	# Full connection banner for the model currently in PoweredBy.
+	# First load: no divider. Later: full-width "model switched" rule
+	# (endpoint "Added" status is a separate console line when applicable).
+	param(
+		[switch]$WithDivider,
+		[string]$DividerLabel = '',
+		[string]$AuthType = '',
+		[int]$ElapsedMs = -1,
+		[switch]$IncludeNativeHelpers,
+		[switch]$IncludeTypeHint
+	)
+	if ($WithDivider) {
+		# Always "model switched" — add-endpoint already prints its own Added status
+		$lab = 'model switched'
+		try {
+			Write-Host ''
+			Write-MBRule -Label $lab
+		} catch {
+			try {
+				Write-Host ''
+				Write-Host ("---- {0} ----" -f $lab) -ForegroundColor DarkGray
+			} catch {}
+		}
+	}
+	try { Show-MBBanner } catch {}
+	try {
+		Write-MBConnectionTail -AuthType $AuthType -ElapsedMs $ElapsedMs `
+			-IncludeNativeHelpers:$IncludeNativeHelpers -IncludeTypeHint:$IncludeTypeHint
+	} catch {}
 }
 
 function Show-MBHelp {
@@ -2268,7 +3773,8 @@ function Show-MBStatus {
 	Write-Host "  History: $($script:Messages.Count) messages" -ForegroundColor Gray
 	Write-Host "  API fails: $($script:MB.ApiFailures) | loop guards: $($script:MB.LoopGuardsFired)" -ForegroundColor Gray
 	Write-Host "  Completions: $(Get-MBApiBaseUrl)/chat/completions" -ForegroundColor DarkGray
-	Write-Host "  Temp/Max: $Temperature / $MaxTokens tok (completion) | continues x$MaxReplyContinues | $MaxTurns tool-loop max" -ForegroundColor Gray
+	$effMax = Get-MBEffectiveMaxTokens
+	Write-Host "  Temp/Max: $Temperature / $effMax tok (completion) | continues x$MaxReplyContinues | $MaxTurns tool-loop max" -ForegroundColor Gray
 	Write-Host ""
 	Write-Host "  Context: " -NoNewline -ForegroundColor Gray
 	$pctColor = Get-MBCtxColor -Level $est.Level
@@ -2277,8 +3783,8 @@ function Show-MBStatus {
 	$srcShort = switch ([string]$est.TokenSource) { 'server' { 'server' } 'usage' { 'usage' } default { 'est' } }
 	Write-Host ("    ~{0:N0} / {1:N0} prompt tok ({2}) | {3:N0} chars | tools ~{4:N0} tok" -f `
 		$est.PromptTokens, $est.UsableTokens, $srcShort, $est.TotalChars, $est.ToolsTokens) -ForegroundColor DarkGray
-	Write-Host ("    window {0:N0} | reserve completion {1:N0} | autocompact {2} | model-digest {3} | compactions {4}" -f `
-		$script:MB.ContextWindow, $MaxTokens, $(if ($script:MB.AutoCompact) { 'ON' } else { 'OFF' }), $(if ($script:MB.ModelCompact) { 'ON' } else { 'OFF' }), $script:MB.CompactionCount) -ForegroundColor DarkGray
+	Write-Host ("    window {0:N0} | reserve completion {1:N0} | auto-compact {2} | model-digest {3} | compactions {4}" -f `
+		$script:MB.ContextWindow, $effMax, $(if ($script:MB.AutoCompact) { 'ON' } else { 'OFF' }), $(if ($script:MB.ModelCompact) { 'ON' } else { 'OFF' }), $script:MB.CompactionCount) -ForegroundColor DarkGray
 	if ($script:MB.LastCompactReason) {
 		Write-Host "    last compact: $($script:MB.LastCompactReason)" -ForegroundColor DarkGray
 	}
@@ -2321,23 +3827,320 @@ function Get-MBTaskApiOrigins {
 	return $out
 }
 
-function Test-MBShouldSendAuthHeader {
-	param([string]$Username, [string]$Password)
-	if ($Username -and $Password) { return $true }
-	if ($script:MB.NpmUser -and $script:MB.NpmPass) { return $true }
-	$k = [string]$ApiKey
+function Test-MBApiKeyUsable {
+	param([string]$Key)
+	$k = [string]$Key
 	if ([string]::IsNullOrWhiteSpace($k)) { return $false }
-	if ($k -eq 'none' -or $k -eq 'null' -or $k -eq '-') { return $false }
+	if ($k -eq 'none' -or $k -eq 'null' -or $k -eq '-' -or $k -eq 'sk-none') { return $false }
 	return $true
 }
 
-function Get-MBAuthHeaderValue {
-	if ($script:MB.NpmUser -and $script:MB.NpmPass) {
+function Test-MBApiBasesMatch {
+	param([string]$A = '', [string]$B = '')
+	$na = ''
+	$nb = ''
+	try { $na = Normalize-MBApiBase -Url $A } catch { $na = ([string]$A).Trim() }
+	try { $nb = Normalize-MBApiBase -Url $B } catch { $nb = ([string]$B).Trim() }
+	if ([string]::IsNullOrWhiteSpace($na) -or [string]::IsNullOrWhiteSpace($nb)) { return $false }
+	if ([string]::Equals($na, $nb, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+	$ra = $na -replace '/v1$', ''
+	$rb = $nb -replace '/v1$', ''
+	if ($ra -and $rb -and [string]::Equals($ra, $rb, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+	return $false
+}
+
+function Test-MBIsPrimaryApiBase {
+	# Primary launch -BaseUrl (llama.cpp / NPM) vs extra OpenAI-compat endpoints (vLLM, Unsloth, …)
+	param([string]$Candidate = '')
+	$n = ''
+	try { $n = Normalize-MBApiBase -Url $Candidate } catch { $n = ([string]$Candidate).Trim() }
+	if ([string]::IsNullOrWhiteSpace($n)) { return $true }
+	$primary = ''
+	try {
+		# Script-level -BaseUrl param (not this function's local name)
+		$primaryRaw = Get-Variable -Name BaseUrl -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+		if ($null -eq $primaryRaw -or [string]::IsNullOrWhiteSpace([string]$primaryRaw)) {
+			$primaryRaw = Get-Variable -Name BaseUrl -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+		}
+		if ($null -ne $primaryRaw) { $primary = Normalize-MBApiBase -Url ([string]$primaryRaw) }
+	} catch { $primary = '' }
+	if ([string]::IsNullOrWhiteSpace($primary)) {
+		try { $primary = Normalize-MBApiBase -Url ([string]$script:MB.PrimaryApiBase) } catch { $primary = '' }
+	}
+	if ([string]::IsNullOrWhiteSpace($primary)) { return $false }
+	return (Test-MBApiBasesMatch -A $n -B $primary)
+}
+
+function Get-MBApiKeyForBase {
+	# Per-endpoint ExtraApiKeys first. Global -ApiKey only for the primary base
+	# (never bleed OpenAI/session keys onto vLLM/Unsloth extras).
+	param(
+		[string]$BaseUrl = '',
+		[switch]$ExtraOnly
+	)
+	try {
+		$n = ''
+		if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
+			try { $n = Normalize-MBApiBase -Url $BaseUrl } catch { $n = [string]$BaseUrl }
+		}
+		if (-not $n) {
+			try { $n = Normalize-MBApiBase -Url ([string]$script:MB.ActiveModelBase) } catch {}
+		}
+		if (-not $n) {
+			try { $n = Normalize-MBApiBase -Url ([string]$script:MB.ResolvedApiBase) } catch {}
+		}
+		$map = $null
+		try { $map = $script:MB.ExtraApiKeys } catch { $map = $null }
+		if ($map -and $n) {
+			# exact + without/with /v1
+			foreach ($cand in @($n, ($n -replace '/v1$', ''), ($n + '/v1'))) {
+				if ([string]::IsNullOrWhiteSpace($cand)) { continue }
+				try {
+					if ($map -is [hashtable] -and $map.ContainsKey($cand)) {
+						$k = [string]$map[$cand]
+						if (Test-MBApiKeyUsable -Key $k) { return $k }
+					} elseif ($map.PSObject.Properties[$cand]) {
+						$k = [string]$map.$cand
+						if (Test-MBApiKeyUsable -Key $k) { return $k }
+					}
+				} catch {}
+				# case-insensitive scan
+				try {
+					if ($map -is [hashtable]) {
+						foreach ($kk in @($map.Keys)) {
+							if ([string]::Equals([string]$kk, $cand, [StringComparison]::OrdinalIgnoreCase)) {
+								$k = [string]$map[$kk]
+								if (Test-MBApiKeyUsable -Key $k) { return $k }
+							}
+						}
+					}
+				} catch {}
+			}
+		}
+	} catch {}
+	if ($ExtraOnly) { return '' }
+	# Global -ApiKey only on primary endpoint
+	if (Test-MBIsPrimaryApiBase -Candidate $BaseUrl) {
+		$g = [string]$ApiKey
+		if (Test-MBApiKeyUsable -Key $g) { return $g }
+	}
+	return ''
+}
+
+function Set-MBApiKeyForBase {
+	param([string]$BaseUrl, [string]$ApiKeyValue)
+	if ([string]::IsNullOrWhiteSpace($BaseUrl)) { return }
+	$n = Normalize-MBApiBase -Url $BaseUrl
+	if ([string]::IsNullOrWhiteSpace($n)) { return }
+	if (-not (Test-MBApiKeyUsable -Key $ApiKeyValue)) { return }
+	try {
+		if ($null -eq $script:MB.ExtraApiKeys -or -not ($script:MB.ExtraApiKeys -is [hashtable])) {
+			$script:MB.ExtraApiKeys = @{}
+		}
+		$script:MB.ExtraApiKeys[$n] = [string]$ApiKeyValue
+		# Also index root and /v1 twin for lookup flexibility
+		$root = $n -replace '/v1$', ''
+		if ($root -and $root -ne $n) { $script:MB.ExtraApiKeys[$root] = [string]$ApiKeyValue }
+		if ($n -notmatch '/v1$') { $script:MB.ExtraApiKeys[($n + '/v1')] = [string]$ApiKeyValue }
+	} catch {}
+	try {
+		if ($script:MB.Wpf -is [hashtable]) {
+			$script:MB.Wpf['ExtraApiKeys'] = $script:MB.ExtraApiKeys
+		} elseif ($script:MB.Wpf) {
+			try { $script:MB.Wpf.ExtraApiKeys = $script:MB.ExtraApiKeys } catch {}
+		}
+	} catch {}
+}
+
+function Set-MBApiAuthModeForBase {
+	# 'npm' | 'apikey' | 'none' — HTTP Authorization mode for this base
+	param(
+		[string]$BaseUrl,
+		[ValidateSet('npm', 'apikey', 'none')]
+		[string]$Mode = 'apikey'
+	)
+	if ([string]::IsNullOrWhiteSpace($BaseUrl)) { return }
+	$n = Normalize-MBApiBase -Url $BaseUrl
+	if ([string]::IsNullOrWhiteSpace($n)) { return }
+	$m = ([string]$Mode).Trim().ToLowerInvariant()
+	if ($m -notin @('npm', 'apikey', 'none')) { $m = 'apikey' }
+	try {
+		if ($null -eq $script:MB.ExtraApiAuth -or -not ($script:MB.ExtraApiAuth -is [hashtable])) {
+			$script:MB.ExtraApiAuth = @{}
+		}
+		$script:MB.ExtraApiAuth[$n] = $m
+		$root = $n -replace '/v1$', ''
+		if ($root -and $root -ne $n) { $script:MB.ExtraApiAuth[$root] = $m }
+		if ($n -notmatch '/v1$') { $script:MB.ExtraApiAuth[($n + '/v1')] = $m }
+	} catch {}
+	try {
+		if ($script:MB.Wpf -is [hashtable]) {
+			$script:MB.Wpf['ExtraApiAuth'] = $script:MB.ExtraApiAuth
+		} elseif ($script:MB.Wpf) {
+			try { $script:MB.Wpf.ExtraApiAuth = $script:MB.ExtraApiAuth } catch {}
+		}
+	} catch {}
+}
+
+function Get-MBApiAuthModeForBase {
+	# Returns 'npm' | 'apikey' | 'none'
+	param([string]$BaseUrl = '')
+	$n = ''
+	try {
+		if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
+			$n = Normalize-MBApiBase -Url $BaseUrl
+		}
+		if (-not $n) { try { $n = Normalize-MBApiBase -Url ([string]$script:MB.ActiveModelBase) } catch {} }
+		if (-not $n) { try { $n = Normalize-MBApiBase -Url ([string]$script:MB.ResolvedApiBase) } catch {} }
+	} catch { $n = ([string]$BaseUrl).Trim() }
+
+	$map = $null
+	try { $map = $script:MB.ExtraApiAuth } catch { $map = $null }
+	if ($map -and $n) {
+		foreach ($cand in @($n, ($n -replace '/v1$', ''), ($n + '/v1'))) {
+			if ([string]::IsNullOrWhiteSpace($cand)) { continue }
+			try {
+				$v = $null
+				if ($map -is [hashtable] -and $map.ContainsKey($cand)) { $v = [string]$map[$cand] }
+				elseif ($map.PSObject.Properties[$cand]) { $v = [string]$map.$cand }
+				else {
+					if ($map -is [hashtable]) {
+						foreach ($kk in @($map.Keys)) {
+							if ([string]::Equals([string]$kk, $cand, [StringComparison]::OrdinalIgnoreCase)) {
+								$v = [string]$map[$kk]
+								break
+							}
+						}
+					}
+				}
+				if ($v) {
+					$vl = $v.Trim().ToLowerInvariant()
+					if ($vl -in @('npm', 'apikey', 'none', 'basic', 'bearer', 'key')) {
+						if ($vl -eq 'basic') { return 'npm' }
+						if ($vl -in @('bearer', 'key')) { return 'apikey' }
+						return $vl
+					}
+				}
+			} catch {}
+		}
+	}
+
+	# Defaults when no explicit mode:
+	#  - primary llama.cpp → npm if logged in, else apikey if -ApiKey set, else none
+	#  - extra with stored key → apikey
+	#  - extra open → none
+	$isPrimary = Test-MBIsPrimaryApiBase -Candidate $n
+	if ($isPrimary -or [string]::IsNullOrWhiteSpace($n)) {
+		if ($script:MB.NpmUser -and $script:MB.NpmPass) { return 'npm' }
+		$g = ''
+		try { $g = [string]$ApiKey } catch { $g = '' }
+		if (Test-MBApiKeyUsable -Key $g) { return 'apikey' }
+		return 'none'
+	}
+	$ek = Get-MBApiKeyForBase -BaseUrl $n -ExtraOnly
+	if (Test-MBApiKeyUsable -Key $ek) { return 'apikey' }
+	return 'none'
+}
+
+function Get-MBNpmBasicAuthHeader {
+	if (-not ($script:MB.NpmUser -and $script:MB.NpmPass)) { return $null }
+	try {
 		$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$($script:MB.NpmUser):$($script:MB.NpmPass)")
 		return ("Basic {0}" -f [Convert]::ToBase64String($authBytes))
+	} catch { return $null }
+}
+
+function Format-MBAuthDisplayLabel {
+	# Human labels for Connected / add-endpoint: NPM | API | Basic
+	# -Short: NPM / API / Basic
+	# default (long): NPM / API key / Basic (None)
+	param(
+		[string]$Mode = '',
+		[string]$BaseUrl = '',
+		[string]$AuthHeader = '',
+		[switch]$Short
+	)
+	$m = ([string]$Mode).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($m) -and $BaseUrl) {
+		try { $m = Get-MBApiAuthModeForBase -BaseUrl $BaseUrl } catch { $m = '' }
 	}
-	if (-not (Test-MBShouldSendAuthHeader)) { return $null }
-	return ("Bearer {0}" -f [string]$ApiKey)
+	if ([string]::IsNullOrWhiteSpace($m) -and $AuthHeader) {
+		if ($AuthHeader -match '^(?i)Basic\s+') { $m = 'npm' }  # may refine below
+		elseif ($AuthHeader -match '^(?i)Bearer\s+') { $m = 'apikey' }
+		else { $m = 'none' }
+	}
+	# If Basic header came from NPM creds → NPM; plain open = none
+	if ($m -eq 'npm' -or ($AuthHeader -match '^(?i)Basic\s+' -and $script:MB.NpmUser -and $script:MB.NpmPass -and (Get-MBApiAuthModeForBase -BaseUrl $BaseUrl) -eq 'npm')) {
+		return 'NPM'
+	}
+	if ($m -in @('apikey', 'api', 'bearer', 'key') -or $AuthHeader -match '^(?i)Bearer\s+') {
+		if ($Short) { return 'API' }
+		return 'API key'
+	}
+	# Open / no Authorization — Connected line uses Basic; radio UI says None
+	if ($Short) { return 'Basic' }
+	return 'Basic (None)'
+}
+
+function Test-MBShouldSendAuthHeader {
+	param(
+		[string]$Username,
+		[string]$Password,
+		[string]$BaseUrl = '',
+		[string]$BearerToken = ''
+	)
+	if ($Username -and $Password) { return $true }
+	if (Test-MBApiKeyUsable -Key $BearerToken) { return $true }
+	$authHdr = Get-MBAuthHeaderValue -BaseUrl $BaseUrl -BearerToken $BearerToken
+	return (-not [string]::IsNullOrWhiteSpace($authHdr))
+}
+
+function Get-MBAuthHeaderValue {
+	param(
+		[string]$BaseUrl = '',
+		[string]$BearerToken = ''
+	)
+	# Per-endpoint HTTP auth only (never chat prompt):
+	#  mode 'npm'    → Basic from session NPM credentials
+	#  mode 'apikey' → Bearer from ExtraApiKeys / -ApiKey / BearerToken
+	#  mode 'none'   → no Authorization (open vLLM, etc.)
+	$target = ([string]$BaseUrl).Trim()
+	if ([string]::IsNullOrWhiteSpace($target)) {
+		try { $target = [string]$script:MB.ActiveModelBase } catch { $target = '' }
+	}
+	if ([string]::IsNullOrWhiteSpace($target)) {
+		try { $target = [string]$script:MB.ResolvedApiBase } catch { $target = '' }
+	}
+
+	# Explicit one-shot Bearer (add/test call) always wins when provided
+	if (Test-MBApiKeyUsable -Key $BearerToken) {
+		return ("Bearer {0}" -f [string]$BearerToken)
+	}
+
+	$mode = Get-MBApiAuthModeForBase -BaseUrl $target
+	switch ($mode) {
+		'npm' {
+			$b = Get-MBNpmBasicAuthHeader
+			if ($b) { return $b }
+			return $null
+		}
+		'apikey' {
+			$k = Get-MBApiKeyForBase -BaseUrl $target -ExtraOnly
+			if (-not (Test-MBApiKeyUsable -Key $k)) {
+				# Primary may use session -ApiKey
+				if (Test-MBIsPrimaryApiBase -Candidate $target) {
+					$k = [string]$ApiKey
+				}
+			}
+			if (Test-MBApiKeyUsable -Key $k) {
+				return ("Bearer {0}" -f $k)
+			}
+			return $null
+		}
+		default {
+			return $null
+		}
+	}
 }
 
 function Stop-MBBackendTasks {
@@ -2402,6 +4205,7 @@ function Request-MBAbort {
 	$script:MB.StreamCancel = $true
 	if ($script:HasNative) {
 		try { [MiniBot.Core.Native]::CancelRequested = $true } catch {}
+		try { [MiniBot.Core.Native]::ExternalCancel = $true } catch {}
 	}
 	if ($script:HasDiskWalk) {
 		try { [MiniBot.Core.DiskWalk]::CancelRequested = $true } catch {}
@@ -2423,6 +4227,9 @@ function Request-MBAbort {
 			$script:MB.ActiveHttpClient.CancelPendingRequests()
 		}
 	} catch {}
+
+	# Sandbox / RunCommand child trees often outlive a hung UI close without this
+	try { Stop-MBTrackedChildProcesses } catch {}
 
 	$n = 0
 	try { $n = Stop-MBBackendTasks } catch { $n = 0 }
@@ -2462,6 +4269,7 @@ function Reset-MBInterrupt {
 	$script:MB.StreamCancel = $false
 	if ($script:HasNative) {
 		try { [MiniBot.Core.Native]::CancelRequested = $false } catch {}
+		try { [MiniBot.Core.Native]::ExternalCancel = $false } catch {}
 	}
 	if ($script:HasDiskWalk) {
 		try { [MiniBot.Core.DiskWalk]::CancelRequested = $false } catch {}
@@ -2800,6 +4608,8 @@ function Complete-MBSessionExit {
 	param([string]$Message = 'session ended.')
 	$script:MB.SessionEnding = $true
 	try { Close-MBLoginSession } catch {}
+	# Kill sandbox/RunCommand process trees before tearing down UI (prevents orphan powershell.exe)
+	try { Stop-MBTrackedChildProcesses } catch {}
 	try {
 		if ($script:MB.Wpf) {
 			$script:MB.Wpf.SoftClose = $false
@@ -2976,10 +4786,9 @@ function Start-MBLoginSession {
             <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
-            <Grid x:Name="LoginRobotHost" Width="22" Height="22" Margin="9,0,0,0"
+            <Grid x:Name="LoginRobotHost" Width="26" Height="26" Margin="4,0,0,0"
                   VerticalAlignment="Center" ToolTip="MiniBot">
-              <!-- Login robot -->
-              <Path x:Name="LoginRobotPath" Width="18" Height="18" Stretch="Uniform"
+              <Path x:Name="LoginRobotPath" Width="22" Height="22" Stretch="Uniform"
                     HorizontalAlignment="Center" VerticalAlignment="Center"
                     Data="M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z">
                 <Path.Fill>
@@ -3044,7 +4853,14 @@ function Start-MBLoginSession {
               <TextBlock Text="]" Foreground="#A0A0AA" FontSize="13" FontWeight="SemiBold"
                          VerticalAlignment="Center"/>
             </StackPanel>
-            <Grid VerticalAlignment="Center" Margin="12,0,0,0">
+            <Ellipse Width="3.5" Height="3.5" Fill="#8A8A96"
+                     Margin="9,1,9,0" VerticalAlignment="Center" Opacity="0.9"
+                     SnapsToDevicePixels="False">
+              <Ellipse.Effect>
+                <DropShadowEffect Color="#000000" BlurRadius="1.5" ShadowDepth="0.5" Opacity="0.45" Direction="270"/>
+              </Ellipse.Effect>
+            </Ellipse>
+            <Grid VerticalAlignment="Center">
               <TextBlock x:Name="LoginTitleLabelShadow" Text="Login" Foreground="#000000" FontSize="12"
                          VerticalAlignment="Center" Margin="1.2,1.2,0,0" Opacity="0.9"
                          IsHitTestVisible="False">
@@ -3065,7 +4881,8 @@ function Start-MBLoginSession {
           </Button>
         </Grid>
       </Border>
-      <Border Grid.Row="1" Background="#121216" Padding="22,18,22,14">
+      <Border Grid.Row="1" Background="#121216" Padding="22,18,22,14"
+              CornerRadius="0,0,8,8" SnapsToDevicePixels="True">
         <Grid>
           <!-- Login -->
           <Grid x:Name="LoginLayer">
@@ -4275,7 +6092,7 @@ function Test-IsSafeCommand {
 	if ($trimmed -match '[\r\n]') { return $false }
 	if ($trimmed -match '`') { return $false }
 	if ($trimmed -match '\$\(') { return $false }
-	# Here-strings (@' / @") and hashtables (@{) — single-quoted pattern avoids ` escapes breaking []
+	# Here-strings (@' / @") and hashtables (@{) - single-quoted pattern avoids ` escapes breaking []
 	if ($trimmed -match '@[''"]|@\{') { return $false }
 	if ($trimmed -match ';') { return $false }
 	if ($trimmed -match '&&|\|\|') { return $false }
@@ -4373,13 +6190,196 @@ function Request-Confirmation {
 }
 
 function Resolve-MBPath {
-	param([string]$Path)
+	param(
+		[string]$Path,
+		[switch]$MustExist
+	)
 	if ([string]::IsNullOrWhiteSpace($Path)) { return $script:MB.WorkingDir }
-	$Path = $Path.Trim().Trim('"').Trim("'")
-	if ([System.IO.Path]::IsPathRooted($Path)) {
-		return [System.IO.Path]::GetFullPath($Path)
+
+	# Existing files: search smart candidates (media / ReadImage / ReadFile)
+	if ($MustExist) {
+		$cands = @(Get-MBPathCandidates -Path $Path)
+		foreach ($c in $cands) {
+			try {
+				if (Test-Path -LiteralPath $c) { return $c }
+			} catch {}
+		}
+		if ($cands.Count -gt 0) { return $cands[0] }
+		return $Path.Trim().Trim('"').Trim("'")
 	}
-	return [System.IO.Path]::GetFullPath((Join-Path $script:MB.WorkingDir $Path))
+
+	# Create/write targets: do not relocate to profile just because a name exists there
+	$p = $Path.Trim().Trim('"').Trim("'")
+	$p = $p -replace '/', '\'
+	$p = $p.TrimStart('<').TrimEnd('>')
+	if ($p.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) {
+		try { $p = ([Uri]$p).LocalPath } catch {}
+	}
+	if ($p -match '%[^%]+%') {
+		try { $p = [Environment]::ExpandEnvironmentVariables($p) } catch {}
+	}
+	if ($p.StartsWith('~\') -or $p -eq '~') {
+		$home = $env:USERPROFILE
+		if (-not $home) { try { $home = [Environment]::GetFolderPath('UserProfile') } catch {} }
+		if ($home) {
+			$rest = if ($p.Length -gt 1) { $p.Substring(2) } else { '' }
+			return [System.IO.Path]::GetFullPath((Join-Path $home $rest))
+		}
+	}
+	# Users\Owner\... without drive → C:\Users\Owner\... (not under System32 CWD)
+	if ($p -match '^(?i)Users\\') {
+		return [System.IO.Path]::GetFullPath(('C:\' + $p))
+	}
+	# Already glued: C:\Windows\System32\Users\... → C:\Users\...
+	if ($p -match '(?i)^[A-Za-z]:\\Windows\\System32\\(Users\\.+)$') {
+		return [System.IO.Path]::GetFullPath(('C:\' + $Matches[1]))
+	}
+	if ($p -match '(?i)^Windows\\System32\\(Users\\.+)$') {
+		return [System.IO.Path]::GetFullPath(('C:\' + $Matches[1]))
+	}
+	$rooted = $false
+	try { $rooted = [System.IO.Path]::IsPathRooted($p) } catch { $rooted = $false }
+	if ($rooted) {
+		if ($p.StartsWith('\') -and -not $p.StartsWith('\\')) {
+			return [System.IO.Path]::GetFullPath(('C:' + $p))
+		}
+		return [System.IO.Path]::GetFullPath($p)
+	}
+	$wd = $script:MB.WorkingDir
+	if ([string]::IsNullOrWhiteSpace($wd)) { $wd = (Get-Location).Path }
+	return [System.IO.Path]::GetFullPath((Join-Path $wd $p))
+}
+
+function Get-MBPathCandidates {
+	# Ordered list of absolute paths to try for a user/model-supplied path.
+	# Fixes common case: CWD is C:\Windows\System32 (elevated) + relative "Users\Owner\..."
+	param([string]$Path)
+	$list = New-Object System.Collections.ArrayList
+	$seen = @{}
+	$add = {
+		param([string]$P)
+		if ([string]::IsNullOrWhiteSpace($P)) { return }
+		try {
+			$full = [System.IO.Path]::GetFullPath($P)
+		} catch {
+			$full = $P
+		}
+		$key = $full.ToLowerInvariant()
+		if ($seen.ContainsKey($key)) { return }
+		$seen[$key] = $true
+		[void]$list.Add($full)
+	}
+
+	if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+	$p = $Path.Trim().Trim('"').Trim("'")
+	$p = $p -replace '/', '\'
+	# strip wrapping angle brackets / markdown leftovers
+	$p = $p.TrimStart('<').TrimEnd('>')
+	if ($p.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) {
+		try {
+			$p = ([Uri]$p).LocalPath
+			$p = $p -replace '/', '\'
+		} catch {}
+	}
+
+	# Unglue accidental System32 CWD joins (elevated launch):
+	# C:\Windows\System32\Users\Owner\... → C:\Users\Owner\...
+	# Also handle relative "Windows\System32\Users\..." leftovers.
+	if ($p -match '(?i)(?:^[A-Za-z]:\\)?Windows\\System32\\(Users\\.+)$') {
+		& $add ('C:\' + $Matches[1])
+		$pUnglue = 'C:\' + $Matches[1]
+		# Prefer unglued path for subsequent logic
+		$p = $pUnglue
+	} elseif ($p -match '(?i)\\Windows\\System32\\(Users\\.+)$') {
+		& $add ('C:\' + $Matches[1])
+		$p = 'C:\' + $Matches[1]
+	}
+
+	# ~ / %USERPROFILE%
+	if ($p.StartsWith('~\' ) -or $p -eq '~') {
+		$home = $env:USERPROFILE
+		if (-not $home) { try { $home = [Environment]::GetFolderPath('UserProfile') } catch {} }
+		if ($home) {
+			$rest = if ($p.Length -gt 1) { $p.Substring(2) } else { '' }
+			& $add (Join-Path $home $rest)
+		}
+	}
+	if ($p -match '%([^%]+)%') {
+		try {
+			$expanded = [Environment]::ExpandEnvironmentVariables($p)
+			if ($expanded -ne $p) { & $add $expanded }
+		} catch {}
+	}
+
+	# Already rooted (C:\..., \\server\share, \absolute-on-drive)
+	$rooted = $false
+	try { $rooted = [System.IO.Path]::IsPathRooted($p) } catch { $rooted = $false }
+	if ($rooted) {
+		& $add $p
+		# \Users\... → C:\Users\... (GetFullPath uses current drive; also try C:)
+		if ($p.StartsWith('\') -and -not $p.StartsWith('\\')) {
+			& $add ('C:' + $p)
+			$drive = $null
+			try {
+				if ($script:MB.WorkingDir -match '^([A-Za-z]:)') { $drive = $Matches[1] }
+			} catch {}
+			if ($drive -and $drive -ne 'C:') { & $add ($drive + $p) }
+		}
+		# Rooted but still looks like a bad System32\Users glue (any drive letter)
+		if ($p -match '(?i)^[A-Za-z]:\\Windows\\System32\\Users\\') {
+			$rest = $p -replace '(?i)^[A-Za-z]:\\Windows\\System32\\', ''
+			& $add ('C:\' + $rest)
+		}
+	} else {
+		# Users\Owner\... or Documents\... without drive → treat as under C:\ or profile
+		if ($p -match '^(?i)Users\\') {
+			& $add ('C:\' + $p)
+		}
+		if ($p -match '^(?i)(Documents|Desktop|Downloads|Pictures|Videos|Music)\\') {
+			$prof = $env:USERPROFILE
+			if (-not $prof) { try { $prof = [Environment]::GetFolderPath('UserProfile') } catch {} }
+			if ($prof) { & $add (Join-Path $prof $p) }
+			& $add ('C:\Users\Public\' + $p)
+		}
+
+		# CWD-relative (agent WorkingDir)
+		$wd = $null
+		try { $wd = [string]$script:MB.WorkingDir } catch { $wd = $null }
+		if ([string]::IsNullOrWhiteSpace($wd)) {
+			try { $wd = (Get-Location).Path } catch { $wd = $env:SystemRoot }
+		}
+		if ($wd) { & $add (Join-Path $wd $p) }
+
+		# If CWD looks like System32 / Windows (common elevated launch), also try profile + Desktop
+		$wdLow = if ($wd) { $wd.ToLowerInvariant() } else { '' }
+		if ($wdLow -match '\\windows(\\system32)?$' -or $wdLow -match '\\system32$') {
+			$prof = $env:USERPROFILE
+			if (-not $prof) { try { $prof = [Environment]::GetFolderPath('UserProfile') } catch {} }
+			if ($prof) {
+				& $add (Join-Path $prof $p)
+				foreach ($sub in @('Desktop', 'Documents', 'Downloads', 'Pictures', 'Videos')) {
+					& $add (Join-Path (Join-Path $prof $sub) $p)
+				}
+			}
+			# bare filename under Desktop
+			$leaf = $null
+			try { $leaf = [System.IO.Path]::GetFileName($p) } catch {}
+			if ($leaf -and $prof) {
+				& $add (Join-Path (Join-Path $prof 'Desktop') $leaf)
+				& $add (Join-Path (Join-Path $prof 'Downloads') $leaf)
+				& $add (Join-Path (Join-Path $prof 'Documents') $leaf)
+				& $add (Join-Path (Join-Path $prof 'Pictures') $leaf)
+			}
+		} else {
+			# Also try under profile for relative paths that look home-ish
+			$prof = $env:USERPROFILE
+			if ($prof -and $p -notmatch '^[A-Za-z]:') {
+				& $add (Join-Path $prof $p)
+			}
+		}
+	}
+
+	return @($list)
 }
 
 function Sanitize-MBText {
@@ -4570,7 +6570,7 @@ function Test-MBReplyIncomplete {
 
 	if ($FinishReason -match '^(?i)length|max_tokens|limit|max_completion_tokens$') { return $true }
 
-	$budget = [int]$MaxTokens
+	$budget = [int](Get-MBEffectiveMaxTokens)
 	try {
 		if ($script:MB.LastRequestMaxTokens -gt 0) { $budget = [int]$script:MB.LastRequestMaxTokens }
 	} catch {}
@@ -4581,8 +6581,8 @@ function Test-MBReplyIncomplete {
 	$t = $Text.TrimEnd()
 	if ($t.Length -lt 12) { return $false }
 
-	if ($t -match '[\.\!\?…]$') { return $false }
-	if ($t -match '[\.\!\?…]["''”»)]$') { return $false }
+	if ($t -match '[\.\!\?...]$') { return $false }
+	if ($t -match '[\.\!\?...]["''”»)]$') { return $false }
 	if ($t -match '(?i)```\s*$') { return $false }
 	if ($t -match '[\)\]\}]\s*$') { return $false }          # ends with ) ] }
 	if ($t -match '(?i)\*\*\s*$') { return $false }
@@ -4592,7 +6592,7 @@ function Test-MBReplyIncomplete {
 	if ($t -match '(?i)^(ok|okay|yes|no|sure|yep|nope|got it|understood)\.?$') { return $false }
 
 	if ($t -match '[,;:]\s*$') { return $true }
-	if ($t -match '[-—–]\s*$') { return $true }
+	if ($t -match '[---]\s*$') { return $true }
 	if ($t -match '\b(the|a|an|and|or|to|of|for|with|that|this|lets|let''s|can|will|would|should|may|might|from|into|about)\s*$') {
 		return $true
 	}
@@ -5092,7 +7092,7 @@ function Get-MBMessagesWithPendingVision {
 		$text = "You can see this image ($label). A full-resolution file was also saved to disk. In your reply: (1) describe what you see if relevant; (2) ALWAYS include the exact save path: $saved"
 	} elseif ($kind -eq 'pdf') {
 		$srcBit = if ($src) { " from PDF: $src" } else { '' }
-		$text = "You can see a rendered PDF page$srcBit ($label, $($pv.Width)x$($pv.Height), ${kb} KB). The text layer was missing or garbled — extract fields VISUALLY (names, policy numbers, dates, limits, insurer). Do not invent values not visible. Do not invent other paths."
+		$text = "You can see a rendered PDF page$srcBit ($label, $($pv.Width)x$($pv.Height), ${kb} KB). The text layer was missing or garbled - extract fields VISUALLY (names, policy numbers, dates, limits, insurer). Do not invent values not visible. Do not invent other paths."
 	} elseif ($src) {
 		$text = "You can see this image from disk: $src ($label, $($pv.Width)x$($pv.Height), ${kb} KB). Describe what you see that answers the user. Do not invent other paths."
 	} else {
@@ -5181,123 +7181,73 @@ function New-MBChatRequestBody {
 
 # Capability map kept short for cold-start token cost.
 # Cold-start group map. Model enables groups by these names.
+# Short labels for errors / ListToolGroups only (not expanded into every system prompt OFF line)
 $script:MBGroupQuickMap = [ordered]@{
-	senses     = 'see/hear: ReadImage, ReadPdf, ViewScreen, SpeakText'
-	system     = 'light inventory: OS, processes, memory, services, software, uptime'
-	network    = 'LAN, ProbeShares, local shares/maps list, printers list'
-	diag       = 'BSOD, events, disk, startup/tasks/drivers, StopProcess, quick diagnostics'
-	repair     = 'RunRepairTool sfc|dism|chkdsk'
-	setup      = 'tune/restore/reboot/NewMachineSetup'
-	identity   = 'local users, join/leave domain'
-	shares     = 'map/unmap, create/remove share, add/remove printer'
-	installers = 'silent install catalog'
-	sandbox    = 'multi-step PS lab'
-	files      = 'DownloadFile; zip expand/compress'
-	packages   = 'PS Gallery modules'
-	registry   = 'ReadRegistry / SetRegistry'
-	clipboard  = 'Clipboard read/write'
-	web        = 'HTTP; BrowsePage; GitHub'
+	senses = 'vision/TTS'; system = 'inventory'; network = 'LAN/shares-find'
+	diag = 'BSOD/disk/events'; repair = 'sfc/dism/chkdsk'; setup = 'tune/setup'
+	identity = 'users/domain'; shares = 'map/share/print'; installers = 'apps'
+	sandbox = 'PS lab'; files = 'dl/zip/cab/iso'; packages = 'PSGallery'
+	registry = 'reg'; clipboard = 'clip'; web = 'HTTP/GitHub'
 }
 
-
 $script:MBSystemPromptBase = @"
-You are $AgentName v$Version - local Windows agent (local model). Tool-first co-pilot: ship scripts, edit files, diagnose, verify with tools.
-Rules: evidence-only (never invent results/paths/status); concise (findings + next steps); PS 5.1 only; paths relative to CWD unless absolute; large files use head/tail/offset+length - never dump multi-MB/binary/.dmp.
-DATA is paramount: never delete or destroy anything (files, folders, profiles, users, shares, maps, printers, etc.) unless the operator explicitly asked to delete that specific thing — never as cleanup, tidy-up, or a helpful side effect. RemoveLocalUser removes the account only; profile data stays. RemoveShare unpublishes only; folder stays.
-Mutate only after read when possible; operator may deny - stop that action, never bypass. Identical tool+args in a row is blocked - change args/tool or synthesize.
-Harness: if a tool parse/return looks wrong (error text, empty/garbled/malformed payload) - or the same failure hits 2+ times - tell the operator immediately (what broke + short evidence + a fix idea if obvious). Trust the tool output; do not re-run or thrash in silence.
-TOOL GROUPS: Only tools in active groups appear in your tool list. core is always on. On every new user task, re-check which groups you need (task may differ from what is already enabled) and EnableToolGroup any missing ones before you work — one call can unlock several (group=network,shares or groups=[diag,repair]). Need something else mid-task? EnableToolGroup once (multi ok), then call the real tools in the same turn - no ask, no ListToolGroups, no narration. Prefer specialized tools over RunCommand.
-MAP (group = when to enable):
-senses = see/hear: ReadImage, ReadPdf (page=1 first), ViewScreen, SpeakText TTS
-system = light inventory: GetSystemInfo, processes, memory, services, software, uptime
-network = LAN, ProbeShares, GetLocalShares/GetMappedDrives/GetPrinters (lists), connections
-diag = BSOD, events, disk health/space, startup/tasks/drivers, StopProcess, RunQuickDiagnostics
-repair = sfc/dism/chkdsk only
-setup = volume/brightness/options/restore/uninstall/reboot/NewMachineSetup
-identity = AddLocalUser/RemoveLocalUser, JoinDomain/LeaveDomain
-shares = Map/Unmap, CreateShare/RemoveShare, Add/Remove printer
-installers = ListInstallers / InstallPackage
-sandbox = multi-step PowerShell lab pieces
-files = DownloadFile, zip expand/compress
-packages = PowerShell Gallery modules
-registry = registry read/write
-clipboard = clipboard read/write
-web = HTTP API, BrowsePage, GitHub files
-SHARE PLAYBOOK (mandatory tools — do not invent shell loops):
-- Find/locate a share → EnableToolGroup groups=[network,shares] then ProbeShares (same turn). No RunCommand net view / Get-SmbShare loops.
-- Known IP → ProbeShares computer=IP share_name=NAME [username= password=]. Unknown host → ProbeShares share_name=NAME (auto search).
-- Optional ScanNetwork only if you need MAC/hostname/vendor inventory; for "find the share" ProbeShares alone.
-- Found → MapNetworkDrive (shares group). Create local share → CreateShare (shares). List local → GetLocalShares (network).
-User-facing text = results and next steps only - never announce enabling tools.
+You are $AgentName v$Version - local Windows tool-first agent (PS 5.1). Evidence only; concise; CWD-relative paths unless absolute; never dump multi-MB/binary/.dmp.
+No delete/destroy unless operator asked for that specific target. Mutate after read when possible; deny = stop. Prefer tools over RunCommand.
+Never ReadFile images/video/PDF/binary (crashes servers) — vision: senses ReadImage/ReadPdf; operator display: markdown below.
+INLINE MEDIA (chat UI) — REQUIRED for play/show/hear: always embed on its own line as ![label](absolute-path). Prefer absolute Windows paths. Images png/jpg/gif/webp/bmp/tif; video mp4/m4v/mov/wmv; audio mp3/wav/flac/m4a/aac/ogg/wma. After DownloadFile / ViewScreen save / FindFiles pick / any "play or show" ask: emit ![…](…) so it plays in-chat. NEVER Start-Process/Invoke-Item/explorer/VLC/default-app first. External player ONLY if format not inline-compatible or operator explicitly asked external. Do not reply with a bare path alone when they should see/hear it.
+Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration).
+MAP: senses=vision/TTS | system=inventory | network=LAN+ProbeShares+lists | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=tune/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso | packages=PSGallery | registry | clipboard | web=HTTP/GitHub
+FindFiles: multi-ext one call; truncated=normal (use rows); specific ask→narrow; vague play/show→pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice→tell operator. User text = results only.
 "@
 
 $script:MBGroupPrompt = [ordered]@{
 	core = @"
-CORE (always on): ReadFile/WriteFile/EditFile/ApplyPatch/ListDirectory/SearchFiles/FindFiles/DiffText; RunCommand; CWD+env; EnableToolGroup/ListToolGroups.
-Edit: EditFile unique search (or occurrence/replaceAll); ApplyPatch multi-hunk; WriteFile only new/full rewrite. Preserve encoding/newlines. On miss: re-read, never invent nearby text.
-RunCommand: runs command text in-process via -EncodedCommand (no outer expansion) or cmd /c - full PS 5.1 syntax works (pipeline `$_, escapes, multi-statement, env vars). Prefer specialized tools over shell. Safe read-only auto-runs; nested shells/writers/downloads/sfc|dism|chkdsk/multi-statement/redirect always prompt. shell=powershell (default) or cmd. Pass the command exactly as you would type it in a .ps1 - do not pre-escape for an outer host.
+CORE: text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; HexView/HexEdit; RunCommand; CWD/env; EnableToolGroup. Prefer specialized tools. MEDIA: always ![label](absolute-path) inline in chat for play/show — shell-open/default app last resort only.
 "@
 	senses = @"
-SENSES (see + speak): ReadImage path= (vision next turn). ReadPdf: default page=1 only - multipage render is expensive; only page>1 if needed. Text extract when clean; auto vision if garbled. ViewScreen: look-only by default (no PNG unless user asked to save). SpeakText: short plain sentences (Windows SAPI). Operator hold-to-talk is Right-Ctrl only. Trust vision over garbled PDF text; do not spam captures or multi-page ReadPdf loops.
+SENSES: ReadImage (vision, auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true → show with ![label](path) inline, not external open); SpeakText. No ReadFile on images/PDF.
 "@
 	system = @"
-SYSTEM (light inventory): GetSystemInfo, GetProcessList/Tree, GetMemoryInfo, GetPowerInfo, GetServiceStatus, ControlService (prompt), GetInstalledSoftware, GetWindowsUpdateStatus, GetSystemUptime.
-Prefer these over Get-ComputerInfo or broad shell inventory. For LAN/shares use network group; for BSOD/events/disk/startup/kill use diag; for sfc/dism/chkdsk use repair.
+SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime. Prefer over Get-ComputerInfo.
 "@
 	network = @"
-NETWORK: GetNetworkInfo, GetNetConnections, ScanNetwork, ProbeShares, GetLocalShares (this PC + access), GetMappedDrives, GetPrinters (lists only).
-- Find/locate a share → ProbeShares immediately (EnableToolGroup network if needed). NEVER RunCommand for share discovery.
-- Known host → ProbeShares computer=<ip> share_name=<name> [username= password=]. Unknown → omit hosts (auto search).
-- ScanNetwork = peer inventory (IP/MAC/hostname/vendor); not a substitute for ProbeShares when the ask is find the share.
-- After hits → EnableToolGroup shares → MapNetworkDrive. Mutate shares/printers with shares group (CreateShare/RemoveShare/Map/Unmap/Add/Remove printer).
+NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; ProbeShares (REQUIRED to find shares - never net view loops); GetLocalShares/MappedDrives/Printers. Known host→ProbeShares computer=; search→omit hosts. Then shares group to map/create.
 "@
 	diag = @"
-DIAG (diagnostics): GetBSODInfo, GetEventLogs, GetDiskHealth, GetDiskSpace, GetStartupItems, GetScheduledTasks, GetDriverInfo, StopProcess (ALWAYS approval; never MiniBot/system processes), RunQuickDiagnostics (bundle).
-- BSOD: GetBSODInfo + GetEventLogs first; list dump names/sizes only — never ReadAllBytes on .dmp.
-- Persistence / "what's running weird": startup + scheduled tasks + drivers; StopProcess only if operator asked to kill.
-- Disk full / dying drive: GetDiskSpace + GetDiskHealth. Repair tools (sfc/dism/chkdsk) are in repair group.
+DIAG: BSOD/events/disk/startup/tasks/drivers/StopProcess/RunQuickDiagnostics. Never dump .dmp bytes. Kill only if asked.
 "@
 	repair = @"
-REPAIR: RunRepairTool sfc|dism|chkdsk ALWAYS prompts. Prefer diag first for BSOD/events/disk evidence. Never dump .dmp binaries.
+REPAIR: RunRepairTool sfc|dism|chkdsk (prompt). Prefer diag first.
 "@
 	setup = @"
-SETUP (tune / new-machine): AudioVolume, DisplayBrightness, SetWindowsOption, ListWindowsOptions, SystemRestore, UninstallSoftware, Reboot, NewMachineSetup.
-- Tweaks always prompt on mutate. Reboot action=reboot|shutdown|abort; delay_sec=60 default; ALWAYS approval.
-- NewMachineSetup profile=residential|business: one approval for SETTINGS + full SOFTWARE catalog (7zip, Chrome, Adobe, ADWCleaner, VLC). Portable: re-enable encryption after setup if needed.
-- Users/domain → identity group. Map/share/printer mutate → shares group. Install apps → installers group.
+SETUP: volume/brightness/options/restore/uninstall/reboot/NewMachineSetup (prompt on mutate).
 "@
 	identity = @"
-IDENTITY: AddLocalUser (optional admin=true), RemoveLocalUser username= (account only — profile folder remains), JoinDomain, LeaveDomain.
-- LeaveDomain REQUIRED local_username + local_password (chat, no popup). NEED_INPUT if missing. No local admin → AddLocalUser admin=true first.
-- Show passwords back when the operator provides them. Always prompt on mutate.
+IDENTITY: Add/RemoveLocalUser; Join/LeaveDomain. Leave needs local admin creds in chat (NEED_INPUT if missing).
 "@
 	shares = @"
-SHARES (mutate network shares/maps/printers): MapNetworkDrive, RemoveMappedDrive, CreateShare, RemoveShare, AddNetworkPrinter, RemoveNetworkPrinter.
-- CreateShare REQUIRES path, name, access_username, access_password, everyone_full (ALWAYS ask Everyone vs specific user). Optional access_right Full|Change|Read. RemoveShare unpublishes only (folder stays). Map needs path; username ⇒ password. No cred popups — NEED_INPUT.
-- Lists are network group: GetLocalShares / GetMappedDrives / GetPrinters. Find remote → ProbeShares (network) then Map here.
-- VERIFY after mutate with operator_card. CreateShare copies UNC; show share password back. SMBv1 check if off. Always approval on mutate.
+SHARES mutate: Map/Unmap; CreateShare (path,name,user,pass,everyone_full required); RemoveShare; printers. Lists=network. Find remote=ProbeShares then Map.
 "@
 	installers = @"
-INSTALLERS (silent download+install, temp files cleaned after each package):
-- ListInstallers / InstallPackage: catalog installs anytime (ALWAYS prompt). Silent; redirects OK. adwcleaner downloads and runs a scan/clean. NewMachineSetup (setup group) also installs the full catalog in one approval.
+INSTALLERS: ListInstallers / InstallPackage (prompt; silent).
 "@
 	sandbox = @"
-SANDBOX: incremental PS lab (not a security boundary). SandBoxWrite name+code (depends_on optional) -> SandBox piece/pieces + assert -> compose=true to ship. merge_results builds `$Result.by_piece/`$Result.merged; resolve_deps topo-sorts. Claim success only if ok=true / asserts pass. SandBoxList = progress. Prefer over RunCommand thrash for multi-step script design.
+SANDBOX: SandBoxWrite→SandBox piece/pieces+assert; compose to ship. Claim pass only if ok=true.
 "@
 	files = @"
-FILES: DownloadFile url+path to save to disk (not MakeHttpRequest). ExpandArchive / CompressArchive for zip. Always prompt on mutate.
+FILES: DownloadFile; zip Expand/Compress; MakeCab/ExpandCab; MakeIso/MountIso/UnmountIso (prompt on mutate). After download/save of media, show with ![label](path) inline.
 "@
 	packages = @"
-PACKAGES: FindPSModule / GetInstalledPSModule (read); InstallPSModule / UpdatePSModule (prompt). Prefer over raw Install-Module in shell.
+PACKAGES: Find/Get/Install/Update PS modules (mutate prompts).
 "@
 	registry = @"
-REGISTRY: ReadRegistry path=; SetRegistry path/name/value/type (always prompts).
+REGISTRY: ReadRegistry; SetRegistry (prompt).
 "@
 	clipboard = @"
-CLIPBOARD: Clipboard action=read|write (always prompts).
+CLIPBOARD: read|write (prompt).
 "@
 	web = @"
-WEB: MakeHttpRequest for HTTP API/status/body; BrowsePage for readable page text; GetGitHubRawFile / ListGitHubDirectory for github.com (ConvertGitHubUrl optional). Do not use MakeHttpRequest as a file downloader - enable files + DownloadFile.
+WEB: MakeHttpRequest/BrowsePage/GitHub raw+list. File downloads→files DownloadFile.
 "@
 }
 
@@ -5328,17 +7278,13 @@ function Get-MBSystemPrompt {
 				if ($snip) { [void]$parts.Add($snip) }
 			}
 		} else {
-			$hint = $g
-			if ($script:MBGroupQuickMap -and $script:MBGroupQuickMap.Contains($g)) {
-				$hint = '{0} ({1})' -f $g, $script:MBGroupQuickMap[$g]
-			}
-			[void]$offBits.Add($hint)
+			[void]$offBits.Add($g)
 		}
 	}
 
-	[void]$parts.Add(("ON: {0}." -f (($onList | ForEach-Object { $_ }) -join ', ')))
+	[void]$parts.Add(("ON: {0}." -f (($onList | ForEach-Object { $_ }) -join ',')))
 	if ($offBits.Count -gt 0) {
-		[void]$parts.Add(("OFF - EnableToolGroup group=<name or comma-list / groups=[...]> then use tools (silent): {0}." -f ($offBits -join '; ')))
+		[void]$parts.Add(("OFF (EnableToolGroup group=a,b): {0}." -f ($offBits -join ',')))
 	}
 	return (($parts | Where-Object { $_ -and "$_".Trim() }) -join "`n")
 }
@@ -5346,25 +7292,27 @@ function Get-MBSystemPrompt {
 $SystemPrompt = Get-MBSystemPrompt
 
 $Tools = @(
-	@{ type = "function"; function = @{ name = "ReadFile"; description = "Read text files. Supports head, tail, or offset+length for large files. Blocks binary types."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; head = @{ type = "integer"; description = "First N lines" }; tail = @{ type = "integer"; description = "Last N lines" }; offset = @{ type = "integer"; description = "1-based start line" }; length = @{ type = "integer"; description = "Lines from offset" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "WriteFile"; description = "Create or overwrite a whole file. Prefer EditFile/ApplyPatch for existing files. Preserves encoding/newlines when overwriting. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" } }; required = @("path","content") } } },
-	@{ type = "function"; function = @{ name = "EditFile"; description = "Precise search/replace edit. Default requires a UNIQUE match (include surrounding context). Use replaceAll=true only when intentional; occurrence=N for the Nth match; edits[] for multiple hunks in one approval. CRLF/LF tolerant. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string"; description = "Exact text to find (include context lines to make unique)" }; replace = @{ type = "string"; description = "Replacement text" }; useRegex = @{ type = "boolean"; description = "Treat search as regex (default false)" }; replaceAll = @{ type = "boolean"; description = "Replace every match (default false — unique match required)" }; occurrence = @{ type = "integer"; description = "1-based match index when multiple matches exist" }; edits = @{ type = "array"; description = "Optional multi-hunk list of {search, replace, useRegex?, replaceAll?, occurrence?}"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply a unified diff or *** Update File patch to existing file(s). Best for multi-hunk structured edits. Include enough context lines so each hunk matches once. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string"; description = "Unified diff or *** Update File patch body" }; path = @{ type = "string"; description = "Optional default file path if patch omits headers" } }; required = @("patch") } } },
-	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell (default) or CMD. PowerShell is sent in-memory via -EncodedCommand (full PS 5.1 syntax: pipeline vars, escapes, multi-statement; no outer-host expansion). Pass command exactly as in a .ps1 - do not wrap or pre-escape. Safe read-only auto-runs; mutating/multi-statement/redirects require approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string"; description = "Exact PowerShell or CMD text to run" }; shell = @{ type = "string"; enum = @("powershell","cmd"); description = "powershell (default) or cmd" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default session setting)" } }; required = @("command") } } },
-	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory entries as JSON (up to 500; reports total/truncated)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Search text file contents under a path (skips common binaries; max 50 matches default)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Root path to search" }; pattern = @{ type = "string"; description = "Regex pattern" }; glob = @{ type = "string"; description = "File filter e.g. *.log, *.ps1" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer"; description = "Max matches (default 50, max 200)" } }; required = @("path","pattern") } } },
-	@{ type = "function"; function = @{ name = "DiffText"; description = "Show a simple line diff between two strings or two files."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string"; description = "Left text OR path if leftIsFile=true" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" } }; required = @("left","right") } } },
-	@{ type = "function"; function = @{ name = "GetWorkingDirectory"; description = "Return agent working directory."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "SetWorkingDirectory"; description = "Set agent working directory for relative paths and commands."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "GetEnvironment"; description = "Selected environment variables and PATH summary."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Optional single variable name" } } } } },
-	@{ type = "function"; function = @{ name = "SetEnvironment"; description = "Set an environment variable. Process scope is immediate (no prompt). User/Machine scopes ALWAYS prompt. Use target=Process|User|Machine."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; value = @{ type = "string" }; target = @{ type = "string"; description = "Process (default) | User | Machine" } }; required = @("name","value") } } },
+	@{ type = "function"; function = @{ name = "ReadFile"; description = "Read text files (head/tail/offset+length). NEVER images/video/PDF/binary — use senses or ![path]."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; head = @{ type = "integer" }; tail = @{ type = "integer" }; offset = @{ type = "integer" }; length = @{ type = "integer" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "WriteFile"; description = "Create/overwrite whole file. Prefer EditFile/ApplyPatch for edits. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" } }; required = @("path","content") } } },
+	@{ type = "function"; function = @{ name = "EditFile"; description = "Search/replace (unique match default). replaceAll / occurrence / edits[] supported. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" }; edits = @{ type = "array"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply unified diff / *** Update File patch. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string" }; path = @{ type = "string" } }; required = @("patch") } } },
+	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell (default) or cmd. Pass exact command text. Mutating/multi-statement/redirects need approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string" }; shell = @{ type = "string"; enum = @("powershell","cmd") }; timeout_sec = @{ type = "integer" } }; required = @("command") } } },
+	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents under path."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" } }; required = @("path","pattern") } } },
+	@{ type = "function"; function = @{ name = "DiffText"; description = "Line diff of two strings or files."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" } }; required = @("left","right") } } },
+	@{ type = "function"; function = @{ name = "HexView"; description = "Hex dump binary file (offset/length/width)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; length = @{ type = "integer" }; width = @{ type = "integer" }; show_ascii = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes at offset (hex= or bytes[]). ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; extend = @{ type = "boolean" }; backup = @{ type = "boolean" } }; required = @("path","offset") } } },
+	@{ type = "function"; function = @{ name = "GetWorkingDirectory"; description = "Agent CWD."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "SetWorkingDirectory"; description = "Set agent CWD."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "GetEnvironment"; description = "Env vars / PATH summary."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" } } } } },
+	@{ type = "function"; function = @{ name = "SetEnvironment"; description = "Set env var. User/Machine ALWAYS prompt; Process does not."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; value = @{ type = "string" }; target = @{ type = "string" } }; required = @("name","value") } } },
 	@{ type = "function"; function = @{ name = "GetSystemInfo"; description = "Basic system information as JSON (OS/CPU/RAM/IPs). Prefer over Get-ComputerInfo or broad inventory shells."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetProcessList"; description = "Top processes by CPU as JSON."; parameters = @{ type = "object"; properties = @{ limit = @{ type = "integer" } } } } },
 	@{ type = "function"; function = @{ name = "StopProcess"; description = "Stop one or more processes. ALWAYS approval. Prefer pid= from GetProcessList; or name= ProcessName (without .exe). force=true (default) uses Force. Never kills MiniBot itself or protected system processes (csrss, lsass, services, smss, wininit, winlogon, System, svchost, dwm, ...). Prefer over taskkill in RunCommand."; parameters = @{ type = "object"; properties = @{ pid = @{ type = "integer"; description = "Process id (preferred)" }; process_id = @{ type = "integer"; description = "Alias for pid" }; name = @{ type = "string"; description = "ProcessName without .exe (may match multiple)" }; force = @{ type = "boolean"; description = "Force kill (default true)" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetProcessTree"; description = "Process parent/child tree (pid, ppid, name, depth). Optional root_pid to start from one process."; parameters = @{ type = "object"; properties = @{ root_pid = @{ type = "integer"; description = "Start from this PID (0 = all roots)" }; max_depth = @{ type = "integer"; description = "Max tree depth (default 6)" }; max_nodes = @{ type = "integer"; description = "Cap nodes returned (default 200)" } } } } },
 	@{ type = "function"; function = @{ name = "GetNetConnections"; description = "TCP connections/listeners (local/remote address:port, state, pid, process). Like netstat."; parameters = @{ type = "object"; properties = @{ state = @{ type = "string"; description = "Filter e.g. Listen, Established" }; port = @{ type = "integer"; description = "Filter by local or remote port" }; max = @{ type = "integer"; description = "Max rows (default 100)" } } } } },
-	@{ type = "function"; function = @{ name = "FindFiles"; description = "Find files by name glob + metadata (modified within N days, size). For content search use SearchFiles."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Root folder (default agent CWD)" }; glob = @{ type = "string"; description = "Name filter e.g. *.ps1 (default *)" }; modified_within_days = @{ type = "integer"; description = "Only files modified in last N days (0 = no filter)" }; min_bytes = @{ type = "integer" }; max_bytes = @{ type = "integer" }; recursive = @{ type = "boolean"; description = "Recurse subfolders (default false)" }; max = @{ type = "integer"; description = "Max results (default 100)" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "ReadImage"; description = "Load an image file for vision (next model reply can see it). png/jpg/gif/bmp/tif/webp. Optional maxWidth downscale for vision (default 1280). No approval."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxWidth = @{ type = "integer"; description = "Vision max width px (default 1280)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "FindFiles"; description = "Find by name/ext/size/days. Multi-ext one call (extensions=[mp4,mkv] or glob='*.mp4;*.mkv'). Cap max=100 (hard 500), newest first; truncated=use rows (specific→narrow; vague play→pick one then INLINE ![label](path)). Content→SearchFiles."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; glob = @{ type = "string" }; globs = @{ type = "array"; items = @{ type = "string" } }; extensions = @{ type = "array"; items = @{ type = "string" } }; modified_within_days = @{ type = "integer" }; min_bytes = @{ type = "integer" }; max_bytes = @{ type = "integer" }; recursive = @{ type = "boolean" }; max = @{ type = "integer" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ReadImage"; description = "Load an image for vision (next model reply can see it). png/jpg/gif/bmp/tif/webp. ALWAYS heavily downscales for the model (default max side ~896px, hard max 1024, max ~0.72MP, JPEG) so large TIFFs/photos cannot OOM llama.cpp. Optional maxWidth is clamped. Prefer small/cropped images. To show the operator the full file without vision cost PREFER inline markdown ![label](absolute-path) in your reply. No approval."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxWidth = @{ type = "integer"; description = "Vision max side px (default ~896, hard-capped at 1024)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "ReadPdf"; description = "Read a PDF (cheap path first). Default page=1 only - multipage vision is expensive; only set page>1 or call again for other pages if the user needs them or page 1 is insufficient. Extracts text when clean; if empty/garbled, auto-renders that one page into vision. render=true forces vision; maxWidth downscales vision."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxChars = @{ type = "integer"; description = "Max text chars (default 50000)" }; page = @{ type = "integer"; description = "1-based page for vision render (default 1). Prefer 1 unless user needs another page." }; render = @{ type = "boolean"; description = "Force page render to vision even if text looks fine" }; autoVision = @{ type = "boolean"; description = "Auto-render when text empty/garbled (default true)" }; maxWidth = @{ type = "integer"; description = "Vision max width px (default 1280)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "Clipboard"; description = "Read or write clipboard text. Always requires approval."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; enum = @("read","write") }; text = @{ type = "string" } }; required = @("action") } } },
 	@{ type = "function"; function = @{ name = "ViewScreen"; description = "Look at the desktop for vision (MemoryStream base64; NO file by default). NO approval. DEFAULT: omit save and path - capture stays in memory for the next model turn only. ONLY set save=true or path= when the user explicitly wants a PNG on disk. After a disk save, reply with the exact path. monitor: primary|all|0|1|... Do not save screenshots unprompted."; parameters = @{ type = "object"; properties = @{ save = @{ type = "boolean"; description = "Write PNG to disk. Default false = memory only. true without path = Desktop. Only when user asked to save." }; path = @{ type = "string"; description = "Disk save path (file or folder). Implies save. Only when user asked for a file. Omit for look-only." }; monitor = @{ type = "string"; description = "primary | all | 0-based monitor index" }; x = @{ type = "integer" }; y = @{ type = "integer" }; width = @{ type = "integer" }; height = @{ type = "integer" }; maxWidth = @{ type = "integer"; description = "Vision downscale max width (default 1280); disk save (if any) is full-res" } }; required = @() } } },
@@ -5380,8 +7328,8 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "GetLocalShares"; description = "List SMB shares published on THIS PC (not remote discovery). Read-only. Returns share name, path, and who has access: share_access / access_summary (share ACL via Get-SmbShareAccess) plus optional ntfs_access on the folder. Special shares (C$, ADMIN$, IPC$) omitted unless include_special=true. include_ntfs=false for share ACL only. For remote shares use ProbeShares; to create use CreateShare; to unpublish use RemoveShare."; parameters = @{ type = "object"; properties = @{ include_special = @{ type = "boolean"; description = "Include admin/special shares ending in $ (default false)" }; include_ntfs = @{ type = "boolean"; description = "Include NTFS ACL on share path (default true)" }; max = @{ type = "integer"; description = "Max shares (default 80)" } } } } },
 	@{ type = "function"; function = @{ name = "GetMappedDrives"; description = "List network drive mappings on THIS PC (letter -> UNC, status). Read-only. Combines Get-SmbMapping, PSDrive, net use. include_disconnected=false to hide Unavailable. Not for finding remote shares (ProbeShares) or mapping (MapNetworkDrive). To disconnect use RemoveMappedDrive (setup group)."; parameters = @{ type = "object"; properties = @{ include_disconnected = @{ type = "boolean"; description = "Include Unavailable/Disconnected maps (default true)" } } } } },
 	@{ type = "function"; function = @{ name = "GetPrinters"; description = "List printers on THIS PC (local + network connections). Read-only. Returns name, port, driver, default, shared. Use RemoveNetworkPrinter to remove; AddNetworkPrinter to add a UNC printer."; parameters = @{ type = "object"; properties = @{ include_remote = @{ type = "boolean"; description = "Include network/UNC printers (default true)" }; max = @{ type = "integer"; description = "Max rows (default 80)" } } } } },
-	@{ type = "function"; function = @{ name = "ScanNetwork"; description = "Scan the local LAN for machines and identify them (IP, MAC, hostname, MAC vendor). Harness-native LAN discovery (no GUI). Discovery: active=true (default) uses fast flood-ping — Test-Connection -Count 1 -AsJob for the whole subnet at once then Wait-Job. Then ARP/neighbors + SendARP MAC discovery (required for vendor OUI), reverse DNS, macvendorlookup. active=false = ARP only (quieter). Default auto primary private /24. Returns sorted hosts. To find which hosts export a share, call ProbeShares next (not RunCommand)."; parameters = @{ type = "object"; properties = @{ subnet = @{ type = "string"; description = "Optional CIDR or prefix e.g. 192.168.1.0/24 or 192.168.1. (default auto)" }; active = @{ type = "boolean"; description = "Flood-ping subnet then ARP/MAC resolve (default true). false = neighbors only" }; resolve_mac = @{ type = "boolean"; description = "SendARP MAC discovery for IPs missing MAC (default true; required for vendors)" }; resolve_hostnames = @{ type = "boolean"; description = "Reverse DNS (default true)" }; resolve_vendors = @{ type = "boolean"; description = "MAC OUI vendor lookup (default true; needs internet + MAC)" }; timeout_ms = @{ type = "integer"; description = "Wait-Job timeout budget ms for flood (default 4000 effective floor)" }; max_hosts = @{ type = "integer"; description = "Max addresses to flood-ping (default 254, max 1022)" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "ProbeShares"; description = "REQUIRED tool when the user asks to find/locate/discover a network share (or which PC has a named share). Do not use RunCommand. TARGETED: computer=IP or hosts=['IP'] only those machines. SEARCH: omit hosts = auto LAN flood then probe. Then TCP 445/139 + timed net use guess (share_name=temp or common names). Optional username/password; access-denied still means share exists. Returns found_uncs/hosts_with_match — next call MapNetworkDrive (setup group). Not for creating shares (use CreateShare)."; parameters = @{ type = "object"; properties = @{ hosts = @{ type = "array"; items = @{ type = "string" }; description = "Known host IPs (targeted). Omit for auto LAN search." }; computer = @{ type = "string"; description = "Single known host (targeted)" }; share_name = @{ type = "string"; description = "Share name to try first e.g. temp" }; share_names = @{ type = "array"; items = @{ type = "string" }; description = "Extra share names to try" }; username = @{ type = "string"; description = "Optional HOST\\share for probe" }; password = @{ type = "string"; description = "Optional password for probe" }; port_timeout_ms = @{ type = "integer"; description = "TCP timeout ms (default 300)" }; probe_timeout_sec = @{ type = "integer"; description = "net use timeout sec per guess (default 3)" }; stop_on_first_match = @{ type = "boolean"; description = "Stop after first hit (default false)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ScanNetwork"; description = "Scan the local LAN for machines and identify them (IP, MAC, hostname, MAC vendor). Harness-native LAN discovery (no GUI). Discovery: active=true (default) uses fast flood-ping - Test-Connection -Count 1 -AsJob for the whole subnet at once then Wait-Job. Then ARP/neighbors + SendARP MAC discovery (required for vendor OUI), reverse DNS, macvendorlookup. active=false = ARP only (quieter). Default auto primary private /24. Returns sorted hosts. To find which hosts export a share, call ProbeShares next (not RunCommand)."; parameters = @{ type = "object"; properties = @{ subnet = @{ type = "string"; description = "Optional CIDR or prefix e.g. 192.168.1.0/24 or 192.168.1. (default auto)" }; active = @{ type = "boolean"; description = "Flood-ping subnet then ARP/MAC resolve (default true). false = neighbors only" }; resolve_mac = @{ type = "boolean"; description = "SendARP MAC discovery for IPs missing MAC (default true; required for vendors)" }; resolve_hostnames = @{ type = "boolean"; description = "Reverse DNS (default true)" }; resolve_vendors = @{ type = "boolean"; description = "MAC OUI vendor lookup (default true; needs internet + MAC)" }; timeout_ms = @{ type = "integer"; description = "Wait-Job timeout budget ms for flood (default 4000 effective floor)" }; max_hosts = @{ type = "integer"; description = "Max addresses to flood-ping (default 254, max 1022)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ProbeShares"; description = "REQUIRED tool when the user asks to find/locate/discover a network share (or which PC has a named share). Do not use RunCommand. TARGETED: computer=IP or hosts=['IP'] only those machines. SEARCH: omit hosts = auto LAN flood then probe. Then TCP 445/139 + timed net use guess (share_name=temp or common names). Optional username/password; access-denied still means share exists. Returns found_uncs/hosts_with_match - next call MapNetworkDrive (setup group). Not for creating shares (use CreateShare)."; parameters = @{ type = "object"; properties = @{ hosts = @{ type = "array"; items = @{ type = "string" }; description = "Known host IPs (targeted). Omit for auto LAN search." }; computer = @{ type = "string"; description = "Single known host (targeted)" }; share_name = @{ type = "string"; description = "Share name to try first e.g. temp" }; share_names = @{ type = "array"; items = @{ type = "string" }; description = "Extra share names to try" }; username = @{ type = "string"; description = "Optional HOST\\share for probe" }; password = @{ type = "string"; description = "Optional password for probe" }; port_timeout_ms = @{ type = "integer"; description = "TCP timeout ms (default 300)" }; probe_timeout_sec = @{ type = "integer"; description = "net use timeout sec per guess (default 3)" }; stop_on_first_match = @{ type = "boolean"; description = "Stop after first hit (default false)" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetWindowsUpdateStatus"; description = "Pending Windows updates (needs PSWindowsUpdate)."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetSystemUptime"; description = "Uptime and last boot."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle: BSOD, events, disk health/space, memory."; parameters = @{ type = "object"; properties = @{} } } },
@@ -5405,6 +7353,11 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "DownloadFile"; description = "Download a URL to a local path (size-capped). ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string" }; path = @{ type = "string"; description = "Destination file path" }; overwrite = @{ type = "boolean"; description = "Overwrite existing file (default false)" }; max_mb = @{ type = "integer"; description = "Max size in MB (default 100, max 512)" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default 120)" } }; required = @("url","path") } } },
 	@{ type = "function"; function = @{ name = "ExpandArchive"; description = "Extract a .zip archive to a folder. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Archive path (.zip)" }; destination = @{ type = "string"; description = "Output folder" }; force = @{ type = "boolean"; description = "Overwrite existing files (default false)" } }; required = @("path","destination") } } },
 	@{ type = "function"; function = @{ name = "CompressArchive"; description = "Create a .zip from a file or folder. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Source file or folder" }; destination = @{ type = "string"; description = "Output .zip path" }; force = @{ type = "boolean"; description = "Overwrite zip if present (default false)" } }; required = @("path","destination") } } },
+	@{ type = "function"; function = @{ name = "MakeIso"; description = "Build a .iso from a folder (IMAPI2 / New-IsoFile style). ALWAYS prompts. Default: folder CONTENTS at ISO root (like Get-ChildItem source | New-IsoFile) — set include_folder=true to wrap as one top-level folder. boot_file= path to efisys.bin (or etfsboot.com) for bootable Windows/WinPE media. force=true overwrites (dismounts if mounted first). title= volume label. Prefer over ad-hoc New-IsoFile scripts."; parameters = @{ type = "object"; properties = @{ source = @{ type = "string"; description = "Source folder (or file) to pack" }; path = @{ type = "string"; description = "Alias for source" }; destination = @{ type = "string"; description = "Output .iso path" }; iso_path = @{ type = "string"; description = "Alias for destination" }; boot_file = @{ type = "string"; description = "Optional boot image e.g. source\\efi\\microsoft\\boot\\efisys.bin" }; title = @{ type = "string"; description = "ISO volume title / label" }; force = @{ type = "boolean"; description = "Overwrite existing .iso (default false)" }; include_folder = @{ type = "boolean"; description = "true = include the source folder itself at ISO root; false (default) = add children only" }; media = @{ type = "string"; description = "IMAPI media type (default DVDPLUSRW_DUALLAYER)" } }; required = @("source","destination") } } },
+	@{ type = "function"; function = @{ name = "MountIso"; description = "Mount a .iso as a virtual drive (Mount-DiskImage). ALWAYS prompts. Returns drive letter. Prefer over shell Mount-DiskImage."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Path to .iso file" }; iso_path = @{ type = "string"; description = "Alias for path" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "UnmountIso"; description = "Dismount a mounted .iso (Dismount-DiskImage). ALWAYS prompts. Pass path= to the .iso and/or letter= drive (e.g. E). Prefer over shell Dismount-DiskImage."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Path to the .iso that is mounted" }; iso_path = @{ type = "string"; description = "Alias for path" }; letter = @{ type = "string"; description = "Drive letter e.g. E or E:" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "MakeCab"; description = "Build a .cab with makecab.exe (LZX by default) and live progress in the UI. ALWAYS prompts. source= folder (pack files inside) and/or files=[paths]. force=true overwrites. Prefer over raw makecab directive scripts."; parameters = @{ type = "object"; properties = @{ source = @{ type = "string"; description = "Folder whose files are packed (non-recursive by default)" }; path = @{ type = "string"; description = "Alias for source folder" }; files = @{ type = "array"; items = @{ type = "string" }; description = "Explicit file paths to pack" }; destination = @{ type = "string"; description = "Output .cab path" }; cab_path = @{ type = "string"; description = "Alias for destination" }; force = @{ type = "boolean"; description = "Overwrite existing .cab (default false)" }; recursive = @{ type = "boolean"; description = "When source is a folder, include subfolders (default false)" }; compression = @{ type = "string"; description = "LZX (default) | MSZIP | none" }; compression_level = @{ type = "integer"; description = "LZX level 1-7 (default 7)" }; compression_memory = @{ type = "integer"; description = "LZX memory 15-21 (default 21)" } }; required = @("destination") } } },
+	@{ type = "function"; function = @{ name = "ExpandCab"; description = "Extract a .cab with expand.exe. ALWAYS prompts. path= .cab, destination= output folder. force=true allows non-empty dest."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Source .cab path" }; cab_path = @{ type = "string"; description = "Alias for path" }; destination = @{ type = "string"; description = "Output folder" }; force = @{ type = "boolean"; description = "Allow extract into existing non-empty folder (default false)" } }; required = @("path","destination") } } },
 	@{ type = "function"; function = @{ name = "FindPSModule"; description = "Search PowerShell Gallery modules (read-only)."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Module name or wildcard" }; max_results = @{ type = "integer"; description = "Max results (default 15)" } }; required = @("name") } } },
 	@{ type = "function"; function = @{ name = "GetInstalledPSModule"; description = "List installed PowerShell modules (optional name filter)."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Optional module name filter" } } } } },
 	@{ type = "function"; function = @{ name = "InstallPSModule"; description = "Install a PowerShell module (default CurrentUser scope). ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; version = @{ type = "string"; description = "Optional exact version" }; scope = @{ type = "string"; description = "CurrentUser (default) or AllUsers" }; allow_prerelease = @{ type = "boolean" } }; required = @("name") } } },
@@ -5418,26 +7371,27 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "UninstallSoftware"; description = "Uninstall an installed program by display name match (Uninstall registry). Prefer exact-ish name from GetInstalledSoftware first. ALWAYS prompts. No silent force beyond QuietUninstall/msiexec when available."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Display name substring to match" }; product_code = @{ type = "string"; description = "Optional MSI product code {GUID}" } }; required = @("name") } } },
 	@{ type = "function"; function = @{ name = "AddLocalUser"; description = "Create a local Windows user. ALWAYS prompts. Optional full_name, description, admin=true (Administrators group). Password is operator-visible (pass what they said; show it back in the result). To delete use RemoveLocalUser."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; password = @{ type = "string" }; full_name = @{ type = "string" }; description = @{ type = "string" }; admin = @{ type = "boolean"; description = "Add to local Administrators (default false)" } }; required = @("username","password") } } },
 	@{ type = "function"; function = @{ name = "JoinDomain"; description = "Join this PC to an Active Directory domain. ALWAYS prompts. Requires domain + domain join credentials. Optional ou= distinguished name, new_name= rename before join, reboot=true to restart after success."; parameters = @{ type = "object"; properties = @{ domain = @{ type = "string"; description = "Domain FQDN e.g. corp.example.com" }; username = @{ type = "string"; description = "Domain account authorized to join (DOMAIN\\user or user@domain)" }; password = @{ type = "string" }; ou = @{ type = "string"; description = "Optional target OU DN" }; new_name = @{ type = "string"; description = "Optional new computer name before join" }; reboot = @{ type = "boolean"; description = "Restart after successful join (default false)" } }; required = @("domain","username","password") } } },
-	@{ type = "function"; function = @{ name = "LeaveDomain"; description = "Leave the Active Directory domain (join workgroup). ALWAYS prompts. REQUIRED: local_username + local_password of a local admin that can sign in after disjoin. No UI password popup — if missing or auth fails, returns NEED_INPUT so you ASK the operator in chat. If no local admin exists, call AddLocalUser admin=true with a password the operator chooses, then LeaveDomain with those creds. workgroup= default WORKGROUP; reboot=true optional. Show the local admin password back to the operator when they provide it."; parameters = @{ type = "object"; properties = @{ workgroup = @{ type = "string"; description = "Target workgroup name (default WORKGROUP)" }; reboot = @{ type = "boolean"; description = "Restart after successful leave (default false)" }; local_username = @{ type = "string"; description = "REQUIRED local admin username" }; local_password = @{ type = "string"; description = "REQUIRED local admin password (operator-visible; no popup)" } }; required = @("local_username","local_password") } } },
-			@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional — if omitted or busy, auto-picks free letter D-Z (RescueMaker-style: skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. If username is set, password is required (no popup — NEED_INPUT if missing; ask operator in chat). Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M — omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string"; description = "Required when username set; ask operator if missing" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "LeaveDomain"; description = "Leave the Active Directory domain (join workgroup). ALWAYS prompts. REQUIRED: local_username + local_password of a local admin that can sign in after disjoin. No UI password popup - if missing or auth fails, returns NEED_INPUT so you ASK the operator in chat. If no local admin exists, call AddLocalUser admin=true with a password the operator chooses, then LeaveDomain with those creds. workgroup= default WORKGROUP; reboot=true optional. Show the local admin password back to the operator when they provide it."; parameters = @{ type = "object"; properties = @{ workgroup = @{ type = "string"; description = "Target workgroup name (default WORKGROUP)" }; reboot = @{ type = "boolean"; description = "Restart after successful leave (default false)" }; local_username = @{ type = "string"; description = "REQUIRED local admin username" }; local_password = @{ type = "string"; description = "REQUIRED local admin password (operator-visible; no popup)" } }; required = @("local_username","local_password") } } },
+			@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional - if omitted or busy, auto-picks free letter D-Z (RescueMaker-style: skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. If username is set, password is required (no popup - NEED_INPUT if missing; ask operator in chat). Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M - omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string"; description = "Required when username set; ask operator if missing" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "RemoveMappedDrive"; description = "Disconnect a mapped network drive letter on THIS PC. ALWAYS approval. REQUIRED: letter= (e.g. Z). Call GetMappedDrives first if unknown. Does not delete remote share data. Prefer over net use /delete in RunCommand."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Drive letter e.g. Z or Z:" }; path = @{ type = "string"; description = "Optional expected UNC (for display/verify)" }; force = @{ type = "boolean"; description = "Force remove (default true)" } }; required = @("letter") } } },
 @{ type = "function"; function = @{ name = "AddNetworkPrinter"; description = "Connect a network/shared printer (\\\\server\\printer). ALWAYS prompts. Optional name= friendly name, set_default=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Printer share UNC \\\\server\\printer" }; name = @{ type = "string"; description = "Optional local display name" }; set_default = @{ type = "boolean"; description = "Set as default printer (default false)" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "RemoveNetworkPrinter"; description = "Remove a printer from THIS PC. ALWAYS approval. REQUIRED: name= exact printer name from GetPrinters (or path= UNC). Prefer over printui in RunCommand."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Printer name from GetPrinters" }; path = @{ type = "string"; description = "Alias — UNC or name" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "RemoveNetworkPrinter"; description = "Remove a printer from THIS PC. ALWAYS approval. REQUIRED: name= exact printer name from GetPrinters (or path= UNC). Prefer over printui in RunCommand."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Printer name from GetPrinters" }; path = @{ type = "string"; description = "Alias - UNC or name" } }; required = @("name") } } },
 	@{ type = "function"; function = @{ name = "RemoveLocalUser"; description = "Delete a local Windows user account. ALWAYS approval. REQUIRED: username=. Refuses built-in accounts (Administrator, Guest, ...) and the currently logged-on user. Does not delete the profile folder under C:\\Users. Prefer over net user /delete in RunCommand."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; name = @{ type = "string"; description = "Alias for username" } }; required = @("username") } } },
 	@{ type = "function"; function = @{ name = "Reboot"; description = "Schedule reboot or shutdown, or abort a pending timer. ALWAYS approval. action=reboot (default) | shutdown | abort. delay_sec=60 default (0=immediate). force=true closes apps. reason= optional message. Abort pending with action=abort. Prefer over shutdown.exe in RunCommand."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "reboot | shutdown | abort" }; delay_sec = @{ type = "integer"; description = "Seconds before reboot/shutdown (default 60, max 86400)" }; reason = @{ type = "string"; description = "Optional comment shown in shutdown UI" }; force = @{ type = "boolean"; description = "Force-close apps (default true)" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "CreateShare"; description = "Share a local folder over SMB. ALWAYS approval once. REQUIRED: path, name, access_username, access_password (or share_password), everyone_full (true|false — ALWAYS ask: Everyone access or only a specific user?). If access_username exists: verifies password via local logon (does not overwrite). If missing: creates user. force_password_update=true (alias reset_password=true) only when operator wants to RESET password on existing user. Grants share+NTFS rights to that user; optionally Everyone. Optional access_right/permission = Full|Change|Read (DEFAULT Full if omitted — do not force Full when Read/Change requested). No UI popups. Show password back. SMBv1 check if off. Copies UNC."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; name = @{ type = "string" }; access_username = @{ type = "string"; description = "Local account for grant (created if missing). Not Everyone." }; access_password = @{ type = "string"; description = "Password for access_username" }; share_password = @{ type = "string"; description = "Alias for access_password" }; everyone_full = @{ type = "boolean"; description = "REQUIRED. true=also grant Everyone same access_right; false=only access_username" }; access_right = @{ type = "string"; description = "Full (default) | Change | Read — share+NTFS level" }; permission = @{ type = "string"; description = "Alias for access_right" }; force_password_update = @{ type = "boolean"; description = "true = reset existing user password to access_password (destructive; only when operator asks)" }; reset_password = @{ type = "boolean"; description = "Alias for force_password_update" }; description = @{ type = "string" }; ensure_network = @{ type = "boolean" }; ensure_discovery = @{ type = "boolean" }; ensure_folder = @{ type = "boolean" }; force = @{ type = "boolean" } }; required = @("path","name","access_username","access_password","everyone_full") } } },
-	@{ type = "function"; function = @{ name = "RemoveShare"; description = "Unpublish a local SMB share on THIS PC. ALWAYS approval. REQUIRED: name (share name from GetLocalShares). Removes the share only — does not delete the folder or local users. force=true (default) closes open files then removes. Refuses special/admin shares (C$, ADMIN$, IPC$, PRINT$). Prefer over RunCommand net share /delete."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Share name to remove (e.g. temp). UNC \\PC\\name also accepted." }; share = @{ type = "string"; description = "Alias for name" }; force = @{ type = "boolean"; description = "Force close sessions and remove (default true)" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "CreateShare"; description = "Share a local folder over SMB. ALWAYS approval once. REQUIRED: path, name, access_username, access_password (or share_password), everyone_full (true|false - ALWAYS ask: Everyone access or only a specific user?). If access_username exists: verifies password via local logon (does not overwrite). If missing: creates user. force_password_update=true (alias reset_password=true) only when operator wants to RESET password on existing user. Grants share+NTFS rights to that user; optionally Everyone. Optional access_right/permission = Full|Change|Read (DEFAULT Full if omitted - do not force Full when Read/Change requested). No UI popups. Show password back. SMBv1 check if off. Copies UNC."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; name = @{ type = "string" }; access_username = @{ type = "string"; description = "Local account for grant (created if missing). Not Everyone." }; access_password = @{ type = "string"; description = "Password for access_username" }; share_password = @{ type = "string"; description = "Alias for access_password" }; everyone_full = @{ type = "boolean"; description = "REQUIRED. true=also grant Everyone same access_right; false=only access_username" }; access_right = @{ type = "string"; description = "Full (default) | Change | Read - share+NTFS level" }; permission = @{ type = "string"; description = "Alias for access_right" }; force_password_update = @{ type = "boolean"; description = "true = reset existing user password to access_password (destructive; only when operator asks)" }; reset_password = @{ type = "boolean"; description = "Alias for force_password_update" }; description = @{ type = "string" }; ensure_network = @{ type = "boolean" }; ensure_discovery = @{ type = "boolean" }; ensure_folder = @{ type = "boolean" }; force = @{ type = "boolean" } }; required = @("path","name","access_username","access_password","everyone_full") } } },
+	@{ type = "function"; function = @{ name = "RemoveShare"; description = "Unpublish a local SMB share on THIS PC. ALWAYS approval. REQUIRED: name (share name from GetLocalShares). Removes the share only - does not delete the folder or local users. force=true (default) closes open files then removes. Refuses special/admin shares (C$, ADMIN$, IPC$, PRINT$). Prefer over RunCommand net share /delete."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Share name to remove (e.g. temp). UNC \\PC\\name also accepted." }; share = @{ type = "string"; description = "Alias for name" }; force = @{ type = "boolean"; description = "Force close sessions and remove (default true)" } }; required = @("name") } } },
 	@{ type = "function"; function = @{ name = "NewMachineSetup"; description = "Full new-machine setup. profile=residential|business (settings flavor only). ALWAYS prompts once listing SETTINGS + SOFTWARE. Settings: restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off. If portable, re-enable encryption after setup is recommended. Software (full personal catalog every time): 7zip, Chrome, Adobe Reader, ADWCleaner (runs a scan), VLC. skip_software=true for settings only. dry_run=true previews."; parameters = @{ type = "object"; properties = @{ profile = @{ type = "string"; description = "residential | business (settings notes only; software catalog is always the full personal set)" }; dry_run = @{ type = "boolean" }; timezone = @{ type = "string" }; skip_restore_point = @{ type = "boolean" }; skip_software = @{ type = "boolean" } }; required = @("profile") } } },
 	@{ type = "function"; function = @{ name = "ListInstallers"; description = "List silent installer catalog (id, name, notes). Read-only. Personal catalog: 7zip, chrome, adobe_reader, adwcleaner, vlc."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "InstallPackage"; description = "Silent download+install from the installers catalog. package=id or packages=[ids]. Follows redirects (dynamic URLs). ALWAYS prompts. Temp downloads cleaned after each package. Ids: 7zip, chrome, adobe_reader, adwcleaner (will run a scan), vlc."; parameters = @{ type = "object"; properties = @{ package = @{ type = "string"; description = "Single package id" }; packages = @{ type = "array"; items = @{ type = "string" }; description = "Multiple package ids" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently unlock one or more tool groups in a single call. Prefer multi when the task needs several: group=network,shares or groups=[network,shares]. Names: senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full (aliases: tune/newmachine->setup, install/chrome/vlc->installers, http->web, ...). Then call the real tools. Never announce."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string"; description = "One group, or comma/space-separated list e.g. setup,system,files" }; groups = @{ type = "array"; items = @{ type = "string" }; description = "Multiple groups (preferred when >1); same names as group=" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "ListToolGroups"; description = "Dump group/tool catalog. Prefer EnableToolGroup using the MAP in the system prompt - usually no need to list first."; parameters = @{ type = "object"; properties = @{} } } }
+	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently enable group(s): group=network,shares or groups=[diag,repair]. See MAP. Then call tools same turn; never narrate."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string" }; groups = @{ type = "array"; items = @{ type = "string" } } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ListToolGroups"; description = "List groups/tools. Prefer EnableToolGroup + MAP."; parameters = @{ type = "object"; properties = @{} } } }
 )
 
 # Progressive tool catalog (core lean; optional groups on demand)
 $script:MBToolCatalog = [ordered]@{
 	core = @(
 		'ReadFile','WriteFile','EditFile','ApplyPatch','ListDirectory','SearchFiles','FindFiles','DiffText',
+		'HexView','HexEdit',
 		'RunCommand','GetWorkingDirectory','SetWorkingDirectory','GetEnvironment','SetEnvironment',
 		'EnableToolGroup','ListToolGroups'
 	)
@@ -5470,7 +7424,7 @@ $script:MBToolCatalog = [ordered]@{
 		'ListInstallers','InstallPackage'
 	)
 	sandbox   = @('SandBoxWrite','SandBox','SandBoxList','GetSandBoxInfo','ClearSandBox')
-	files     = @('DownloadFile','ExpandArchive','CompressArchive')
+	files     = @('DownloadFile','ExpandArchive','CompressArchive','MakeCab','ExpandCab','MakeIso','MountIso','UnmountIso')
 	packages  = @('FindPSModule','GetInstalledPSModule','InstallPSModule','UpdatePSModule')
 	registry  = @('ReadRegistry','SetRegistry')
 	clipboard = @('Clipboard')
@@ -5481,67 +7435,67 @@ $script:MBToolCatalog = [ordered]@{
 $script:MBToolGroupMeta = [ordered]@{
 	core = @{
 		Label       = 'Core'
-		Description = 'Files, edits, shell, CWD, env (always on)'
+		Description = 'Always available: read/write files, edit code, run commands, and manage the working folder.'
 	}
 	senses = @{
 		Label       = 'Senses'
-		Description = 'Vision (ReadImage, ReadPdf, ViewScreen) + SpeakText TTS'
+		Description = 'See the screen, read images/PDFs, and speak replies aloud.'
 	}
 	system = @{
 		Label       = 'System'
-		Description = 'Light inventory: OS, processes, memory, services, software, uptime'
+		Description = 'Inspect this PC: hardware, processes, memory, services, installed software, and uptime.'
 	}
 	network = @{
 		Label       = 'Network'
-		Description = 'LAN scan, ProbeShares, local shares/maps, printers list, connections'
+		Description = 'Scan the LAN, discover shares, list mapped drives/printers, and view connections.'
 	}
 	diag = @{
 		Label       = 'Diag'
-		Description = 'Diagnostics: BSOD, events, disk, startup/tasks/drivers, StopProcess, quick diagnostics'
+		Description = 'Troubleshoot crashes, event logs, disks, startup items, drivers, and quick health checks.'
 	}
 	repair = @{
 		Label       = 'Repair'
-		Description = 'sfc, DISM, chkdsk (always prompts)'
+		Description = 'Run repair tools (sfc, DISM, chkdsk). Approval is required before changes.'
 	}
 	setup = @{
 		Label       = 'Setup / Tune'
-		Description = 'Volume, brightness, Windows options, restore, uninstall, reboot, NewMachineSetup'
+		Description = 'Tune Windows: volume, brightness, options, restore points, uninstall, reboot, new-machine setup.'
 	}
 	identity = @{
 		Label       = 'Identity'
-		Description = 'Local users add/remove, join/leave domain'
+		Description = 'Manage local users and join or leave an Active Directory domain.'
 	}
 	shares = @{
 		Label       = 'Shares'
-		Description = 'Map/unmap drives, create/remove SMB shares, add/remove printers'
+		Description = 'Map/unmap drives, create or remove folder shares, and add/remove network printers.'
 	}
 	installers = @{
 		Label       = 'Installers'
-		Description = 'Silent catalog installs: 7zip, Chrome, Adobe, ADWCleaner, VLC'
+		Description = 'Download and silently install common apps (7-Zip, Chrome, Reader, VLC, and more).'
 	}
 	sandbox = @{
 		Label       = 'SandBox'
-		Description = 'Incremental PowerShell lab: pieces, compose, PASS/FAIL checks'
+		Description = 'Build and test PowerShell scripts in a safe incremental lab before applying them.'
 	}
 	files = @{
 		Label       = 'Files'
-		Description = 'Download and zip extract/compress'
+		Description = 'Download files, zip/cab archives, and make/mount/unmount ISO images.'
 	}
 	packages = @{
 		Label       = 'Packages'
-		Description = 'PowerShell Gallery find/install/update'
+		Description = 'Find, install, and update PowerShell modules from the Gallery.'
 	}
 	registry = @{
 		Label       = 'Registry'
-		Description = 'Read/write registry keys (write prompts)'
+		Description = 'Read and change Windows registry values (writes require approval).'
 	}
 	clipboard = @{
 		Label       = 'Clipboard'
-		Description = 'Read/write Windows clipboard'
+		Description = 'Read or set the Windows clipboard text.'
 	}
 	web = @{
 		Label       = 'Web / HTTP'
-		Description = 'HTTP client, page fetch, GitHub helpers'
+		Description = 'Call HTTP APIs, fetch web pages, and pull files from GitHub.'
 	}
 
 }
@@ -5648,6 +7602,18 @@ function Get-MBToolUiTips {
 		$toolTips['ListToolGroups'] = "ListToolGroups`nShow which tool groups are available and what they contain."
 	}
 
+	# Vision-gated senses tools: orange UI when Abilities lacks lowercase "vision"
+	$hasVision = $false
+	try { $hasVision = [bool](Test-MBModelHasVision) } catch { $hasVision = $false }
+	if (-not $hasVision) {
+		foreach ($vt in @(Get-MBVisionToolNames)) {
+			$base = ''
+			if ($toolTips.ContainsKey($vt)) { $base = [string]$toolTips[$vt] }
+			if ([string]::IsNullOrWhiteSpace($base)) { $base = $vt }
+			$toolTips[$vt] = ("{0}`n`nUnavailable: current model does not support vision (no 'vision' in Abilities)." -f $base.TrimEnd())
+		}
+	}
+
 	return @{
 		groups = $groupTips
 		labels = $groupLabels
@@ -5684,7 +7650,9 @@ function Update-MBWpfToolGroupBar {
 		}
 	} catch {}
 	$usedList = @($usedList | Sort-Object)
-	$fp = ((@($activeList) -join ',') + '|u:' + ($usedList -join ','))
+	$hasVision = $false
+	try { $hasVision = [bool](Test-MBModelHasVision) } catch { $hasVision = $false }
+	$fp = ((@($activeList) -join ',') + '|u:' + ($usedList -join ',') + '|v:' + $(if ($hasVision) { '1' } else { '0' }))
 	if (-not $Force) {
 		try {
 			if ($W.ToolGroupsFp -eq $fp -and $W.ToolGroupsBuilt -and -not $W.ToolGroupsDirty) { return }
@@ -5700,6 +7668,10 @@ function Update-MBWpfToolGroupBar {
 				$toolsByGroup[$g] = @()
 			}
 		} catch { $toolsByGroup[$g] = @() }
+	}
+	$visionBlocked = @{}
+	if (-not $hasVision) {
+		foreach ($vt in @(Get-MBVisionToolNames)) { $visionBlocked[$vt] = $true }
 	}
 
 	# Active chips first so they stay visible on the first wrap line
@@ -5744,6 +7716,8 @@ function Update-MBWpfToolGroupBar {
 			groupTips          = $(if ($tips) { $tips.groups } else { @{} })
 			toolTips           = $(if ($tips) { $tips.tools } else { @{} })
 			usedTools          = @($usedList)
+			modelHasVision     = $hasVision
+			visionBlocked      = $visionBlocked
 			fp                 = $fp
 		}
 		$W.ToolGroupsDirty = $true
@@ -5804,6 +7778,9 @@ function Resolve-MBToolGroupName {
 		'lab' = 'sandbox'; 'sandboxes' = 'sandbox'
 		'download' = 'files'; 'downloads' = 'files'; 'zip' = 'files'; 'archive' = 'files'
 		'unzip' = 'files'; 'compress' = 'files'; 'expand' = 'files'
+		'iso' = 'files'; 'makeiso' = 'files'; 'mountiso' = 'files'; 'unmountiso' = 'files'
+		'dismountiso' = 'files'; 'isofile' = 'files'
+		'cab' = 'files'; 'makecab' = 'files'; 'expandcab' = 'files'; 'cabinet' = 'files'
 		'module' = 'packages'; 'modules' = 'packages'; 'gallery' = 'packages'
 		'psgallery' = 'packages'; 'psmodule' = 'packages'; 'psmodules' = 'packages'
 		'reg' = 'registry'; 'regs' = 'registry'
@@ -5838,6 +7815,8 @@ function Resolve-MBToolName {
 		'exec' = 'RunCommand'; 'bash' = 'RunCommand'; 'powershell' = 'RunCommand'
 		'list_dir' = 'ListDirectory'; 'ls' = 'ListDirectory'; 'dir' = 'ListDirectory'
 		'search' = 'SearchFiles'; 'grep' = 'SearchFiles'; 'find' = 'FindFiles'
+		'hex' = 'HexView'; 'hexview' = 'HexView'; 'hex_view' = 'HexView'; 'hexdump' = 'HexView'
+		'hexedit' = 'HexEdit'; 'hex_edit' = 'HexEdit'; 'hexpatch' = 'HexEdit'
 		'screenshot' = 'ViewScreen'; 'screen' = 'ViewScreen'; 'capture' = 'ViewScreen'
 		'image' = 'ReadImage'; 'pdf' = 'ReadPdf'; 'read_pdf' = 'ReadPdf'; 'read_image' = 'ReadImage'
 		'http' = 'MakeHttpRequest'; 'fetch' = 'BrowsePage'; 'browse' = 'BrowsePage'
@@ -5904,6 +7883,9 @@ function Get-MBToolEnableHint {
 	param([string]$ToolName)
 	$resolved = Resolve-MBToolName -Name $ToolName
 	if (-not $resolved) { $resolved = $ToolName }
+	if ((Test-MBToolNeedsVision -Name $resolved) -and -not (Test-MBModelHasVision)) {
+		return "Current model has no vision ability (Abilities must include 'vision'). $resolved is unavailable - do not call it."
+	}
 	$grp = Get-MBToolGroupForName -Name $resolved
 	if ($grp -and $grp -ne 'core') {
 		return "Call EnableToolGroup with group=$grp then call $resolved (same turn; do not narrate)."
@@ -5912,6 +7894,70 @@ function Get-MBToolEnableHint {
 		return "Tool $resolved is in core and should already be available."
 	}
 	return "Call ListToolGroups or EnableToolGroup using the MAP (senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web)."
+}
+
+function Get-MBAbilityParts {
+	# Same tokens as the banner Abilities line (lowercase bits: vision, audio, ...)
+	$capBits = New-Object System.Collections.ArrayList
+	try {
+		$m = Get-MBActiveModel
+		if ([string]::IsNullOrWhiteSpace($m) -or $m -eq 'Select Model') { return @() }
+		$info = $null
+		try { $info = $script:MB.ServerInfo } catch { $info = $null }
+		$ent = $null
+		try {
+			$k = [string]$script:MB.ActiveModelKey
+			if ($k) { $ent = @($script:MB.RemoteModelEntries | Where-Object { $_.Key -eq $k } | Select-Object -First 1) }
+			if (-not $ent) { $ent = @($script:MB.RemoteModelEntries | Where-Object { $_.Id -eq $m } | Select-Object -First 1) }
+		} catch {}
+		$vision = $false
+		$audio = $false
+		$slots = 0
+		$nParams = 0
+		if ($ent) {
+			try { if ($ent.NParams -gt 0) { $nParams = [double]$ent.NParams } } catch {}
+			try { $vision = [bool]$ent.Vision } catch {}
+		}
+		if ($info) {
+			try { $vision = [bool]$info.Vision } catch {}
+			try { $audio = [bool]$info.Audio } catch {}
+			try { if ([int]$info.TotalSlots -gt 0) { $slots = [int]$info.TotalSlots } } catch {}
+		}
+		if ($vision) { [void]$capBits.Add('vision') }
+		if ($audio) { [void]$capBits.Add('audio') }
+		if ($slots -eq 1) {
+			[void]$capBits.Add('logical (1)')
+		} elseif ($slots -gt 1) {
+			[void]$capBits.Add(('synchronous ({0})' -f $slots))
+		}
+		$ps = Format-MBParamCount -N $nParams
+		if ($ps) { [void]$capBits.Add(('{0} params' -f $ps)) }
+	} catch {}
+	return @($capBits)
+}
+
+function Test-MBModelHasVision {
+	# Abilities line shows lowercase "vision" when present - match that token only
+	try {
+		foreach ($p in @(Get-MBAbilityParts)) {
+			if ([string]$p -ceq 'vision') { return $true }
+		}
+	} catch {}
+	return $false
+}
+
+function Get-MBVisionToolNames {
+	@('ReadImage', 'ReadPdf', 'ViewScreen')
+}
+
+function Test-MBToolNeedsVision {
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+	$t = $Name.Trim()
+	foreach ($n in @(Get-MBVisionToolNames)) {
+		if ([string]::Equals($n, $t, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+	}
+	return $false
 }
 
 function Get-MBActiveToolNames {
@@ -5934,10 +7980,13 @@ function Get-MBActiveToolNames {
 	}
 	[void]$toAdd.Add('EnableToolGroup')
 	[void]$toAdd.Add('ListToolGroups')
+	# Vision tools only when Abilities includes lowercase "vision" (even if senses group is on)
+	$hasVision = $false
+	try { $hasVision = [bool](Test-MBModelHasVision) } catch { $hasVision = $false }
 	foreach ($n in @($toAdd)) {
-		if (-not [string]::IsNullOrWhiteSpace($n)) {
-			$map[$n.ToLowerInvariant()] = $n
-		}
+		if ([string]::IsNullOrWhiteSpace($n)) { continue }
+		if (-not $hasVision -and (Test-MBToolNeedsVision -Name $n)) { continue }
+		$map[$n.ToLowerInvariant()] = $n
 	}
 	return @($map.Values)
 }
@@ -6164,6 +8213,67 @@ function Get-MBToolGroupsStatus {
 	}) -Depth 6
 }
 
+function Test-MBBinaryMediaSniff {
+	# Detect image/pdf/video by magic bytes (extension-agnostic). Never feed these to ReadFile text path.
+	param([string]$Path)
+	try {
+		if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		try {
+			$buf = New-Object byte[] 16
+			$n = $fs.Read($buf, 0, 16)
+			if ($n -lt 3) { return $null }
+			# PNG
+			if ($n -ge 4 -and $buf[0] -eq 0x89 -and $buf[1] -eq 0x50 -and $buf[2] -eq 0x4E -and $buf[3] -eq 0x47) { return 'image' }
+			# JPEG
+			if ($buf[0] -eq 0xFF -and $buf[1] -eq 0xD8 -and $buf[2] -eq 0xFF) { return 'image' }
+			# GIF
+			if ($buf[0] -eq 0x47 -and $buf[1] -eq 0x49 -and $buf[2] -eq 0x46) { return 'image' }
+			# BMP
+			if ($buf[0] -eq 0x42 -and $buf[1] -eq 0x4D) { return 'image' }
+			# WEBP (RIFF....WEBP)
+			if ($n -ge 12 -and $buf[0] -eq 0x52 -and $buf[1] -eq 0x49 -and $buf[2] -eq 0x46 -and $buf[3] -eq 0x46 -and $buf[8] -eq 0x57 -and $buf[9] -eq 0x45 -and $buf[10] -eq 0x42 -and $buf[11] -eq 0x50) { return 'image' }
+			# TIFF II* / MM*
+			if ($n -ge 4 -and (($buf[0] -eq 0x49 -and $buf[1] -eq 0x49 -and $buf[2] -eq 0x2A) -or ($buf[0] -eq 0x4D -and $buf[1] -eq 0x4D -and $buf[2] -eq 0x00 -and $buf[3] -eq 0x2A))) { return 'image' }
+			# ICO
+			if ($n -ge 4 -and $buf[0] -eq 0x00 -and $buf[1] -eq 0x00 -and $buf[2] -eq 0x01 -and $buf[3] -eq 0x00) { return 'image' }
+			# PDF
+			if ($n -ge 4 -and $buf[0] -eq 0x25 -and $buf[1] -eq 0x50 -and $buf[2] -eq 0x44 -and $buf[3] -eq 0x46) { return 'pdf' }
+			# MP4 / ISO-BMFF (....ftyp)
+			if ($n -ge 8 -and $buf[4] -eq 0x66 -and $buf[5] -eq 0x74 -and $buf[6] -eq 0x79 -and $buf[7] -eq 0x70) { return 'video' }
+			# null-heavy head → binary (not text)
+			$nulls = 0
+			for ($i = 0; $i -lt $n; $i++) { if ($buf[$i] -eq 0) { $nulls++ } }
+			if ($n -ge 8 -and $nulls -ge [Math]::Max(2, [int]($n * 0.25))) { return 'binary' }
+		} finally {
+			try { $fs.Dispose() } catch {}
+		}
+	} catch {}
+	return $null
+}
+
+function Get-MBReadFileMediaBlockMessage {
+	param(
+		[string]$Kind,
+		[string]$Ext = ''
+	)
+	$k = ([string]$Kind).ToLowerInvariant()
+	$e = ([string]$Ext).ToLowerInvariant()
+	if ($k -eq 'image' -or $e -in @('.png','.jpg','.jpeg','.gif','.bmp','.ico','.webp','.tif','.tiff','.heic','.heif','.jfif')) {
+		return "BLOCKED: Never use ReadFile on images (crashes / corrupts context). For model vision: EnableToolGroup group=senses then ReadImage path=... . To show the operator the file in chat: ![label](path). Do not dump binary as text."
+	}
+	if ($k -eq 'pdf' -or $e -eq '.pdf') {
+		return "BLOCKED: Never use ReadFile on PDFs. EnableToolGroup group=senses then ReadPdf path=... (page=1 first). Do not dump binary as text."
+	}
+	if ($k -eq 'video' -or $e -in @('.mp4','.m4v','.mov','.avi','.mkv','.wmv','.webm')) {
+		return "BLOCKED: Never use ReadFile on video. Show/play INLINE with ![label](absolute-path) in chat (required). Default app only if format is not inline-compatible. Do not dump binary as text."
+	}
+	if ($e) {
+		return "BLOCKED: File type '$e' cannot be read as text. Do not dump binary with ReadFile."
+	}
+	return "BLOCKED: File looks binary/media - never ReadFile. Use ReadImage/ReadPdf for vision media, or ![path] to display for the operator."
+}
+
 function Invoke-ReadFile {
 	param(
 		[string]$path,
@@ -6181,22 +8291,30 @@ function Invoke-ReadFile {
 	if ($file.PSIsContainer) { return "ERROR: Path is a directory. Use ListDirectory: $path" }
 
 	$ext = $file.Extension.ToLower()
+	$imageExt = @('.png','.jpg','.jpeg','.gif','.bmp','.ico','.webp','.tif','.tiff','.heic','.heif','.jfif')
+	$videoExt = @('.mp4','.m4v','.mov','.avi','.mkv','.wmv','.webm')
+	$audioExt = @('.mp3','.wav','.flac','.aac','.ogg','.m4a','.wma')
 	$blockedExtensions = @(
 		'.exe','.dll','.sys','.drv','.ocx','.com','.scr','.msi','.msp','.mst','.cab',
 		'.dmp','.hdmp','.mdmp','.kdmp',
 		'.zip','.rar','.7z','.tar','.gz','.bz2','.xz','.iso','.img','.wim','.esd',
 		'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.odt','.ods','.odp',
-		'.png','.jpg','.jpeg','.gif','.bmp','.ico','.webp','.mp4','.avi','.mkv','.mov','.mp3','.wav','.flac',
 		'.db','.sqlite','.mdb','.accdb','.bin','.pak','.bundle','.so','.dylib'
-	)
+	) + $imageExt + $videoExt + $audioExt
+
+	# Extension gate (cheap)
 	if ($blockedExtensions -contains $ext) {
-		if ($ext -in @('.png','.jpg','.jpeg','.gif','.bmp','.webp','.tif','.tiff')) {
-			return "BLOCKED: '$ext' is an image - EnableToolGroup group=senses then ReadImage path=... (senses). Do not dump binary as text."
-		}
-		if ($ext -eq '.pdf') {
-			return "BLOCKED: PDF - EnableToolGroup group=senses then ReadPdf path=... (default page=1 only; auto vision if garbled; page=N only if needed)."
-		}
-		return "BLOCKED: File type '$ext' cannot be read as text."
+		if ($imageExt -contains $ext) { return (Get-MBReadFileMediaBlockMessage -Kind 'image' -Ext $ext) }
+		if ($ext -eq '.pdf') { return (Get-MBReadFileMediaBlockMessage -Kind 'pdf' -Ext $ext) }
+		if ($videoExt -contains $ext) { return (Get-MBReadFileMediaBlockMessage -Kind 'video' -Ext $ext) }
+		return "BLOCKED: File type '$ext' cannot be read as text. Do not dump binary with ReadFile."
+	}
+
+	# Magic-byte gate (renamed / extensionless images still blocked)
+	$sniff = $null
+	try { $sniff = Test-MBBinaryMediaSniff -Path $path } catch { $sniff = $null }
+	if ($sniff -in @('image', 'pdf', 'video', 'binary')) {
+		return (Get-MBReadFileMediaBlockMessage -Kind $sniff -Ext $ext)
 	}
 
 	$isLarge = $file.Length -gt 1MB
@@ -6471,7 +8589,7 @@ function Invoke-MBLiteralReplace {
 		}
 		$extra = if ($positions.Count -gt 5) { "`n  ... +$($positions.Count - 5) more" } else { '' }
 		$result.Error = @"
-Search matched $($positions.Count) times — refusing ambiguous edit (unique match required by default).
+Search matched $($positions.Count) times - refusing ambiguous edit (unique match required by default).
 Make 'search' unique with surrounding lines, OR set replaceAll=true, OR set occurrence=N (1-based).
 Matches:
 $($locs -join "`n")$extra
@@ -6537,7 +8655,7 @@ function Invoke-MBRegexReplace {
 			return $result
 		}
 		if (-not $ReplaceAll -and $mc.Count -gt 1) {
-			$result.Error = "Regex matched $($mc.Count) times — set replaceAll=true or occurrence=N, or narrow the pattern."
+			$result.Error = "Regex matched $($mc.Count) times - set replaceAll=true or occurrence=N, or narrow the pattern."
 			return $result
 		}
 		if ($ReplaceAll) {
@@ -6911,7 +9029,7 @@ Or:
 				return "ERROR: $fp hunk #$hNum old text not found.`n$hint`nHunk old (first 300 chars):`n$snip"
 			}
 			if ($positions.Count -gt 1) {
-				return "ERROR: $fp hunk #$hNum matched $($positions.Count) places — add more context lines to make it unique."
+				return "ERROR: $fp hunk #$hNum matched $($positions.Count) places - add more context lines to make it unique."
 			}
 			$pos = $positions[0]
 			$work = $work.Remove($pos, $oldText.Length).Insert($pos, $newText)
@@ -6930,7 +9048,7 @@ Or:
 		[void]$previewBlocks.Add("File: $fp (hunks=$hNum, line deltas≈$($diff.LineDiffs), enc=$($st.Encoding))`n$($diff.Preview)")
 	}
 
-	$details = "ApplyPatch — $($plan.Count) file(s)`n`n" + ($previewBlocks -join "`n`n")
+	$details = "ApplyPatch - $($plan.Count) file(s)`n`n" + ($previewBlocks -join "`n`n")
 	if (-not (Request-Confirmation -Title "ApplyPatch requires approval" -Details $details)) {
 		return "BLOCKED BY USER: Patch denied by operator."
 	}
@@ -6948,6 +9066,105 @@ Or:
 	return "SUCCESS${auto}: Patch applied:`n - " + ($ok -join "`n - ")
 }
 
+function Stop-MBProcessTree {
+	# Kill process + descendants. Process.Kill() alone leaves sandbox grandchildren running.
+	param([int]$ProcessId)
+	if ($ProcessId -le 0) { return }
+	if ($script:HasNative) {
+		try {
+			[MiniBot.Core.Native]::KillProcessTree($ProcessId)
+			return
+		} catch {}
+	}
+	try {
+		$psi = New-Object System.Diagnostics.ProcessStartInfo
+		$psi.FileName = 'taskkill.exe'
+		$psi.Arguments = "/F /T /PID $ProcessId"
+		$psi.UseShellExecute = $false
+		$psi.CreateNoWindow = $true
+		$psi.RedirectStandardOutput = $true
+		$psi.RedirectStandardError = $true
+		$tk = [System.Diagnostics.Process]::Start($psi)
+		if ($tk) {
+			try { [void]$tk.WaitForExit(8000) } catch {}
+			try { $tk.Dispose() } catch {}
+		}
+	} catch {
+		try {
+			$p = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+			try { $p.Kill() } catch {}
+			try { [void]$p.WaitForExit(3000) } catch {}
+			try { $p.Dispose() } catch {}
+		} catch {}
+	}
+}
+
+function Register-MBChildProcess {
+	param([int]$ProcessId)
+	if ($ProcessId -le 0) { return }
+	try {
+		if ($null -eq $script:MB.ChildProcessIds) {
+			$script:MB.ChildProcessIds = New-Object System.Collections.ArrayList
+		}
+		foreach ($x in @($script:MB.ChildProcessIds)) {
+			if ([int]$x -eq $ProcessId) { return }
+		}
+		[void]$script:MB.ChildProcessIds.Add($ProcessId)
+	} catch {}
+	if ($script:HasNative) {
+		try { [MiniBot.Core.Native]::ActiveChildPid = $ProcessId } catch {}
+	}
+}
+
+function Unregister-MBChildProcess {
+	param([int]$ProcessId)
+	if ($ProcessId -le 0) { return }
+	try {
+		if ($script:MB.ChildProcessIds) {
+			$next = New-Object System.Collections.ArrayList
+			foreach ($x in @($script:MB.ChildProcessIds)) {
+				if ([int]$x -ne $ProcessId) { [void]$next.Add([int]$x) }
+			}
+			$script:MB.ChildProcessIds = $next
+		}
+	} catch {}
+	if ($script:HasNative) {
+		try {
+			if ([int][MiniBot.Core.Native]::ActiveChildPid -eq $ProcessId) {
+				[MiniBot.Core.Native]::ActiveChildPid = 0
+			}
+		} catch {}
+	}
+}
+
+function Stop-MBTrackedChildProcesses {
+	$ids = New-Object System.Collections.ArrayList
+	try {
+		foreach ($x in @($script:MB.ChildProcessIds)) {
+			$n = 0
+			try { $n = [int]$x } catch { $n = 0 }
+			if ($n -gt 0) { [void]$ids.Add($n) }
+		}
+	} catch {}
+	if ($script:HasNative) {
+		try {
+			$ap = [int][MiniBot.Core.Native]::ActiveChildPid
+			if ($ap -gt 0 -and -not ($ids -contains $ap)) { [void]$ids.Add($ap) }
+		} catch {}
+	}
+	foreach ($id in @($ids)) {
+		try { Stop-MBProcessTree -ProcessId ([int]$id) } catch {}
+		try { Unregister-MBChildProcess -ProcessId ([int]$id) } catch {}
+	}
+	try {
+		if ($script:MB.ChildProcessIds) { $script:MB.ChildProcessIds.Clear() }
+		else { $script:MB.ChildProcessIds = New-Object System.Collections.ArrayList }
+	} catch { $script:MB.ChildProcessIds = New-Object System.Collections.ArrayList }
+	if ($script:HasNative) {
+		try { [MiniBot.Core.Native]::ActiveChildPid = 0 } catch {}
+	}
+}
+
 function Invoke-MBProcessCapture {
 	param(
 		[Parameter(Mandatory = $true)][string]$FileName,
@@ -6959,11 +9176,17 @@ function Invoke-MBProcessCapture {
 		$WorkingDir = if ($script:MB.WorkingDir) { $script:MB.WorkingDir } else { (Get-Location).Path }
 	}
 
+	# Prefer managed wait loop so Esc / WPF close / InterruptFlag are polled.
 	if ($script:HasNative) {
-		if ($script:MB.Interrupt) {
-			try { [MiniBot.Core.Native]::CancelRequested = $true } catch {}
-		}
-		return [MiniBot.Core.Native]::RunProcess($FileName, $Arguments, $WorkingDir, $TimeoutMs)
+		try {
+			if ($script:MB.Interrupt) {
+				[MiniBot.Core.Native]::CancelRequested = $true
+				[MiniBot.Core.Native]::ExternalCancel = $true
+			} else {
+				[MiniBot.Core.Native]::CancelRequested = $false
+				[MiniBot.Core.Native]::ExternalCancel = $false
+			}
+		} catch {}
 	}
 
 	$sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -6974,8 +9197,10 @@ function Invoke-MBProcessCapture {
 		ElapsedMs  = 0
 		TimedOut   = $false
 		Cancelled  = $false
+		Pid        = 0
 	}
 	$proc = $null
+	$childPid = 0
 	try {
 		$psi = New-Object System.Diagnostics.ProcessStartInfo
 		$psi.FileName = $FileName
@@ -6994,20 +9219,65 @@ function Invoke-MBProcessCapture {
 		$proc = New-Object System.Diagnostics.Process
 		$proc.StartInfo = $psi
 		[void]$proc.Start()
+		try {
+			$childPid = [int]$proc.Id
+			$result.Pid = $childPid
+			Register-MBChildProcess -ProcessId $childPid
+		} catch { $childPid = 0 }
 		$outTask = $proc.StandardOutput.ReadToEndAsync()
 		$errTask = $proc.StandardError.ReadToEndAsync()
 
+		$spin = 0
 		while (-not $proc.HasExited) {
-			if ((Test-MBInterrupt)) {
-				try { $proc.Kill() } catch {}
+			$spin++
+			$wantCancel = $false
+			try {
+				if (Test-MBInterrupt) { $wantCancel = $true }
+			} catch {
+				if ($script:MB.Interrupt) { $wantCancel = $true }
+			}
+			try {
+				if ($script:MB.Wpf -and ($script:MB.Wpf.ExitRequested -or $script:MB.Wpf.InterruptFlag)) {
+					$wantCancel = $true
+					$script:MB.Interrupt = $true
+				}
+			} catch {}
+			if ($script:HasNative) {
+				try {
+					if ([MiniBot.Core.Native]::CancelRequested -or [MiniBot.Core.Native]::ExternalCancel) {
+						$wantCancel = $true
+					}
+				} catch {}
+			}
+
+			if ($wantCancel) {
+				try { Stop-MBProcessTree -ProcessId $childPid } catch { try { $proc.Kill() } catch {} }
 				$result.Cancelled = $true
 				$script:MB.Interrupt = $true
+				try { [void]$proc.WaitForExit(5000) } catch {}
 				break
 			}
 			if ($TimeoutMs -gt 0 -and $sw.ElapsedMilliseconds -gt $TimeoutMs) {
-				try { $proc.Kill() } catch {}
+				try { Stop-MBProcessTree -ProcessId $childPid } catch { try { $proc.Kill() } catch {} }
 				$result.TimedOut = $true
+				try { [void]$proc.WaitForExit(5000) } catch {}
 				break
+			}
+			if (($spin % 5) -eq 0) {
+				try {
+					$d = $null
+					try { if ($script:MB.Wpf) { $d = $script:MB.Wpf.Dispatcher } } catch {}
+					if ($d -and -not $d.HasShutdownStarted -and $d.CheckAccess()) {
+						$frame = New-Object System.Windows.Threading.DispatcherFrame
+						$cb = [System.Windows.Threading.DispatcherOperationCallback]{
+							param($f)
+							try { $f.Continue = $false } catch {}
+							return $null
+						}
+						[void]$d.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, $cb, $frame)
+						[System.Windows.Threading.Dispatcher]::PushFrame($frame)
+					}
+				} catch {}
 			}
 			Start-Sleep -Milliseconds 40
 		}
@@ -7015,25 +9285,45 @@ function Invoke-MBProcessCapture {
 		if (-not $result.Cancelled -and -not $result.TimedOut) {
 			try { [void]$proc.WaitForExit(2000) } catch {}
 			try { $result.ExitCode = $proc.ExitCode } catch { $result.ExitCode = -1 }
+		} elseif ($proc.HasExited) {
+			try { $result.ExitCode = $proc.ExitCode } catch { $result.ExitCode = -1 }
 		}
 
 		try {
 			if ($outTask.IsCompleted) { $result.StdOut = [string]$outTask.Result }
 			else {
-				try { [void]$outTask.Wait(500) } catch {}
+				try { [void]$outTask.Wait(1500) } catch {}
 				if ($outTask.IsCompleted) { $result.StdOut = [string]$outTask.Result }
 			}
 		} catch {}
 		try {
 			if ($errTask.IsCompleted) { $result.StdErr = [string]$errTask.Result }
 			else {
-				try { [void]$errTask.Wait(500) } catch {}
+				try { [void]$errTask.Wait(1500) } catch {}
 				if ($errTask.IsCompleted) { $result.StdErr = [string]$errTask.Result }
+			}
+		} catch {}
+		try {
+			$maxCap = 1500000
+			if ($result.StdOut -and $result.StdOut.Length -gt $maxCap) {
+				$result.StdOut = $result.StdOut.Substring(0, $maxCap) + "`n...[stdout capped]..."
+			}
+			if ($result.StdErr -and $result.StdErr.Length -gt $maxCap) {
+				$result.StdErr = $result.StdErr.Substring(0, $maxCap) + "`n...[stderr capped]..."
 			}
 		} catch {}
 	} catch {
 		$result.StdErr = $_.Exception.Message
+		if ($childPid -gt 0) { try { Stop-MBProcessTree -ProcessId $childPid } catch {} }
 	} finally {
+		if ($childPid -gt 0) {
+			try {
+				$still = $false
+				try { $still = -not $proc.HasExited } catch { $still = $false }
+				if ($still) { Stop-MBProcessTree -ProcessId $childPid }
+			} catch {}
+			try { Unregister-MBChildProcess -ProcessId $childPid } catch {}
+		}
 		if ($proc) { try { $proc.Dispose() } catch {} }
 	}
 	$sw.Stop()
@@ -8314,6 +10604,22 @@ function Invoke-RunCommand {
 		}
 	}
 
+	# Bulk recursive listings (esp. media) thrash context when FindFiles already capped results.
+	# Point the model back at FindFiles + inline play instead of dumping 1000+ paths via GCI.
+	if ($shell -ne 'cmd' -and [string]$command -match '(?i)\b(Get-ChildItem|gci|dir|ls)\b' -and [string]$command -match '(?i)-Recurse') {
+		$mediaIsh = [string]$command -match '(?i)(\.mp4|\.mkv|\.avi|\.mov|\.wmv|\.webm|\.m4v|\.mp3|\.wav|\.flac|\.m4a|\.aac|\.ogg|\.wma|\.png|\.jpe?g|\.gif|\.webp|\.tif|\*media\*|\*video\*|\*music\*|\*photo\*|-Include|-Filter)'
+		if ($mediaIsh -or [string]$command -match '(?i)FullName|Select-Object') {
+			return (
+				"REDIRECTED: Do not dump large recursive file lists with Get-ChildItem (wastes time/context; still truncates).`n" +
+				"Use FindFiles path=... recursive=true extensions=[mp4,mkv,...] or glob='*.mp4;*.mkv' max=50-100.`n" +
+				"If FindFiles already returned truncated=true: do not re-fetch everything. " +
+				"Specific ask (named file/subject/folder) → narrow filters to match. " +
+				"Deliberately vague ask (play something / random …) → pick one from files[] and act.`n" +
+				"Play/show: ![label](absolute-path) INLINE. Default app only as last resort (incompatible format or explicit external player)."
+			)
+		}
+	}
+
 	# Never interpolate $command into expandable strings (eats $_, $$, `" , etc. in the parent).
 	# In-memory only: build script bytes → Base64 → -EncodedCommand (no temp files).
 	try {
@@ -9099,7 +11405,7 @@ function Invoke-ViewScreen {
 		[int]$y = -1,
 		[int]$width = 0,
 		[int]$height = 0,
-		[int]$maxWidth = 1280
+		[int]$maxWidth = 0
 	)
 	try {
 		Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
@@ -9107,6 +11413,7 @@ function Invoke-ViewScreen {
 	} catch {
 		return "ERROR: System.Drawing / WinForms not available for ViewScreen: $($_.Exception.Message)"
 	}
+	# Vision caps applied in Set-MBPendingVisionFromBitmap (safe default if 0)
 
 	$useRegion = ($width -gt 0 -and $height -gt 0)
 	$monLabel = if ([string]::IsNullOrWhiteSpace($monitor)) { 'primary' } else { $monitor.Trim() }
@@ -9200,26 +11507,6 @@ function Invoke-ViewScreen {
 		$g = [System.Drawing.Graphics]::FromImage($bmp)
 		$g.CopyFromScreen($rect.X, $rect.Y, 0, 0, $rect.Size, [System.Drawing.CopyPixelOperation]::SourceCopy)
 
-		$visionBmp = $bmp
-		if ($maxWidth -gt 0 -and $bmp.Width -gt $maxWidth) {
-			$newW = $maxWidth
-			$newH = [math]::Max(1, [int][math]::Round($bmp.Height * ($maxWidth / [double]$bmp.Width)))
-			$scaled = New-Object System.Drawing.Bitmap $newW, $newH
-			$sg = [System.Drawing.Graphics]::FromImage($scaled)
-			try {
-				$sg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-				$sg.DrawImage($bmp, 0, 0, $newW, $newH)
-			} finally {
-				$sg.Dispose()
-			}
-			$visionBmp = $scaled
-		}
-
-		$ms = New-Object System.IO.MemoryStream
-		$visionBmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-		$bytes = $ms.ToArray()
-		$b64 = [Convert]::ToBase64String($bytes)
-
 		if ($saveToDisk -and $diskPath) {
 			$dir = Split-Path -Parent $diskPath
 			if ($dir -and -not (Test-Path -LiteralPath $dir)) {
@@ -9236,20 +11523,16 @@ function Invoke-ViewScreen {
 			Write-Host "    saved: $diskPath" -ForegroundColor Green
 		}
 
-		$script:MB.PendingVision = @{
-			Base64    = $b64
-			Width     = $visionBmp.Width
-			Height    = $visionBmp.Height
-			SizeBytes = $bytes.Length
-			Label     = $monLabel
-			Mime      = 'image/png'
-			SavedPath = $(if ($saveToDisk) { $diskPath } else { $null })
+		# Vision payload: shared safe downscale/JPEG caps (prevents CUDA OOM on mmproj)
+		$pv = Set-MBPendingVisionFromBitmap -Bitmap $bmp -MaxWidth $maxWidth -Label $monLabel -SourcePath $(if ($saveToDisk) { $diskPath } else { '' }) -Kind 'screen' -Mime 'image/jpeg'
+		if ($saveToDisk -and $diskPath -and $script:MB.PendingVision) {
+			try { $script:MB.PendingVision.SavedPath = $diskPath } catch {}
 		}
 
 		if ($saveToDisk) {
 			$uxLines = @(
 				"SAVED_TO: $diskPath"
-				"Tell the user this exact path in your next reply."
+				"Tell the user this exact path in your next reply. Prefer showing it INLINE with markdown: ![capture](exact-absolute-path)."
 				"If they also wanted a description, briefly describe the screen too."
 			) -join "`n"
 		} else {
@@ -9267,13 +11550,13 @@ function Invoke-ViewScreen {
 			savedFullRes  = [bool]$saveToDisk
 			monitor       = $monLabel
 			capture       = @{ x = $rect.X; y = $rect.Y; width = $rect.Width; height = $rect.Height }
-			image         = @{ width = $visionBmp.Width; height = $visionBmp.Height }
+			image         = @{ width = $pv.Width; height = $pv.Height; sourceWidth = $bmp.Width; sourceHeight = $bmp.Height }
 			dpiAware      = [bool]$script:HasDpiScreen
-			sizeBytes     = $bytes.Length
-			sizeKB        = [math]::Round($bytes.Length / 1KB, 1)
+			sizeBytes     = $pv.SizeBytes
+			sizeKB        = [math]::Round($pv.SizeBytes / 1KB, 1)
+			mime          = $pv.Mime
 			visionPending = $true
 		}
-		$script:MB.PendingVision.Kind = 'screen'
 		return ($uxLines + "`n" + (ConvertTo-MBJson $payload -Depth 4))
 	} catch {
 		return "ERROR: ViewScreen failed: $($_.Exception.Message)"
@@ -9285,39 +11568,95 @@ function Invoke-ViewScreen {
 	}
 }
 
+
+function Get-MBVisionImageLimits {
+	# Keep vision tiles small for llama.cpp mmproj on limited VRAM (T4 OOM on large TIFFs).
+	return @{
+		DefaultMaxSide = 896
+		HardMaxSide    = 1024
+		MaxPixels      = 720000
+		MaxBytes       = 750000
+	}
+}
+
 function Set-MBPendingVisionFromBitmap {
 	param(
 		$Bitmap,
-		[int]$MaxWidth = 1280,
+		[int]$MaxWidth = 0,
 		[string]$Label = 'image',
 		[string]$SourcePath = '',
 		[string]$Kind = 'image',
-		[string]$Mime = 'image/png'
+		[string]$Mime = 'image/jpeg'
 	)
 	$scaled = $null
 	$ms = $null
 	try {
+		$lim = Get-MBVisionImageLimits
+		$maxSide = [int]$MaxWidth
+		if ($maxSide -le 0) { $maxSide = [int]$lim.DefaultMaxSide }
+		if ($maxSide -gt [int]$lim.HardMaxSide) { $maxSide = [int]$lim.HardMaxSide }
+		if ($maxSide -lt 256) { $maxSide = 256 }
+
+		$srcW = [double]$Bitmap.Width
+		$srcH = [double]$Bitmap.Height
+		if ($srcW -lt 1) { $srcW = 1 }
+		if ($srcH -lt 1) { $srcH = 1 }
+
+		$scale = 1.0
+		if ($srcW -gt $maxSide) { $scale = [Math]::Min($scale, $maxSide / $srcW) }
+		if ($srcH -gt $maxSide) { $scale = [Math]::Min($scale, $maxSide / $srcH) }
+		$maxPix = [double]$lim.MaxPixels
+		$curPix = $srcW * $srcH * $scale * $scale
+		if ($curPix -gt $maxPix) {
+			$scale = [Math]::Min($scale, [Math]::Sqrt($maxPix / ($srcW * $srcH)))
+		}
+
 		$visionBmp = $Bitmap
-		if ($MaxWidth -gt 0 -and $Bitmap.Width -gt $MaxWidth) {
-			$newW = $MaxWidth
-			$newH = [math]::Max(1, [int][math]::Round($Bitmap.Height * ($MaxWidth / [double]$Bitmap.Width)))
+		if ($scale -lt 0.999) {
+			$newW = [Math]::Max(1, [int][Math]::Round($srcW * $scale))
+			$newH = [Math]::Max(1, [int][Math]::Round($srcH * $scale))
 			$scaled = New-Object System.Drawing.Bitmap $newW, $newH
 			$sg = [System.Drawing.Graphics]::FromImage($scaled)
 			try {
 				$sg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+				$sg.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
 				$sg.DrawImage($Bitmap, 0, 0, $newW, $newH)
-			} finally { $sg.Dispose() }
+			} finally {
+				$sg.Dispose()
+			}
 			$visionBmp = $scaled
 		}
-		$ms = New-Object System.IO.MemoryStream
-		$fmt = [System.Drawing.Imaging.ImageFormat]::Png
-		$outMime = 'image/png'
-		if ($Mime -match 'jpeg|jpg') {
-			$fmt = [System.Drawing.Imaging.ImageFormat]::Jpeg
-			$outMime = 'image/jpeg'
+
+		# Always JPEG for vision payload (smaller than PNG/TIFF)
+		$maxBytes = [int]$lim.MaxBytes
+		$bytes = $null
+		$attempt = 0
+		while ($attempt -lt 4) {
+			$attempt++
+			if ($null -ne $ms) { try { $ms.Dispose() } catch {} }
+			$ms = New-Object System.IO.MemoryStream
+			$visionBmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+			$bytes = $ms.ToArray()
+			if ($bytes.Length -le $maxBytes) { break }
+
+			# Still too large: shrink again
+			$nw = [Math]::Max(64, [int][Math]::Round($visionBmp.Width * 0.75))
+			$nh = [Math]::Max(64, [int][Math]::Round($visionBmp.Height * 0.75))
+			$next = New-Object System.Drawing.Bitmap $nw, $nh
+			$sg2 = [System.Drawing.Graphics]::FromImage($next)
+			try {
+				$sg2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+				$sg2.DrawImage($visionBmp, 0, 0, $nw, $nh)
+			} finally {
+				$sg2.Dispose()
+			}
+			if ($null -ne $scaled) {
+				try { $scaled.Dispose() } catch {}
+			}
+			$scaled = $next
+			$visionBmp = $scaled
 		}
-		$visionBmp.Save($ms, $fmt)
-		$bytes = $ms.ToArray()
+
 		$b64 = [Convert]::ToBase64String($bytes)
 		$script:MB.PendingVision = @{
 			Base64     = $b64
@@ -9325,36 +11664,40 @@ function Set-MBPendingVisionFromBitmap {
 			Height     = $visionBmp.Height
 			SizeBytes  = $bytes.Length
 			Label      = $Label
-			Mime       = $outMime
+			Mime       = 'image/jpeg'
 			SourcePath = $SourcePath
 			SavedPath  = $null
 			Kind       = $Kind
 		}
 		return $script:MB.PendingVision
 	} finally {
-		if ($ms) { try { $ms.Dispose() } catch {} }
-		if ($scaled) { try { $scaled.Dispose() } catch {} }
+		if ($null -ne $ms) { try { $ms.Dispose() } catch {} }
+		if ($null -ne $scaled) { try { $scaled.Dispose() } catch {} }
 	}
 }
 
 function Invoke-ReadImage {
 	param(
 		[string]$path,
-		[int]$maxWidth = 1280
+		[int]$maxWidth = 0
 	)
 	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required." }
-	$full = Resolve-MBPath -Path $path
-	if (-not (Test-Path -LiteralPath $full)) { return "ERROR: File not found: $full" }
+	$full = Resolve-MBPath -Path $path -MustExist
+	if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+		$tried = @((Get-MBPathCandidates -Path $path) | Select-Object -First 6) -join ' | '
+		return "ERROR: File not found: $path (cwd=$($script:MB.WorkingDir); tried: $tried)"
+	}
 	$item = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
 	if (-not $item -or $item.PSIsContainer) { return "ERROR: Path is not a file: $full" }
 	$ext = $item.Extension.ToLowerInvariant()
-	$okExt = @('.png','.jpg','.jpeg','.gif','.bmp','.tif','.tiff','.webp')
+	$okExt = @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp')
 	if ($okExt -notcontains $ext) {
 		return "ERROR: Unsupported image type '$ext'. Use: png, jpg, jpeg, gif, bmp, tif, webp."
 	}
-	$maxMb = 40
+	$maxMb = 25
 	if ($item.Length -gt ($maxMb * 1MB)) {
-		return "ERROR: Image too large ($([math]::Round($item.Length/1MB,1)) MB). Max ~${maxMb} MB."
+		$mb = [math]::Round($item.Length / 1MB, 1)
+		return "ERROR: Image file too large on disk ($mb MB). Max about ${maxMb} MB. Resize externally, or show the operator with markdown image syntax without vision."
 	}
 	try {
 		Add-Type -AssemblyName System.Drawing -ErrorAction Stop
@@ -9366,43 +11709,51 @@ function Invoke-ReadImage {
 	try {
 		$fs = [System.IO.File]::Open($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
 		$bmp = New-Object System.Drawing.Bitmap $fs
-		$mime = switch ($ext) {
-			{ $_ -in @('.jpg','.jpeg') } { 'image/jpeg' }
-			'.gif' { 'image/gif' }
-			'.bmp' { 'image/bmp' }
-			'.webp' { 'image/webp' }
-			default { 'image/png' }
+		$px = [int64]$bmp.Width * [int64]$bmp.Height
+		if ($px -gt 25000000) {
+			return "ERROR: Image resolution too large ($($bmp.Width)x$($bmp.Height)). Resize or crop first."
 		}
-		$sendMime = if ($ext -in @('.jpg','.jpeg')) { 'image/jpeg' } else { 'image/png' }
 		$label = [System.IO.Path]::GetFileName($full)
-		$pv = Set-MBPendingVisionFromBitmap -Bitmap $bmp -MaxWidth $maxWidth -Label $label -SourcePath $full -Kind 'file' -Mime $sendMime
-		Write-Host ("    read image {0} ({1}x{2} -> vision {3}x{4})" -f $label, $bmp.Width, $bmp.Height, $pv.Width, $pv.Height) -ForegroundColor DarkGray
+		$pv = Set-MBPendingVisionFromBitmap -Bitmap $bmp -MaxWidth $maxWidth -Label $label -SourcePath $full -Kind 'file' -Mime 'image/jpeg'
+		$kb = [math]::Round($pv.SizeBytes / 1KB, 1)
+		Write-Host ("    read image {0} ({1}x{2} -> vision {3}x{4}, {5} KB jpeg)" -f $label, $bmp.Width, $bmp.Height, $pv.Width, $pv.Height, $kb) -ForegroundColor DarkGray
+		$showHint = 'Do not invent other paths. Prefer INLINE chat display (no vision cost): ![name](exact-absolute-path).'
 		$ux = @(
 			"IMAGE_LOADED: $full"
-			"Vision payload pending for next model reply (describe what you see)."
-			"Do not invent other paths."
+			("Vision payload: {0}x{1} jpeg (~{2} KB) pending for next model reply (source was {3}x{4})." -f $pv.Width, $pv.Height, $kb, $bmp.Width, $bmp.Height)
+			$showHint
 		) -join "`n"
 		$payload = [ordered]@{
 			success       = $true
 			path          = $full
 			visionPending = $true
-			image         = @{ width = $pv.Width; height = $pv.Height; sourceWidth = $bmp.Width; sourceHeight = $bmp.Height }
+			image         = @{
+				width        = $pv.Width
+				height       = $pv.Height
+				sourceWidth  = $bmp.Width
+				sourceHeight = $bmp.Height
+				downscaled   = ($pv.Width -ne $bmp.Width -or $pv.Height -ne $bmp.Height)
+			}
 			sizeBytes     = $pv.SizeBytes
-			sizeKB        = [math]::Round($pv.SizeBytes / 1KB, 1)
+			sizeKB        = $kb
 			mime          = $pv.Mime
 		}
-		return ($ux + "`n" + (ConvertTo-MBJson $payload -Depth 4))
+		return ($ux + "`n" + (ConvertTo-MBJson $payload -Depth 5))
 	} catch {
 		$msg = $_.Exception.Message
 		if ($ext -eq '.webp') {
-			$msg += " (WebP may need a newer GDI+ / codec on this machine — try PNG or JPEG.)"
+			$msg = $msg + " (WebP may need a newer GDI+ codec - try PNG or JPEG.)"
+		}
+		if ($ext -eq '.tif' -or $ext -eq '.tiff') {
+			$msg = $msg + " (TIFF decode failed - try converting to JPEG/PNG first.)"
 		}
 		return "ERROR: ReadImage failed: $msg"
 	} finally {
-		if ($bmp) { try { $bmp.Dispose() } catch {} }
-		if ($fs) { try { $fs.Dispose() } catch {} }
+		if ($null -ne $bmp) { try { $bmp.Dispose() } catch {} }
+		if ($null -ne $fs) { try { $fs.Dispose() } catch {} }
 	}
 }
+
 
 function Test-MBPdfTextGarbled {
 	param([string]$Text)
@@ -9726,7 +12077,7 @@ function Invoke-ReadPdf {
 		[int]$page = 1,
 		[bool]$render = $false,
 		[bool]$autoVision = $true,
-		[int]$maxWidth = 1280
+		[int]$maxWidth = 0
 	)
 	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required." }
 	$full = Resolve-MBPath -Path $path
@@ -9742,7 +12093,7 @@ function Invoke-ReadPdf {
 	if ($maxChars -le 0) { $maxChars = 50000 }
 	if ($maxChars -gt 200000) { $maxChars = 200000 }
 	if ($page -lt 1) { $page = 1 }
-	if ($maxWidth -le 0) { $maxWidth = 1280 }
+	# maxWidth 0 => vision helper uses safe default (~896 max side)
 
 	if (-not ("MiniBot.Core.PdfText" -as [type])) {
 		$pdfCs = @'
@@ -9928,7 +12279,9 @@ namespace MiniBot.Core {
 
 		$bmp = $null
 		try {
-			$rend = Invoke-MBPdfRenderPageBitmap -Path $full -Page $page -Dpi 150 -DestWidth ([math]::Max($maxWidth, 1200))
+			# Render page no larger than vision hard max (avoids huge bitmaps before encode)
+			$destW = if ($maxWidth -gt 0) { [Math]::Min(1024, $maxWidth) } else { 896 }
+			$rend = Invoke-MBPdfRenderPageBitmap -Path $full -Page $page -Dpi 120 -DestWidth $destW
 			if (-not $rend.Ok -or -not $rend.Bitmap) {
 				$note = "Text extract failed/garbled ($reason) and page render failed."
 				if ($rend.Error) { $note += " Render errors: $($rend.Error)" }
@@ -10793,7 +13146,7 @@ function Get-MBPrimaryLanContext {
 
 function Get-MBLocalHostIdentitySet {
 	# Keys (lowercase) that mean "this machine" for share scan / probe filters.
-	# Covers primary LAN IP, all adapters, DNS names, localhost — not only $ctx.ip.
+	# Covers primary LAN IP, all adapters, DNS names, localhost - not only $ctx.ip.
 	$set = @{}
 	$add = {
 		param([string]$k)
@@ -11022,7 +13375,7 @@ function Invoke-MBFloodPingSubnet {
 						}
 					}
 				} elseif ($j.State -eq 'Running') {
-					# Timed out still running — treat target as no-reply; stop it
+					# Timed out still running - treat target as no-reply; stop it
 					try { Stop-Job -Job $j -Force -ErrorAction SilentlyContinue } catch {}
 				}
 			} catch {}
@@ -11193,7 +13546,7 @@ function Invoke-ScanNetwork {
 			$mac = [string]$arp[$ip]
 			$macSource = 'arp'
 		}
-		# MAC discovery (SendARP) when ARP table lacks L2 address — required for vendor OUI
+		# MAC discovery (SendARP) when ARP table lacks L2 address - required for vendor OUI
 		if ($doMac -and [string]::IsNullOrWhiteSpace($mac)) {
 			$m2 = Get-MBMacFromIp -Ip $ip
 			if ($m2) {
@@ -11350,7 +13703,7 @@ function Test-MBShareMapGuess {
 		$blob -match '(?i)(System error 5|Access is denied|1326|Logon failure|86|network password|user name or password|1219|multiple connections)' -or
 		$exit -in @(5, 86, 1219, 1326, 1909, 2202)
 	) {
-		# Share name resolved; credentials wrong/missing/conflict — still a hit for discovery
+		# Share name resolved; credentials wrong/missing/conflict - still a hit for discovery
 		$status = 'exists_auth_required'
 		$found = $true
 	} elseif (
@@ -11456,7 +13809,7 @@ function Invoke-ProbeShares {
 			}) -Depth 4
 		}
 	} else {
-		# Targeted list may still include this PC (e.g. from ScanNetwork self row) — never probe self for remote shares
+		# Targeted list may still include this PC (e.g. from ScanNetwork self row) - never probe self for remote shares
 		$filtered = New-Object System.Collections.ArrayList
 		foreach ($t in @($targets)) {
 			if (Test-MBIsLocalHostTarget -HostName $t -IdentitySet $selfIds) {
@@ -11505,7 +13858,7 @@ function Invoke-ProbeShares {
 			}
 		}
 	}
-	# Defaults when none specified — common residential/business share names
+	# Defaults when none specified - common residential/business share names
 	if ($candidates.Count -eq 0) {
 		foreach ($n in @('temp', 'share', 'data', 'public', 'users', 'shared', 'media', 'backup', 'files', 'docs')) {
 			[void]$candidates.Add($n)
@@ -11796,7 +14149,7 @@ function Invoke-ControlService {
 	try {
 		$svc = Get-Service -Name $name -ErrorAction Stop
 	} catch {
-		return "ERROR: Service not found: $name — $($_.Exception.Message)"
+		return "ERROR: Service not found: $name - $($_.Exception.Message)"
 	}
 
 	$details = "Service: $($svc.Name) ($($svc.DisplayName))`nCurrent: Status=$($svc.Status) StartType=$($svc.StartType)`nAction: $action"
@@ -12199,6 +14552,865 @@ function Invoke-CompressArchive {
 	}
 }
 
+# ISO helpers (IMAPI2 / Chris Wu New-IsoFile style — embedded, no download required)
+function Initialize-MBIsoFileType {
+	if ('MB_ISOFileWriter' -as [type]) { return $true }
+	try {
+		$cp = New-Object System.CodeDom.Compiler.CompilerParameters
+		$cp.CompilerOptions = '/unsafe'
+		Add-Type -CompilerParameters $cp -TypeDefinition @'
+public class MB_ISOFileWriter {
+  public unsafe static void Create(string Path, object Stream, int BlockSize, int TotalBlocks) {
+    int bytes = 0;
+    byte[] buf = new byte[BlockSize];
+    var ptr = (System.IntPtr)(&bytes);
+    var o = System.IO.File.OpenWrite(Path);
+    var i = Stream as System.Runtime.InteropServices.ComTypes.IStream;
+    if (o != null) {
+      while (TotalBlocks-- > 0) {
+        i.Read(buf, BlockSize, ptr);
+        o.Write(buf, 0, bytes);
+      }
+      o.Flush();
+      o.Close();
+    }
+  }
+}
+'@ -ErrorAction Stop
+		return [bool]('MB_ISOFileWriter' -as [type])
+	} catch {
+		return $false
+	}
+}
+
+function Dismount-MBIsoIfMounted {
+	param([string]$IsoPath)
+	if ([string]::IsNullOrWhiteSpace($IsoPath)) { return }
+	if (-not (Test-Path -LiteralPath $IsoPath)) { return }
+	try {
+		$img = Get-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue
+		if ($img -and $img.Attached) {
+			Dismount-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue | Out-Null
+		}
+	} catch {}
+}
+
+function Get-MBIsoMountInfo {
+	param([string]$IsoPath)
+	$out = [ordered]@{
+		path         = $IsoPath
+		attached     = $false
+		drive_letter = ''
+		device_path  = ''
+	}
+	if ([string]::IsNullOrWhiteSpace($IsoPath) -or -not (Test-Path -LiteralPath $IsoPath)) { return $out }
+	try {
+		$img = Get-DiskImage -ImagePath $IsoPath -ErrorAction Stop
+		$out.attached = [bool]$img.Attached
+		$out.device_path = [string]$img.DevicePath
+		if ($img.Attached) {
+			$vol = Get-Volume -DiskImage $img -ErrorAction SilentlyContinue | Select-Object -First 1
+			if ($vol -and $vol.DriveLetter) {
+				$out.drive_letter = ([string]$vol.DriveLetter).TrimEnd(':')
+			}
+		}
+	} catch {}
+	return $out
+}
+
+function New-MBIsoFile {
+	# Create ISO from paths (contents). Based on Chris Wu New-IsoFile / IMAPI2.
+	param(
+		[Parameter(Mandatory = $true)]
+		[object[]]$Items,
+		[Parameter(Mandatory = $true)]
+		[string]$Path,
+		[string]$BootFile = '',
+		[string]$Title = '',
+		[string]$Media = 'DVDPLUSRW_DUALLAYER',
+		[switch]$Force
+	)
+	if (-not (Initialize-MBIsoFileType)) {
+		throw "ISO writer type failed to load (needs Windows PowerShell + /unsafe Add-Type)."
+	}
+	$mediaTypes = @(
+		'UNKNOWN','CDROM','CDR','CDRW','DVDROM','DVDRAM','DVDPLUSR','DVDPLUSRW','DVDPLUSR_DUALLAYER',
+		'DVDDASHR','DVDDASHRW','DVDDASHR_DUALLAYER','DISK','DVDPLUSRW_DUALLAYER','HDDVDROM','HDDVDR',
+		'HDDVDRAM','BDROM','BDR','BDRE'
+	)
+	$mediaName = if ([string]::IsNullOrWhiteSpace($Media)) { 'DVDPLUSRW_DUALLAYER' } else { $Media.Trim().ToUpperInvariant() }
+	$mediaIdx = [array]::IndexOf($mediaTypes, $mediaName)
+	if ($mediaIdx -lt 0) { throw "Unknown media type '$Media'. Use e.g. DVDPLUSRW_DUALLAYER, DVDPLUSR, CDR." }
+
+	$volTitle = if ([string]::IsNullOrWhiteSpace($Title)) {
+		(Get-Date).ToString('yyyyMMdd-HHmmss')
+	} else {
+		# Volume labels are limited; strip bad chars
+		$t = [regex]::Replace([string]$Title, '[\\/:*?"<>|]', '_')
+		if ($t.Length -gt 32) { $t = $t.Substring(0, 32) }
+		$t
+	}
+
+	$boot = $null
+	if (-not [string]::IsNullOrWhiteSpace($BootFile)) {
+		if (-not (Test-Path -LiteralPath $BootFile -PathType Leaf)) {
+			throw "Boot file not found: $BootFile"
+		}
+		if ($mediaName -in @('BDR', 'BDRE')) {
+			Write-Warning "Bootable image often fails with media type $mediaName"
+		}
+		$stream = New-Object -ComObject ADODB.Stream
+		$stream.Type = 1 # adTypeBinary
+		$stream.Open()
+		$stream.LoadFromFile((Get-Item -LiteralPath $BootFile).FullName)
+		$boot = New-Object -ComObject IMAPI2FS.BootOptions
+		$boot.AssignBootImage($stream)
+	}
+
+	$image = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
+	$image.VolumeName = $volTitle
+	$image.ChooseImageDefaultsForMediaType($mediaIdx)
+
+	$itemCount = 0
+	foreach ($raw in @($Items)) {
+		if ($null -eq $raw) { continue }
+		$item = $null
+		if ($raw -is [System.IO.FileInfo] -or $raw -is [System.IO.DirectoryInfo]) {
+			$item = $raw
+		} else {
+			$p = [string]$raw
+			if ([string]::IsNullOrWhiteSpace($p)) { continue }
+			if (-not (Test-Path -LiteralPath $p)) { throw "Source item not found: $p" }
+			$item = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+		}
+		if (-not $item) { continue }
+		try {
+			# true = include the item node (file or folder tree)
+			[void]$image.Root.AddTree($item.FullName, $true)
+			$itemCount++
+		} catch {
+			throw ("Failed adding '{0}': {1} (try a different media type or fewer files)" -f $item.FullName, $_.Exception.Message.Trim())
+		}
+	}
+	if ($itemCount -eq 0) { throw "No files/folders were added to the ISO." }
+
+	if ($boot) { $image.BootImageOptions = $boot }
+
+	if ((Test-Path -LiteralPath $Path) -and -not $Force) {
+		throw "ISO already exists (use force=true): $Path"
+	}
+	if (Test-Path -LiteralPath $Path) {
+		Dismount-MBIsoIfMounted -IsoPath $Path
+		Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+	}
+	$parent = Split-Path -Parent $Path
+	if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+		throw "Parent directory does not exist: $parent"
+	}
+	# Ensure empty target file exists for IMAPI writer
+	[void](New-Item -Path $Path -ItemType File -Force -ErrorAction Stop)
+
+	$result = $image.CreateResultImage()
+	[MB_ISOFileWriter]::Create($Path, $result.ImageStream, $result.BlockSize, $result.TotalBlocks)
+	return (Get-Item -LiteralPath $Path -ErrorAction Stop)
+}
+
+function Invoke-MakeIso {
+	param(
+		[string]$source = '',
+		[string]$destination = '',
+		[string]$boot_file = '',
+		[string]$title = '',
+		[bool]$force = $false,
+		[bool]$include_folder = $false,
+		[string]$media = 'DVDPLUSRW_DUALLAYER'
+	)
+	if ([string]::IsNullOrWhiteSpace($source)) { return "ERROR: source is required (folder to pack)." }
+	if ([string]::IsNullOrWhiteSpace($destination)) { return "ERROR: destination is required (output .iso path)." }
+
+	$src = Resolve-MBPath $source
+	$dest = Resolve-MBPath $destination
+	if (-not (Test-Path -LiteralPath $src)) { return "ERROR: Source not found: $src" }
+
+	$destExt = [System.IO.Path]::GetExtension($dest)
+	if ($destExt -and $destExt.ToLowerInvariant() -ne '.iso') {
+		return "ERROR: destination must end with .iso (got '$destExt')."
+	}
+	if (-not $destExt) { $dest = "$dest.iso" }
+
+	$boot = ''
+	if (-not [string]::IsNullOrWhiteSpace($boot_file)) {
+		$boot = Resolve-MBPath $boot_file
+		if (-not (Test-Path -LiteralPath $boot -PathType Leaf)) {
+			return "ERROR: boot_file not found: $boot"
+		}
+	}
+
+	if ((Test-Path -LiteralPath $dest) -and -not $force) {
+		return "ERROR: Destination ISO exists (set force=true): $dest"
+	}
+
+	# Match CMD workflow: Get-ChildItem source | New-IsoFile  (children at ISO root)
+	$items = @()
+	$srcItem = Get-Item -LiteralPath $src -Force -ErrorAction Stop
+	if ($srcItem.PSIsContainer -and -not $include_folder) {
+		$items = @(Get-ChildItem -LiteralPath $src -Force -ErrorAction Stop)
+		if ($items.Count -eq 0) { return "ERROR: Source folder is empty: $src" }
+	} else {
+		$items = @($srcItem)
+	}
+
+	$modeLabel = if ($include_folder -or -not $srcItem.PSIsContainer) {
+		'include source item as-is'
+	} else {
+		'folder contents at ISO root (bootable-media style)'
+	}
+	$details = @"
+Build ISO image (IMAPI2 / New-IsoFile style):
+
+  Source:      $src
+  Mode:        $modeLabel
+  Items:       $($items.Count)
+  ISO:         $dest
+  Boot file:   $(if ($boot) { $boot } else { '(none)' })
+  Title:       $(if ($title) { $title } else { '(auto timestamp)' })
+  Media:       $media
+  Force:       $force
+"@
+	if (-not (Request-Confirmation -Title "MakeIso requires approval" -Details $details)) {
+		return "BLOCKED BY USER: MakeIso denied by operator."
+	}
+
+	try {
+		$sw = [System.Diagnostics.Stopwatch]::StartNew()
+		$fi = New-MBIsoFile -Items $items -Path $dest -BootFile $boot -Title $title -Media $media -Force:$force
+		$sw.Stop()
+		$prefix = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+		return ConvertTo-MBJson ([ordered]@{
+			success        = $true
+			message        = ("{0}: ISO created {1}" -f $prefix, $dest)
+			source         = $src
+			destination    = $dest
+			boot_file      = $(if ($boot) { $boot } else { $null })
+			title          = $(if ($title) { $title } else { $null })
+			include_folder = [bool]$include_folder
+			item_count     = [int]$items.Count
+			bytes          = [int64]$fi.Length
+			duration_ms    = [int]$sw.ElapsedMilliseconds
+			bootable       = [bool](-not [string]::IsNullOrWhiteSpace($boot))
+		}) -Depth 5
+	} catch {
+		return "ERROR: MakeIso failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-MountIso {
+	param([string]$path = '')
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required (.iso file)." }
+	$iso = Resolve-MBPath $path
+	if (-not (Test-Path -LiteralPath $iso -PathType Leaf)) {
+		return "ERROR: ISO not found: $iso"
+	}
+	$ext = [System.IO.Path]::GetExtension($iso)
+	if ($ext -and $ext.ToLowerInvariant() -ne '.iso') {
+		return "ERROR: path should be a .iso file (got '$ext')."
+	}
+
+	$cur = Get-MBIsoMountInfo -IsoPath $iso
+	if ($cur.attached -and $cur.drive_letter) {
+		return ConvertTo-MBJson ([ordered]@{
+			success      = $true
+			message      = "Already mounted at $($cur.drive_letter):"
+			path         = $iso
+			drive_letter = $cur.drive_letter
+			already      = $true
+		})
+	}
+
+	$details = "Mount ISO image:`n`n  ISO: $iso"
+	if (-not (Request-Confirmation -Title "MountIso requires approval" -Details $details)) {
+		return "BLOCKED BY USER: MountIso denied by operator."
+	}
+
+	try {
+		$img = Mount-DiskImage -ImagePath $iso -PassThru -ErrorAction Stop
+		# Storage subsystem sometimes needs a moment to assign a letter
+		$letter = ''
+		for ($i = 0; $i -lt 20; $i++) {
+			Start-Sleep -Milliseconds 150
+			$info = Get-MBIsoMountInfo -IsoPath $iso
+			if ($info.drive_letter) { $letter = $info.drive_letter; break }
+			try {
+				$vol = Get-Volume -DiskImage $img -ErrorAction SilentlyContinue | Select-Object -First 1
+				if ($vol -and $vol.DriveLetter) {
+					$letter = ([string]$vol.DriveLetter).TrimEnd(':')
+					break
+				}
+			} catch {}
+		}
+		$prefix = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+		return ConvertTo-MBJson ([ordered]@{
+			success      = $true
+			message      = $(if ($letter) { "$prefix`: Mounted $iso -> ${letter}:" } else { "$prefix`: Mounted $iso (no drive letter yet)" })
+			path         = $iso
+			drive_letter = $letter
+			device_path  = $(try { [string]$img.DevicePath } catch { '' })
+		})
+	} catch {
+		return "ERROR: MountIso failed: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-UnmountIso {
+	param(
+		[string]$path = '',
+		[string]$letter = ''
+	)
+	$iso = ''
+	$drive = ''
+	if (-not [string]::IsNullOrWhiteSpace($path)) {
+		$iso = Resolve-MBPath $path
+	}
+	if (-not [string]::IsNullOrWhiteSpace($letter)) {
+		$drive = ([string]$letter).Trim().TrimEnd(':').ToUpperInvariant()
+		if ($drive.Length -ne 1 -or $drive -notmatch '^[A-Z]$') {
+			return "ERROR: letter must be a single drive letter (e.g. E)."
+		}
+	}
+	if (-not $iso -and -not $drive) {
+		return "ERROR: Provide path= to the .iso and/or letter= drive to unmount."
+	}
+
+	# Resolve ISO path from drive letter if needed
+	if (-not $iso -and $drive) {
+		try {
+			$disk = Get-Volume -DriveLetter $drive -ErrorAction Stop | Get-Partition -ErrorAction SilentlyContinue | Get-Disk -ErrorAction SilentlyContinue
+			# Prefer DiskImage lookup via Get-DiskImage for all attached
+			$attached = @(Get-DiskImage -ErrorAction SilentlyContinue | Where-Object { $_.Attached })
+			foreach ($a in $attached) {
+				try {
+					$vol = Get-Volume -DiskImage $a -ErrorAction SilentlyContinue | Select-Object -First 1
+					if ($vol -and ([string]$vol.DriveLetter).TrimEnd(':').ToUpperInvariant() -eq $drive) {
+						$iso = [string]$a.ImagePath
+						break
+					}
+				} catch {}
+			}
+		} catch {}
+		if (-not $iso) {
+			# Fallback: dismount by path only works with ImagePath; try letter-based CIM
+			return "ERROR: Could not resolve mounted ISO for letter ${drive}:. Pass path= to the .iso file."
+		}
+	}
+
+	if ($iso -and -not (Test-Path -LiteralPath $iso)) {
+		return "ERROR: ISO path not found: $iso"
+	}
+
+	$info = if ($iso) { Get-MBIsoMountInfo -IsoPath $iso } else { $null }
+	$details = "Unmount ISO image:`n`n  ISO:    $(if ($iso) { $iso } else { '(unknown)' })`n  Letter: $(if ($drive) { $drive + ':' } else { $(if ($info -and $info.drive_letter) { $info.drive_letter + ':' } else { '(auto)' }) })"
+	if (-not (Request-Confirmation -Title "UnmountIso requires approval" -Details $details)) {
+		return "BLOCKED BY USER: UnmountIso denied by operator."
+	}
+
+	try {
+		if ($info -and -not $info.attached) {
+			return ConvertTo-MBJson ([ordered]@{
+				success = $true
+				message = "ISO was not mounted: $iso"
+				path    = $iso
+				already = $true
+			})
+		}
+		Dismount-DiskImage -ImagePath $iso -ErrorAction Stop | Out-Null
+		$prefix = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+		return ConvertTo-MBJson ([ordered]@{
+			success      = $true
+			message      = "$prefix`: Dismounted $iso"
+			path         = $iso
+			drive_letter = $(if ($info) { $info.drive_letter } else { $drive })
+		})
+	} catch {
+		return "ERROR: UnmountIso failed: $($_.Exception.Message)"
+	}
+}
+
+function Get-MBMakeCabExe {
+	$candidates = @(
+		(Join-Path $env:WINDIR 'System32\makecab.exe'),
+		(Join-Path $env:WINDIR 'SysWOW64\makecab.exe'),
+		'makecab.exe'
+	)
+	foreach ($c in $candidates) {
+		if ($c -eq 'makecab.exe') {
+			$cmd = Get-Command makecab.exe -ErrorAction SilentlyContinue
+			if ($cmd -and $cmd.Source) { return [string]$cmd.Source }
+			continue
+		}
+		if (Test-Path -LiteralPath $c) { return $c }
+	}
+	return $null
+}
+
+function Get-MBExpandCabExe {
+	$candidates = @(
+		(Join-Path $env:WINDIR 'System32\expand.exe'),
+		(Join-Path $env:WINDIR 'SysWOW64\expand.exe'),
+		'expand.exe'
+	)
+	foreach ($c in $candidates) {
+		if ($c -eq 'expand.exe') {
+			$cmd = Get-Command expand.exe -ErrorAction SilentlyContinue
+			if ($cmd -and $cmd.Source) { return [string]$cmd.Source }
+			continue
+		}
+		if (Test-Path -LiteralPath $c) { return $c }
+	}
+	return $null
+}
+
+function Invoke-MakeCab {
+	param(
+		[string]$source = '',
+		$files = $null,
+		[string]$destination = '',
+		[bool]$force = $false,
+		[bool]$recursive = $false,
+		[string]$compression = 'LZX',
+		[int]$compression_level = 7,
+		[int]$compression_memory = 21
+	)
+	if ([string]::IsNullOrWhiteSpace($destination)) {
+		return "ERROR: destination is required (output .cab path)."
+	}
+	$dest = Resolve-MBPath $destination
+	$destExt = [System.IO.Path]::GetExtension($dest)
+	if ($destExt -and $destExt.ToLowerInvariant() -ne '.cab') {
+		return "ERROR: destination must end with .cab (got '$destExt')."
+	}
+	if (-not $destExt) { $dest = "$dest.cab" }
+
+	$makecab = Get-MBMakeCabExe
+	if (-not $makecab) {
+		return "ERROR: makecab.exe not found (expected under %WINDIR%\\System32)."
+	}
+
+	# Collect source files: folder and/or explicit list
+	$fileList = New-Object System.Collections.ArrayList
+	$addFile = {
+		param([string]$fp, [string]$cabName = '')
+		if ([string]::IsNullOrWhiteSpace($fp)) { return }
+		$full = Resolve-MBPath $fp
+		if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+			throw "File not found: $full"
+		}
+		$name = if ($cabName) { [System.IO.Path]::GetFileName($cabName) } else { [System.IO.Path]::GetFileName($full) }
+		if ([string]::IsNullOrWhiteSpace($name)) { $name = [System.IO.Path]::GetFileName($full) }
+		[void]$fileList.Add([pscustomobject]@{ FullName = $full; CabName = $name })
+	}
+
+	try {
+		foreach ($f in @(Convert-MBForceArray $files)) {
+			if ($null -eq $f) { continue }
+			if ($f -is [string]) {
+				& $addFile ([string]$f) ''
+			} else {
+				$p = Get-MBProp $f 'path'
+				if (-not $p) { $p = Get-MBProp $f 'source' }
+				if (-not $p) { $p = Get-MBProp $f 'file' }
+				$n = Get-MBProp $f 'name'
+				if (-not $n) { $n = Get-MBProp $f 'cab_name' }
+				if ($p) { & $addFile ([string]$p) ([string]$n) }
+			}
+		}
+		if (-not [string]::IsNullOrWhiteSpace($source)) {
+			$src = Resolve-MBPath $source
+			if (-not (Test-Path -LiteralPath $src)) { return "ERROR: source not found: $src" }
+			$item = Get-Item -LiteralPath $src -Force -ErrorAction Stop
+			if ($item.PSIsContainer) {
+				$gci = @{
+					LiteralPath = $src
+					File        = $true
+					Force       = $true
+					ErrorAction = 'Stop'
+				}
+				if ($recursive) { $gci['Recurse'] = $true }
+				foreach ($fi in @(Get-ChildItem @gci)) {
+					$rel = $fi.Name
+					if ($recursive) {
+						try {
+							$rel = $fi.FullName.Substring($src.TrimEnd('\', '/').Length).TrimStart('\', '/')
+							$rel = $rel -replace '/', '\'
+						} catch { $rel = $fi.Name }
+					}
+					# CAB entry names: use flat name unless recursive (then path with backslash → underscore for safety in simple mode)
+					$cabName = if ($recursive -and $rel -match '[\\/]') {
+						($rel -replace '[\\/]', '_')
+					} else {
+						[System.IO.Path]::GetFileName($rel)
+					}
+					& $addFile $fi.FullName $cabName
+				}
+			} else {
+				& $addFile $item.FullName ''
+			}
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+
+	if ($fileList.Count -eq 0) {
+		return "ERROR: No files to pack. Pass source= folder and/or files=[...]."
+	}
+	# Deduplicate cab names (keep first)
+	$seen = @{}
+	$unique = New-Object System.Collections.ArrayList
+	foreach ($e in @($fileList)) {
+		$key = [string]$e.CabName
+		if ($seen.ContainsKey($key.ToLowerInvariant())) {
+			$base = [System.IO.Path]::GetFileNameWithoutExtension($key)
+			$ext = [System.IO.Path]::GetExtension($key)
+			$i = 2
+			do {
+				$try = "{0}_{1}{2}" -f $base, $i, $ext
+				$i++
+			} while ($seen.ContainsKey($try.ToLowerInvariant()))
+			$e.CabName = $try
+			$key = $try
+		}
+		$seen[$key.ToLowerInvariant()] = $true
+		[void]$unique.Add($e)
+	}
+	$fileList = $unique
+
+	if ((Test-Path -LiteralPath $dest) -and -not $force) {
+		return "ERROR: Destination cab exists (set force=true): $dest"
+	}
+	$parent = Split-Path -Parent $dest
+	if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+		return "ERROR: Parent directory does not exist: $parent"
+	}
+
+	$comp = ([string]$compression).Trim().ToUpperInvariant()
+	if ([string]::IsNullOrWhiteSpace($comp)) { $comp = 'LZX' }
+	if ($comp -notin @('LZX', 'MSZIP', 'NONE', 'OFF')) {
+		return "ERROR: compression must be LZX, MSZIP, or none (got '$compression')."
+	}
+	if ($compression_level -lt 1) { $compression_level = 1 }
+	if ($compression_level -gt 7) { $compression_level = 7 }
+	if ($compression_memory -lt 15) { $compression_memory = 15 }
+	if ($compression_memory -gt 21) { $compression_memory = 21 }
+
+	$sample = @($fileList | Select-Object -First 8 | ForEach-Object { "  $($_.CabName)  <=  $($_.FullName)" })
+	if ($fileList.Count -gt 8) { $sample += "  ... +$($fileList.Count - 8) more" }
+	$details = @"
+Build cabinet (makecab.exe):
+
+  Output:       $dest
+  Files:        $($fileList.Count)
+  Compression:  $comp$(if ($comp -eq 'LZX') { " level=$compression_level mem=$compression_memory" } else { '' })
+  Force:        $force
+
+$($sample -join "`n")
+"@
+	if (-not (Request-Confirmation -Title "MakeCab requires approval" -Details $details)) {
+		return "BLOCKED BY USER: MakeCab denied by operator."
+	}
+
+	$workRoot = $null
+	try {
+		$workRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("MiniBotCab_" + [guid]::NewGuid().ToString('N').Substring(0, 10))
+		New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
+		$stage = Join-Path $workRoot 'src'
+		New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+		# Stage files as 100, 101, ... (like offline.config) with cabinet names in quotes
+		$ddfLines = New-Object System.Collections.Generic.List[string]
+		[void]$ddfLines.Add('.new Cabinet')
+		[void]$ddfLines.Add('.Set Cabinet=ON')
+		[void]$ddfLines.Add('.Set CabinetFileCountThreshold=0')
+		[void]$ddfLines.Add('.Set ChecksumWidth=1')
+		[void]$ddfLines.Add('.Set ClusterSize=CDROM')
+		[void]$ddfLines.Add('.Set LongSourceFileNames=ON')
+		if ($comp -eq 'NONE' -or $comp -eq 'OFF') {
+			[void]$ddfLines.Add('.Set CompressionType=MSZIP') # ignored when Compress=OFF via cmdline
+		} elseif ($comp -eq 'MSZIP') {
+			[void]$ddfLines.Add('.Set CompressionType=MSZIP')
+		} else {
+			[void]$ddfLines.Add('.Set CompressionType=LZX')
+			[void]$ddfLines.Add(".Set CompressionLevel=$compression_level")
+			[void]$ddfLines.Add(".Set CompressionMemory=$compression_memory")
+		}
+		[void]$ddfLines.Add('.Set DiskDirectoryTemplate=')
+		[void]$ddfLines.Add('.Set FolderFileCountThreshold=0')
+		[void]$ddfLines.Add('.Set FolderSizeThreshold=0')
+		[void]$ddfLines.Add('.Set GenerateInf=OFF')
+		[void]$ddfLines.Add('.Set MaxCabinetSize=0')
+		[void]$ddfLines.Add('.Set MaxDiskFileCount=0')
+		[void]$ddfLines.Add('.Set MaxDiskSize=0')
+		[void]$ddfLines.Add('.Set MaxErrors=0')
+		[void]$ddfLines.Add('.Set RptFileName=nul')
+		[void]$ddfLines.Add('.Set UniqueFiles=ON')
+		[void]$ddfLines.Add('.Set SourceDir=.')
+
+		$id = 100
+		foreach ($e in @($fileList)) {
+			$srcName = [string]$id
+			$staged = Join-Path $stage $srcName
+			Copy-Item -LiteralPath $e.FullName -Destination $staged -Force -ErrorAction Stop
+			# source id  "cabinet name"
+			$cabSafe = ([string]$e.CabName) -replace '"', ''
+			[void]$ddfLines.Add(('{0} "{1}"' -f $srcName, $cabSafe))
+			$id++
+		}
+
+		$ddfPath = Join-Path $workRoot 'cabinet.ddf'
+		$outCab = Join-Path $workRoot 'out.cab'
+		# CabinetNameTemplate can be absolute
+		$compressArg = if ($comp -eq 'NONE' -or $comp -eq 'OFF') { 'OFF' } else { 'ON' }
+		$ddfText = ($ddfLines -join "`r`n") + "`r`n"
+		[System.IO.File]::WriteAllText($ddfPath, $ddfText, (New-Object System.Text.UTF8Encoding $false))
+
+		if ((Test-Path -LiteralPath $dest) -and $force) {
+			Remove-Item -LiteralPath $dest -Force -ErrorAction Stop
+		}
+
+		try { Write-MBDownloadProgress -Label 'MakeCab' -Percent 0 -Phase start -Detail ("packing {0} file(s)" -f $fileList.Count) } catch {}
+
+		$psi = New-Object System.Diagnostics.ProcessStartInfo
+		$psi.FileName = $makecab
+		# /F ddf /D Compress=ON|OFF /D CabinetNameTemplate=out.cab
+		$psi.Arguments = "/F `"$ddfPath`" /D Compress=$compressArg /D CabinetNameTemplate=`"$outCab`""
+		$psi.WorkingDirectory = $stage
+		$psi.UseShellExecute = $false
+		$psi.RedirectStandardOutput = $true
+		$psi.RedirectStandardError = $true
+		$psi.CreateNoWindow = $true
+		try {
+			$utf8 = New-Object System.Text.UTF8Encoding $false
+			$psi.StandardOutputEncoding = $utf8
+			$psi.StandardErrorEncoding = $utf8
+		} catch {}
+
+		$proc = New-Object System.Diagnostics.Process
+		$proc.StartInfo = $psi
+		$childPid = 0
+		$lastPct = -1
+		$sw = [System.Diagnostics.Stopwatch]::StartNew()
+		$stderrBag = New-Object System.Text.StringBuilder
+		$stdoutBag = New-Object System.Text.StringBuilder
+
+		# Progress lines look like: "  12.34% - completing disk..."
+		$pctRx = [regex]'(?i)(\d{1,3})(?:\.\d+)?\s*%'
+
+		[void]$proc.Start()
+		try {
+			$childPid = [int]$proc.Id
+			Register-MBChildProcess -ProcessId $childPid
+		} catch { $childPid = 0 }
+
+		# Async stderr drain
+		$errTask = $proc.StandardError.ReadToEndAsync()
+
+		$readLine = {
+			param($pr)
+			try { return $pr.StandardOutput.ReadLine() } catch { return $null }
+		}
+		while (-not $proc.HasExited) {
+			if (Test-MBInterrupt) {
+				try { Stop-MBProcessTree -ProcessId $childPid } catch { try { $proc.Kill() } catch {} }
+				try { Write-MBDownloadProgress -Label 'MakeCab' -Percent -1 -Phase fail -Detail 'cancelled' } catch {}
+				if ($childPid -gt 0) { try { Unregister-MBChildProcess -ProcessId $childPid } catch {} }
+				return "ERROR: MakeCab cancelled by operator."
+			}
+			$line = & $readLine $proc
+			if ($null -ne $line) {
+				[void]$stdoutBag.AppendLine($line)
+				$m = $pctRx.Match([string]$line)
+				if ($m.Success) {
+					$p = 0
+					[void][int]::TryParse($m.Groups[1].Value, [ref]$p)
+					if ($p -gt 100) { $p = 100 }
+					if ($p -ne $lastPct) {
+						$lastPct = $p
+						try { Write-MBDownloadProgress -Label 'MakeCab' -Percent $p -Phase update -Detail ([string]$line).Trim() } catch {}
+					}
+				}
+			} else {
+				Start-Sleep -Milliseconds 40
+			}
+			# Soft timeout: 30 min for huge packs
+			if ($sw.ElapsedMilliseconds -gt 1800000) {
+				try { Stop-MBProcessTree -ProcessId $childPid } catch { try { $proc.Kill() } catch {} }
+				try { Write-MBDownloadProgress -Label 'MakeCab' -Percent -1 -Phase fail -Detail 'timeout' } catch {}
+				if ($childPid -gt 0) { try { Unregister-MBChildProcess -ProcessId $childPid } catch {} }
+				return "ERROR: MakeCab timed out after 30 minutes."
+			}
+		}
+		# Drain remaining stdout after exit
+		try {
+			while ($true) {
+				$line = & $readLine $proc
+				if ($null -eq $line) { break }
+				[void]$stdoutBag.AppendLine($line)
+				$m = $pctRx.Match([string]$line)
+				if ($m.Success) {
+					$p = 0
+					[void][int]::TryParse($m.Groups[1].Value, [ref]$p)
+					if ($p -gt 100) { $p = 100 }
+					if ($p -ne $lastPct) {
+						$lastPct = $p
+						try { Write-MBDownloadProgress -Label 'MakeCab' -Percent $p -Phase update } catch {}
+					}
+				}
+			}
+		} catch {}
+		try { [void]$proc.WaitForExit(2000) } catch {}
+		$exitCode = -1
+		try { $exitCode = [int]$proc.ExitCode } catch { $exitCode = -1 }
+		try {
+			if ($errTask.IsCompleted) { [void]$stderrBag.Append([string]$errTask.Result) }
+			else {
+				try { [void]$errTask.Wait(1000) } catch {}
+				if ($errTask.IsCompleted) { [void]$stderrBag.Append([string]$errTask.Result) }
+			}
+		} catch {}
+		if ($childPid -gt 0) { try { Unregister-MBChildProcess -ProcessId $childPid } catch {} }
+		try { $proc.Dispose() } catch {}
+
+		if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $outCab)) {
+			# Some makecab builds write CabinetNameTemplate relative to SourceDir
+			$alt = Join-Path $stage 'out.cab'
+			if ((Test-Path -LiteralPath $alt) -and -not (Test-Path -LiteralPath $outCab)) {
+				$outCab = $alt
+			}
+		}
+		if (-not (Test-Path -LiteralPath $outCab)) {
+			$err = $stderrBag.ToString()
+			if ([string]::IsNullOrWhiteSpace($err)) { $err = $stdoutBag.ToString() }
+			if ($err.Length -gt 800) { $err = $err.Substring($err.Length - 800) }
+			try { Write-MBDownloadProgress -Label 'MakeCab' -Percent -1 -Phase fail -Detail 'makecab failed' } catch {}
+			return ("ERROR: makecab failed (exit {0}). {1}" -f $exitCode, $err.Trim())
+		}
+
+		Copy-Item -LiteralPath $outCab -Destination $dest -Force -ErrorAction Stop
+		$fi = Get-Item -LiteralPath $dest -ErrorAction Stop
+		$sw.Stop()
+		try { Write-MBDownloadProgress -Label 'MakeCab' -Percent 100 -Phase done -Detail $dest } catch {}
+		$prefix = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+		return ConvertTo-MBJson ([ordered]@{
+			success            = $true
+			message            = ("{0}: CAB created {1}" -f $prefix, $dest)
+			destination        = $dest
+			bytes              = [int64]$fi.Length
+			file_count         = [int]$fileList.Count
+			compression        = $comp
+			compression_level  = $(if ($comp -eq 'LZX') { $compression_level } else { $null })
+			duration_ms        = [int]$sw.ElapsedMilliseconds
+			files              = @($fileList | Select-Object -First 40 | ForEach-Object {
+				[ordered]@{ name = $_.CabName; source = $_.FullName }
+			})
+		}) -Depth 6
+	} catch {
+		try { Write-MBDownloadProgress -Label 'MakeCab' -Percent -1 -Phase fail -Detail $_.Exception.Message } catch {}
+		return "ERROR: MakeCab failed: $($_.Exception.Message)"
+	} finally {
+		if ($workRoot -and (Test-Path -LiteralPath $workRoot)) {
+			try { Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+		}
+	}
+}
+
+function Invoke-ExpandCab {
+	param(
+		[string]$path = '',
+		[string]$destination = '',
+		[bool]$force = $false
+	)
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required (.cab file)." }
+	if ([string]::IsNullOrWhiteSpace($destination)) { return "ERROR: destination is required (output folder)." }
+
+	$cab = Resolve-MBPath $path
+	$dest = Resolve-MBPath $destination
+	if (-not (Test-Path -LiteralPath $cab -PathType Leaf)) {
+		return "ERROR: CAB not found: $cab"
+	}
+	$ext = [System.IO.Path]::GetExtension($cab)
+	if ($ext -and $ext.ToLowerInvariant() -ne '.cab') {
+		return "ERROR: path should be a .cab file (got '$ext')."
+	}
+
+	$expand = Get-MBExpandCabExe
+	if (-not $expand) {
+		return "ERROR: expand.exe not found (expected under %WINDIR%\\System32)."
+	}
+
+	if (Test-Path -LiteralPath $dest) {
+		$item = Get-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+		if ($item -and -not $item.PSIsContainer) {
+			return "ERROR: destination exists and is a file: $dest"
+		}
+		$kids = @()
+		try { $kids = @(Get-ChildItem -LiteralPath $dest -Force -ErrorAction SilentlyContinue) } catch {}
+		if ($kids.Count -gt 0 -and -not $force) {
+			return "ERROR: destination is not empty (set force=true): $dest"
+		}
+	}
+
+	$details = "Extract cabinet:`n`n  CAB:  $cab`n  Dest: $dest`n  Force: $force"
+	if (-not (Request-Confirmation -Title "ExpandCab requires approval" -Details $details)) {
+		return "BLOCKED BY USER: ExpandCab denied by operator."
+	}
+
+	try {
+		if (-not (Test-Path -LiteralPath $dest)) {
+			New-Item -ItemType Directory -Path $dest -Force | Out-Null
+		}
+		try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent 0 -Phase start -Detail $cab } catch {}
+		# expand -F:* cab dest\
+		$destArg = $dest.TrimEnd('\') + '\'
+		$rr = Invoke-MBProcessCapture -FileName $expand -Arguments ("-F:* `"$cab`" `"$destArg`"") -WorkingDir $dest -TimeoutMs 600000
+		if ($rr.TimedOut) {
+			try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent -1 -Phase fail -Detail 'timeout' } catch {}
+			return "ERROR: ExpandCab timed out."
+		}
+		if ($rr.Cancelled) {
+			try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent -1 -Phase fail -Detail 'cancelled' } catch {}
+			return "ERROR: ExpandCab cancelled."
+		}
+		if ([int]$rr.ExitCode -ne 0) {
+			$err = [string]$rr.StdErr
+			if ([string]::IsNullOrWhiteSpace($err)) { $err = [string]$rr.StdOut }
+			if ($err.Length -gt 600) { $err = $err.Substring($err.Length - 600) }
+			try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent -1 -Phase fail -Detail 'expand failed' } catch {}
+			return ("ERROR: expand.exe failed (exit {0}). {1}" -f $rr.ExitCode, $err.Trim())
+		}
+		$entries = @()
+		try {
+			$entries = @(Get-ChildItem -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 50)
+		} catch {}
+		try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent 100 -Phase done -Detail $dest } catch {}
+		$prefix = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+		return ConvertTo-MBJson ([ordered]@{
+			success     = $true
+			message     = "$prefix`: Extracted $cab -> $dest"
+			path        = $cab
+			destination = $dest
+			sample      = @($entries | ForEach-Object {
+				[ordered]@{
+					name = $_.Name
+					full = $_.FullName
+					type = $(if ($_.PSIsContainer) { 'dir' } else { 'file' })
+					size = $(if (-not $_.PSIsContainer) { [int64]$_.Length } else { $null })
+				}
+			})
+		}) -Depth 5
+	} catch {
+		try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent -1 -Phase fail -Detail $_.Exception.Message } catch {}
+		return "ERROR: ExpandCab failed: $($_.Exception.Message)"
+	}
+}
+
 function Invoke-FindPSModule {
 	param(
 		[string]$name,
@@ -12477,10 +15689,82 @@ function Invoke-SetRegistry {
 	}
 }
 
+function Convert-MBFindFilePatterns {
+	# Normalize glob / globs / extensions into a unique list of -like patterns (e.g. *.mp4).
+	# Important: do NOT default-merge glob='*' with extensions — that would match every file
+	# because matchAny treats '*' as accept-all. Only use '*' when no real filters were given.
+	param(
+		$glob = $null,
+		$globs = $null,
+		$extensions = $null
+	)
+	$patterns = New-Object System.Collections.ArrayList
+	$seen = @{}
+	$addOne = {
+		param([string]$Raw)
+		if ([string]::IsNullOrWhiteSpace($Raw)) { return }
+		$x = $Raw.Trim().Trim('"').Trim("'")
+		if ([string]::IsNullOrWhiteSpace($x)) { return }
+		$key = $x.ToLowerInvariant()
+		if ($seen.ContainsKey($key)) { return }
+		$seen[$key] = $true
+		[void]$patterns.Add($x)
+	}
+	$addMaybeSplit = {
+		param($Raw)
+		if ($null -eq $Raw) { return }
+		if ($Raw -is [System.Array] -or ($Raw -is [System.Collections.IEnumerable] -and -not ($Raw -is [string]))) {
+			foreach ($item in @($Raw)) { & $addMaybeSplit $item }
+			return
+		}
+		$s = [string]$Raw
+		if ([string]::IsNullOrWhiteSpace($s)) { return }
+		# Multi in one string: "*.mp4;*.mkv" or "*.mp4,*.mkv" or "*.mp4|*.mkv"
+		if ($s -match '[,;|]') {
+			foreach ($piece in ($s -split '[,;|]+')) {
+				& $addOne $piece
+			}
+		} else {
+			& $addOne $s
+		}
+	}
+	& $addMaybeSplit $glob
+	& $addMaybeSplit $globs
+	foreach ($extRaw in @(Convert-MBForceArray $extensions)) {
+		if ($null -eq $extRaw) { continue }
+		$e = [string]$extRaw
+		if ([string]::IsNullOrWhiteSpace($e)) { continue }
+		# allow "mp4", ".mp4", "*.mp4", or "mp4,mkv"
+		if ($e -match '[,;|]') {
+			foreach ($piece in ($e -split '[,;|]+')) {
+				$p = $piece.Trim().TrimStart('.')
+				if ($p -match '^\*') { & $addOne $p }
+				elseif ($p) { & $addOne ("*.{0}" -f $p) }
+			}
+		} else {
+			$p = $e.Trim()
+			if ($p -match '[\*\?]') { & $addOne $p }
+			else {
+				$p = $p.TrimStart('.')
+				if ($p) { & $addOne ("*.{0}" -f $p) }
+			}
+		}
+	}
+	# If any real filter exists, drop bare '*' (model sometimes sends glob='*' with extensions=…)
+	$real = New-Object System.Collections.ArrayList
+	foreach ($p in @($patterns)) {
+		if ([string]$p -ne '*') { [void]$real.Add($p) }
+	}
+	if ($real.Count -gt 0) { return @($real) }
+	return @('*')
+}
+
 function Invoke-FindFiles {
 	param(
 		[string]$path = '.',
-		[string]$glob = '*',
+		$glob = $null,
+		$globs = $null,
+		$extensions = $null,
 		[int]$modified_within_days = 0,
 		[long]$min_bytes = 0,
 		[long]$max_bytes = 0,
@@ -12491,7 +15775,8 @@ function Invoke-FindFiles {
 	if ($max -gt 500) { $max = 500 }
 	$root = Resolve-MBPath -Path $path
 	if (-not (Test-Path -LiteralPath $root)) { return "ERROR: path not found: $root" }
-	$g = if ([string]::IsNullOrWhiteSpace($glob)) { '*' } else { $glob }
+	$patterns = @(Convert-MBFindFilePatterns -glob $glob -globs $globs -extensions $extensions)
+	if ($patterns.Count -eq 0) { $patterns = @('*') }
 	try {
 		$gci = @{
 			LiteralPath = $root
@@ -12500,10 +15785,45 @@ function Invoke-FindFiles {
 			Force       = $true
 		}
 		if ($recursive) { $gci['Recurse'] = $true }
-		if ($g -notmatch '[\\/]') { $gci['Filter'] = $g }
+
+		# Single simple name filter → native Filter (fast). Multi-pattern → one walk + -like any.
+		$useNativeFilter = ($patterns.Count -eq 1 -and $patterns[0] -ne '*' -and $patterns[0] -notmatch '[\\/]')
+		if ($useNativeFilter) {
+			$gci['Filter'] = $patterns[0]
+		}
 		$files = @(Get-ChildItem @gci)
-		if ($g -match '[\\/]') {
-			$files = @($files | Where-Object { $_.Name -like $g -or $_.FullName -like $g })
+		if (-not $useNativeFilter) {
+			$matchAny = {
+				param($f)
+				$n = [string]$f.Name
+				$full = [string]$f.FullName
+				$ext = ''
+				try { $ext = [string]$f.Extension } catch { $ext = '' }
+				foreach ($p in $patterns) {
+					if ($p -eq '*') { return $true }
+					# Extension-style patterns: *.mp4 or .mp4 → match Extension (more reliable than name -like)
+					if ($p -match '^\*\.([A-Za-z0-9]+)$') {
+						$want = '.' + $Matches[1]
+						if ($ext -and [string]::Equals($ext, $want, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+						continue
+					}
+					if ($p -match '^\.([A-Za-z0-9]+)$') {
+						$want = '.' + $Matches[1]
+						if ($ext -and [string]::Equals($ext, $want, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+						continue
+					}
+					if ($p -match '[\\/]') {
+						if ($full -like $p -or $n -like $p) { return $true }
+					} else {
+						if ($n -like $p) { return $true }
+					}
+				}
+				return $false
+			}
+			$files = @($files | Where-Object { & $matchAny $_ })
+		} elseif ($patterns[0] -match '[\\/]') {
+			$p0 = $patterns[0]
+			$files = @($files | Where-Object { $_.Name -like $p0 -or $_.FullName -like $p0 })
 		}
 		if ($modified_within_days -gt 0) {
 			$cut = (Get-Date).AddDays(-[double]$modified_within_days)
@@ -12526,16 +15846,280 @@ function Invoke-FindFiles {
 				created  = $f.CreationTime.ToString('s')
 			}
 		})
-		return ConvertTo-MBJson @{
+		$isTrunc = ($total -gt $rows.Count)
+		$payload = [ordered]@{
 			root      = $root
-			glob      = $g
+			glob      = $(if ($patterns.Count -eq 1) { $patterns[0] } else { ($patterns -join ';') })
+			globs     = $patterns
 			count     = $rows.Count
 			total     = $total
-			truncated = ($total -gt $rows.Count)
+			truncated = $isTrunc
 			files     = $rows
+		}
+		if ($isTrunc) {
+			$payload['hint'] = (
+				"TRUNCATED: showing {0} of {1} matches (newest first). Do NOT re-run FindFiles with the same args or Get-ChildItem -Recurse to dump the rest. " +
+				"If the operator was SPECIFIC (named file/subject/folder/criteria): narrow path/name/days/size (or raise max once, hard max 500) until you match — do not pick a random unrelated file. " +
+				"If they were deliberately VAGUE (e.g. play something / show a random … / any clip with no criteria): pick one suitable path from files[] now and act — no extra search loops. " +
+				"Play/show: embed INLINE as ![label](absolute-path). Default app only if format is not inline-compatible or they asked external."
+			) -f $rows.Count, $total
+		}
+		return ConvertTo-MBJson $payload
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Convert-MBOffsetToInt64 {
+	# Accept int/long or string "123" / "0x1A0" / "1A0h"
+	param($Value, [long]$Default = 0)
+	if ($null -eq $Value) { return $Default }
+	if ($Value -is [long] -or $Value -is [int] -or $Value -is [int64]) {
+		$n = [long]$Value
+		if ($n -lt 0) { return $Default }
+		return $n
+	}
+	$s = ([string]$Value).Trim()
+	if ([string]::IsNullOrWhiteSpace($s)) { return $Default }
+	try {
+		if ($s -match '^(?i)0x([0-9a-f]+)$') {
+			return [Convert]::ToInt64($Matches[1], 16)
+		}
+		if ($s -match '^(?i)([0-9a-f]+)h$') {
+			return [Convert]::ToInt64($Matches[1], 16)
+		}
+		$n2 = 0L
+		if ([long]::TryParse($s, [ref]$n2)) {
+			if ($n2 -lt 0) { return $Default }
+			return $n2
+		}
+	} catch {}
+	return $Default
+}
+
+function Convert-MBHexStringToBytes {
+	# "DE AD BE EF", "DEADBEEF", "0xDE,0xAD", "de:ad:be:ef"
+	param([string]$Hex)
+	$out = New-Object System.Collections.Generic.List[byte]
+	if ([string]::IsNullOrWhiteSpace($Hex)) { return ,@() }
+	$s = [string]$Hex
+	$s = $s -replace '(?i)0x', ''
+	$s = $s -replace '[^0-9A-Fa-f]', ''
+	if (($s.Length % 2) -ne 0) {
+		throw "Hex string must have an even number of digits (got $($s.Length))."
+	}
+	if ($s.Length -eq 0) { return ,@() }
+	for ($i = 0; $i -lt $s.Length; $i += 2) {
+		$out.Add([Convert]::ToByte($s.Substring($i, 2), 16))
+	}
+	return ,$out.ToArray()
+}
+
+function Format-MBHexDump {
+	param(
+		[byte[]]$Bytes,
+		[long]$BaseOffset = 0,
+		[int]$Width = 16,
+		[bool]$ShowAscii = $true
+	)
+	if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return '(empty)' }
+	if ($Width -lt 1) { $Width = 16 }
+	if ($Width -gt 32) { $Width = 32 }
+	$sb = New-Object System.Text.StringBuilder
+	$i = 0
+	while ($i -lt $Bytes.Length) {
+		$lineOff = $BaseOffset + $i
+		[void]$sb.Append(('{0:X8}  ' -f $lineOff))
+		$ascii = New-Object System.Text.StringBuilder
+		for ($c = 0; $c -lt $Width; $c++) {
+			if (($i + $c) -lt $Bytes.Length) {
+				$b = $Bytes[$i + $c]
+				[void]$sb.Append(('{0:X2} ' -f $b))
+				if ($ShowAscii) {
+					if ($b -ge 32 -and $b -le 126) { [void]$ascii.Append([char]$b) }
+					else { [void]$ascii.Append('.') }
+				}
+			} else {
+				[void]$sb.Append('   ')
+				if ($ShowAscii) { [void]$ascii.Append(' ') }
+			}
+			if ($c -eq 7) { [void]$sb.Append(' ') }
+		}
+		if ($ShowAscii) {
+			[void]$sb.Append(' |')
+			[void]$sb.Append($ascii.ToString())
+			[void]$sb.Append('|')
+		}
+		[void]$sb.AppendLine()
+		$i += $Width
+	}
+	return $sb.ToString().TrimEnd()
+}
+
+function Invoke-HexView {
+	param(
+		[string]$path,
+		$offset = 0,
+		[int]$length = 256,
+		[int]$width = 16,
+		[bool]$show_ascii = $true
+	)
+	$path = Resolve-MBPath -Path $path -MustExist
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+
+	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
+	if ($length -le 0) { $length = 256 }
+	if ($length -gt 8192) { $length = 8192 }
+	if ($width -le 0) { $width = 16 }
+	if ($width -gt 32) { $width = 32 }
+
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$fileLen = $fs.Length
+		if ($off -ge $fileLen) {
+			return ConvertTo-MBJson @{
+				path          = $path
+				file_size     = $fileLen
+				offset        = $off
+				offset_hex    = ('0x{0:X}' -f $off)
+				length        = 0
+				truncated    = $false
+				note          = 'offset at or past EOF'
+				dump          = ''
+			}
+		}
+		$take = [int][Math]::Min([long]$length, $fileLen - $off)
+		$buf = New-Object byte[] $take
+		[void]$fs.Seek($off, [System.IO.SeekOrigin]::Begin)
+		$read = $fs.Read($buf, 0, $take)
+		if ($read -lt $take) {
+			$tmp = New-Object byte[] $read
+			[Array]::Copy($buf, $tmp, $read)
+			$buf = $tmp
+		}
+		$dump = Format-MBHexDump -Bytes $buf -BaseOffset $off -Width $width -ShowAscii $show_ascii
+		return ConvertTo-MBJson @{
+			path          = $path
+			file_size     = $fileLen
+			offset        = $off
+			offset_hex    = ('0x{0:X}' -f $off)
+			length        = $buf.Length
+			width         = $width
+			truncated    = (($off + $buf.Length) -lt $fileLen)
+			show_ascii    = $show_ascii
+			dump          = $dump
 		}
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
+	} finally {
+		if ($null -ne $fs) { try { $fs.Dispose() } catch {} }
+	}
+}
+
+function Invoke-HexEdit {
+	param(
+		[string]$path,
+		$offset = 0,
+		[string]$hex = '',
+		$bytes = $null,
+		[bool]$extend = $true,
+		[bool]$backup = $true
+	)
+	$path = Resolve-MBPath -Path $path
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+
+	$off = Convert-MBOffsetToInt64 -Value $offset -Default -1
+	if ($off -lt 0) { return 'ERROR: invalid offset (use decimal or 0xHEX)' }
+
+	$patch = $null
+	try {
+		if ($null -ne $bytes) {
+			$list = New-Object System.Collections.Generic.List[byte]
+			foreach ($b in @(Convert-MBForceArray $bytes)) {
+				$n = 0
+				if (-not [int]::TryParse(([string]$b), [ref]$n)) {
+					return "ERROR: invalid byte value: $b"
+				}
+				if ($n -lt 0 -or $n -gt 255) { return "ERROR: byte out of range 0-255: $n" }
+				$list.Add([byte]$n)
+			}
+			$patch = $list.ToArray()
+		} elseif (-not [string]::IsNullOrWhiteSpace($hex)) {
+			$patch = Convert-MBHexStringToBytes -Hex $hex
+		} else {
+			return 'ERROR: provide hex= or bytes=[]'
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+	if ($null -eq $patch -or $patch.Length -eq 0) { return 'ERROR: empty patch' }
+	if ($patch.Length -gt 65536) { return 'ERROR: patch too large (max 65536 bytes per call)' }
+
+	$exists = Test-Path -LiteralPath $path -PathType Leaf
+	$end = $off + $patch.Length
+	$curSize = 0L
+	if ($exists) {
+		try { $curSize = (Get-Item -LiteralPath $path).Length } catch { $curSize = 0 }
+	}
+	$previewDump = Format-MBHexDump -Bytes $patch -BaseOffset $off -Width 16 -ShowAscii $true
+	$details = @"
+Path: $path
+Offset: $off (0x$('{0:X}' -f $off))
+Bytes: $($patch.Length)
+Extend past EOF: $extend
+Backup (.bak): $backup
+Exists: $exists (current size $curSize)
+End after write: $end
+
+Patch:
+$previewDump
+"@
+	if (-not (Request-Confirmation -Title 'HexEdit requires approval' -Details $details -Code $previewDump -CodeLang 'text')) {
+		return 'BLOCKED BY USER: HexEdit denied by operator.'
+	}
+
+	$fs = $null
+	try {
+		if ($exists -and $backup) {
+			$bak = $path + '.bak'
+			if (-not (Test-Path -LiteralPath $bak)) {
+				[System.IO.File]::Copy($path, $bak, $false)
+			}
+		}
+		$parent = [System.IO.Path]::GetDirectoryName($path)
+		if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+			[void][System.IO.Directory]::CreateDirectory($parent)
+		}
+		$mode = if ($exists) { [System.IO.FileMode]::Open } else { [System.IO.FileMode]::Create }
+		$fs = [System.IO.File]::Open($path, $mode, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+		$needLen = $off + $patch.Length
+		if ($needLen -gt $fs.Length) {
+			if (-not $extend -and $exists) {
+				return "ERROR: write past EOF (file size $($fs.Length), need $needLen). Set extend=true or lower offset."
+			}
+			$fs.SetLength($needLen)
+		}
+		[void]$fs.Seek($off, [System.IO.SeekOrigin]::Begin)
+		$fs.Write($patch, 0, $patch.Length)
+		$fs.Flush()
+		$newSize = $fs.Length
+		$tag = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+		return ConvertTo-MBJson @{
+			status     = $tag
+			path       = $path
+			offset     = $off
+			offset_hex = ('0x{0:X}' -f $off)
+			written    = $patch.Length
+			file_size  = $newSize
+			backup     = $(if ($backup) { $path + '.bak' } else { $null })
+			dump       = $previewDump
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	} finally {
+		if ($null -ne $fs) { try { $fs.Dispose() } catch {} }
 	}
 }
 
@@ -13074,6 +16658,7 @@ function Test-ModelConnection {
 		[string]$BaseUrl,
 		[string]$Username,
 		[string]$Password,
+		[string]$BearerToken = '',
 		[int]$TimeoutSeconds = 8
 	)
 	$raw = [string]$BaseUrl
@@ -13089,24 +16674,40 @@ function Test-ModelConnection {
 	while ($raw.EndsWith('/')) { $raw = $raw.Substring(0, $raw.Length - 1) }
 
 	$bases = New-Object System.Collections.Generic.List[string]
-	[void]$bases.Add($raw)
+	# Prefer /v1 first for vLLM / Unsloth / OpenAI-compat
 	if ($raw -match '/v1$') {
+		[void]$bases.Add($raw)
 		$root = $raw -replace '/v1$', ''
 		if ($root -and -not $bases.Contains($root)) { [void]$bases.Add($root) }
 	} else {
-		$v1 = $raw + '/v1'
-		if (-not $bases.Contains($v1)) { [void]$bases.Add($v1) }
+		[void]$bases.Add($raw + '/v1')
+		[void]$bases.Add($raw)
 	}
 
 	$headers = @{}
-	$authType = 'None'
-	if ($Username -and $Password) {
+	# Display labels: NPM | API | Basic  (never "None" — open endpoints show as Basic)
+	$authType = 'Basic'
+	# Bearer / per-base key first; explicit Username/Password only if no key
+	# (NPM Basic only when Get-MBAuthHeaderValue decides the target is primary)
+	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $BearerToken
+	if ($auth) {
+		$headers['Authorization'] = $auth
+		$authType = Format-MBAuthDisplayLabel -BaseUrl $raw -AuthHeader $auth -Short
+	} elseif ($Username -and $Password) {
 		$credBytes = [System.Text.Encoding]::UTF8.GetBytes("${Username}:${Password}")
 		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
-		$authType = 'Basic'
-	} elseif (Test-MBShouldSendAuthHeader -Username $Username -Password $Password) {
-		$headers['Authorization'] = "Bearer $ApiKey"
-		$authType = 'Bearer'
+		# Explicit user/pass without ExtraApiAuth mode → still show NPM if session NPM, else Basic
+		try {
+			if ($script:MB.NpmUser -and $script:MB.NpmPass -and
+				[string]::Equals([string]$Username, [string]$script:MB.NpmUser, [StringComparison]::Ordinal) -and
+				[string]::Equals([string]$Password, [string]$script:MB.NpmPass, [StringComparison]::Ordinal)) {
+				$authType = 'NPM'
+			} else {
+				$authType = 'Basic'
+			}
+		} catch { $authType = 'Basic' }
+	} else {
+		$authType = Format-MBAuthDisplayLabel -Mode 'none' -BaseUrl $raw -Short
 	}
 
 	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
@@ -13132,7 +16733,7 @@ function Test-ModelConnection {
 				if (-not (Test-MBModelsApiResponse -Response $response)) {
 					$lastFail = [pscustomobject]@{
 						Success = $false; StatusCode = 200
-						Message = "Got HTTP 200 from $testUrl but body is not a models API (need OpenAI/llama.cpp JSON, not HTML). Use the llama.cpp / API base (e.g. :8081), not the Open-WebUI web UI port."
+						Message = "Got HTTP 200 from $testUrl but body is not a models API (need OpenAI JSON from vLLM/Unsloth/llama.cpp, not HTML). Use the API base (e.g. :8000/v1 or :8081), not a web UI port."
 						AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
 					}
 					continue
@@ -13246,12 +16847,23 @@ function Invoke-ModelStreaming {
 		$body = $null
 		Write-MBDebugLog -Step 'STREAM_ATTEMPT' -Detail ("n={0}" -f $attempt)
 		try {
+			$activeModelName = Get-MBActiveModel
+			if ([string]::IsNullOrWhiteSpace($activeModelName)) {
+				Stop-MBAnimation
+				Write-MBWarn 'Select a model in the title bar (PoweredBy) before chatting.'
+				return [pscustomobject]@{
+					choices       = @(@{ message = @{ role = 'assistant'; content = '' } })
+					ok            = $false
+					finish_reason = 'error'
+					error         = 'no model selected'
+				}
+			}
 			$workMessages = @(Ensure-MBPromptBudget -Messages $workMessages -TargetPct $(if ($attempt -gt 2) { 0.55 } else { 0.70 }))
 			$workMessages = @(Repair-MBMessagesEncoding -Messages $workMessages)
 			$activeTools = @(Get-MBActiveTools)
 			Write-MBDebugLog -Step 'STREAM_BODY_BUILD' -Detail ("tools={0}" -f @($activeTools).Count)
 			$reqMaxTok = Get-MBRequestMaxTokens -Messages $workMessages
-			$body = New-MBChatRequestBody -Messages $workMessages -Tools $activeTools -ModelName $Model -Temp $Temperature -MaxTok $reqMaxTok -Stream $true
+			$body = New-MBChatRequestBody -Messages $workMessages -Tools $activeTools -ModelName $activeModelName -Temp $Temperature -MaxTok $reqMaxTok -Stream $true
 			$script:MB.LastBodyChars = $body.Length
 			Write-MBDebugLog -Step 'STREAM_BODY_OK' -Detail ("chars={0} max_tokens={1}" -f $body.Length, $reqMaxTok)
 		} catch {
@@ -13291,12 +16903,11 @@ function Invoke-ModelStreaming {
 
 			$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $completionsUrl)
 
-			if ($script:MB.NpmUser -and $script:MB.NpmPass) {
-				$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$($script:MB.NpmUser):$($script:MB.NpmPass)")
-				$authBase64 = [Convert]::ToBase64String($authBytes)
-				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $authBase64)
-			} elseif (Test-MBShouldSendAuthHeader) {
-				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", [string]$ApiKey)
+			$authHdr = Get-MBAuthHeaderValue -BaseUrl $apiBase
+			if ($authHdr -match '^(?i)Basic\s+(.+)$') {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $Matches[1].Trim())
+			} elseif ($authHdr -match '^(?i)Bearer\s+(.+)$') {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $Matches[1].Trim())
 			}
 
 			try {
@@ -13346,7 +16957,7 @@ function Invoke-ModelStreaming {
 				$code = [int]$httpResponse.StatusCode
 				$hint = ""
 				if ($code -eq 405) {
-					$hint = " — wrong API base (often Open-WebUI web UI port). Use llama.cpp/OpenAI base that serves POST /chat/completions (e.g. http://HOST:8081), not the web UI."
+					$hint = " - wrong API base (often Open-WebUI web UI port). Use llama.cpp/OpenAI base that serves POST /chat/completions (e.g. http://HOST:8081), not the web UI."
 				}
 				throw ("HTTP {0} {1} {2}{3} [{4}]" -f $code, $httpResponse.ReasonPhrase, $errBody, $hint, $completionsUrl)
 			}
@@ -13749,7 +17360,7 @@ function Invoke-MBCompletion {
 	try {
 		$norm = @(Normalize-MBMessagesForApi -Messages $Messages)
 		$req = @{
-			model       = $Model
+			model       = (Get-MBActiveModel)
 			messages    = $norm
 			temperature = $Temp
 			max_tokens  = $MaxTok
@@ -13763,11 +17374,11 @@ function Invoke-MBCompletion {
 		try {
 			$cts.CancelAfter([TimeSpan]::FromSeconds([math]::Max(10, $TimeoutSec)))
 			$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $completionsUrl)
-			if ($script:MB.NpmUser -and $script:MB.NpmPass) {
-				$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$($script:MB.NpmUser):$($script:MB.NpmPass)")
-				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", ([Convert]::ToBase64String($authBytes)))
-			} elseif (Test-MBShouldSendAuthHeader) {
-				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", [string]$ApiKey)
+			$authHdr2 = Get-MBAuthHeaderValue -BaseUrl (Get-MBApiBaseUrl)
+			if ($authHdr2 -match '^(?i)Basic\s+(.+)$') {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $Matches[1].Trim())
+			} elseif ($authHdr2 -match '^(?i)Bearer\s+(.+)$') {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $Matches[1].Trim())
 			}
 			$request.Content = New-Object System.Net.Http.ByteArrayContent (,[byte[]]$bodyBytes)
 			$request.Content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue ("application/json")
@@ -13851,12 +17462,15 @@ function Get-MBToolFingerprint {
 			[void]$parts.Add($shell.ToLowerInvariant())
 			[void]$parts.Add($cmd)
 		}
-		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^SandBox$|^SandBoxWrite$' {
-			foreach ($k in @('path','search','replace','pattern','glob','head','tail','offset','length','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description')) {
+		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^FindFiles$|^HexView$|^HexEdit$|^SandBox$|^SandBoxWrite$' {
+			foreach ($k in @('path','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description')) {
 				if (Test-MBHasProp $ArgsObj $k) {
 					$v = Get-MBProp $ArgsObj $k
 					if ($null -ne $v) {
-						$s = [string]$v
+						$s = $null
+						if ($v -is [System.Array] -or ($v -is [System.Collections.IEnumerable] -and -not ($v -is [string]))) {
+							try { $s = (@($v) | ForEach-Object { "$_" }) -join ',' } catch { $s = [string]$v }
+						} else { $s = [string]$v }
 						if ($s.Length -gt 200) { $s = $s.Substring(0, 200) }
 						[void]$parts.Add("$k=$s")
 					}
@@ -13906,8 +17520,8 @@ function Get-MBToolFingerprint {
 				}
 			}
 		}
-		'^ControlService$|^ExpandArchive$|^CompressArchive$|^FindPSModule$|^GetInstalledPSModule$|^InstallPSModule$|^UpdatePSModule$' {
-			foreach ($k in @('name','action','startup_type','path','destination','force','version','scope','allow_prerelease','max_results')) {
+		'^ControlService$|^ExpandArchive$|^CompressArchive$|^MakeCab$|^ExpandCab$|^MakeIso$|^MountIso$|^UnmountIso$|^FindPSModule$|^GetInstalledPSModule$|^InstallPSModule$|^UpdatePSModule$' {
+			foreach ($k in @('name','action','startup_type','path','source','destination','iso_path','cab_path','boot_file','title','force','include_folder','media','letter','files','recursive','compression','compression_level','compression_memory','version','scope','allow_prerelease','max_results')) {
 				if (Test-MBHasProp $ArgsObj $k) {
 					$v = Get-MBProp $ArgsObj $k
 					if ($null -ne $v -and "$v" -ne '') { [void]$parts.Add("$k=$v") }
@@ -14951,7 +18565,7 @@ function Set-MBLocalUserPassword {
 			[void]$errs.Add(('Set-LocalUser: {0}' -f $_.Exception.Message))
 		}
 	}
-	# 2) net user — single raw arg line so special chars in password are quoted safely
+	# 2) net user - single raw arg line so special chars in password are quoted safely
 	try {
 		$passEsc = $pass -replace '"', '""'
 		$netLine = 'user {0} "{1}"' -f $user, $passEsc
@@ -14981,7 +18595,7 @@ function Set-MBLocalUserPassword {
 }
 
 function Get-MBLocalAdminAccounts {
-	# Local (not domain) members of Administrators — enabled first.
+	# Local (not domain) members of Administrators - enabled first.
 	$list = New-Object System.Collections.ArrayList
 	$seen = @{}
 	$rawNames = New-Object System.Collections.ArrayList
@@ -15327,7 +18941,7 @@ function Resolve-MBWindowsAccountName {
 	}
 	if (-not [string]::IsNullOrWhiteSpace($d)) {
 		if ($u -match '^(?<h>[^\\]+)\\(?<n>.+)$') {
-			# already qualified — keep as-is unless domain was meant to override host part
+			# already qualified - keep as-is unless domain was meant to override host part
 			return $u
 		}
 		if ($u -match '@') { return $u }
@@ -15349,7 +18963,7 @@ function Normalize-MBUncPath {
 		if (-not $p.StartsWith('\\')) { $p = '\' + $p }
 		else {
 			# became \server\share after collapse of \\\\server -> need \\
-			# After {2,} -> \, leading \\ becomes \ — fix UNC root
+			# After {2,} -> \, leading \\ becomes \ - fix UNC root
 			if ($p -match '^\\[^\\]') { $p = '\' + $p }
 		}
 	} elseif ($p -match '^[A-Za-z0-9._-]+\\.+') {
@@ -15369,12 +18983,12 @@ function Test-MBDriveLetterFreeForMap {
 	#         → free letter
 	#     )
 	# Empty CD/DVD: EXIST may be false (no media) but drivetype is CD-ROM → skipped.
-	# Only "No such Drive" is accepted — Fixed/Remote/Removable/RAM are not free.
+	# Only "No such Drive" is accepted - Fixed/Remote/Removable/RAM are not free.
 	param([string]$Letter)
 	$L = ([string]$Letter).Trim().TrimEnd(':').ToUpperInvariant()
 	if ($L -notmatch '^[A-Z]$') { return $false }
 
-	# Step 1 — RescueMaker: IF NOT EXIST L:\*
+	# Step 1 - RescueMaker: IF NOT EXIST L:\*
 	# (cmd EXIST L:\* is false for empty CD and for truly unused letters)
 	try {
 		if (Test-Path -LiteralPath "${L}:\") { return $false }
@@ -15383,7 +18997,7 @@ function Test-MBDriveLetterFreeForMap {
 		return $false
 	}
 
-	# Step 2 — FSUTIL FSINFO drivetype L:
+	# Step 2 - FSUTIL FSINFO drivetype L:
 	#   "E: - No such Drive"  → free
 	#   "D: - CD-ROM Drive"   → reserved (looks free without media; never use)
 	#   "C: - Fixed Drive" / "Remote Network Drive" / etc. → in use
@@ -15396,7 +19010,7 @@ function Test-MBDriveLetterFreeForMap {
 		if ($blob -match '(?i)No such') { return $true }
 		return $false
 	} catch {
-		# fsutil unavailable — DriveInfo fallback (same rules)
+		# fsutil unavailable - DriveInfo fallback (same rules)
 		try {
 			$di = New-Object System.IO.DriveInfo ("${L}:")
 			if ($di.DriveType -eq [System.IO.DriveType]::CDRom) { return $false }
@@ -15414,7 +19028,7 @@ function Get-MBAvailableDriveLetter {
 	$pref = ([string]$Prefer).Trim().TrimEnd(':').ToUpperInvariant()
 	$order = New-Object System.Collections.ArrayList
 	if ($pref -match '^[A-Z]$' -and $pref -notin @('A', 'B', 'C')) { [void]$order.Add($pref) }
-	# D through Z only (same as RescueMaker FOR D E F ... Z) — never auto-pick A/B/C
+	# D through Z only (same as RescueMaker FOR D E F ... Z) - never auto-pick A/B/C
 	foreach ($code in 68..90) { # D=68 .. Z=90
 		$ch = [string][char]$code
 		if ($ch -ne $pref) { [void]$order.Add($ch) }
@@ -15506,7 +19120,7 @@ function Invoke-MapNetworkDrive {
 		$err = ''
 		$exit = 0
 
-		# Prefer New-SmbMapping — UserName as PowerShell string (HOST\user safe)
+		# Prefer New-SmbMapping - UserName as PowerShell string (HOST\user safe)
 		if (Get-Command New-SmbMapping -ErrorAction SilentlyContinue) {
 			try {
 				$mapParams = @{
@@ -16081,7 +19695,7 @@ function Invoke-CreateShare {
 	if ([string]::IsNullOrEmpty($pass) -and -not [string]::IsNullOrEmpty([string]$share_password)) {
 		$pass = [string]$share_password
 	}
-	# Permission level: Full (default) | Change | Read — not forced Full if caller passes another right
+	# Permission level: Full (default) | Change | Read - not forced Full if caller passes another right
 	$rightRaw = ([string]$access_right).Trim()
 	if ([string]::IsNullOrWhiteSpace($rightRaw)) { $rightRaw = ([string]$permission).Trim() }
 	$accessRight = Resolve-MBShareAccessRight -Right $rightRaw
@@ -16091,7 +19705,7 @@ function Invoke-CreateShare {
 		return "ERROR: share name must be 1-80 chars starting with letter/digit [A-Za-z0-9._$-]."
 	}
 
-	# everyone_full is REQUIRED (no silent default) — Windows often needs an explicit user grant
+	# everyone_full is REQUIRED (no silent default) - Windows often needs an explicit user grant
 	$missing = New-Object System.Collections.ArrayList
 	$everyoneProvided = $false
 	$everyoneFull = $false
@@ -16112,9 +19726,9 @@ function Invoke-CreateShare {
 			missing    = @($missing)
 			message    = @'
 NEED_INPUT: CreateShare needs explicit access choice from the operator (ask in chat, no popup):
-  1) everyone_full = true|false  — ALWAYS ask: "Everyone access, or only a specific user?" (Everyone alone often fails on Win10/11; we still grant a named local user the same right.)
-  2) access_username — local account for share+NTFS grant (create if missing; e.g. share, bob, tech)
-  3) access_password (alias share_password) — password for that account; show it back to the operator
+  1) everyone_full = true|false  - ALWAYS ask: "Everyone access, or only a specific user?" (Everyone alone often fails on Win10/11; we still grant a named local user the same right.)
+  2) access_username - local account for share+NTFS grant (create if missing; e.g. share, bob, tech)
+  3) access_password (alias share_password) - password for that account; show it back to the operator
 Optional: access_right / permission = Full|Change|Read (default Full if omitted).
 Then call CreateShare with path, name, everyone_full, access_username, access_password [, access_right].
 '@
@@ -16334,7 +19948,7 @@ Create SMB share (password-protected):
 			$n = Grant-MBNtfsAccess -Path $folder -Identity 'Everyone' -AccessRight $accessRight
 			[void]$aclLog.Add([ordered]@{ layer = 'ntfs'; account = 'Everyone'; right = $accessRight; ok = $n.ok; detail = $(if ($n.err) { $n.err } else { "exit $($n.exit)" }) })
 		}
-		# Explicit grant for the access user (always — Windows often needs a named principal)
+		# Explicit grant for the access user (always - Windows often needs a named principal)
 		$userShareOk = $false
 		foreach ($acct in @("$hostName\$shareUser", $shareUser, ".\$shareUser")) {
 			$g = Grant-MBSmbShareAccess -ShareName $shareName -Account $acct -AccessRight $accessRight
@@ -16511,7 +20125,7 @@ function Invoke-RemoveShare {
 	$uncOut = "\\$hostName\$shareName"
 
 	$details = @"
-Remove SMB share (unpublish only — folder stays):
+Remove SMB share (unpublish only - folder stays):
   share name     = $shareName
   UNC            = $uncOut
   folder         = $(if ($folder) { $folder } else { '(path unknown)' })
@@ -16722,7 +20336,7 @@ Remove mapped network drive:
 			}) -Depth 4
 		}
 		if ($still.ok) {
-			# Method reported success but still present — try net again
+			# Method reported success but still present - try net again
 			try {
 				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('use', "${let}:", '/delete', '/y') -TimeoutSec 30
 			} catch {}
@@ -16754,7 +20368,7 @@ Remove mapped network drive:
 
 function Invoke-StopProcess {
 	param(
-		# Do not name a param $pid — shadows automatic $PID
+		# Do not name a param $pid - shadows automatic $PID
 		[object]$process_id = $null,
 		[string]$name = '',
 		[object]$force = $true
@@ -16776,7 +20390,7 @@ function Invoke-StopProcess {
 	$doForce = $true
 	try { $doForce = Convert-MBToBool -Value $force -Default $true } catch {}
 
-	# Critical system processes — never kill
+	# Critical system processes - never kill
 	$protected = @(
 		'System', 'Idle', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass',
 		'svchost', 'Registry', 'Memory Compression', 'Secure System', 'fontdrvhost',
@@ -17056,7 +20670,7 @@ function Invoke-Reboot {
 		try {
 			$r = Invoke-MBSetupNative -File 'shutdown.exe' -ArgumentList @('/a') -TimeoutSec 15
 			$ok = $r.ok -or (([string]$r.err + [string]$r.out) -match '(?i)no.*shutdown|was aborted|1116')
-			# exit 1116 = no shutdown in progress — treat as ok-ish
+			# exit 1116 = no shutdown in progress - treat as ok-ish
 			$blob = (([string]$r.out) + ' ' + ([string]$r.err)).Trim()
 			$card = Write-MBOperatorCard -Title 'SHUTDOWN ABORTED' -Fields ([ordered]@{
 				Action = 'abort'
@@ -17464,7 +21078,7 @@ function Invoke-MBEnsureSevenZipForExtract {
 
 function Get-MBNewMachineSoftwareManifest {
 	param([string]$Profile)
-	# Personal catalog: install every package (no business profile split).
+	# Release: full personal catalog every time (profile only affects settings notes).
 	$cat = Get-MBInstallerCatalog
 	$list = New-Object System.Collections.ArrayList
 	foreach ($key in @($cat.Keys)) {
@@ -17663,6 +21277,7 @@ function Invoke-MBSetupInstallPackage {
 
 function Invoke-ListInstallers {
 	param([string]$profile = 'all')
+	# Release catalog is personal-only; list every package (profile filter ignored).
 	$cat = Get-MBInstallerCatalog
 	$rows = @()
 	foreach ($key in @($cat.Keys)) {
@@ -17681,7 +21296,7 @@ function Invoke-ListInstallers {
 	return ConvertTo-MBJson ([ordered]@{
 		ok       = $true
 		count    = $rows.Count
-		note     = 'Personal catalog. Silent installs; temp files cleaned after each package. ADWCleaner runs a scan/clean. NewMachineSetup installs the full catalog.'
+		note     = 'Silent installs; temp files cleaned after each package. ADWCleaner runs a scan/clean.'
 		packages = $rows
 	}) -Depth 6
 }
@@ -17875,6 +21490,7 @@ function Invoke-NewMachineSetup {
 	}
 
 	# Portable = form factor / use pattern, not desktop vs laptop labels.
+	# Always recommend re-enabling encryption when portable; stress it more for business.
 	$portableEncryptNote = 'If this machine is portable, re-enable Device Encryption / BitLocker after setup.'
 
 	$software = @()
@@ -18078,6 +21694,9 @@ function Invoke-MBTool {
 		}
 		if (-not $match) { $match = Resolve-MBToolName -Name $Name }
 		if ($match) {
+			if ((Test-MBToolNeedsVision -Name $match) -and -not (Test-MBModelHasVision)) {
+				return "ERROR: Tool '$match' requires vision. Current model has no 'vision' ability - do not call ReadImage, ReadPdf, or ViewScreen."
+			}
 			$hint = Get-MBToolEnableHint -ToolName $match
 			return "ERROR: Tool '$match' is not in the active tool list. $hint"
 		}
@@ -18165,12 +21784,31 @@ function Invoke-MBTool {
 			"FindFiles" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path' '.') }
 				if (Test-MBHasProp $ArgsObj 'glob') { $p['glob'] = (Get-MBProp $ArgsObj 'glob') }
+				if (Test-MBHasProp $ArgsObj 'globs') { $p['globs'] = (Get-MBProp $ArgsObj 'globs') }
+				if (Test-MBHasProp $ArgsObj 'extensions') { $p['extensions'] = (Get-MBProp $ArgsObj 'extensions') }
 				if (Test-MBHasProp $ArgsObj 'modified_within_days') { $p['modified_within_days'] = [int](Get-MBProp $ArgsObj 'modified_within_days') }
 				if (Test-MBHasProp $ArgsObj 'min_bytes') { $p['min_bytes'] = [long](Get-MBProp $ArgsObj 'min_bytes') }
 				if (Test-MBHasProp $ArgsObj 'max_bytes') { $p['max_bytes'] = [long](Get-MBProp $ArgsObj 'max_bytes') }
 				if (Test-MBHasProp $ArgsObj 'recursive') { $p['recursive'] = [bool](Get-MBProp $ArgsObj 'recursive') }
 				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
 				Invoke-FindFiles @p
+			}
+			"HexView" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
+				if (Test-MBHasProp $ArgsObj 'length') { $p['length'] = [int](Get-MBProp $ArgsObj 'length') }
+				if (Test-MBHasProp $ArgsObj 'width') { $p['width'] = [int](Get-MBProp $ArgsObj 'width') }
+				if (Test-MBHasProp $ArgsObj 'show_ascii') { $p['show_ascii'] = [bool](Get-MBProp $ArgsObj 'show_ascii') }
+				Invoke-HexView @p
+			}
+			"HexEdit" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
+				if (Test-MBHasProp $ArgsObj 'hex') { $p['hex'] = [string](Get-MBProp $ArgsObj 'hex') }
+				if (Test-MBHasProp $ArgsObj 'bytes') { $p['bytes'] = (Get-MBProp $ArgsObj 'bytes') }
+				if (Test-MBHasProp $ArgsObj 'extend') { $p['extend'] = [bool](Get-MBProp $ArgsObj 'extend') }
+				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = [bool](Get-MBProp $ArgsObj 'backup') }
+				Invoke-HexEdit @p
 			}
 			"ReadImage" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
@@ -18364,6 +22002,53 @@ function Invoke-MBTool {
 				}
 				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = [bool](Get-MBProp $ArgsObj 'force') }
 				Invoke-CompressArchive @p
+			}
+			"MakeIso" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'source') { $p['source'] = (Get-MBProp $ArgsObj 'source') }
+				elseif (Test-MBHasProp $ArgsObj 'path') { $p['source'] = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'destination') { $p['destination'] = (Get-MBProp $ArgsObj 'destination') }
+				elseif (Test-MBHasProp $ArgsObj 'iso_path') { $p['destination'] = (Get-MBProp $ArgsObj 'iso_path') }
+				if (Test-MBHasProp $ArgsObj 'boot_file') { $p['boot_file'] = (Get-MBProp $ArgsObj 'boot_file') }
+				if (Test-MBHasProp $ArgsObj 'title') { $p['title'] = (Get-MBProp $ArgsObj 'title') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = [bool](Get-MBProp $ArgsObj 'force') }
+				if (Test-MBHasProp $ArgsObj 'include_folder') { $p['include_folder'] = [bool](Get-MBProp $ArgsObj 'include_folder') }
+				if (Test-MBHasProp $ArgsObj 'media') { $p['media'] = (Get-MBProp $ArgsObj 'media') }
+				Invoke-MakeIso @p
+			}
+			"MountIso" {
+				$iso = Get-MBProp $ArgsObj 'path'
+				if ([string]::IsNullOrWhiteSpace([string]$iso)) { $iso = Get-MBProp $ArgsObj 'iso_path' }
+				Invoke-MountIso -path $iso
+			}
+			"UnmountIso" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				elseif (Test-MBHasProp $ArgsObj 'iso_path') { $p['path'] = (Get-MBProp $ArgsObj 'iso_path') }
+				if (Test-MBHasProp $ArgsObj 'letter') { $p['letter'] = (Get-MBProp $ArgsObj 'letter') }
+				Invoke-UnmountIso @p
+			}
+			"MakeCab" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'source') { $p['source'] = (Get-MBProp $ArgsObj 'source') }
+				elseif (Test-MBHasProp $ArgsObj 'path') { $p['source'] = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'files') { $p['files'] = (Get-MBProp $ArgsObj 'files') }
+				if (Test-MBHasProp $ArgsObj 'destination') { $p['destination'] = (Get-MBProp $ArgsObj 'destination') }
+				elseif (Test-MBHasProp $ArgsObj 'cab_path') { $p['destination'] = (Get-MBProp $ArgsObj 'cab_path') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = [bool](Get-MBProp $ArgsObj 'force') }
+				if (Test-MBHasProp $ArgsObj 'recursive') { $p['recursive'] = [bool](Get-MBProp $ArgsObj 'recursive') }
+				if (Test-MBHasProp $ArgsObj 'compression') { $p['compression'] = (Get-MBProp $ArgsObj 'compression') }
+				if (Test-MBHasProp $ArgsObj 'compression_level') { $p['compression_level'] = [int](Get-MBProp $ArgsObj 'compression_level') }
+				if (Test-MBHasProp $ArgsObj 'compression_memory') { $p['compression_memory'] = [int](Get-MBProp $ArgsObj 'compression_memory') }
+				Invoke-MakeCab @p
+			}
+			"ExpandCab" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				elseif (Test-MBHasProp $ArgsObj 'cab_path') { $p['path'] = (Get-MBProp $ArgsObj 'cab_path') }
+				if (Test-MBHasProp $ArgsObj 'destination') { $p['destination'] = (Get-MBProp $ArgsObj 'destination') }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = [bool](Get-MBProp $ArgsObj 'force') }
+				Invoke-ExpandCab @p
 			}
 			"FindPSModule" {
 				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
@@ -18646,7 +22331,7 @@ function Invoke-MBTool {
 		$result = "ERROR in ${Name}: [$exType] $($_.Exception.Message)"
 		if ($stack) { $result += "`n$stack" }
 		if ("$($_.Exception.Message)" -match 'types do not match|cannot convert|parameterbinding') {
-			$result += "`nHINT: SandBox tools read args via `$script:MB_ToolArgs (no typed params). If you still see this, an internal helper is typed — report the stack above."
+			$result += "`nHINT: SandBox tools read args via `$script:MB_ToolArgs (no typed params). If you still see this, an internal helper is typed - report the stack above."
 		}
 	}
 
@@ -18678,12 +22363,8 @@ function Get-MBAuthHeaders {
 		'Content-Type' = 'application/json'
 		'Accept'       = 'application/json'
 	}
-	if ($script:MB.NpmUser -and $script:MB.NpmPass) {
-		$authBytes = [System.Text.Encoding]::UTF8.GetBytes("$($script:MB.NpmUser):$($script:MB.NpmPass)")
-		$h['Authorization'] = "Basic " + [Convert]::ToBase64String($authBytes)
-	} elseif (Test-MBShouldSendAuthHeader) {
-		$h['Authorization'] = "Bearer $ApiKey"
-	}
+	$auth = Get-MBAuthHeaderValue -BaseUrl (Get-MBApiBaseUrl)
+	if ($auth) { $h['Authorization'] = $auth }
 	return $h
 }
 
@@ -18852,7 +22533,7 @@ function Get-MBEffectivePromptBudget {
 
 function Get-MBCompletionReserve {
 	$window = [math]::Max(2048, [int]$script:MB.ContextWindow)
-	$want = [math]::Max(1024, [int]$MaxTokens)
+	$want = [math]::Max(1024, [int](Get-MBEffectiveMaxTokens))
 	# Allow large MaxTokens on large context windows
 	$maxShare = [math]::Floor($window * 0.60)
 	if ($maxShare -lt 1024) { $maxShare = [math]::Floor($window * 0.45) }
@@ -18866,7 +22547,7 @@ function Get-MBRequestMaxTokens {
 		[array]$Messages,
 		[int]$Floor = 1024
 	)
-	$cap = [math]::Max(256, [int]$MaxTokens)
+	$cap = [math]::Max(256, [int](Get-MBEffectiveMaxTokens))
 	$window = [math]::Max(2048, [int]$script:MB.ContextWindow)
 	$promptTok = 0
 	try {
@@ -19173,7 +22854,7 @@ function Enter-MBCompacting {
 		$script:MB.CompactingDepth = [int]$script:MB.CompactingDepth + 1
 		$script:MB.IsCompacting = $true
 		if (Test-MBWpfActive) {
-			Update-MBWpfSticky -Status 'autocompacting'
+			Update-MBWpfSticky -Status 'auto-compacting'
 		}
 	} catch {}
 }
@@ -19430,7 +23111,9 @@ function Show-MBContextDetail {
 		switch ($est.Level) { 'hard' { 'Red' } 'soft' { 'Yellow' } default { 'Green' } }
 	)
 	Write-Host ("  Budget used    : {0:P1}  (~{1:N0} / {2:N0} usable prompt tok)" -f $est.Pct, $est.PromptTokens, $est.UsableTokens) -ForegroundColor Gray
-	Write-Host ("  Model n_ctx    : {0:N0} tok (ContextWindowTokens)" -f $est.WindowTokens) -ForegroundColor Gray
+	$ctxSrc = 'config'
+	try { $ctxSrc = [string]$script:MB.ContextSource } catch {}
+	Write-Host ("  Model n_ctx    : {0:N0} tok ({1})" -f $est.WindowTokens, $ctxSrc) -ForegroundColor Gray
 	Write-Host ("  Usable prompt  : {0:N0} tok (n_ctx minus completion reserve)" -f $est.UsableTokens) -ForegroundColor Gray
 	Write-Host ("  Reserved       : {0:N0} tok reserved for completion (MaxTokens)" -f $est.ReserveTokens) -ForegroundColor Gray
 	$srcLabel = switch ([string]$est.TokenSource) {
@@ -19554,6 +23237,7 @@ function Initialize-MBSpeech {
 }
 
 function Stop-MBSpeech {
+	try { Stop-MBSpeechWaveVisualizer } catch {}
 	try {
 		if ($script:MB.SpeechSynth) {
 			try { $script:MB.SpeechSynth.SpeakAsyncCancelAll() } catch {}
@@ -19612,14 +23296,51 @@ function Invoke-MBSpeak {
 			try { $script:MB.SpeechSynth.Rate = $Rate } catch {}
 		}
 		try { $script:MB.SpeechSynth.SpeakAsyncCancelAll() } catch {}
+		try { Stop-MBSpeechWavePlayback } catch {}
+
+		# WPF: synthesize TTS to WAV → play + high-FPS wave scrub.
+		# Always wait for playback to finish so the agent turn cannot race ahead of speech.
+		$useWave = $false
+		try { $useWave = [bool](Test-MBWpfActive) } catch { $useWave = $false }
+		if ($useWave) {
+			$ms = $null
+			try {
+				$ms = New-Object System.IO.MemoryStream
+				$script:MB.SpeechSynth.SetOutputToWaveStream($ms)
+				$script:MB.SpeechSynth.Speak($speakable)
+			} finally {
+				try { $script:MB.SpeechSynth.SetOutputToDefaultAudioDevice() } catch {}
+			}
+			$bytes = $null
+			try { $bytes = $ms.ToArray() } catch { $bytes = $null }
+			try { if ($ms) { $ms.Dispose() } } catch {}
+			$pcm = $null
+			if ($bytes) { $pcm = ConvertFrom-MBWavBytes -Bytes $bytes }
+			if ($pcm -and $pcm.Ok -and $pcm.Samples -and $pcm.Samples.Length -gt 2) {
+				Start-MBSpeechWaveFromPcm -Samples $pcm.Samples -SampleRate ([int]$pcm.SampleRate) -DurationMs ([int]$pcm.DurationMs) -WavBytes $bytes
+				# Block until audio+wave complete (pump UI so CompositionTarget keeps firing)
+				Wait-MBSpeechWavePlayback
+				try {
+					if (-not [bool]$script:MB.SpeechEnabled) { Stop-MBSpeechWaveVisualizer }
+				} catch {}
+				return ("SUCCESS: Spoke ({0} chars, tts-wave {1}ms)." -f $speakable.Length, [int]$pcm.DurationMs)
+			}
+			try { Start-MBSpeechWaveVisualizer -ForceSpeaking } catch {}
+		}
+
+		# Fallback: device TTS (no sample wave)
 		if ($Async) {
 			[void]$script:MB.SpeechSynth.SpeakAsync($speakable)
 			return "SUCCESS: Speaking ($($speakable.Length) chars, async)."
 		} else {
 			$script:MB.SpeechSynth.Speak($speakable)
+			try {
+				if (-not [bool]$script:MB.SpeechEnabled) { Stop-MBSpeechWaveVisualizer }
+			} catch {}
 			return "SUCCESS: Spoke ($($speakable.Length) chars)."
 		}
 	} catch {
+		try { $script:MB.SpeechSynth.SetOutputToDefaultAudioDevice() } catch {}
 		return "ERROR: TTS failed: $($_.Exception.Message)"
 	}
 }
@@ -19663,7 +23384,7 @@ function Invoke-MBSpeechListen {
 			while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
 		} catch {}
 
-		& $paint '● REC  hold Right-Ctrl… release to stop'
+		& $paint '● REC  hold Right-Ctrl... release to stop'
 
 		$null = Register-ObjectEvent -InputObject $eng -EventName SpeechRecognized -SourceIdentifier 'MB.Speech.Rec' -Action {
 			try {
@@ -19720,7 +23441,7 @@ function Invoke-MBSpeechListen {
 			} elseif ($hyp) {
 				"● REC  $hyp"
 			} else {
-				'● REC  hold Right-Ctrl… release to stop'
+				'● REC  hold Right-Ctrl... release to stop'
 			}
 			if ($show -ne $lastPaint) {
 				& $paint $show
@@ -19799,6 +23520,7 @@ function Enable-MBSpeechMode {
 		try {
 			if ($script:MB.SpeechSynth) { $script:MB.SpeechSynth.SpeakAsyncCancelAll() }
 		} catch {}
+		try { Stop-MBSpeechWaveVisualizer } catch {}
 	}
 	$script:MB.SpeechEnabled = [bool]$On
 	if ($On) {
@@ -19811,6 +23533,7 @@ function Enable-MBSpeechMode {
 				try { Sync-MBPromptAfterToolGroups } catch { try { Initialize-MBToolsOverhead } catch {} }
 			}
 		} catch {}
+		try { Start-MBSpeechWaveVisualizer } catch {}
 		$dict = if ($script:MB.SpeechEngine) { 'dictation OK' } else { 'dictation UNAVAILABLE (TTS only)' }
 		$auto = if ($script:MB.SpeechAutoReply) { 'ON' } else { 'off' }
 		return "Speech mode ON ($dict). Hold Right-Ctrl to talk, release to stop. Typing works when RCtrl is up. Auto-speak: $auto. Tool: SpeakText."
@@ -19823,6 +23546,497 @@ function Enable-MBSpeechMode {
 		} catch {}
 		return "Speech mode OFF."
 	}
+}
+
+
+
+# Speech codebox: real SAPI PCM (WaveStream) + SoundPlayer + CompositionTarget.Rendering (high FPS).
+# No WASAPI / no Add-Type audio COM.
+function Resolve-MBSpeechWaveControls {
+	$W = $script:MB.Wpf
+	if (-not $W) { return $false }
+	try {
+		if (-not $W.SpeechWaveBox -and $W.Window) {
+			$W.SpeechWaveBox = $W.Window.FindName('SpeechWaveBox')
+			$W.SpeechWaveCanvas = $W.Window.FindName('SpeechWaveCanvas')
+			$W.SpeechWaveLine = $W.Window.FindName('SpeechWaveLine')
+			$W.SpeechWaveStatus = $W.Window.FindName('SpeechWaveStatus')
+			$W.SpeechWaveLang = $W.Window.FindName('SpeechWaveLang')
+		}
+	} catch {}
+	return [bool]$W.SpeechWaveBox
+}
+
+function ConvertFrom-MBWavBytes {
+	param([byte[]]$Bytes)
+	$result = @{
+		Ok         = $false
+		Samples    = [float[]]@()
+		SampleRate = 22050
+		Channels   = 1
+		Bits       = 16
+		DurationMs = 0
+	}
+	if (-not $Bytes -or $Bytes.Length -lt 44) { return $result }
+	try {
+		if ([char]$Bytes[0] -ne 'R' -or [char]$Bytes[8] -ne 'W') { return $result }
+		$pos = 12
+		$fmtCh = 1
+		$fmtRate = 22050
+		$fmtBits = 16
+		$fmtTag = 1
+		$dataOff = -1
+		$dataLen = 0
+		while (($pos + 8) -le $Bytes.Length) {
+			$id = [Text.Encoding]::ASCII.GetString($Bytes, $pos, 4)
+			$size = [BitConverter]::ToInt32($Bytes, $pos + 4)
+			if ($size -lt 0) { break }
+			$chunk = $pos + 8
+			if ($id -eq 'fmt ' -and ($chunk + 16) -le $Bytes.Length) {
+				$fmtTag = [BitConverter]::ToUInt16($Bytes, $chunk)
+				$fmtCh = [BitConverter]::ToUInt16($Bytes, $chunk + 2)
+				$fmtRate = [BitConverter]::ToInt32($Bytes, $chunk + 4)
+				$fmtBits = [BitConverter]::ToUInt16($Bytes, $chunk + 14)
+			} elseif ($id -eq 'data') {
+				$dataOff = $chunk
+				$dataLen = $size
+				break
+			}
+			$pos = $chunk + $size
+			if (($pos % 2) -eq 1) { $pos++ }
+		}
+		if ($dataOff -lt 0 -or $dataLen -le 0) { return $result }
+		if (($dataOff + $dataLen) -gt $Bytes.Length) { $dataLen = $Bytes.Length - $dataOff }
+		if ($fmtCh -lt 1) { $fmtCh = 1 }
+		if ($fmtRate -lt 1) { $fmtRate = 22050 }
+		$bytesPer = [Math]::Max(1, [int]($fmtBits / 8))
+		$frame = $bytesPer * $fmtCh
+		if ($frame -lt 1) { return $result }
+		$nFrames = [int][Math]::Floor($dataLen / $frame)
+		if ($nFrames -lt 2) { return $result }
+		# True duration from original stream (never from downsampled rate)
+		$durationMs = [int][Math]::Round(1000.0 * $nFrames / [double]$fmtRate)
+		if ($durationMs -lt 80) { $durationMs = 80 }
+
+		# Keep denser samples for smooth scrub (~48k max)
+		$target = 48000
+		$step = 1
+		if ($nFrames -gt $target) { $step = [int][Math]::Ceiling($nFrames / [double]$target) }
+		$outN = [int][Math]::Ceiling($nFrames / [double]$step)
+		$samples = New-Object 'System.Single[]' $outN
+		$oi = 0
+		for ($f = 0; $f -lt $nFrames -and $oi -lt $outN; $f += $step) {
+			$sum = 0.0
+			for ($c = 0; $c -lt $fmtCh; $c++) {
+				$off = $dataOff + ($f * $frame) + ($c * $bytesPer)
+				if (($off + $bytesPer) -gt $Bytes.Length) { break }
+				$s = 0.0
+				if ($fmtTag -eq 3 -and $fmtBits -eq 32) {
+					$s = [BitConverter]::ToSingle($Bytes, $off)
+				} elseif ($fmtBits -eq 16) {
+					$s = [BitConverter]::ToInt16($Bytes, $off) / 32768.0
+				} elseif ($fmtBits -eq 8) {
+					$s = ($Bytes[$off] - 128) / 128.0
+				} elseif ($fmtBits -eq 32 -and $fmtTag -eq 1) {
+					$s = [BitConverter]::ToInt32($Bytes, $off) / 2147483648.0
+				} else {
+					$s = [BitConverter]::ToInt16($Bytes, $off) / 32768.0
+				}
+				$sum += $s
+			}
+			$samples[$oi] = [float]($sum / $fmtCh)
+			$oi++
+		}
+		if ($oi -lt $outN) {
+			$trim = New-Object 'System.Single[]' $oi
+			[Array]::Copy($samples, $trim, $oi)
+			$samples = $trim
+		}
+		$result.Ok = $true
+		$result.Samples = $samples
+		$result.SampleRate = $fmtRate
+		$result.Channels = $fmtCh
+		$result.Bits = $fmtBits
+		$result.DurationMs = $durationMs
+		return $result
+	} catch {
+		return $result
+	}
+}
+
+function Stop-MBSpeechWavePlayback {
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
+	try {
+		if ($W.SpeechWavePlayer) {
+			try { $W.SpeechWavePlayer.Stop() } catch {}
+			try { $W.SpeechWavePlayer.Dispose() } catch {}
+		}
+	} catch {}
+	try {
+		if ($W.SpeechWavePlayStream) { $W.SpeechWavePlayStream.Dispose() }
+	} catch {}
+	try { $W.SpeechWavePlayer = $null } catch {}
+	try { $W.SpeechWavePlayStream = $null } catch {}
+	try { $W.SpeechWavePlaying = $false } catch {}
+	try {
+		if ($W.SpeechWaveClock) { $W.SpeechWaveClock.Stop() }
+	} catch {}
+}
+
+function Start-MBSpeechWaveRenderLoop {
+	# CompositionTarget.Rendering ≈ display refresh (very smooth)
+	if (-not (Test-MBWpfActive)) { return }
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
+	$ui = {
+		try {
+			if ([bool]$W.SpeechWaveRenderHooked) { return }
+			$handler = [System.EventHandler] {
+				param($s, $e)
+				try { Update-MBSpeechWaveFrame } catch {}
+			}
+			$W.SpeechWaveRenderHandler = $handler
+			[System.Windows.Media.CompositionTarget]::add_Rendering($handler)
+			$W.SpeechWaveRenderHooked = $true
+		} catch {
+			# Fallback timer ~120fps if CompositionTarget unavailable
+			try {
+				if (-not $W.SpeechWaveTimer) {
+					$tm = New-Object System.Windows.Threading.DispatcherTimer
+					$tm.Interval = [TimeSpan]::FromMilliseconds(8)
+					$tm.add_Tick({
+						param($s2, $e2)
+						try { Update-MBSpeechWaveFrame } catch {}
+					}.GetNewClosure())
+					$W.SpeechWaveTimer = $tm
+				}
+				if (-not $W.SpeechWaveTimer.IsEnabled) { $W.SpeechWaveTimer.Start() }
+			} catch {}
+		}
+	}.GetNewClosure()
+	try { Invoke-MBWpf -Action $ui } catch { try { & $ui } catch {} }
+}
+
+function Stop-MBSpeechWaveRenderLoop {
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
+	$ui = {
+		try {
+			if ([bool]$W.SpeechWaveRenderHooked -and $W.SpeechWaveRenderHandler) {
+				[System.Windows.Media.CompositionTarget]::remove_Rendering($W.SpeechWaveRenderHandler)
+			}
+		} catch {}
+		try { $W.SpeechWaveRenderHooked = $false } catch {}
+		try { $W.SpeechWaveRenderHandler = $null } catch {}
+		try {
+			if ($W.SpeechWaveTimer) { $W.SpeechWaveTimer.Stop() }
+		} catch {}
+	}.GetNewClosure()
+	try { Invoke-MBWpf -Action $ui } catch { try { & $ui } catch {} }
+}
+
+function Start-MBSpeechWaveVisualizer {
+	param([switch]$ForceSpeaking)
+	if (-not (Test-MBWpfActive)) { return }
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
+	if ($ForceSpeaking) {
+		try { $W.SpeechWaveForceSpeaking = $true } catch {}
+		try { $W.SpeechWaveForceUntil = [Environment]::TickCount + 600 } catch {}
+	}
+	$ui = {
+		try {
+			if (-not (Resolve-MBSpeechWaveControls)) { return }
+			$box = $W.SpeechWaveBox
+			$box.Visibility = [System.Windows.Visibility]::Visible
+			try { [System.Windows.Controls.Panel]::SetZIndex($box, 8) } catch {}
+			if ($W.SpeechWaveLang) { $W.SpeechWaveLang.Text = 'speech' }
+			if ($ForceSpeaking -and $W.SpeechWaveStatus) {
+				$W.SpeechWaveStatus.Text = 'speaking'
+				try {
+					$bc = New-Object System.Windows.Media.BrushConverter
+					$W.SpeechWaveStatus.Foreground = $bc.ConvertFromString('#00BFFF')
+				} catch {}
+			}
+		} catch {}
+	}.GetNewClosure()
+	try { Invoke-MBWpf -Action $ui } catch { try { & $ui } catch {} }
+	try { Start-MBSpeechWaveRenderLoop } catch {}
+}
+
+function Start-MBSpeechWaveFromPcm {
+	param(
+		[float[]]$Samples,
+		[int]$SampleRate = 22050,
+		[int]$DurationMs = 0,
+		[byte[]]$WavBytes = $null
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
+	if (-not $Samples -or $Samples.Length -lt 2) { return }
+
+	try { Stop-MBSpeechWavePlayback } catch {}
+	$W.SpeechWaveSamples = $Samples
+	$W.SpeechWaveSampleRate = [Math]::Max(1, $SampleRate)
+	if ($DurationMs -gt 0) {
+		$W.SpeechWaveDurationMs = $DurationMs
+	} else {
+		$W.SpeechWaveDurationMs = [int][Math]::Max(80, [Math]::Round(1000.0 * $Samples.Length / [double]$W.SpeechWaveSampleRate))
+	}
+	$W.SpeechWaveForceSpeaking = $false
+	$W.SpeechWaveIdleTicks = 0
+
+	$clock = New-Object System.Diagnostics.Stopwatch
+	$W.SpeechWaveClock = $clock
+	$W.SpeechWavePlaying = $true
+
+	if ($WavBytes -and $WavBytes.Length -gt 44) {
+		try {
+			$playMs = New-Object System.IO.MemoryStream (,$WavBytes)
+			$playMs.Position = 0
+			$player = New-Object System.Media.SoundPlayer
+			$player.Stream = $playMs
+			$player.Load()
+			$W.SpeechWavePlayStream = $playMs
+			$W.SpeechWavePlayer = $player
+			$clock.Restart()
+			$player.Play()
+		} catch {
+			$clock.Restart()
+		}
+	} else {
+		$clock.Restart()
+	}
+
+	try { Start-MBSpeechWaveVisualizer } catch {}
+	$ui = {
+		try {
+			if ($W.SpeechWaveLang) { $W.SpeechWaveLang.Text = ('speech {0} tts' -f ([char]0x00B7)) }
+			if ($W.SpeechWaveStatus) {
+				$W.SpeechWaveStatus.Text = 'speaking'
+				$bc = New-Object System.Windows.Media.BrushConverter
+				$W.SpeechWaveStatus.Foreground = $bc.ConvertFromString('#00BFFF')
+			}
+		} catch {}
+	}.GetNewClosure()
+	try { Invoke-MBWpf -Action $ui } catch { try { & $ui } catch {} }
+}
+
+function Wait-MBSpeechWavePlayback {
+	param([int]$PadMs = 40)
+	$W = $script:MB.Wpf
+	if (-not $W) { return }
+	$dur = 0
+	try { $dur = [int]$W.SpeechWaveDurationMs } catch { $dur = 0 }
+	if ($dur -lt 1) { $dur = 1 }
+	$limit = $dur + [Math]::Max(0, $PadMs)
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	$d = $null
+	try { $d = $W.Dispatcher } catch { $d = $null }
+	while ($sw.ElapsedMilliseconds -lt $limit) {
+		$still = $true
+		try {
+			if ($W.SpeechWaveClock -and $W.SpeechWaveClock.IsRunning) {
+				if ($W.SpeechWaveClock.ElapsedMilliseconds -ge $dur) { $still = $false }
+			} elseif (-not [bool]$W.SpeechWavePlaying) {
+				$still = $false
+			}
+		} catch {}
+		if (-not $still) { break }
+		# Pump UI so CompositionTarget.Rendering keeps updating the wave
+		try {
+			if ($d) {
+				if ($d.CheckAccess()) {
+					try { Update-MBSpeechWaveFrame } catch {}
+				} else {
+					[void]$d.Invoke([Action]{
+						try { Update-MBSpeechWaveFrame } catch {}
+					}, [System.Windows.Threading.DispatcherPriority]::Render)
+				}
+			}
+		} catch {}
+		Start-Sleep -Milliseconds 4
+	}
+	try { $W.SpeechWavePlaying = $false } catch {}
+	try {
+		if ($W.SpeechWaveClock) { $W.SpeechWaveClock.Stop() }
+	} catch {}
+}
+
+function Stop-MBSpeechWaveVisualizer {
+	if (-not $script:MB.Wpf) { return }
+	$W = $script:MB.Wpf
+	try { $W.SpeechWaveForceSpeaking = $false } catch {}
+	try { $W.SpeechWavePlaying = $false } catch {}
+	try { Stop-MBSpeechWavePlayback } catch {}
+	try { Stop-MBSpeechWaveRenderLoop } catch {}
+	try { $W.SpeechWaveSamples = $null } catch {}
+	$ui = {
+		try { if ($W.SpeechWaveBox) { $W.SpeechWaveBox.Visibility = [System.Windows.Visibility]::Collapsed } } catch {}
+		try {
+			if ($W.SpeechWaveLine) { $W.SpeechWaveLine.Points = (New-Object System.Windows.Media.PointCollection) }
+		} catch {}
+		try {
+			if ($W.SpeechWaveStatus) {
+				$W.SpeechWaveStatus.Text = 'idle'
+				$bc = New-Object System.Windows.Media.BrushConverter
+				$W.SpeechWaveStatus.Foreground = $bc.ConvertFromString('#6A6A76')
+			}
+		} catch {}
+		try { if ($W.SpeechWaveLang) { $W.SpeechWaveLang.Text = 'speech' } } catch {}
+	}.GetNewClosure()
+	try { Invoke-MBWpf -Action $ui } catch { try { & $ui } catch {} }
+}
+
+function Update-MBSpeechWaveFrame {
+	# UI thread - high frequency via CompositionTarget.Rendering
+	if (-not $script:MB.Wpf) { return }
+	$W = $script:MB.Wpf
+	if (-not (Resolve-MBSpeechWaveControls)) { return }
+	if ($W.SpeechWaveBox.Visibility -ne [System.Windows.Visibility]::Visible) { return }
+	$canvas = $W.SpeechWaveCanvas
+	$line = $W.SpeechWaveLine
+	if (-not $canvas -or -not $line) { return }
+
+	$ww = [double]$canvas.ActualWidth
+	$hh = [double]$canvas.ActualHeight
+	if ($ww -lt 8 -or $hh -lt 8 -or [double]::IsNaN($ww) -or [double]::IsNaN($hh)) {
+		try { $ww = [Math]::Max(8.0, [double]$W.SpeechWaveBox.ActualWidth - 24.0) } catch { $ww = 320.0 }
+		$hh = 84.0
+	}
+	if ($ww -lt 8) { $ww = 320.0 }
+	if ($hh -lt 8) { $hh = 84.0 }
+
+	$samples = $null
+	try { $samples = $W.SpeechWaveSamples } catch { $samples = $null }
+	$playing = $false
+	try { $playing = [bool]$W.SpeechWavePlaying } catch { $playing = $false }
+	$listening = $false
+	try {
+		if ((Test-MBSpeechPttDown) -and [bool]$script:MB.SpeechEnabled) { $listening = $true }
+	} catch {}
+	try {
+		if (-not $listening -and [bool]$script:MB.SpeechListening) { $listening = $true }
+	} catch {}
+
+	$playhead = 0.0
+	$dur = 0
+	try { $dur = [int]$W.SpeechWaveDurationMs } catch { $dur = 0 }
+	$elapsed = 0
+	try {
+		if ($W.SpeechWaveClock) { $elapsed = [int]$W.SpeechWaveClock.ElapsedMilliseconds }
+	} catch { $elapsed = 0 }
+
+	if ($playing -and $dur -gt 0) {
+		if ($elapsed -ge $dur) {
+			$playhead = 1.0
+			$W.SpeechWavePlaying = $false
+			$playing = $false
+			try { if ($W.SpeechWaveClock) { $W.SpeechWaveClock.Stop() } } catch {}
+		} else {
+			$playhead = $elapsed / [double]$dur
+			if ($playhead -lt 0) { $playhead = 0 }
+			if ($playhead -gt 1) { $playhead = 1 }
+		}
+	}
+
+	$speaking = $playing
+	if (-not $speaking -and $samples -and $elapsed -gt 0 -and $elapsed -lt $dur) { $speaking = $true }
+
+	# Auto-hide after TTS when speech mode is off (leave a short tail)
+	try {
+		if (-not $speaking -and -not $listening -and -not [bool]$script:MB.SpeechEnabled) {
+			$idleN = 0
+			try { $idleN = [int]$W.SpeechWaveIdleTicks } catch { $idleN = 0 }
+			$idleN++
+			$W.SpeechWaveIdleTicks = $idleN
+			# CompositionTarget is ~60fps → ~0.5s tail
+			if ($idleN -gt 30) {
+				try { Stop-MBSpeechWaveRenderLoop } catch {}
+				$W.SpeechWaveBox.Visibility = [System.Windows.Visibility]::Collapsed
+				$W.SpeechWaveIdleTicks = 0
+				try { $W.SpeechWaveSamples = $null } catch {}
+				return
+			}
+		} else {
+			$W.SpeechWaveIdleTicks = 0
+		}
+	} catch {}
+
+	$st = 'idle'
+	$stHex = '#6A6A76'
+	if ($speaking) { $st = 'speaking'; $stHex = '#00BFFF' }
+	elseif ($listening) { $st = 'listening'; $stHex = '#9ECE6A' }
+	try {
+		if ($W.SpeechWaveStatus -and [string]$W.SpeechWaveStatus.Text -ne $st) {
+			$W.SpeechWaveStatus.Text = $st
+			$bc = New-Object System.Windows.Media.BrushConverter
+			$W.SpeechWaveStatus.Foreground = $bc.ConvertFromString($stHex)
+		}
+	} catch {}
+
+	$n = 220
+	$mid = $hh * 0.5
+	$ampScale = $hh * 0.47
+	$pts = New-Object System.Windows.Media.PointCollection
+
+	if ($samples -and $samples.Length -gt 2 -and ($speaking -or ($playhead -gt 0 -and $playhead -lt 1))) {
+		$len = $samples.Length
+		$center = [int][Math]::Floor($playhead * ($len - 1))
+		if ($center -lt 0) { $center = 0 }
+		if ($center -ge $len) { $center = $len - 1 }
+		# ~100ms window of audio at original rate, mapped through downsampled buffer
+		$win = [Math]::Min($len, [Math]::Max(320, [int]($len * 0.06)))
+		$a = $center - [int]($win / 2)
+		if ($a -lt 0) { $a = 0 }
+		$b = $a + $win
+		if ($b -gt $len) { $b = $len; $a = [Math]::Max(0, $b - $win) }
+		$span = [Math]::Max(1, $b - $a - 1)
+		for ($i = 0; $i -lt $n; $i++) {
+			$t = $i / [double][Math]::Max(1, $n - 1)
+			$x = $t * $ww
+			$i0 = $a + [int]($t * $span)
+			$i1 = $a + [int]((($i + 1) / [double]$n) * $span)
+			if ($i1 -le $i0) { $i1 = $i0 + 1 }
+			if ($i1 -gt $b) { $i1 = $b }
+			$peak = 0.0
+			$signed = 0.0
+			for ($j = $i0; $j -lt $i1; $j++) {
+				$v = [double]$samples[$j]
+				$av = [Math]::Abs($v)
+				if ($av -gt $peak) { $peak = $av; $signed = $v }
+			}
+			$v = $signed * 3.0
+			if ($v -gt 1) { $v = 1 }
+			if ($v -lt -1) { $v = -1 }
+			$y = $mid - ($v * $ampScale)
+			if ($y -lt 1.5) { $y = 1.5 }
+			if ($y -gt ($hh - 1.5)) { $y = $hh - 1.5 }
+			[void]$pts.Add((New-Object System.Windows.Point($x, $y)))
+		}
+	} else {
+		$ph = 0.0
+		try { $ph = [double]$W.SpeechWavePhase } catch { $ph = 0.0 }
+		if ($listening) { $ph += 0.22 } else { $ph += 0.08 }
+		$W.SpeechWavePhase = $ph
+		for ($i = 0; $i -lt $n; $i++) {
+			$t = $i / [double][Math]::Max(1, $n - 1)
+			$x = $t * $ww
+			if ($listening) {
+				$v = [Math]::Sin(($t * 11.0) + $ph) * 0.12
+				$v += [Math]::Sin(($t * 27.0) - $ph) * 0.06
+			} else {
+				$v = [Math]::Sin(($t * 6.283185) + $ph * 0.35) * 0.04
+			}
+			$y = $mid - ($v * $ampScale)
+			if ($y -lt 1.5) { $y = 1.5 }
+			if ($y -gt ($hh - 1.5)) { $y = $hh - 1.5 }
+			[void]$pts.Add((New-Object System.Windows.Point($x, $y)))
+		}
+	}
+	try { $line.Points = $pts } catch {}
 }
 
 function Invoke-SpeakText {
@@ -19893,7 +24107,7 @@ function Get-MBSessionFormat {
 
 function Ensure-MBSessionScanType {
 	if ('MiniBot.SessionScan' -as [type]) { return }
-	# Background thread + Join(timeout) — never call Directory.GetFiles on the WPF UI thread.
+	# Background thread + Join(timeout) - never call Directory.GetFiles on the WPF UI thread.
 	$code = @'
 using System;
 using System.Collections.Generic;
@@ -20022,7 +24236,7 @@ function Resume-MBWpfForModal {
 
 function Get-MBSessionFileRows {
 	param([string]$Dir, [int]$Max = 400, [int]$TimeoutMs = 2000)
-	# Timed scan only — bare Directory.GetFiles freezes the UI on Desktop/OneDrive.
+	# Timed scan only - bare Directory.GetFiles freezes the UI on Desktop/OneDrive.
 	$rows = New-Object System.Collections.ArrayList
 	if ([string]::IsNullOrWhiteSpace($Dir)) { return @() }
 	try { Ensure-MBSessionScanType } catch {}
@@ -20080,8 +24294,8 @@ function Show-MBSessionFilePicker {
 		[string]$InitialDirectory = ''
 	)
 	# Simple model:
-	#  1) scan files on agent thread (timed C# helper — never touches UI)
-	#  2) BeginInvoke paint + show overlay (never Dispatcher.Invoke — no UI deadlock)
+	#  1) scan files on agent thread (timed C# helper - never touches UI)
+	#  2) BeginInvoke paint + show overlay (never Dispatcher.Invoke - no UI deadlock)
 	#  3) WaitOne for Save/Open/Cancel
 	$agentTitle = try { Get-MBAgentDisplayTitle } catch { '[{0}-Agent]' -f $(if ($AgentName) { $AgentName } else { 'MiniBot' }) }
 	if ([string]::IsNullOrWhiteSpace($Title)) {
@@ -20202,7 +24416,7 @@ function Show-MBSessionFilePicker {
 		}.GetNewClosure()
 
 		# Same pattern as Auth overlay (works): synchronous Invoke for a light paint.
-		# Scan already finished on agent thread — this Invoke is instant.
+		# Scan already finished on agent thread - this Invoke is instant.
 		try {
 			if ($d.CheckAccess()) {
 				& $paint
@@ -20298,7 +24512,7 @@ function Save-MBSessionJson {
 		)
 		if ($activeTools.Count -eq 0) { $activeTools = @('core') }
 	} catch { $activeTools = @('core') }
-	# Flatten messages first — raw ConvertTo-Json -Depth 30 on live PSObjects can peg CPU after Save.
+	# Flatten messages first - raw ConvertTo-Json -Depth 30 on live PSObjects can peg CPU after Save.
 	$plainMsgs = New-Object System.Collections.ArrayList
 	foreach ($m in @($Messages)) {
 		if ($null -eq $m) { continue }
@@ -20316,7 +24530,7 @@ function Save-MBSessionJson {
 	$payload = [ordered]@{
 		version     = [string]$Version
 		savedAt     = (Get-Date).ToString('o')
-		model       = [string]$Model
+		model       = (Get-MBActiveModel)
 		baseUrl     = [string]$BaseUrl
 		cwd         = [string]$script:MB.WorkingDir
 		messages    = @($plainMsgs.ToArray())
@@ -20358,7 +24572,7 @@ function Save-MBSessionMarkdown {
 	$Path = Resolve-MBPath $Path
 	$sb = New-Object System.Text.StringBuilder
 	[void]$sb.AppendLine("# MiniBot Transcript")
-	[void]$sb.AppendLine("Model: $Model")
+	[void]$sb.AppendLine(("Model: {0}" -f (Get-MBActiveModel)))
 	[void]$sb.AppendLine("Agent: $AgentName")
 	[void]$sb.AppendLine("Cwd: $($script:MB.WorkingDir)")
 	$toolsList = @('core')
@@ -20761,7 +24975,7 @@ function Show-MBImportedMessages {
 		[string]$Label = 'loaded'
 	)
 	# Console replay only: user turns + assistant text (what the operator saw).
-	# Tool JSON / tool results stay in $script:Messages for the model — not painted.
+	# Tool JSON / tool results stay in $script:Messages for the model - not painted.
 	if (-not $Messages -or $Messages.Count -eq 0) { return }
 	try {
 		Write-Host ""
@@ -21085,6 +25299,8 @@ function Reset-MBMdStream {
 	$script:MB.MdHeadLevel = 0
 	$script:MB.MdFontSize = 0
 	$script:MB.MdAtLineStart = $true
+	$script:MB.MdSkipBlankAfterBlock = $false
+	$script:MB.MdInList = $false
 	$script:MB.MdInTable = $false
 	$script:MB.MdTableLine = ''
 	$script:MB.MdTableRows = New-Object System.Collections.ArrayList
@@ -21218,14 +25434,34 @@ function Test-MBMdStyleOn {
 }
 
 function Test-MBMdLinkHoldOpen {
-	# True while an incomplete markdown link is buffered across stream chunks.
+	# True while an incomplete markdown link/image is buffered across stream chunks.
 	param([string]$S)
 	if ([string]::IsNullOrEmpty($S)) { return $false }
 	$idx = 0
 	$len = $S.Length
 	while ($idx -lt $len) {
+		# Image: ![alt](...
+		if ($S[$idx] -eq [char]'!' -and ($idx + 1) -lt $len -and $S[$idx + 1] -eq [char]'[') {
+			$close = $S.IndexOf([char]']', $idx + 2)
+			if ($close -lt 0) { return $true }
+			if (($close + 1) -ge $len) { return $true }
+			if ($S[$close + 1] -ne [char]'(') {
+				$idx = $idx + 2
+				continue
+			}
+			$urlStart = $close + 2
+			$paren = $S.IndexOf([char]')', $urlStart)
+			if ($paren -lt 0) { return $true }
+			$idx = $paren + 1
+			continue
+		}
 		$open = $S.IndexOf([char]'[', $idx)
 		if ($open -lt 0) { break }
+		# skip if this [ is part of ![ already handled
+		if ($open -gt 0 -and $S[$open - 1] -eq [char]'!') {
+			$idx = $open + 1
+			continue
+		}
 		$close = $S.IndexOf([char]']', $open + 1)
 		if ($close -lt 0) { return $true }
 		if (($close + 1) -ge $len) { return $true }
@@ -21242,7 +25478,7 @@ function Test-MBMdLinkHoldOpen {
 			# Still typing URL, or empty after ](
 			if ($partial.Length -eq 0) { return $true }
 			if ($partial -match '^(?i)https?://' -or $partial -match '^(?i)www\.') { return $true }
-			# ](something that is clearly not a URL — do not hold forever
+			# ](something that is clearly not a URL - do not hold forever
 			if ($partial -match '\s' -or $partial.Length -gt 12) {
 				$idx = $open + 1
 				continue
@@ -21331,6 +25567,20 @@ function Write-MBMdProcessInline {
 			[void]$buf.Append($work[$i])
 			$i++
 			continue
+		}
+		# Inline markdown media: ![alt](path-or-url) — spaces in Windows paths allowed
+		if ($work[$i] -eq [char]'!' -and ($i + 1) -lt $len -and $work[$i + 1] -eq [char]'[') {
+			$rest = $work.Substring($i)
+			$mk = Test-MBMdMediaMarkup -Text $rest
+			if ($mk -and $mk.Ok) {
+				if ($buf.Length -gt 0) {
+					Write-MBMdEmit -Text $buf.ToString() -NoNewline
+					[void]$buf.Clear()
+				}
+				Write-MBWpfMedia -Path ([string]$mk.Path) -Alt ([string]$mk.Alt) -Kind ([string]$mk.Kind)
+				$i += [int]$mk.Length
+				continue
+			}
 		}
 		$mk = Test-MBMdMarkerAt -S $work -I $i
 		if ($null -ne $mk) {
@@ -21424,7 +25674,7 @@ function Write-MBMdEmitTable {
 	if (-not $script:MB.Wpf.WriteQueue) {
 		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 	}
-	$sep = [string][char]0x1F  # unit separator — not used in normal cell text
+	$sep = [string][char]0x1F  # unit separator - not used in normal cell text
 	$payload = New-Object System.Collections.ArrayList
 	foreach ($r in @($Rows)) {
 		if ($null -eq $r) { continue }
@@ -21579,6 +25829,31 @@ function Write-MBMdEmitRule {
 		MdFontSize = 0
 		MdHead    = 0
 		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+	$script:MB.MdSkipBlankAfterBlock = $true
+	$script:MB.MdInList = $false
+}
+
+function Write-MBMdEnsureListLeadIn {
+	if ([bool]$script:MB.MdInList) { return }
+	$script:MB.MdInList = $true
+	if (-not (Test-MBWpfActive)) { return }
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind       = 'md-list-lead'
+		Text       = ''
+		Color      = 'DarkGray'
+		NoNewline  = $true
+		MdBold     = 0
+		MdItalic   = 0
+		MdStrike   = 0
+		MdCode     = 0
+		MdFontSize = 0
+		MdHead     = 0
+		MdNoLinks  = 1
+		Brand      = $(try { [string]$AgentName } catch { 'MiniBot' })
 	})
 }
 
@@ -21770,6 +26045,2229 @@ function Write-MBMdCodeClose {
 		MdNoLinks = 1
 		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
 	})
+	$script:MB.MdSkipBlankAfterBlock = $true
+}
+
+function Get-MBMediaKindFromPath {
+	# image | video | audio — extension-based (paths may contain spaces)
+	param([string]$PathOrUrl)
+	$p = ([string]$PathOrUrl).Trim().Trim('"').Trim("'")
+	if ([string]::IsNullOrWhiteSpace($p)) { return $null }
+	# strip optional <...> wrappers left from markdown
+	if ($p.Length -ge 2 -and $p[0] -eq [char]'<' -and $p[$p.Length - 1] -eq [char]'>') {
+		$p = $p.Substring(1, $p.Length - 2).Trim()
+	}
+	# strip query/hash for extension check
+	$check = $p
+	try {
+		if ($check -match '^(?i)https?://') {
+			$u = [Uri]$check
+			$check = $u.AbsolutePath
+		} elseif ($check -match '^(?i)file://') {
+			$check = ([Uri]$check).LocalPath
+		}
+	} catch {}
+	# decode %20 etc. so ".mp3" is visible after URL-encoding
+	try { $check = [Uri]::UnescapeDataString($check) } catch {}
+	$ext = ''
+	try { $ext = [System.IO.Path]::GetExtension($check).ToLowerInvariant() } catch { $ext = '' }
+	if ($ext -in @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tif', '.tiff', '.ico')) { return 'image' }
+	if ($ext -in @('.mp4', '.m4v', '.mov', '.wmv', '.avi', '.mkv', '.webm', '.mpeg', '.mpg')) { return 'video' }
+	if ($ext -in @('.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.opus', '.aiff', '.aif')) { return 'audio' }
+	return $null
+}
+
+function Resolve-MBMediaSource {
+	# Returns @{ Ok; Kind; Uri; Display; Error }
+	# Handles Windows paths with spaces for image/video/audio alike.
+	param([string]$Raw)
+	$out = @{ Ok = $false; Kind = ''; Uri = $null; Display = ''; Error = '' }
+	$raw = [string]$Raw
+	try { $raw = Convert-MBMdMediaTarget -Raw $raw } catch {
+		$raw = ([string]$Raw).Trim().Trim('"').Trim("'")
+	}
+	if ([string]::IsNullOrWhiteSpace($raw)) {
+		$out.Error = 'empty path'
+		return $out
+	}
+	$kind = Get-MBMediaKindFromPath -PathOrUrl $raw
+	if (-not $kind) {
+		$out.Error = 'unsupported media type'
+		return $out
+	}
+	$out.Kind = $kind
+	$out.Display = $raw
+	try {
+		if ($raw -match '^(?i)https?://') {
+			$out.Uri = ([Uri]$raw).AbsoluteUri
+			$out.Ok = $true
+			return $out
+		}
+		# Local file: try several absolute candidates (do NOT glue Users\... under System32 CWD)
+		# Get-MBPathCandidates + LiteralPath keep spaces intact
+		$cands = @(Get-MBPathCandidates -Path $raw)
+		$found = $null
+		$tried = New-Object System.Collections.ArrayList
+		foreach ($c in $cands) {
+			if ($tried.Count -lt 8) { [void]$tried.Add($c) }
+			try {
+				if (Test-Path -LiteralPath $c -PathType Leaf) {
+					$found = $c
+					break
+				}
+			} catch {}
+		}
+		if (-not $found) {
+			$hint = if ($tried.Count -gt 0) { ($tried -join ' | ') } else { $raw }
+			$out.Error = "file not found (cwd=$($script:MB.WorkingDir)): tried $hint"
+			return $out
+		}
+		$full = [System.IO.Path]::GetFullPath($found)
+		$out.Uri = (New-Object System.Uri -ArgumentList $full, ([System.UriKind]::Absolute)).AbsoluteUri
+		# MediaElement is happier with explicit file:/// form
+		try {
+			if (-not $out.Uri.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) {
+				$out.Uri = ([Uri]$full).AbsoluteUri
+			}
+		} catch {}
+		$out.Display = $full
+		$out.Ok = $true
+		return $out
+	} catch {
+		$out.Error = $_.Exception.Message
+		return $out
+	}
+}
+
+
+function Get-MBVideoFrameSize {
+	# Shell folder details (Frame Width/Height) — same approach as the working standalone player.
+	param([string]$Source)
+	$out = @{ Width = 0; Height = 0 }
+	if ([string]::IsNullOrWhiteSpace($Source)) { return $out }
+	try {
+		if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { return $out }
+	} catch { return $out }
+	$shell = $null
+	try {
+		$shell = New-Object -ComObject Shell.Application
+		$file = Get-Item -LiteralPath $Source -ErrorAction Stop
+		$folder = $shell.Namespace($file.Directory.FullName)
+		if ($null -eq $folder) { return $out }
+		$attrlist = @{}
+		for ($attr = 0; $attr -le 500; $attr++) {
+			$attrname = $folder.GetDetailsOf($folder.Items, $attr)
+			if ($attrname -and -not $attrlist.ContainsKey($attrname)) {
+				$attrlist[$attrname] = $attr
+			}
+		}
+		$fileInfo = $folder.ParseName($file.Name)
+		foreach ($pair in @(
+			@{ Key = 'Frame Width'; Dest = 'Width' },
+			@{ Key = 'Frame Height'; Dest = 'Height' },
+			@{ Key = 'Width'; Dest = 'Width' },
+			@{ Key = 'Height'; Dest = 'Height' }
+		)) {
+			if ($out[$pair.Dest] -gt 0) { continue }
+			if (-not $attrlist.ContainsKey($pair.Key)) { continue }
+			$raw = [string]$folder.GetDetailsOf($fileInfo, $attrlist[$pair.Key])
+			if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+			$digits = ($raw -replace '[^\d]', '')
+			$n = 0
+			if ([int]::TryParse($digits, [ref]$n) -and $n -gt 0 -and $n -lt 20000) {
+				$out[$pair.Dest] = $n
+			}
+		}
+	} catch {
+	} finally {
+		if ($null -ne $shell) {
+			try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) } catch {}
+		}
+	}
+	return $out
+}
+
+
+
+function global:Resolve-MBPlayableVideoPath {
+	param([string]$Path)
+	$out = @{ Ok = $false; IsHttp = $false; Path = ''; Uri = $null; Error = '' }
+	if ([string]::IsNullOrWhiteSpace($Path)) {
+		$out.Error = 'empty path'
+		return $out
+	}
+	$src = [string]$Path.Trim().Trim('"').Trim("'")
+	if ($src -match '^(?i)https?://') {
+		$out.IsHttp = $true
+		$out.Path = $src
+		try { $out.Uri = [Uri]$src } catch { $out.Error = 'bad url'; return $out }
+		$out.Ok = $true
+		return $out
+	}
+	try {
+		if ($src -match '^(?i)file://') {
+			$src = ([Uri]$src).LocalPath
+			try { $src = [Uri]::UnescapeDataString($src) } catch {}
+		}
+		if ($src -match '(?i)^[A-Za-z]:\\Windows\\System32\\(Users\\.+)$') {
+			$src = 'C:\' + $Matches[1]
+		}
+		$found = $null
+		if (Test-Path -LiteralPath $src -PathType Leaf) {
+			$found = [System.IO.Path]::GetFullPath($src)
+		} else {
+			foreach ($c in @(Get-MBPathCandidates -Path $src)) {
+				try {
+					if (Test-Path -LiteralPath $c -PathType Leaf) {
+						$found = [System.IO.Path]::GetFullPath($c)
+						break
+					}
+				} catch {}
+			}
+		}
+		if (-not $found) {
+			$out.Error = "file not found: $src"
+			return $out
+		}
+		$out.Path = $found
+		$out.Uri = New-Object System.Uri -ArgumentList $found, ([System.UriKind]::Absolute)
+		$out.Ok = $true
+		return $out
+	} catch {
+		$out.Error = $_.Exception.Message
+		return $out
+	}
+}
+
+function global:Stop-MBInlineVideoState {
+	param([hashtable]$State)
+	if ($null -eq $State) { $State = @{} }
+	try {
+		$me = $State['MediaElement']
+		$flags = $null
+		try { $flags = $State['Flags'] } catch {}
+		if ($null -eq $me -and $flags -is [hashtable]) { $me = $flags['Player'] }
+		if ($null -ne $me) {
+			try { $me.Stop() } catch {}
+			try { $me.Close() } catch {}
+			try { $me.Source = $null } catch {}
+		}
+	} catch {}
+	# Clear leftover flyout overlay from older builds
+	try {
+		$layer = $null
+		if ($State -is [hashtable]) { $layer = $State['Overlay'] }
+		if ($null -eq $layer -and $flags -is [hashtable]) { $layer = $flags['Layer'] }
+		if ($null -ne $layer) {
+			try {
+				$par = [System.Windows.Media.VisualTreeHelper]::GetParent($layer)
+				if ($par -is [System.Windows.Controls.Panel]) { [void]$par.Children.Remove($layer) }
+			} catch {}
+		}
+	} catch {}
+	try {
+		if ($flags -is [hashtable] -and $flags['RestorePlaceholder']) {
+			& $flags['RestorePlaceholder'] $flags
+		}
+	} catch {}
+	if ($State -is [hashtable]) {
+		$State['MediaElement'] = $null
+		$State['MediaPlayer'] = $null
+		$State['Popup'] = $null
+		$State['Overlay'] = $null
+		$State['Playing'] = $false
+		$State['Started'] = $false
+	}
+}
+
+function global:Show-MBVideoErrorInHost {
+	param($HostElement, [string]$Message)
+	try {
+		if ($HostElement -is [System.Windows.Controls.Border]) {
+			$tb = New-Object System.Windows.Controls.TextBlock
+			$tb.Text = [string]$Message
+			$tb.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(240, 92, 92))
+			$tb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+			$tb.Margin = New-Object System.Windows.Thickness(10)
+			$tb.FontSize = 12
+			$HostElement.Child = $tb
+		}
+	} catch {}
+}
+
+function global:Start-MBInlineVideoInHost {
+	# MediaElement fills the codebox host; controls are a fade overlay ON the video (not under it).
+	# Wiring matches the working card buttons: Flags + OuterState + GetNewClosure (no flaky name lookup).
+	param(
+		$HostElement,
+		[string]$Path,
+		[double]$Width = 480,
+		[double]$Height = 270,
+		[hashtable]$State = $null
+	)
+	if ($null -eq $HostElement) { return $false }
+	if ($null -eq $State) { $State = @{} }
+
+	# Resolve path with .NET only (this function runs as a bag ScriptBlock on the STA
+	# thread — cmdlets like Test-Path are often unavailable in that session state).
+	$resolved = @{ Ok = $false; IsHttp = $false; Path = ''; Uri = $null; Error = 'resolve failed' }
+	$fileExists = {
+		param([string]$P)
+		if ([string]::IsNullOrWhiteSpace($P)) { return $false }
+		try { return [System.IO.File]::Exists($P) } catch { return $false }
+	}
+	try {
+		$src = [string]$Path
+		if ([string]::IsNullOrWhiteSpace($src)) {
+			$State['LastError'] = 'empty path'
+			return $false
+		}
+		$src = $src.Trim().Trim('"').Trim("'")
+		if ($src -match '^(?i)https?://') {
+			$resolved.IsHttp = $true
+			$resolved.Path = $src
+			try { $resolved.Uri = [Uri]$src } catch { $resolved.Uri = $src }
+			$resolved.Ok = $true
+			$resolved.Error = ''
+		} else {
+			if ($src -match '^(?i)file://') {
+				try { $src = ([Uri]$src).LocalPath } catch {}
+				try { $src = [Uri]::UnescapeDataString($src) } catch {}
+			}
+			$src = $src -replace '/', '\'
+			if ($src -match '(?i)^[A-Za-z]:\\Windows\\System32\\(Users\\.+)$') { $src = 'C:\' + $Matches[1] }
+			if ($src -match '^(?i)Users\\') { $src = 'C:\' + $src }
+			$found = $null
+			if (& $fileExists $src) {
+				try { $found = [System.IO.Path]::GetFullPath($src) } catch { $found = $src }
+			}
+			if (-not $found) {
+				try {
+					$bag = $null
+					if ($State -is [hashtable]) { $bag = $State['WpfBag'] }
+					$resFn = $null
+					if ($bag -is [hashtable] -and $bag['VideoResolve']) { $resFn = $bag['VideoResolve'] }
+					if ($null -ne $resFn) {
+						$r2 = & $resFn -Path $src
+						if ($r2 -and $r2.Ok -and $r2.Path -and -not $r2.IsHttp) {
+							$p2 = [string]$r2.Path
+							if (& $fileExists $p2) {
+								try { $found = [System.IO.Path]::GetFullPath($p2) } catch { $found = $p2 }
+							}
+						} elseif ($r2 -and $r2.Ok -and $r2.IsHttp) {
+							$resolved.IsHttp = $true
+							$resolved.Path = [string]$r2.Path
+							$resolved.Uri = $r2.Uri
+							$resolved.Ok = $true
+							$resolved.Error = ''
+						}
+					}
+				} catch {}
+			}
+			if (-not $resolved.Ok) {
+				if ($found) {
+					$resolved.Path = $found
+					$resolved.Uri = New-Object System.Uri -ArgumentList $found, ([System.UriKind]::Absolute)
+					$resolved.Ok = $true
+					$resolved.Error = ''
+				} else {
+					$State['LastError'] = "file not found: $src"
+					try {
+						if ($HostElement -is [System.Windows.Controls.Border]) {
+							$tb = New-Object System.Windows.Controls.TextBlock
+							$tb.Text = ("Video error: file not found: {0}" -f $src)
+							$tb.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(240, 92, 92))
+							$tb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+							$tb.Margin = New-Object System.Windows.Thickness(10)
+							$HostElement.Child = $tb
+						}
+					} catch {}
+					return $false
+				}
+			}
+		}
+	} catch {
+		$State['LastError'] = $_.Exception.Message
+		return $false
+	}
+
+	$w = [Math]::Max(240.0, [double]$Width)
+	$h = [Math]::Max(140.0, [double]$Height)
+
+	# Tear down prior session
+	try {
+		$prev = $null
+		if ($State['MediaElement']) { $prev = $State['MediaElement'] }
+		if ($null -eq $prev -and $State['Flags']) { $prev = $State['Flags']['Player'] }
+		if ($null -ne $prev) {
+			try { $prev.Stop() } catch {}
+			try { $prev.Close() } catch {}
+			try { $prev.Source = $null } catch {}
+		}
+		$fs = $null
+		if ($State['Flags'] -and $State['Flags']['FsWindow']) { $fs = $State['Flags']['FsWindow'] }
+		if ($null -ne $fs) { try { $fs.Close() } catch {} }
+	} catch {}
+
+	$State['Path'] = $resolved.Path
+	$State['Uri'] = $resolved.Uri
+	$State['Width'] = $w
+	$State['Height'] = $h
+	$State['Host'] = $HostElement
+
+	try {
+		if ($HostElement -is [System.Windows.FrameworkElement]) {
+			$HostElement.Width = $w
+			$HostElement.Height = $h
+			$HostElement.MinHeight = $h
+			$HostElement.ClipToBounds = $true
+		}
+	} catch {}
+
+	# Root grid: video + overlay controls (same parent for inline and fullscreen reparent)
+	$root = New-Object System.Windows.Controls.Grid
+	$root.Background = [System.Windows.Media.Brushes]::Black
+	$root.ClipToBounds = $true
+
+	$me = New-Object System.Windows.Controls.MediaElement
+	$me.LoadedBehavior = [System.Windows.Controls.MediaState]::Manual
+	$me.UnloadedBehavior = [System.Windows.Controls.MediaState]::Stop
+	$me.Stretch = [System.Windows.Media.Stretch]::Uniform
+	# Default volume from bag (STA AddScript sets VideoDefaultVolume = 1.0)
+	$initVol = 1.0
+	try {
+		$bagV = $null
+		if ($State -is [hashtable]) { $bagV = $State['WpfBag'] }
+		if ($bagV -is [hashtable] -and $null -ne $bagV['VideoDefaultVolume']) {
+			$initVol = [double]$bagV['VideoDefaultVolume']
+		}
+	} catch {}
+	if ($initVol -lt 0) { $initVol = 0 }
+	if ($initVol -gt 1) { $initVol = 1 }
+	$me.Volume = $initVol
+	try { $me.IsMuted = $false } catch {}
+	$me.ScrubbingEnabled = $true
+	$me.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+	$me.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
+	# MediaElement.Source must be a Uri (string assignment is flaky across PS hosts)
+	try {
+		if ($resolved.IsHttp) {
+			$me.Source = [Uri]$resolved.Uri
+		} else {
+			if ($null -ne $resolved.Uri) { $me.Source = [Uri]$resolved.Uri }
+			else { $me.Source = New-Object System.Uri -ArgumentList ([string]$resolved.Path), ([System.UriKind]::Absolute) }
+		}
+	} catch {
+		try { $me.Source = New-Object System.Uri -ArgumentList ([string]$resolved.Path), ([System.UriKind]::Absolute) } catch {}
+	}
+	[void]$root.Children.Add($me)
+
+	# Overlay chrome (bottom of video)
+	$chrome = New-Object System.Windows.Controls.Border
+	$chrome.VerticalAlignment = [System.Windows.VerticalAlignment]::Bottom
+	$chrome.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+	$chrome.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(0xCC, 0x12, 0x12, 0x16))
+	$chrome.Padding = New-Object System.Windows.Thickness(10, 8, 10, 10)
+	$chrome.IsHitTestVisible = $true
+	$chrome.Visibility = [System.Windows.Visibility]::Visible
+	$chrome.Opacity = 1.0
+	try { [System.Windows.Controls.Panel]::SetZIndex($chrome, 100) } catch {}
+
+	$chromeCol = New-Object System.Windows.Controls.StackPanel
+	$chromeCol.Orientation = [System.Windows.Controls.Orientation]::Vertical
+
+	$slider = New-Object System.Windows.Controls.Slider
+	$slider.Minimum = 0
+	$slider.Maximum = 1
+	$slider.Value = 0
+	$slider.Height = 22
+	$slider.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
+	$slider.IsMoveToPointEnabled = $true
+	$slider.Cursor = [System.Windows.Input.Cursors]::Hand
+	[void]$chromeCol.Children.Add($slider)
+
+	$btnRow = New-Object System.Windows.Controls.StackPanel
+	$btnRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+
+	# NoMouseOver
+	$noMoTpl = $null
+	try {
+		$resHost = $null
+		try { $resHost = [System.Windows.Window]::GetWindow($HostElement) } catch {}
+		if ($null -ne $resHost) { try { $noMoTpl = $resHost.TryFindResource('NoMouseOverButtonTemplate') } catch {} }
+	} catch {}
+	if ($null -eq $noMoTpl) {
+		try {
+			$noMoXaml = '<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}" CornerRadius="3" SnapsToDevicePixels="True"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
+			$noMoTpl = [System.Windows.Markup.XamlReader]::Parse($noMoXaml)
+		} catch {}
+	}
+
+	# Video control icons (Material-style Path data from workspace .xaml assets)
+	$vidIconData = @{
+		play      = 'M8,5.14V19.14L19,12.14L8,5.14Z'
+		pause     = 'M14,19H18V5H14M6,19H10V5H6V19Z'
+		stop      = 'M18,18H6V6H18V18Z'
+		fs        = 'M5,5H10V7H7V10H5V5M14,5H19V10H17V7H14V5M17,14H19V19H14V17H17V14M10,17V19H5V14H7V17H10Z'
+		fsExit    = 'M14,14H19V16H16V19H14V14M5,14H10V19H8V16H5V14M8,5H10V10H5V8H8V5M19,8V10H14V5H16V8H19Z'
+		openNew   = 'M14,3V5H17.59L7.76,14.83L9.17,16.24L19,6.41V10H21V3M19,19H5V5H12V3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V12H19V19Z'
+		volMute   = 'M3,9H7L12,4V20L7,15H3V9M16.59,12L14,9.41L15.41,8L18,10.59L20.59,8L22,9.41L19.41,12L22,14.59L20.59,16L18,13.41L15.41,16L14,14.59L16.59,12Z'
+		volLow    = 'M7,9V15H11L16,20V4L11,9H7Z'
+		volMed    = 'M5,9V15H9L14,20V4L9,9M18.5,12C18.5,10.23 17.5,8.71 16,7.97V16C17.5,15.29 18.5,13.76 18.5,12Z'
+		volHigh   = 'M14,3.23V5.29C16.89,6.15 19,8.83 19,12C19,15.17 16.89,17.84 14,18.7V20.77C18,19.86 21,16.28 21,12C21,7.72 18,4.14 14,3.23M16.5,12C16.5,10.23 15.5,8.71 14,7.97V16C15.5,15.29 16.5,13.76 16.5,12M3,9V15H7L12,20V4L7,9H3Z'
+	}
+	$volIconKeyFromLevel = {
+		param([double]$Level, [bool]$Muted = $false)
+		if ($Muted -or $Level -le 0.001) { return 'volMute' }
+		if ($Level -le 0.33) { return 'volLow' }
+		if ($Level -le 0.66) { return 'volMed' }
+		return 'volHigh'
+	}.GetNewClosure()
+	$iconFg = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xE0, 0xE0, 0xE8))
+	$mkVidIcon = {
+		param([string]$Data)
+		$p = New-Object System.Windows.Shapes.Path
+		$p.Width = 14
+		$p.Height = 14
+		$p.Stretch = [System.Windows.Media.Stretch]::Uniform
+		$p.Data = [System.Windows.Media.Geometry]::Parse([string]$Data)
+		$p.Fill = $iconFg
+		$p.IsHitTestVisible = $false
+		$p.SnapsToDevicePixels = $true
+		return $p
+	}.GetNewClosure()
+	$setVidIcon = {
+		param($Btn, [string]$Key)
+		try {
+			if ($null -eq $Btn) { return }
+			$data = ''
+			try {
+				$f = $Btn.Tag
+				if ($f -is [hashtable] -and $f['IconData'] -and $f['IconData'][$Key]) {
+					$data = [string]$f['IconData'][$Key]
+				}
+			} catch {}
+			if (-not $data) { $data = [string]$vidIconData[$Key] }
+			if (-not $data) { return }
+			$mk = $null
+			try { if ($Btn.Tag -is [hashtable]) { $mk = $Btn.Tag['MkVidIcon'] } } catch {}
+			if ($null -ne $mk) { $Btn.Content = (& $mk $data) }
+			else { $Btn.Content = (& $mkVidIcon $data) }
+		} catch {}
+	}.GetNewClosure()
+	$makeVidTip = {
+		param([string]$Text)
+		try {
+			$tip = New-Object System.Windows.Controls.ToolTip
+			$tip.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x1A, 0x1A, 0x1E))
+			$tip.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xC8, 0xC8, 0xD0))
+			$tip.BorderBrush = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x3A, 0x3A, 0x42))
+			$tip.BorderThickness = New-Object System.Windows.Thickness(1)
+			$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
+			$tip.HasDropShadow = $true
+			try { $tip.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Mouse } catch {}
+			$ttb = New-Object System.Windows.Controls.TextBlock
+			$ttb.Text = [string]$Text
+			$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+			$ttb.MaxWidth = 260
+			$ttb.Foreground = $tip.Foreground
+			$ttb.FontSize = 12
+			$ttb.LineHeight = 16
+			$tip.Content = $ttb
+			return $tip
+		} catch {
+			return [string]$Text
+		}
+	}.GetNewClosure()
+	$setVidTip = {
+		param($Target, [string]$Text)
+		if ($null -eq $Target) { return }
+		try {
+			# Prefer main-window themed tip factory when available
+			$wpf = $null
+			try { $wpf = $script:MB.Wpf } catch {}
+			if ($wpf -and $wpf.SetThemedToolTip) {
+				& $wpf.SetThemedToolTip $Target $Text 260
+				return
+			}
+		} catch {}
+		try {
+			$Target.ToolTip = (& $makeVidTip $Text)
+			try {
+				[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($Target, 350)
+				[System.Windows.Controls.ToolTipService]::SetShowDuration($Target, 20000)
+			} catch {}
+		} catch {
+			try { $Target.ToolTip = [string]$Text } catch {}
+		}
+	}.GetNewClosure()
+	$mkBtn = {
+		param([string]$Text, $BgRgb, $HoverRgb, $BorderRgb)
+		$b = New-Object System.Windows.Controls.Button
+		$b.Content = $Text
+		$b.Padding = New-Object System.Windows.Thickness(12, 4, 12, 4)
+		$b.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+		$b.Cursor = [System.Windows.Input.Cursors]::Hand
+		$b.FontSize = 11
+		$b.Focusable = $true
+		$b.IsHitTestVisible = $true
+		$b.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xE0, 0xE0, 0xE8))
+		$bgN = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb([byte]$BgRgb[0], [byte]$BgRgb[1], [byte]$BgRgb[2]))
+		$bgH = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb([byte]$HoverRgb[0], [byte]$HoverRgb[1], [byte]$HoverRgb[2]))
+		$bd = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb([byte]$BorderRgb[0], [byte]$BorderRgb[1], [byte]$BorderRgb[2]))
+		$b.Background = $bgN
+		$b.BorderBrush = $bd
+		$b.BorderThickness = New-Object System.Windows.Thickness(1)
+		if ($null -ne $noMoTpl) { try { $b.Template = $noMoTpl } catch {} }
+		$b.Add_MouseEnter({ param($s, $e) try { $s.Background = $bgH } catch {} }.GetNewClosure())
+		$b.Add_MouseLeave({ param($s, $e) try { $s.Background = $bgN } catch {} }.GetNewClosure())
+		return $b
+	}.GetNewClosure()
+	$mkIconBtn = {
+		param([string]$IconKey, $BgRgb, $HoverRgb, $BorderRgb, [string]$Tip = '')
+		$b = New-Object System.Windows.Controls.Button
+		$b.Content = (& $mkVidIcon ([string]$vidIconData[$IconKey]))
+		$b.Width = 34
+		$b.Height = 28
+		$b.Padding = New-Object System.Windows.Thickness(8, 5, 8, 5)
+		$b.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+		$b.Cursor = [System.Windows.Input.Cursors]::Hand
+		$b.Focusable = $true
+		$b.IsHitTestVisible = $true
+		$b.HorizontalContentAlignment = [System.Windows.HorizontalAlignment]::Center
+		$b.VerticalContentAlignment = [System.Windows.VerticalAlignment]::Center
+		$bgN = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb([byte]$BgRgb[0], [byte]$BgRgb[1], [byte]$BgRgb[2]))
+		$bgH = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb([byte]$HoverRgb[0], [byte]$HoverRgb[1], [byte]$HoverRgb[2]))
+		$bd = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb([byte]$BorderRgb[0], [byte]$BorderRgb[1], [byte]$BorderRgb[2]))
+		$b.Background = $bgN
+		$b.BorderBrush = $bd
+		$b.BorderThickness = New-Object System.Windows.Thickness(1)
+		if ($null -ne $noMoTpl) { try { $b.Template = $noMoTpl } catch {} }
+		$b.Add_MouseEnter({ param($s, $e) try { $s.Background = $bgH } catch {} }.GetNewClosure())
+		$b.Add_MouseLeave({ param($s, $e) try { $s.Background = $bgN } catch {} }.GetNewClosure())
+		if ($Tip) { & $setVidTip $b $Tip }
+		return $b
+	}.GetNewClosure()
+
+	$flags = [System.Collections.Hashtable]::Synchronized(@{
+		Playing        = $true
+		Player         = $me
+		Host           = $HostElement
+		Root           = $root
+		Chrome         = $chrome
+		Slider         = $slider
+		Path           = [string]$resolved.Path
+		Title          = $(if ($State['Title']) { [string]$State['Title'] } else { '' })
+		Width          = $w
+		Height         = $h
+		OuterState     = $State
+		Fullscreen     = $false
+		FsWindow       = $null
+		Scrubbing      = $false
+		HideTick       = [Environment]::TickCount
+		ProgTimer      = $null
+		HideTimer      = $null
+		Ended          = $false
+		Muted          = $false
+		UnMutedVolume  = $initVol
+		VolSlider      = $null
+		VolPct         = $null
+		MuteBtn        = $null
+		IconData       = $vidIconData
+		MkVidIcon      = $mkVidIcon
+		SetVidIcon     = $setVidIcon
+		SetVidTip      = $setVidTip
+		VolIconKey     = $volIconKeyFromLevel
+	})
+	$me.Tag = $flags
+	$State['MediaElement'] = $me
+	$State['Flags'] = $flags
+	$State['Mode'] = 'inline'
+	$State['Playing'] = $true
+	$State['Started'] = $true
+	$State['Failed'] = $false
+	$State['Overlay'] = $null
+
+	$endSession = {
+		param($f)
+		try {
+			if (-not ($f -is [hashtable])) { return }
+			try {
+				$pt = $f['ProgTimer']
+				if ($null -ne $pt) { $pt.Stop() }
+			} catch {}
+			try {
+				$ht = $f['HideTimer']
+				if ($null -ne $ht) { $ht.Stop() }
+			} catch {}
+			$player = $f['Player']
+			if ($null -ne $player) {
+				try { $player.Stop() } catch {}
+				try { $player.Close() } catch {}
+				try { $player.Source = $null } catch {}
+			}
+			# Exit fullscreen first if needed
+			try {
+				if ([bool]$f['Fullscreen'] -and $null -ne $f['FsWindow']) {
+					$fsw = $f['FsWindow']
+					$rootEl = $f['Root']
+					$hostEl = $f['Host']
+					try {
+						$fsw.Content = $null
+						if ($hostEl -is [System.Windows.Controls.Border] -and $null -ne $rootEl) {
+							$hostEl.Child = $rootEl
+						}
+					} catch {}
+					try { $fsw.Close() } catch {}
+					$f['FsWindow'] = $null
+					$f['Fullscreen'] = $false
+				}
+			} catch {}
+			$f['Player'] = $null
+			$f['Playing'] = $false
+			$outer = $f['OuterState']
+			if ($outer -is [hashtable]) {
+				$outer['Started'] = $false
+				$outer['Failed'] = $false
+				$outer['Playing'] = $false
+				$outer['MediaElement'] = $null
+				$outer['Flags'] = $null
+			}
+			$hostEl2 = $f['Host']
+			if ($hostEl2 -is [System.Windows.Controls.Border]) {
+				# No text overlay - blank black frame only (click host restarts via outer handler)
+				$hostEl2.Child = $null
+				try { $hostEl2.Background = [System.Windows.Media.Brushes]::Black } catch {}
+				try {
+					if ($f['Width']) { $hostEl2.Width = [double]$f['Width'] }
+					if ($f['Height']) { $hostEl2.Height = [double]$f['Height'] }
+					$hostEl2.MaxHeight = [double]::PositiveInfinity
+				} catch {}
+			}
+		} catch {}
+	}.GetNewClosure()
+	$flags['EndSession'] = $endSession
+	$flags['RestorePlaceholder'] = $endSession
+
+	$showChrome = {
+		param($f)
+		try {
+			if (-not ($f -is [hashtable])) { return }
+			$ch = $f['Chrome']
+			if ($null -ne $ch) {
+				# Visible + hit-testable when shown (hidden uses Collapsed so video gets mouse again)
+				$ch.Visibility = [System.Windows.Visibility]::Visible
+				$ch.Opacity = 1.0
+				$ch.IsHitTestVisible = $true
+			}
+			$f['HideTick'] = [Environment]::TickCount
+			$f['ChromeVisible'] = $true
+		} catch {}
+	}.GetNewClosure()
+	$flags['ShowChrome'] = $showChrome
+	$flags['ChromeVisible'] = $true
+
+	# --- Buttons (icon controls + themed tooltips) ---
+	$btnPause = & $mkIconBtn 'pause' @(0x3A, 0x3A, 0x48) @(0x4A, 0x4A, 0x5A) @(0x4A, 0x8A, 0xB8) 'Pause'
+	$btnPause.Tag = $flags
+	& $setVidTip $btnPause 'Pause'
+	$btnPause.Add_Click({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			$player = $f['Player']
+			if ($null -eq $player) { return }
+			$setI = $null
+			try { $setI = $f['SetVidIcon'] } catch {}
+			$setT = $null
+			try { $setT = $f['SetVidTip'] } catch {}
+			if ([bool]$f['Playing']) {
+				$player.Pause()
+				$f['Playing'] = $false
+				if ($null -ne $setI) { & $setI $s 'play' } else { $s.Content = 'Play' }
+				if ($null -ne $setT) { & $setT $s 'Play' }
+				try { $f['OuterState']['Playing'] = $false } catch {}
+			} else {
+				if ([bool]$f['Ended']) {
+					try { $player.Position = [TimeSpan]::Zero } catch {}
+					$f['Ended'] = $false
+				}
+				$player.Play()
+				$f['Playing'] = $true
+				if ($null -ne $setI) { & $setI $s 'pause' } else { $s.Content = 'Pause' }
+				if ($null -ne $setT) { & $setT $s 'Pause' }
+				try { $f['OuterState']['Playing'] = $true } catch {}
+			}
+			try { & $f['ShowChrome'] $f } catch {}
+			if ($e) { $e.Handled = $true }
+		} catch {}
+	}.GetNewClosure())
+	$flags['PauseBtn'] = $btnPause
+	[void]$btnRow.Children.Add($btnPause)
+
+	$btnStop = & $mkIconBtn 'stop' @(0x3A, 0x3A, 0x48) @(0x4A, 0x4A, 0x5A) @(0x5A, 0x5A, 0x66) 'Stop'
+	$btnStop.Tag = $flags
+	& $setVidTip $btnStop 'Stop and return to start'
+	$btnStop.Add_Click({
+		param($s, $e)
+		try {
+			# Stop = pause at start with Play ready (keep player + OSD; do not tear down)
+			$f = $s.Tag
+			$player = $f['Player']
+			if ($null -eq $player) { return }
+			try { $player.Pause() } catch {}
+			try { $player.Stop() } catch {}
+			try { $player.Position = [TimeSpan]::Zero } catch {}
+			$f['Playing'] = $false
+			$f['Ended'] = $false
+			try { $f['OuterState']['Playing'] = $false } catch {}
+			try {
+				if ($f['PauseBtn']) {
+					$setI = $f['SetVidIcon']
+					$setT = $f['SetVidTip']
+					if ($null -ne $setI) { & $setI $f['PauseBtn'] 'play' }
+					else { $f['PauseBtn'].Content = 'Play' }
+					if ($null -ne $setT) { & $setT $f['PauseBtn'] 'Play' }
+				}
+			} catch {}
+			try {
+				$sl = $f['Slider']
+				if ($null -ne $sl) { $sl.Value = 0 }
+			} catch {}
+			try { & $f['ShowChrome'] $f } catch {}
+			if ($e) { $e.Handled = $true }
+		} catch {}
+	}.GetNewClosure())
+	[void]$btnRow.Children.Add($btnStop)
+
+	# Mute + volume (0-1). Icon follows level: mute / low / med / high (workspace xaml paths).
+	# Handlers use Tag only — no GetNewClosure (cross-runspace ScriptBlock safety).
+	$syncVolIcon = {
+		param($f, [double]$Level)
+		try {
+			if (-not ($f -is [hashtable])) { return }
+			$btn = $f['MuteBtn']
+			if ($null -eq $btn) { return }
+			$keyFn = $f['VolIconKey']
+			$setI = $f['SetVidIcon']
+			$setT = $f['SetVidTip']
+			$muted = [bool]$f['Muted'] -or ($Level -le 0.001)
+			$k = 'volMute'
+			if ($null -ne $keyFn) { $k = [string](& $keyFn $Level $muted) }
+			elseif ($muted) { $k = 'volMute' }
+			elseif ($Level -le 0.33) { $k = 'volLow' }
+			elseif ($Level -le 0.66) { $k = 'volMed' }
+			else { $k = 'volHigh' }
+			if ($null -ne $setI) { & $setI $btn $k }
+			if ($null -ne $setT) {
+				$tip = if ($muted) { 'Unmute' } else { 'Mute / volume' }
+				& $setT $btn $tip
+			}
+		} catch {}
+	}.GetNewClosure()
+	$flags['SyncVolIcon'] = $syncVolIcon
+
+	$initVolKey = [string](& $volIconKeyFromLevel $initVol $false)
+	$btnMute = & $mkIconBtn $initVolKey @(0x3A, 0x3A, 0x48) @(0x4A, 0x4A, 0x5A) @(0x5A, 0x5A, 0x66) 'Mute / unmute'
+	$btnMute.Tag = $flags
+	& $setVidTip $btnMute 'Mute / unmute'
+	$flags['MuteBtn'] = $btnMute
+	$btnMute.Add_Click({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			$player = $f['Player']
+			if ($null -eq $player) { return }
+			$sync = $null
+			try { $sync = $f['SyncVolIcon'] } catch {}
+			if (-not [bool]$f['Muted']) {
+				try { $f['UnMutedVolume'] = [double]$player.Volume } catch { $f['UnMutedVolume'] = 1.0 }
+				if ([double]$f['UnMutedVolume'] -le 0.001) { $f['UnMutedVolume'] = 0.5 }
+				$player.Volume = 0
+				try { $player.IsMuted = $true } catch {}
+				$f['Muted'] = $true
+				try { if ($f['VolSlider']) { $f['VolSlider'].Value = 0 } } catch {}
+				try { if ($f['VolPct']) { $f['VolPct'].Text = '0%' } } catch {}
+				if ($null -ne $sync) { & $sync $f 0.0 }
+			} else {
+				$v = [double]$f['UnMutedVolume']
+				if ($v -le 0.001) { $v = 0.5 }
+				try { $player.IsMuted = $false } catch {}
+				$player.Volume = $v
+				$f['Muted'] = $false
+				try { if ($f['VolSlider']) { $f['VolSlider'].Value = $v } } catch {}
+				try {
+					$pct = [int][Math]::Round($v * 100.0)
+					if ($f['VolPct']) { $f['VolPct'].Text = ('{0}%' -f $pct) }
+				} catch {}
+				if ($null -ne $sync) { & $sync $f $v }
+			}
+			try { if ($f['ShowChrome']) { & $f['ShowChrome'] $f } } catch {}
+			if ($e) { $e.Handled = $true }
+		} catch {}
+	})
+	[void]$btnRow.Children.Add($btnMute)
+
+	$volSlider = New-Object System.Windows.Controls.Slider
+	$volSlider.Minimum = 0
+	$volSlider.Maximum = 1
+	$volSlider.SmallChange = 0.01
+	$volSlider.LargeChange = 0.1
+	$volSlider.Width = 88
+	$volSlider.Height = 20
+	$volSlider.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+	$volSlider.Margin = New-Object System.Windows.Thickness(0, 0, 6, 0)
+	$volSlider.Cursor = [System.Windows.Input.Cursors]::Hand
+	$volSlider.IsMoveToPointEnabled = $true
+	$volSlider.Tag = $flags
+	$flags['VolSlider'] = $volSlider
+	# Subscribe before setting Value so first paint syncs label; handler is Tag-only (safe).
+	$volSlider.Add_ValueChanged({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			$player = $f['Player']
+			if ($null -eq $player) { return }
+			$v = [double]$s.Value
+			try { $player.IsMuted = ($v -le 0.001) } catch {}
+			$player.Volume = $v
+			if ($v -gt 0.001) {
+				$f['UnMutedVolume'] = $v
+				$f['Muted'] = $false
+			} else {
+				$f['Muted'] = $true
+			}
+			try {
+				$pct = [int][Math]::Round($v * 100.0)
+				if ($f['VolPct']) { $f['VolPct'].Text = ('{0}%' -f $pct) }
+			} catch {}
+			try {
+				$sync = $f['SyncVolIcon']
+				if ($null -ne $sync) { & $sync $f $v }
+			} catch {}
+		} catch {}
+	})
+	$volSlider.Add_PreviewMouseDown({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			if ($f -is [hashtable] -and $f['ShowChrome']) { & $f['ShowChrome'] $f }
+		} catch {}
+	})
+	$volSlider.Value = $initVol
+	try { & $syncVolIcon $flags $initVol } catch {}
+	[void]$btnRow.Children.Add($volSlider)
+
+	$volPct = New-Object System.Windows.Controls.TextBlock
+	$volPct.Text = ('{0}%' -f [int][Math]::Round($initVol * 100.0))
+	$volPct.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x8A, 0x8A, 0x96))
+	$volPct.FontSize = 11
+	$volPct.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+	$volPct.Width = 40
+	$volPct.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+	$flags['VolPct'] = $volPct
+	[void]$btnRow.Children.Add($volPct)
+
+	$btnExt = & $mkIconBtn 'openNew' @(0x3A, 0x3A, 0x48) @(0x4A, 0x4A, 0x5A) @(0x5A, 0x5A, 0x66) 'Open externally'
+	$btnExt.Tag = $flags
+	& $setVidTip $btnExt 'Open in external player'
+	$btnExt.Add_Click({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			$p = [string]$f['Path']
+			# File.Exists — no Test-Path (same STA scriptblock constraint)
+			$okFile = $false
+			try { $okFile = [System.IO.File]::Exists($p) } catch {}
+			if ($p -and $okFile) { Start-Process -FilePath $p | Out-Null }
+			elseif ($p -match '^(?i)https?://') { Start-Process -FilePath $p | Out-Null }
+			try { if ($f['ShowChrome']) { & $f['ShowChrome'] $f } } catch {}
+			if ($e) { $e.Handled = $true }
+		} catch {}
+	})
+	[void]$btnRow.Children.Add($btnExt)
+
+	$btnFs = & $mkIconBtn 'fs' @(0x3A, 0x3A, 0x48) @(0x4A, 0x4A, 0x5A) @(0x4A, 0x8A, 0xB8) 'Fullscreen'
+	$btnFs.Tag = $flags
+	& $setVidTip $btnFs 'Enter fullscreen'
+	# Reparent helper: keep clock position across fullscreen enter/exit
+	$reparentKeepPos = {
+		param($f, $newParent, [switch]$ToHost)
+		try {
+			$player = $f['Player']
+			$rootEl = $f['Root']
+			if ($null -eq $rootEl) { return }
+			$savedPos = [TimeSpan]::Zero
+			$wasPlaying = $false
+			if ($null -ne $player) {
+				try { $savedPos = $player.Position } catch {}
+				try { $wasPlaying = [bool]$f['Playing'] } catch {}
+				# Pause briefly so reparent doesn't glitch clock
+				try { $player.Pause() } catch {}
+			}
+			if ($ToHost) {
+				$hostEl = $f['Host']
+				try {
+					$fs = $f['FsWindow']
+					if ($null -ne $fs) { $fs.Content = $null }
+				} catch {}
+				if ($hostEl -is [System.Windows.Controls.Border]) {
+					$hostEl.Child = $rootEl
+				}
+			} else {
+				$hostEl = $f['Host']
+				try {
+					if ($hostEl -is [System.Windows.Controls.Border]) { $hostEl.Child = $null }
+				} catch {}
+				if ($null -ne $newParent) {
+					if ($newParent -is [System.Windows.Window]) {
+						$newParent.Content = $rootEl
+					} elseif ($newParent -is [System.Windows.Controls.ContentControl]) {
+						$newParent.Content = $rootEl
+					}
+				}
+			}
+			# Restore position after layout (MediaElement can reset on reparent)
+			if ($null -ne $player) {
+				$restore = {
+					try {
+						$player.Position = $savedPos
+						if ($wasPlaying) { $player.Play() }
+						else { $player.Pause() }
+					} catch {}
+				}.GetNewClosure()
+				try {
+					$player.Dispatcher.BeginInvoke([Action]$restore, [System.Windows.Threading.DispatcherPriority]::Loaded) | Out-Null
+				} catch {
+					try { & $restore } catch {}
+				}
+			}
+		} catch {}
+	}.GetNewClosure()
+	$flags['ReparentKeepPos'] = $reparentKeepPos
+
+	$btnFs.Add_Click({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			$rootEl = $f['Root']
+			$hostEl = $f['Host']
+			if ($null -eq $rootEl) { return }
+			$rp = $f['ReparentKeepPos']
+			$setI = $null; $setT = $null
+			try { $setI = $f['SetVidIcon'] } catch {}
+			try { $setT = $f['SetVidTip'] } catch {}
+			if (-not [bool]$f['Fullscreen']) {
+				$fs = New-Object System.Windows.Window
+				$fs.WindowStyle = [System.Windows.WindowStyle]::None
+				$fs.ResizeMode = [System.Windows.ResizeMode]::NoResize
+				$fs.WindowState = [System.Windows.WindowState]::Maximized
+				$fs.Background = [System.Windows.Media.Brushes]::Black
+				$fs.Topmost = $true
+				$fs.ShowInTaskbar = $true
+				$fs.Title = ('MiniBot - {0}' -f $(if ($f['Title']) { $f['Title'] } else { 'Video' }))
+				$f['FsWindow'] = $fs
+				$f['Fullscreen'] = $true
+				if ($null -ne $setI) { & $setI $s 'fsExit' } else { $s.Content = 'Exit FS' }
+				if ($null -ne $setT) { & $setT $s 'Exit fullscreen' }
+				$fs.Tag = $f
+				if ($null -ne $rp) { & $rp $f $fs }
+				else {
+					try { if ($hostEl -is [System.Windows.Controls.Border]) { $hostEl.Child = $null } } catch {}
+					$fs.Content = $rootEl
+				}
+				$fs.Add_KeyDown({
+					param($ws, $we)
+					try {
+						if ($we.Key -eq [System.Windows.Input.Key]::Escape) {
+							$ff = $ws.Tag
+							if (-not ($ff -is [hashtable])) { return }
+							$ff['Fullscreen'] = $false
+							$btn = $null
+							try { $btn = $ff['FsBtn'] } catch {}
+							try {
+								if ($btn) {
+									$setIi = $ff['SetVidIcon']; $setTt = $ff['SetVidTip']
+									if ($null -ne $setIi) { & $setIi $btn 'fs' } else { $btn.Content = 'Fullscreen' }
+									if ($null -ne $setTt) { & $setTt $btn 'Enter fullscreen' }
+								}
+							} catch {}
+							$rph = $ff['ReparentKeepPos']
+							if ($null -ne $rph) { & $rph $ff $null -ToHost }
+							else {
+								$root2 = $ff['Root']; $host2 = $ff['Host']
+								try { $ws.Content = $null } catch {}
+								if ($host2 -is [System.Windows.Controls.Border] -and $null -ne $root2) { $host2.Child = $root2 }
+							}
+							$ff['FsWindow'] = $null
+							try { $ws.Tag = $null } catch {}
+							try { $ws.Close() } catch {}
+							$we.Handled = $true
+						}
+					} catch {}
+				}.GetNewClosure())
+				$fs.Add_Closed({
+					param($ws, $we)
+					try {
+						$ff = $ws.Tag
+						if (-not ($ff -is [hashtable])) { return }
+						if ([bool]$ff['Fullscreen']) {
+							$ff['Fullscreen'] = $false
+							$rph = $ff['ReparentKeepPos']
+							if ($null -ne $rph) { & $rph $ff $null -ToHost }
+							$ff['FsWindow'] = $null
+							try {
+								if ($ff['FsBtn']) {
+									$setIi = $ff['SetVidIcon']; $setTt = $ff['SetVidTip']
+									if ($null -ne $setIi) { & $setIi $ff['FsBtn'] 'fs' } else { $ff['FsBtn'].Content = 'Fullscreen' }
+									if ($null -ne $setTt) { & $setTt $ff['FsBtn'] 'Enter fullscreen' }
+								}
+							} catch {}
+						}
+					} catch {}
+				}.GetNewClosure())
+				[void]$fs.Show()
+				[void]$fs.Activate()
+			} else {
+				$fs = $f['FsWindow']
+				$f['Fullscreen'] = $false
+				if ($null -ne $setI) { & $setI $s 'fs' } else { $s.Content = 'Fullscreen' }
+				if ($null -ne $setT) { & $setT $s 'Enter fullscreen' }
+				if ($null -ne $rp) { & $rp $f $null -ToHost }
+				else {
+					$rootEl2 = $f['Root']; $hostEl2 = $f['Host']
+					if ($null -ne $fs) { try { $fs.Content = $null } catch {} }
+					if ($hostEl2 -is [System.Windows.Controls.Border] -and $null -ne $rootEl2) {
+						try { $hostEl2.Child = $rootEl2 } catch {}
+					}
+				}
+				$f['FsWindow'] = $null
+				if ($null -ne $fs) {
+					try { $fs.Tag = $null } catch {}
+					try { $fs.Close() } catch {}
+				}
+			}
+			try { & $f['ShowChrome'] $f } catch {}
+			if ($e) { $e.Handled = $true }
+		} catch {}
+	}.GetNewClosure())
+	$flags['FsBtn'] = $btnFs
+	[void]$btnRow.Children.Add($btnFs)
+
+	[void]$chromeCol.Children.Add($btnRow)
+	$chrome.Child = $chromeCol
+	[void]$root.Children.Add($chrome)
+
+	# Progress slider: click-to-seek + drag (PowerPlayer-style position control)
+	$slider.Minimum = 0
+	$slider.Maximum = 100
+	$slider.IsMoveToPointEnabled = $true
+	$slider.IsSnapToTickEnabled = $false
+	$slider.Tag = $flags
+
+	$seekFromSlider = {
+		param($sl, $f)
+		try {
+			$player = $null
+			if ($f -is [hashtable]) { $player = $f['Player'] }
+			if ($null -eq $player) { return }
+			if (-not $player.NaturalDuration.HasTimeSpan) { return }
+			$dur = $player.NaturalDuration.TimeSpan.TotalSeconds
+			if ($dur -le 0) { return }
+			$pct = [double]$sl.Value
+			if ($pct -lt 0) { $pct = 0 }
+			if ($pct -gt 100) { $pct = 100 }
+			$player.Position = [TimeSpan]::FromSeconds(($pct / 100.0) * $dur)
+		} catch {}
+	}.GetNewClosure()
+	$flags['SeekFromSlider'] = $seekFromSlider
+
+	$slider.Add_PreviewMouseLeftButtonDown({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			if ($f -is [hashtable]) { $f['Scrubbing'] = $true }
+			# Click anywhere on track: force value from mouse X (not only thumb drag)
+			try {
+				$pt = $e.GetPosition($s)
+				$w = [double]$s.ActualWidth
+				if ($w -gt 1) {
+					$ratio = $pt.X / $w
+					if ($ratio -lt 0) { $ratio = 0 }
+					if ($ratio -gt 1) { $ratio = 1 }
+					$s.Value = $s.Minimum + $ratio * ($s.Maximum - $s.Minimum)
+				}
+			} catch {}
+			try {
+				if ($f -is [hashtable] -and $f['SeekFromSlider']) { & $f['SeekFromSlider'] $s $f }
+			} catch {}
+			try { & $f['ShowChrome'] $f } catch {}
+		} catch {}
+	}.GetNewClosure())
+	$slider.Add_PreviewMouseMove({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			if (-not ($f -is [hashtable])) { return }
+			if (-not [bool]$f['Scrubbing']) { return }
+			if ($e.LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed) { return }
+			try {
+				$pt = $e.GetPosition($s)
+				$w = [double]$s.ActualWidth
+				if ($w -gt 1) {
+					$ratio = $pt.X / $w
+					if ($ratio -lt 0) { $ratio = 0 }
+					if ($ratio -gt 1) { $ratio = 1 }
+					$s.Value = $s.Minimum + $ratio * ($s.Maximum - $s.Minimum)
+				}
+			} catch {}
+			try {
+				if ($f['SeekFromSlider']) { & $f['SeekFromSlider'] $s $f }
+			} catch {}
+			try { & $f['ShowChrome'] $f } catch {}
+		} catch {}
+	}.GetNewClosure())
+	$slider.Add_PreviewMouseLeftButtonUp({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			try {
+				if ($f -is [hashtable] -and $f['SeekFromSlider']) { & $f['SeekFromSlider'] $s $f }
+			} catch {}
+			if ($f -is [hashtable]) { $f['Scrubbing'] = $false }
+			try { & $f['ShowChrome'] $f } catch {}
+		} catch {
+			try { if ($s.Tag -is [hashtable]) { $s.Tag['Scrubbing'] = $false } } catch {}
+		}
+	}.GetNewClosure())
+
+	# Progress timer
+	$progTimer = New-Object System.Windows.Threading.DispatcherTimer
+	$progTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+	$progTimer.Tag = $flags
+	$progTimer.Add_Tick({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			if (-not ($f -is [hashtable])) { return }
+			if ([bool]$f['Scrubbing']) { return }
+			$player = $f['Player']
+			$sl = $f['Slider']
+			if ($null -eq $player -or $null -eq $sl) { return }
+			if ($player.NaturalDuration.HasTimeSpan) {
+				$dur = $player.NaturalDuration.TimeSpan.TotalSeconds
+				if ($dur -gt 0) {
+					$sl.Value = ($player.Position.TotalSeconds / $dur) * 100.0
+				}
+			}
+		} catch {}
+	}.GetNewClosure())
+	$flags['ProgTimer'] = $progTimer
+	$progTimer.Start()
+
+	# Auto-hide OSD after 2.5s with no mouse movement (unhide on any mouseover/move)
+	$hideTimer = New-Object System.Windows.Threading.DispatcherTimer
+	$hideTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+	$hideTimer.Tag = $flags
+	$hideTimer.Add_Tick({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			if (-not ($f -is [hashtable])) { return }
+			$ch = $f['Chrome']
+			if ($null -eq $ch) { return }
+			# Keep visible while scrubbing progress
+			if ([bool]$f['Scrubbing']) {
+				$f['HideTick'] = [Environment]::TickCount
+				return
+			}
+			$idle = [Environment]::TickCount - [int]$f['HideTick']
+			if ($idle -lt 0) { $idle = 0 }
+			if ($idle -ge 2500) {
+				if ($ch.Visibility -ne [System.Windows.Visibility]::Collapsed) {
+					$ch.Visibility = [System.Windows.Visibility]::Collapsed
+					$ch.IsHitTestVisible = $false
+					$f['ChromeVisible'] = $false
+				}
+			}
+		} catch {}
+	}.GetNewClosure())
+	$flags['HideTimer'] = $hideTimer
+	$hideTimer.Start()
+
+	# Tag root / chrome / media for show-on-mouseover
+	$root.Tag = $flags
+	$chrome.Tag = $flags
+	$me.Tag = $flags
+
+	$onMouseActivity = {
+		param($s, $e)
+		try {
+			$f = $null
+			if ($s.Tag -is [hashtable]) { $f = $s.Tag }
+			if ($null -eq $f) { return }
+			if ($f['ShowChrome']) { & $f['ShowChrome'] $f }
+		} catch {}
+	}.GetNewClosure()
+
+	# Any movement over video surface or OSD resets idle timer and shows controls
+	$root.Add_MouseMove($onMouseActivity)
+	$root.Add_MouseEnter($onMouseActivity)
+	$chrome.Add_MouseMove($onMouseActivity)
+	$chrome.Add_MouseEnter($onMouseActivity)
+	$me.Add_MouseMove($onMouseActivity)
+	$me.Add_MouseEnter($onMouseActivity)
+	# Preview events fire even when a child would otherwise eat the bubble
+	$root.Add_PreviewMouseMove($onMouseActivity)
+	$me.Add_PreviewMouseMove($onMouseActivity)
+
+	# Click video toggles play/pause and shows chrome
+	$me.Add_MouseLeftButtonUp({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			if (-not ($f -is [hashtable])) { return }
+			# Ignore if click originated from chrome (should not hit me)
+			$player = $f['Player']
+			if ($null -eq $player) { $player = $s }
+			if ([bool]$f['Playing']) {
+				$player.Pause()
+				$f['Playing'] = $false
+				try {
+					if ($f['PauseBtn']) {
+						if ($f['SetVidIcon']) { & $f['SetVidIcon'] $f['PauseBtn'] 'play' }
+						if ($f['SetVidTip']) { & $f['SetVidTip'] $f['PauseBtn'] 'Play' }
+					}
+				} catch {}
+				try { $f['OuterState']['Playing'] = $false } catch {}
+			} else {
+				if ([bool]$f['Ended']) {
+					try { $player.Position = [TimeSpan]::Zero } catch {}
+					$f['Ended'] = $false
+				}
+				$player.Play()
+				$f['Playing'] = $true
+				try {
+					if ($f['PauseBtn']) {
+						if ($f['SetVidIcon']) { & $f['SetVidIcon'] $f['PauseBtn'] 'pause' }
+						if ($f['SetVidTip']) { & $f['SetVidTip'] $f['PauseBtn'] 'Pause' }
+					}
+				} catch {}
+				try { $f['OuterState']['Playing'] = $true } catch {}
+			}
+			try { & $f['ShowChrome'] $f } catch {}
+			if ($e) { $e.Handled = $true }
+		} catch {}
+	}.GetNewClosure())
+
+	$me.Add_MediaOpened({
+		param($s, $e)
+		try {
+			$s.Play()
+			$f = $s.Tag
+			if ($f -is [hashtable]) {
+				$f['Playing'] = $true
+				try {
+					if ($f['PauseBtn'] -and $f['SetVidIcon']) {
+						& $f['SetVidIcon'] $f['PauseBtn'] 'pause'
+						if ($f['SetVidTip']) { & $f['SetVidTip'] $f['PauseBtn'] 'Pause' }
+					}
+				} catch {}
+				try { & $f['ShowChrome'] $f } catch {}
+			}
+		} catch {}
+	}.GetNewClosure())
+
+	$me.Add_MediaEnded({
+		param($s, $e)
+		try {
+			$s.Stop()
+			try { $s.Position = [TimeSpan]::Zero } catch {}
+			$f = $s.Tag
+			if ($f -is [hashtable]) {
+				$f['Playing'] = $false
+				$f['Ended'] = $true
+				try {
+					if ($f['PauseBtn']) {
+						if ($f['SetVidIcon']) { & $f['SetVidIcon'] $f['PauseBtn'] 'play' }
+						if ($f['SetVidTip']) { & $f['SetVidTip'] $f['PauseBtn'] 'Restart' }
+					}
+				} catch {}
+				try { $f['OuterState']['Playing'] = $false } catch {}
+				try { & $f['ShowChrome'] $f } catch {}
+			}
+		} catch {}
+	}.GetNewClosure())
+
+	$me.Add_MediaFailed({
+		param($s, $e)
+		try {
+			$f = $s.Tag
+			$why = ''
+			try { if ($e.ErrorException) { $why = [string]$e.ErrorException.Message } } catch {}
+			if (-not $why) { $why = 'decode failed' }
+			# Do NOT EndSession here — tearing down on async decode errors races autoplay success
+			# flags and leaves the card dead. Keep player + OSD; show error on chrome title path.
+			try {
+				if ($f -is [hashtable]) {
+					$f['Playing'] = $false
+					try {
+						if ($f['PauseBtn']) {
+							if ($f['SetVidIcon']) { & $f['SetVidIcon'] $f['PauseBtn'] 'play' }
+							if ($f['SetVidTip']) { & $f['SetVidTip'] $f['PauseBtn'] 'Play' }
+						}
+					} catch {}
+					try { $f['OuterState']['Playing'] = $false } catch {}
+					try { $f['OuterState']['LastError'] = $why } catch {}
+					try { & $f['ShowChrome'] $f } catch {}
+				}
+			} catch {}
+		} catch {}
+	}.GetNewClosure())
+
+	if ($HostElement -is [System.Windows.Controls.Border]) {
+		$HostElement.Child = $root
+		$HostElement.Padding = New-Object System.Windows.Thickness(0)
+		try { $HostElement.Background = [System.Windows.Media.Brushes]::Black } catch {}
+		try { $HostElement.ClipToBounds = $true } catch {}
+	} else {
+		$State['LastError'] = 'HostElement is not a Border'
+		return $false
+	}
+
+	try {
+		$bag = $null
+		if ($State -is [hashtable]) { $bag = $State['WpfBag'] }
+		if ($null -ne $bag) {
+			if ($bag -is [hashtable]) { $bag['VideoState'] = $State }
+			else { try { $bag.VideoState = $State } catch {} }
+		}
+	} catch {}
+
+	try { $me.Play() } catch {}
+	try { & $showChrome $flags } catch {}
+	$State['MediaElement'] = $me
+	$State['Flags'] = $flags
+	$State['Started'] = $true
+	$State['Failed'] = $false
+	$State['Playing'] = $true
+	$State['LastError'] = ''
+	$State['Path'] = [string]$resolved.Path
+	return $true
+}
+
+function global:Toggle-MBInlineVideoState {
+	param([hashtable]$State)
+	if ($null -eq $State) { return }
+	try {
+		$f = $null
+		try { $f = $State['Flags'] } catch {}
+		$me = $null
+		if ($f -is [hashtable]) { $me = $f['Player'] }
+		if ($null -eq $me) { $me = $State['MediaElement'] }
+		if ($null -eq $me) { return }
+		$playing = $false
+		if ($f -is [hashtable]) { $playing = [bool]$f['Playing'] }
+		else { $playing = [bool]$State['Playing'] }
+		if ($playing) {
+			$me.Pause()
+			$State['Playing'] = $false
+			if ($f -is [hashtable]) {
+				$f['Playing'] = $false
+				try {
+					if ($f['PauseBtn']) {
+						if ($f['SetVidIcon']) { & $f['SetVidIcon'] $f['PauseBtn'] 'play' }
+						if ($f['SetVidTip']) { & $f['SetVidTip'] $f['PauseBtn'] 'Play' }
+					}
+				} catch {}
+				try { & $f['ShowChrome'] $f } catch {}
+			}
+		} else {
+			$me.Play()
+			$State['Playing'] = $true
+			if ($f -is [hashtable]) {
+				$f['Playing'] = $true
+				try {
+					if ($f['PauseBtn']) {
+						if ($f['SetVidIcon']) { & $f['SetVidIcon'] $f['PauseBtn'] 'pause' }
+						if ($f['SetVidTip']) { & $f['SetVidTip'] $f['PauseBtn'] 'Pause' }
+					}
+				} catch {}
+				try { & $f['ShowChrome'] $f } catch {}
+			}
+		}
+	} catch {}
+}
+
+function global:Show-MBVideoPlayerWindow {
+	# Floating player with MiniBot-themed chrome (no system titlebar brushes)
+	param(
+		[string]$Path,
+		[string]$Title = ''
+	)
+	try {
+		$resolved = $null
+		try {
+			$resFn = $null
+			try { if ($global:MB_VideoApi) { $resFn = $global:MB_VideoApi['Resolve'] } } catch {}
+			try { if ($null -eq $resFn -and $script:MB -and $script:MB.Video) { $resFn = $script:MB.Video['Resolve'] } } catch {}
+			if ($null -ne $resFn) { $resolved = & $resFn -Path $Path }
+		} catch { $resolved = $null }
+		if ($null -eq $resolved) {
+			$resolved = @{ Ok = $false; IsHttp = $false; Path = ''; Uri = $null; Error = 'resolve failed' }
+			try {
+				$src = [string]$Path.Trim().Trim('"').Trim("'")
+				if ($src -match '^(?i)https?://') {
+					$resolved.Ok = $true; $resolved.IsHttp = $true; $resolved.Path = $src; $resolved.Uri = [Uri]$src; $resolved.Error = ''
+				} elseif (Test-Path -LiteralPath $src -PathType Leaf) {
+					$found = [System.IO.Path]::GetFullPath($src)
+					$resolved.Ok = $true; $resolved.Path = $found
+					$resolved.Uri = New-Object System.Uri -ArgumentList $found, ([System.UriKind]::Absolute)
+					$resolved.Error = ''
+				} else { $resolved.Error = "file not found: $src" }
+			} catch { $resolved.Error = $_.Exception.Message }
+		}
+		if (-not $resolved.Ok) {
+			try {
+				[System.Windows.MessageBox]::Show(("Video file not found:`n{0}`n{1}" -f $Path, $resolved.Error), 'MiniBot Video') | Out-Null
+			} catch {}
+			return
+		}
+
+		$winW = 960.0
+		$winH = 540.0
+		if (-not $resolved.IsHttp -and $resolved.Path) {
+			try {
+				$sz = Get-MBVideoFrameSize -Source $resolved.Path
+				if ([int]$sz.Width -gt 0) { $winW = [double]$sz.Width }
+				if ([int]$sz.Height -gt 0) { $winH = [double]$sz.Height }
+				$wa = [System.Windows.SystemParameters]::WorkArea
+				$maxW = [Math]::Max(320.0, $wa.Width * 0.90)
+				$maxH = [Math]::Max(240.0, $wa.Height * 0.90)
+				if ($winW -gt $maxW -or $winH -gt $maxH) {
+					$scale = [Math]::Min($maxW / [Math]::Max(1.0, $winW), $maxH / [Math]::Max(1.0, $winH))
+					$winW = [Math]::Round($winW * $scale)
+					$winH = [Math]::Round($winH * $scale)
+				}
+			} catch {}
+		}
+		if ($winW -lt 320) { $winW = 320 }
+		if ($winH -lt 180) { $winH = 180 }
+		$titleH = 36.0
+		$ctrlH = 40.0
+
+		$winTitle = [string]$Title
+		if ([string]::IsNullOrWhiteSpace($winTitle)) {
+			if (-not $resolved.IsHttp) {
+				try { $winTitle = [System.IO.Path]::GetFileName($resolved.Path) } catch { $winTitle = 'Video' }
+			} else { $winTitle = 'Video' }
+		}
+
+		$window = New-Object System.Windows.Window
+		$window.Title = ('MiniBot - {0}' -f $winTitle)
+		$window.Width = $winW
+		$window.Height = ($winH + $titleH + $ctrlH)
+		$window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterScreen
+		$window.WindowStyle = [System.Windows.WindowStyle]::None
+		$window.AllowsTransparency = $true
+		$window.Background = [System.Windows.Media.Brushes]::Transparent
+		$window.ResizeMode = [System.Windows.ResizeMode]::CanResizeWithGrip
+		$window.ShowInTaskbar = $true
+		$window.Topmost = $true
+		try {
+			$chrome = New-Object System.Windows.Shell.WindowChrome
+			$chrome.CaptionHeight = 0
+			$chrome.ResizeBorderThickness = New-Object System.Windows.Thickness(6)
+			$chrome.GlassFrameThickness = New-Object System.Windows.Thickness(0)
+			$chrome.CornerRadius = New-Object System.Windows.CornerRadius(8)
+			[System.Windows.Shell.WindowChrome]::SetWindowChrome($window, $chrome)
+		} catch {}
+
+		$outer = New-Object System.Windows.Controls.Border
+		$outer.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x12, 0x12, 0x16))
+		$outer.BorderBrush = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x2A, 0x2A, 0x30))
+		$outer.BorderThickness = New-Object System.Windows.Thickness(1)
+		$outer.CornerRadius = New-Object System.Windows.CornerRadius(8)
+		$outer.ClipToBounds = $true
+
+		$root = New-Object System.Windows.Controls.Grid
+		$r0 = New-Object System.Windows.Controls.RowDefinition
+		$r0.Height = [System.Windows.GridLength]::Auto
+		$r1 = New-Object System.Windows.Controls.RowDefinition
+		$r1.Height = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+		$r2 = New-Object System.Windows.Controls.RowDefinition
+		$r2.Height = [System.Windows.GridLength]::Auto
+		[void]$root.RowDefinitions.Add($r0)
+		[void]$root.RowDefinitions.Add($r1)
+		[void]$root.RowDefinitions.Add($r2)
+
+		# Themed titlebar
+		$titleBar = New-Object System.Windows.Controls.Border
+		$titleBar.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x2A, 0x2A, 0x30))
+		$titleBar.BorderBrush = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x3A, 0x3A, 0x42))
+		$titleBar.BorderThickness = New-Object System.Windows.Thickness(0, 0, 0, 1)
+		$titleBar.Padding = New-Object System.Windows.Thickness(10, 0, 0, 0)
+		$titleBar.Height = $titleH
+		$titleBar.Cursor = [System.Windows.Input.Cursors]::SizeAll
+		$tg = New-Object System.Windows.Controls.Grid
+		$c0 = New-Object System.Windows.Controls.ColumnDefinition
+		$c0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+		$c1 = New-Object System.Windows.Controls.ColumnDefinition
+		$c1.Width = [System.Windows.GridLength]::Auto
+		[void]$tg.ColumnDefinitions.Add($c0)
+		[void]$tg.ColumnDefinitions.Add($c1)
+		$titleTb = New-Object System.Windows.Controls.TextBlock
+		$titleTb.Text = ('MiniBot - {0}' -f $winTitle)
+		$titleTb.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xC8, 0xC8, 0xD0))
+		$titleTb.FontSize = 12
+		$titleTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+		$titleTb.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
+		try { $titleTb.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI, Consolas, Cascadia Mono, Courier New') } catch {}
+		[System.Windows.Controls.Grid]::SetColumn($titleTb, 0)
+		[void]$tg.Children.Add($titleTb)
+
+		$noMoTpl = $null
+		try {
+			$noMoXaml = '<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
+			$noMoTpl = [System.Windows.Markup.XamlReader]::Parse($noMoXaml)
+		} catch {}
+
+		$btnX = New-Object System.Windows.Controls.Button
+		$btnX.Content = 'X'
+		$btnX.Width = 46
+		$btnX.Height = $titleH
+		$btnX.FontSize = 12
+		$btnX.Cursor = [System.Windows.Input.Cursors]::Hand
+		$btnX.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xC8, 0xC8, 0xD0))
+		$btnX.Background = [System.Windows.Media.Brushes]::Transparent
+		$btnX.BorderThickness = New-Object System.Windows.Thickness(0)
+		if ($null -ne $noMoTpl) { try { $btnX.Template = $noMoTpl } catch {} }
+		$btnX.Tag = $window
+		$bgX = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x2A, 0x2A, 0x30))
+		$bgXh = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xB8, 0x0F, 0x0A))
+		$btnX.Add_MouseEnter({ param($s,$e) try { $s.Background = $bgXh; $s.Foreground = [System.Windows.Media.Brushes]::White } catch {} }.GetNewClosure())
+		$btnX.Add_MouseLeave({ param($s,$e) try { $s.Background = [System.Windows.Media.Brushes]::Transparent; $s.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xC8, 0xC8, 0xD0)) } catch {} }.GetNewClosure())
+		$btnX.Add_Click({
+			param($s, $e)
+			try { $s.Tag.Close() } catch {}
+		}.GetNewClosure())
+		[System.Windows.Controls.Grid]::SetColumn($btnX, 1)
+		[void]$tg.Children.Add($btnX)
+		$titleBar.Child = $tg
+		$titleBar.Add_MouseLeftButtonDown({
+			param($s, $e)
+			try {
+				if ($e.ClickCount -eq 1) {
+					$w = [System.Windows.Window]::GetWindow($s)
+					if ($null -ne $w) { $w.DragMove() }
+				}
+			} catch {}
+		}.GetNewClosure())
+		[System.Windows.Controls.Grid]::SetRow($titleBar, 0)
+		[void]$root.Children.Add($titleBar)
+
+		$player = New-Object System.Windows.Controls.MediaElement
+		$player.LoadedBehavior = [System.Windows.Controls.MediaState]::Manual
+		$player.UnloadedBehavior = [System.Windows.Controls.MediaState]::Stop
+		$player.Stretch = [System.Windows.Media.Stretch]::Uniform
+		$player.Volume = 1.0
+		$player.Cursor = [System.Windows.Input.Cursors]::Hand
+		if ($resolved.IsHttp) { $player.Source = $resolved.Uri }
+		else { $player.Source = [string]$resolved.Path }
+		$vidBorder = New-Object System.Windows.Controls.Border
+		$vidBorder.Background = [System.Windows.Media.Brushes]::Black
+		$vidBorder.Child = $player
+		[System.Windows.Controls.Grid]::SetRow($vidBorder, 1)
+		[void]$root.Children.Add($vidBorder)
+
+		# Bottom control bar
+		$bar = New-Object System.Windows.Controls.Border
+		$bar.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x1A, 0x1A, 0x1E))
+		$bar.Padding = New-Object System.Windows.Thickness(10, 6, 10, 6)
+		$bar.BorderBrush = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x2A, 0x2A, 0x30))
+		$bar.BorderThickness = New-Object System.Windows.Thickness(0, 1, 0, 0)
+		$barRow = New-Object System.Windows.Controls.StackPanel
+		$barRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+
+		$vstate = [hashtable]@{ Playing = $true; Player = $player; Path = [string]$resolved.Path; Window = $window }
+		$window.Tag = $vstate
+		$player.Tag = $vstate
+
+		$popIconData = @{
+			play  = 'M8,5.14V19.14L19,12.14L8,5.14Z'
+			pause = 'M14,19H18V5H14M6,19H10V5H6V19Z'
+			stop  = 'M18,18H6V6H18V18Z'
+		}
+		$iconFgPop = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xE0, 0xE0, 0xE8))
+		$mkPopIcon = {
+			param([string]$Data)
+			$p = New-Object System.Windows.Shapes.Path
+			$p.Width = 14; $p.Height = 14
+			$p.Stretch = [System.Windows.Media.Stretch]::Uniform
+			$p.Data = [System.Windows.Media.Geometry]::Parse([string]$Data)
+			$p.Fill = $iconFgPop
+			$p.IsHitTestVisible = $false
+			return $p
+		}.GetNewClosure()
+		$setPopIcon = {
+			param($Btn, [string]$Key)
+			try {
+				if ($null -eq $Btn) { return }
+				$d = [string]$popIconData[$Key]
+				if ($d) { $Btn.Content = (& $mkPopIcon $d) }
+			} catch {}
+		}.GetNewClosure()
+		$makePopTip = {
+			param([string]$Text)
+			try {
+				$tip = New-Object System.Windows.Controls.ToolTip
+				$tip.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x1A, 0x1A, 0x1E))
+				$tip.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xC8, 0xC8, 0xD0))
+				$tip.BorderBrush = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x3A, 0x3A, 0x42))
+				$tip.BorderThickness = New-Object System.Windows.Thickness(1)
+				$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
+				$tip.HasDropShadow = $true
+				$ttb = New-Object System.Windows.Controls.TextBlock
+				$ttb.Text = [string]$Text
+				$ttb.Foreground = $tip.Foreground
+				$ttb.FontSize = 12
+				$tip.Content = $ttb
+				return $tip
+			} catch { return [string]$Text }
+		}.GetNewClosure()
+		$mkPB = {
+			param([string]$Text, $Bg, $Hover, $Brd)
+			$b = New-Object System.Windows.Controls.Button
+			$b.Content = $Text
+			$b.Padding = New-Object System.Windows.Thickness(14, 4, 14, 4)
+			$b.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+			$b.Cursor = [System.Windows.Input.Cursors]::Hand
+			$b.FontSize = 12
+			$b.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xE0, 0xE0, 0xE8))
+			$b.Background = $Bg
+			$b.BorderBrush = $Brd
+			$b.BorderThickness = New-Object System.Windows.Thickness(1)
+			if ($null -ne $noMoTpl) { try { $b.Template = $noMoTpl } catch {} }
+			$b.Add_MouseEnter({ param($s,$e) try { $s.Background = $Hover } catch {} }.GetNewClosure())
+			$b.Add_MouseLeave({ param($s,$e) try { $s.Background = $Bg } catch {} }.GetNewClosure())
+			return $b
+		}.GetNewClosure()
+		$mkPopIconBtn = {
+			param([string]$IconKey, $Bg, $Hover, $Brd, [string]$Tip)
+			$b = New-Object System.Windows.Controls.Button
+			$b.Content = (& $mkPopIcon ([string]$popIconData[$IconKey]))
+			$b.Width = 34; $b.Height = 28
+			$b.Padding = New-Object System.Windows.Thickness(8, 5, 8, 5)
+			$b.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+			$b.Cursor = [System.Windows.Input.Cursors]::Hand
+			$b.Background = $Bg
+			$b.BorderBrush = $Brd
+			$b.BorderThickness = New-Object System.Windows.Thickness(1)
+			$b.HorizontalContentAlignment = [System.Windows.HorizontalAlignment]::Center
+			$b.VerticalContentAlignment = [System.Windows.VerticalAlignment]::Center
+			if ($null -ne $noMoTpl) { try { $b.Template = $noMoTpl } catch {} }
+			$b.Add_MouseEnter({ param($s,$e) try { $s.Background = $Hover } catch {} }.GetNewClosure())
+			$b.Add_MouseLeave({ param($s,$e) try { $s.Background = $Bg } catch {} }.GetNewClosure())
+			try { $b.ToolTip = (& $makePopTip $Tip) } catch { $b.ToolTip = $Tip }
+			return $b
+		}.GetNewClosure()
+
+		$bgN = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x3A, 0x3A, 0x48))
+		$bgH = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x4A, 0x4A, 0x5A))
+		$bdN = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x4A, 0x8A, 0xB8))
+		$btnPause = & $mkPopIconBtn 'pause' $bgN $bgH $bdN 'Pause'
+		$btnPause.Tag = $vstate
+		$btnPause.Add_Click({
+			param($s, $e)
+			try {
+				$st = $s.Tag
+				$pl = $st['Player']
+				if ($null -eq $pl) { return }
+				if ([bool]$st['Playing']) {
+					$pl.Pause(); $st['Playing'] = $false
+					& $setPopIcon $s 'play'
+					try { $s.ToolTip = (& $makePopTip 'Play') } catch {}
+				} else {
+					$pl.Play(); $st['Playing'] = $true
+					& $setPopIcon $s 'pause'
+					try { $s.ToolTip = (& $makePopTip 'Pause') } catch {}
+				}
+			} catch {}
+		}.GetNewClosure())
+		$vstate['PauseBtn'] = $btnPause
+		$vstate['SetPopIcon'] = $setPopIcon
+		$vstate['MakePopTip'] = $makePopTip
+		[void]$barRow.Children.Add($btnPause)
+
+		$btnStop = & $mkPopIconBtn 'stop' $bgN $bgH (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x5A, 0x5A, 0x66))) 'Stop and return to start'
+		$btnStop.Tag = $vstate
+		$btnStop.Add_Click({
+			param($s, $e)
+			try {
+				$st = $s.Tag
+				$pl = $st['Player']
+				if ($null -eq $pl) { return }
+				$pl.Stop()
+				try { $pl.Position = [TimeSpan]::Zero } catch {}
+				$st['Playing'] = $false
+				try {
+					if ($st['PauseBtn']) {
+						& $st['SetPopIcon'] $st['PauseBtn'] 'play'
+						try { $st['PauseBtn'].ToolTip = (& $st['MakePopTip'] 'Play') } catch {}
+					}
+				} catch {}
+			} catch {}
+		}.GetNewClosure())
+		[void]$barRow.Children.Add($btnStop)
+
+		$btnClose2 = & $mkPB 'Close' (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x5A, 0x2A, 0x2A))) (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x6A, 0x3A, 0x3A))) (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x8A, 0x4A, 0x4A)))
+		$btnClose2.Tag = $vstate
+		try { $btnClose2.ToolTip = (& $makePopTip 'Close player') } catch {}
+		$btnClose2.Add_Click({
+			param($s, $e)
+			try { $s.Tag['Window'].Close() } catch {}
+		}.GetNewClosure())
+		[void]$barRow.Children.Add($btnClose2)
+
+		$bar.Child = $barRow
+		[System.Windows.Controls.Grid]::SetRow($bar, 2)
+		[void]$root.Children.Add($bar)
+
+		$outer.Child = $root
+		$window.Content = $outer
+
+		$player.Add_MediaOpened({ param($s,$e) try { $s.Play() } catch {} }.GetNewClosure())
+		$player.Add_MediaEnded({
+			param($s, $e)
+			try {
+				$s.Stop(); try { $s.Position = [TimeSpan]::Zero } catch {}
+				$st = $s.Tag
+				if ($st -is [hashtable]) {
+					$st['Playing'] = $false
+					try {
+						if ($st['PauseBtn'] -and $st['SetPopIcon']) {
+							& $st['SetPopIcon'] $st['PauseBtn'] 'play'
+							try { $st['PauseBtn'].ToolTip = (& $st['MakePopTip'] 'Restart') } catch {}
+						}
+					} catch {}
+				}
+			} catch {}
+		}.GetNewClosure())
+		$player.Add_MediaFailed({
+			param($s, $e)
+			try {
+				$why = ''
+				try { if ($e.ErrorException) { $why = [string]$e.ErrorException.Message } } catch {}
+				if (-not $why) { $why = 'codec not supported' }
+				[System.Windows.MessageBox]::Show(("Playback failed:`n{0}" -f $why), 'MiniBot Video') | Out-Null
+				$st = $s.Tag
+				$p = $null
+				if ($st -is [hashtable]) { $p = [string]$st['Path'] }
+				if ($p -and (Test-Path -LiteralPath $p)) { Start-Process -FilePath $p | Out-Null }
+			} catch {}
+		}.GetNewClosure())
+		$player.Add_MouseLeftButtonUp({
+			param($s, $e)
+			try {
+				$st = $s.Tag
+				if ([bool]$st['Playing']) {
+					$s.Pause(); $st['Playing'] = $false
+					try { if ($st['SetPopIcon']) { & $st['SetPopIcon'] $st['PauseBtn'] 'play'; $st['PauseBtn'].ToolTip = (& $st['MakePopTip'] 'Play') } } catch {}
+				} else {
+					$s.Play(); $st['Playing'] = $true
+					try { if ($st['SetPopIcon']) { & $st['SetPopIcon'] $st['PauseBtn'] 'pause'; $st['PauseBtn'].ToolTip = (& $st['MakePopTip'] 'Pause') } } catch {}
+				}
+				if ($e) { $e.Handled = $true }
+			} catch {}
+		}.GetNewClosure())
+		$window.Add_KeyDown({
+			param($s, $e)
+			try {
+				if ($e.Key -eq [System.Windows.Input.Key]::Escape) { $s.Close(); return }
+				if ($e.Key -eq [System.Windows.Input.Key]::Space) {
+					$st = $s.Tag; $pl = $st['Player']
+					if ($null -ne $pl) {
+						if ([bool]$st['Playing']) {
+							$pl.Pause(); $st['Playing'] = $false
+							try { if ($st['SetPopIcon']) { & $st['SetPopIcon'] $st['PauseBtn'] 'play'; $st['PauseBtn'].ToolTip = (& $st['MakePopTip'] 'Play') } } catch {}
+						} else {
+							$pl.Play(); $st['Playing'] = $true
+							try { if ($st['SetPopIcon']) { & $st['SetPopIcon'] $st['PauseBtn'] 'pause'; $st['PauseBtn'].ToolTip = (& $st['MakePopTip'] 'Pause') } } catch {}
+						}
+						$e.Handled = $true
+					}
+				}
+			} catch {}
+		}.GetNewClosure())
+		$window.Add_Closed({
+			param($s, $e)
+			try {
+				$st = $s.Tag; $pl = $null
+				if ($st -is [hashtable]) { $pl = $st['Player'] }
+				if ($null -ne $pl) {
+					try { $pl.Stop() } catch {}
+					try { $pl.Close() } catch {}
+					try { $pl.Source = $null } catch {}
+				}
+			} catch {}
+		}.GetNewClosure())
+
+		try { $player.Play() } catch {}
+
+		try {
+			$owner = $null
+			if ($script:MB -and $script:MB.Wpf) {
+				try { $owner = $script:MB.Wpf.Window } catch {}
+				if ($null -eq $owner) { try { $owner = $script:MB.Wpf['Window'] } catch {} }
+			}
+			if ($null -ne $owner) { $window.Owner = $owner }
+		} catch {}
+
+		[void]$window.Show()
+		[void]$window.Activate()
+		try {
+			$window.Dispatcher.BeginInvoke([Action]{
+				try { $window.Topmost = $false } catch {}
+			}, [System.Windows.Threading.DispatcherPriority]::ApplicationIdle) | Out-Null
+		} catch {
+			try { $window.Topmost = $false } catch {}
+		}
+	} catch {
+		try {
+			[System.Windows.MessageBox]::Show(("Pop out failed: {0}" -f $_.Exception.Message), 'MiniBot Video') | Out-Null
+		} catch {}
+	}
+}
+
+function ConvertTo-MBUnboundScriptBlock {
+	# Function scriptblocks are bound to the defining runspace. When STA invokes them,
+	# cmdlets (New-Object, Test-Path) disappear. [scriptblock]::Create makes an unbound
+	# copy that runs in the CALLER runspace (STA has a full default session).
+	param($ScriptBlock)
+	if ($null -eq $ScriptBlock) { return $null }
+	try {
+		if ($ScriptBlock -isnot [scriptblock]) { return $null }
+		$txt = $ScriptBlock.ToString()
+		if ([string]::IsNullOrWhiteSpace($txt)) { return $ScriptBlock }
+		return [scriptblock]::Create($txt)
+	} catch {
+		return $ScriptBlock
+	}
+}
+
+function Get-MBFunctionScriptText {
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+	try {
+		$cmd = Get-Command -Name $Name -CommandType Function -ErrorAction Stop
+		if ($null -ne $cmd -and $null -ne $cmd.ScriptBlock) { return $cmd.ScriptBlock.ToString() }
+	} catch {}
+	try {
+		$it = Get-Item -LiteralPath ("Function:{0}" -f $Name) -ErrorAction SilentlyContinue
+		if ($null -ne $it -and $null -ne $it.ScriptBlock) { return $it.ScriptBlock.ToString() }
+	} catch {}
+	return $null
+}
+
+function Set-MBVideoScriptGlobals {
+	# Capture function text + unbound scriptblocks for STA bag.
+	$map = [ordered]@{
+		Resolve     = 'Resolve-MBPlayableVideoPath'
+		StopInline  = 'Stop-MBInlineVideoState'
+		StartInline = 'Start-MBInlineVideoInHost'
+		Toggle      = 'Toggle-MBInlineVideoState'
+		PopOut      = 'Show-MBVideoPlayerWindow'
+	}
+	foreach ($key in @($map.Keys)) {
+		$name = [string]$map[$key]
+		$txt = Get-MBFunctionScriptText -Name $name
+		$sb = $null
+		if ($txt) {
+			try { $sb = [scriptblock]::Create($txt) } catch {}
+		}
+		if ($null -eq $sb) {
+			try {
+				$cmd = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue
+				if ($null -ne $cmd) { $sb = ConvertTo-MBUnboundScriptBlock $cmd.ScriptBlock; $txt = $cmd.ScriptBlock.ToString() }
+			} catch {}
+		}
+		switch ($key) {
+			'Resolve'     { $global:MB_Video_Resolve = $sb; $global:MB_Video_ResolveText = $txt }
+			'StopInline'  { $global:MB_Video_StopInline = $sb; $global:MB_Video_StopInlineText = $txt }
+			'StartInline' { $global:MB_Video_StartInline = $sb; $global:MB_Video_StartInlineText = $txt }
+			'Toggle'      { $global:MB_Video_Toggle = $sb; $global:MB_Video_ToggleText = $txt }
+			'PopOut'      { $global:MB_Video_PopOut = $sb; $global:MB_Video_PopOutText = $txt }
+		}
+	}
+}
+
+# Permanent scriptblock handles (unbound — safe for STA & $W['VideoStartInline'])
+try { Set-MBVideoScriptGlobals } catch {
+	try { $global:MB_Video_Resolve     = ConvertTo-MBUnboundScriptBlock (Get-Item 'Function:Resolve-MBPlayableVideoPath' -ErrorAction SilentlyContinue).ScriptBlock } catch {}
+	try { $global:MB_Video_StopInline  = ConvertTo-MBUnboundScriptBlock (Get-Item 'Function:Stop-MBInlineVideoState' -ErrorAction SilentlyContinue).ScriptBlock } catch {}
+	try { $global:MB_Video_StartInline = ConvertTo-MBUnboundScriptBlock (Get-Item 'Function:Start-MBInlineVideoInHost' -ErrorAction SilentlyContinue).ScriptBlock } catch {}
+	try { $global:MB_Video_Toggle      = ConvertTo-MBUnboundScriptBlock (Get-Item 'Function:Toggle-MBInlineVideoState' -ErrorAction SilentlyContinue).ScriptBlock } catch {}
+	try { $global:MB_Video_PopOut      = ConvertTo-MBUnboundScriptBlock (Get-Item 'Function:Show-MBVideoPlayerWindow' -ErrorAction SilentlyContinue).ScriptBlock } catch {}
+}
+
+function global:Register-MBVideoApi {
+	# Merge into $global:MB_VideoApi. NEVER replace a good scriptblock with $null
+	# (WPF WriteQueue used to call this and wipe the API when Get-Command failed).
+	try { Set-MBVideoScriptGlobals } catch {}
+	$api = $null
+	try {
+		if ($global:MB_VideoApi -is [hashtable]) {
+			$api = @{}
+			foreach ($k in @($global:MB_VideoApi.Keys)) { $api[$k] = $global:MB_VideoApi[$k] }
+		}
+	} catch { $api = $null }
+	if ($null -eq $api) { $api = @{} }
+
+	# Prefer permanent globals set at script load (unbound clones)
+	$prefer = @{
+		StartInline = $global:MB_Video_StartInline
+		StopInline  = $global:MB_Video_StopInline
+		Toggle      = $global:MB_Video_Toggle
+		PopOut      = $global:MB_Video_PopOut
+		Resolve     = $global:MB_Video_Resolve
+	}
+	foreach ($key in @($prefer.Keys)) {
+		if ($null -ne $prefer[$key]) {
+			$api[$key] = $prefer[$key]
+		}
+	}
+
+	# Fill any remaining holes via Get-Command → unbound
+	$map = @{
+		StartInline = 'Start-MBInlineVideoInHost'
+		StopInline  = 'Stop-MBInlineVideoState'
+		Toggle      = 'Toggle-MBInlineVideoState'
+		PopOut      = 'Show-MBVideoPlayerWindow'
+		Resolve     = 'Resolve-MBPlayableVideoPath'
+	}
+	foreach ($key in @($map.Keys)) {
+		if ($null -ne $api[$key]) { continue }
+		$name = [string]$map[$key]
+		$sb = $null
+		try {
+			$cmd = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue
+			if ($null -ne $cmd) { $sb = ConvertTo-MBUnboundScriptBlock $cmd.ScriptBlock }
+		} catch {}
+		if ($null -ne $sb) { $api[$key] = $sb }
+	}
+
+	try { $global:MB_VideoApi = $api } catch {}
+	try {
+		if ($script:MB -is [hashtable]) {
+			$script:MB['Video'] = $api
+		} elseif ($null -ne $script:MB) {
+			try { $script:MB | Add-Member -NotePropertyName Video -NotePropertyValue $api -Force } catch { $script:MB.Video = $api }
+		}
+	} catch {}
+	# WPF STA only sees $W bag. Put both scriptblocks AND source text (STA AddScript rebuilds unbound there).
+	try {
+		$wpfBag = $null
+		if ($script:MB -is [hashtable] -and $script:MB.ContainsKey('Wpf')) { $wpfBag = $script:MB['Wpf'] }
+		elseif ($script:MB.Wpf) { $wpfBag = $script:MB.Wpf }
+		if ($null -ne $wpfBag) {
+			$setIf = {
+				param($bag, $key, $val)
+				if ($null -eq $val) { return }
+				if ($bag -is [hashtable]) { $bag[$key] = $val }
+				else { try { $bag.$key = $val } catch {} }
+			}
+			& $setIf $wpfBag 'VideoApi' $api
+			& $setIf $wpfBag 'VideoStartInline' $api['StartInline']
+			& $setIf $wpfBag 'VideoStopInline' $api['StopInline']
+			& $setIf $wpfBag 'VideoToggle' $api['Toggle']
+			& $setIf $wpfBag 'VideoPopOut' $api['PopOut']
+			& $setIf $wpfBag 'VideoResolve' $api['Resolve']
+			& $setIf $wpfBag 'VideoStartInlineText' $global:MB_Video_StartInlineText
+			& $setIf $wpfBag 'VideoStopInlineText' $global:MB_Video_StopInlineText
+			& $setIf $wpfBag 'VideoToggleText' $global:MB_Video_ToggleText
+			& $setIf $wpfBag 'VideoPopOutText' $global:MB_Video_PopOutText
+			& $setIf $wpfBag 'VideoResolveText' $global:MB_Video_ResolveText
+			if ($wpfBag -is [hashtable] -and -not $wpfBag.ContainsKey('VideoDefaultVolume')) {
+				$wpfBag['VideoDefaultVolume'] = 1.0
+			}
+		}
+	} catch {}
+	return $api
+}
+try { Register-MBVideoApi | Out-Null } catch {}
+
+function Convert-MBMdMediaTarget {
+	# Normalize path/url from markdown ](...) target. Allows spaces (Windows media paths).
+	param([string]$Raw)
+	$p = [string]$Raw
+	if ([string]::IsNullOrWhiteSpace($p)) { return '' }
+	$p = $p.Trim()
+	# markdown title: path "title" or path 'title' (not part of the file path)
+	if ($p -match '^(.*?)\s+"[^"]*"\s*$') { $p = [string]$Matches[1].Trim() }
+	elseif ($p -match "^(.*?)\s+'[^']*'\s*$") { $p = [string]$Matches[1].Trim() }
+	# <path with spaces>
+	if ($p.Length -ge 2 -and $p[0] -eq [char]'<' -and $p[$p.Length - 1] -eq [char]'>') {
+		$p = $p.Substring(1, $p.Length - 2).Trim()
+	}
+	$p = $p.Trim().Trim('"').Trim("'")
+	return $p
+}
+
+function Convert-MBMdMediaLabel {
+	# Display title for image/video/audio cards. PRESERVES spaces in labels and filenames
+	# e.g. ![My Song Title](...), or bare path ...\My Song.mp3 → "My Song".
+	param(
+		[string]$Alt = '',
+		[string]$PathOrDisplay = '',
+		[string]$Fallback = 'Media',
+		[int]$MaxLen = 96
+	)
+	$name = ''
+	if (-not [string]::IsNullOrWhiteSpace($Alt)) {
+		$name = [string]$Alt
+		# unescape common markdown escapes inside labels: \[ \] \( \) \!
+		try { $name = [regex]::Replace($name, '\\([\\\[\]\(\)!])', '$1') } catch {}
+	} elseif (-not [string]::IsNullOrWhiteSpace($PathOrDisplay)) {
+		$p = [string]$PathOrDisplay
+		try { $p = Convert-MBMdMediaTarget -Raw $p } catch {}
+		try {
+			if ($p -match '^(?i)https?://') {
+				$u = [Uri]$p
+				$leaf = [System.IO.Path]::GetFileName($u.AbsolutePath)
+				try { $leaf = [Uri]::UnescapeDataString($leaf) } catch {}
+				$name = [System.IO.Path]::GetFileNameWithoutExtension($leaf)
+				if ([string]::IsNullOrWhiteSpace($name)) { $name = $leaf }
+			} elseif ($p -match '^(?i)file://') {
+				$lp = ([Uri]$p).LocalPath
+				try { $lp = [Uri]::UnescapeDataString($lp) } catch {}
+				$name = [System.IO.Path]::GetFileNameWithoutExtension($lp)
+				if ([string]::IsNullOrWhiteSpace($name)) { $name = [System.IO.Path]::GetFileName($lp) }
+			} else {
+				$name = [System.IO.Path]::GetFileNameWithoutExtension($p)
+				if ([string]::IsNullOrWhiteSpace($name)) { $name = [System.IO.Path]::GetFileName($p) }
+			}
+		} catch {
+			$name = [string]$PathOrDisplay
+		}
+	}
+	try { $name = ConvertTo-MBWpfSafeText -Text $name } catch {}
+	# Keep multi-word titles: only normalize CR/LF/tab and collapse repeated spaces
+	$name = [regex]::Replace([string]$name, '[\r\n\t]+', ' ')
+	$name = [regex]::Replace($name, ' {2,}', ' ')
+	$name = $name.Trim()
+	if ([string]::IsNullOrWhiteSpace($name)) {
+		if ([string]::IsNullOrWhiteSpace($Fallback)) { return '' }
+		return [string]$Fallback
+	}
+	if ($MaxLen -gt 0 -and $name.Length -gt $MaxLen) {
+		$cut = [Math]::Max(1, $MaxLen - 3)
+		$name = $name.Substring(0, $cut).TrimEnd() + '...'
+	}
+	return $name
+}
+
+function Test-MBMdMediaMarkup {
+	# Parse ![alt](path) for image / video / audio.
+	# BOTH alt labels and paths may contain spaces:
+	#   ![My Song Title](C:\Users\Owner\Music\My Song.mp3)
+	#   ![vacation photo](C:\Users\Owner\Pictures\Lake Day.png)
+	# FullLine: entire string must be the markup. Else: match only at start (inline).
+	param(
+		[string]$Text,
+		[switch]$FullLine
+	)
+	$s = [string]$Text
+	if ([string]::IsNullOrWhiteSpace($s)) { return @{ Ok = $false } }
+	if ($FullLine) { $s = $s.Trim() }
+	# Prefer greedy-to-last-) so names like "clip (final).mp4" work for all media kinds.
+	# Inline: try greedy first when the tail looks like a media path; else first ).
+	$tryPaths = New-Object System.Collections.ArrayList
+	if ($s -match '^!\[([^\]]*)\]\(\s*(.+)\s*\)$' -or ((-not $FullLine) -and $s -match '^!\[([^\]]*)\]\(\s*(.+)\s*\)')) {
+		[void]$tryPaths.Add(@{ Alt = [string]$Matches[1]; Raw = [string]$Matches[2]; Matched = [string]$Matches[0] })
+	}
+	if (-not $FullLine -and $s -match '^!\[([^\]]*)\]\(\s*(.+?)\s*\)') {
+		[void]$tryPaths.Add(@{ Alt = [string]$Matches[1]; Raw = [string]$Matches[2]; Matched = [string]$Matches[0] })
+	}
+	foreach ($cand in @($tryPaths)) {
+		$path = Convert-MBMdMediaTarget -Raw ([string]$cand.Raw)
+		if ([string]::IsNullOrWhiteSpace($path)) { continue }
+		$kind = Get-MBMediaKindFromPath -PathOrUrl $path
+		if (-not $kind) { continue }
+		# Preserve multi-word labels (do not split on spaces)
+		$alt = [string]$cand.Alt
+		$alt = [regex]::Replace($alt, '[\r\n\t]+', ' ')
+		$alt = [regex]::Replace($alt, ' {2,}', ' ').Trim()
+		$matched = [string]$cand.Matched
+		return @{
+			Ok      = $true
+			Alt     = $alt
+			Path    = $path
+			Kind    = $kind
+			Matched = $matched
+			Length  = $matched.Length
+		}
+	}
+	return @{ Ok = $false }
+}
+
+function Write-MBWpfMedia {
+	param(
+		[string]$Path,
+		[string]$Alt = '',
+		[string]$Kind = ''
+	)
+	if (-not (Test-MBWpfActive)) { return }
+	$src = Resolve-MBMediaSource -Raw $Path
+	if (-not $src.Ok) {
+		$msg = if ($src.Error) { $src.Error } else { 'cannot load media' }
+		Write-MBWpfStyled -Text ("[media: {0}]" -f $msg) -Color 'DarkYellow'
+		return
+	}
+	$k = [string]$src.Kind
+	if ($Kind -in @('image', 'video', 'audio')) { $k = $Kind }
+	# Keep spaces in song/photo/video titles
+	$altKeep = [string]$Alt
+	$altKeep = [regex]::Replace($altKeep, '[\r\n\t]+', ' ')
+	$altKeep = [regex]::Replace($altKeep, ' {2,}', ' ').Trim()
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'md-media'
+		Text      = [string]$src.Display
+		MediaUri  = [string]$src.Uri
+		MediaKind = $k
+		MediaAlt  = $altKeep
+		Color     = 'Cyan'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 0
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+	$script:MB.MdSkipBlankAfterBlock = $true
+}
+
+function Test-MBMdImageLine {
+	param([string]$Line)
+	$L = ([string]$Line).Trim()
+	# ![alt](path with spaces ok)
+	$mk = Test-MBMdMediaMarkup -Text $L -FullLine
+	if ($mk -and $mk.Ok) {
+		return @{ Ok = $true; Alt = [string]$mk.Alt; Path = [string]$mk.Path; Kind = [string]$mk.Kind }
+	}
+	# Bare media path on its own line (spaces allowed)
+	if ($L -match '^(?i)((?:[a-z]:[\\/]|\\\\|\.{0,2}[\\/]|https?://|file://).+\.(?:png|jpe?g|gif|bmp|webp|tif{1,2}|mp4|m4v|mov|wmv|avi|mkv|webm|mp3|wav|flac|aac|ogg|m4a|wma|opus))$') {
+		$p = Convert-MBMdMediaTarget -Raw ([string]$Matches[1])
+		if (Get-MBMediaKindFromPath -PathOrUrl $p) {
+			return @{ Ok = $true; Alt = ''; Path = $p; Kind = (Get-MBMediaKindFromPath -PathOrUrl $p) }
+		}
+	}
+	return @{ Ok = $false }
 }
 
 function Write-MBMdFlushHold {
@@ -21789,13 +28287,27 @@ function Write-MBMdFlushHold {
 	if (Test-MBMdIsRuleText -S $work) {
 		Complete-MBMdTableIfAny
 		Write-MBMdEmitRule
-		$script:MB.MdAtLineStart = $false
+		$script:MB.MdSkipBlankAfterBlock = $true
+		$script:MB.MdAtLineStart = $true
 		return
 	}
 
 	if ([bool]$script:MB.MdAtLineStart) {
+		# Full-line media: ![alt](path) or bare image/video/audio path (spaces ok)
+		$mediaLine = Test-MBMdImageLine -Line $work
+		if ($mediaLine -and $mediaLine.Ok) {
+			Complete-MBMdTableIfAny
+			$script:MB.MdInList = $false
+			$mkKind = ''
+			try { $mkKind = [string]$mediaLine.Kind } catch {}
+			Write-MBWpfMedia -Path ([string]$mediaLine.Path) -Alt ([string]$mediaLine.Alt) -Kind $mkKind
+			$script:MB.MdAtLineStart = $true
+			$script:MB.MdSkipBlankAfterBlock = $true
+			return
+		}
 		if ($work -match '^```(.*)$') {
 			Complete-MBMdTableIfAny
+			$script:MB.MdInList = $false
 			$script:MB.MdFence = $true
 			$script:MB.MdFenceLang = [string]$Matches[1]
 			$script:MB.MdFenceBuf = ''
@@ -21806,6 +28318,7 @@ function Write-MBMdFlushHold {
 			return
 		}
 		if ($work -match '^(#{1,3})(\s+)(.*)$') {
+			$script:MB.MdInList = $false
 			$level = [int]$Matches[1].Length
 			$body = [string]$Matches[3]
 			$script:MB.MdHeadLevel = $level
@@ -21819,6 +28332,7 @@ function Write-MBMdFlushHold {
 			return
 		}
 		if ($work -match '^(#{1,3})$') {
+			$script:MB.MdInList = $false
 			$level = [int]$Matches[1].Length
 			$script:MB.MdHeadLevel = $level
 			$script:MB.MdLineBold = $true
@@ -21827,11 +28341,13 @@ function Write-MBMdFlushHold {
 			return
 		}
 		if ($work -match '^[-*+]$') {
+			Write-MBMdEnsureListLeadIn
 			Write-MBWpfStyled -Text ([string][char]0x2022) -NoNewline -Color 'DarkGray'
 			$script:MB.MdAtLineStart = $false
 			return
 		}
 		if ($work -match '^[-*+](\s+)(.*)$') {
+			Write-MBMdEnsureListLeadIn
 			Write-MBWpfStyled -Text ([string][char]0x2022 + ' ') -NoNewline -Color 'DarkGray'
 			$script:MB.MdAtLineStart = $false
 			$body = [string]$Matches[2]
@@ -21842,6 +28358,7 @@ function Write-MBMdFlushHold {
 			return
 		}
 		if ($work -match '^(\d+)\.(\s+)(.*)$') {
+			Write-MBMdEnsureListLeadIn
 			Write-MBWpfStyled -Text ($Matches[1] + '. ') -NoNewline -Color 'DarkGray'
 			$script:MB.MdAtLineStart = $false
 			$body = [string]$Matches[3]
@@ -21852,10 +28369,12 @@ function Write-MBMdFlushHold {
 			return
 		}
 		if ($work -match '^(\d+)\.$') {
+			Write-MBMdEnsureListLeadIn
 			Write-MBWpfStyled -Text ($Matches[1] + '.') -NoNewline -Color 'DarkGray'
 			$script:MB.MdAtLineStart = $false
 			return
 		}
+		$script:MB.MdInList = $false
 		if ($work -eq '>') {
 			Write-MBWpfStyled -Text ([string][char]0x2502) -NoNewline -Color 'DarkGray'
 			$script:MB.MdLineItalic = $true
@@ -21875,6 +28394,7 @@ function Write-MBMdFlushHold {
 		}
 	}
 
+	if ([bool]$script:MB.MdAtLineStart) { $script:MB.MdInList = $false }
 	Write-MBMdProcessInline -Text $work
 	$script:MB.MdAtLineStart = $false
 	if (-not (Test-MBMdHoldOpen -S $work)) {
@@ -21893,9 +28413,21 @@ function Write-MBMdEmitWhitespace {
 			Complete-MBMdTableIfAny
 			return
 		}
+		if ([bool]$script:MB.MdSkipBlankAfterBlock -and ($Ws -match '^[\r\n\s]+$')) {
+			$script:MB.MdSkipBlankAfterBlock = $false
+			if ($Ws -match '\n\s*\n') {
+				try { Complete-MBMdTableIfAny } catch {}
+				$script:MB.MdInList = $false
+			}
+			return
+		}
 		if ($Ws -match '\n\s*\n') {
 			Complete-MBMdTableIfAny
+			$script:MB.MdInList = $false
 		}
+	}
+	if ([bool]$script:MB.MdSkipBlankAfterBlock) {
+		$script:MB.MdSkipBlankAfterBlock = $false
 	}
 	Write-MBMdEmit -Text $Ws -NoNewline
 }
@@ -21934,6 +28466,7 @@ function Write-MBMdStreamAppend {
 					}
 				}
 				$script:MB.MdAtLineStart = $true
+				$script:MB.MdSkipBlankAfterBlock = $true
 			} else {
 				$script:MB.MdFenceBuf = [string]$script:MB.MdFenceBuf + $line + "`n"
 				if (Test-MBWpfActive) {
@@ -22392,9 +28925,9 @@ function Update-MBWpfSticky {
 		}
 		if ([string]::IsNullOrWhiteSpace($label)) { $label = $raw.Trim() }
 		$mode = 'ready'
-		if ($label -match '(?i)autocompact|compact') {
+		if ($label -match '(?i)auto-?compact|compact') {
 			$mode = 'compacting'
-			$label = 'autocompacting...'
+			$label = 'auto-compacting...'
 		} elseif ($label -match '(?i)error|fail') {
 			$mode = 'error'
 			$label = 'error'
@@ -22465,6 +28998,14 @@ function Sync-MBAutoCompactFromWpf {
 function Get-MBWpfLowerRightText {
 	try { Sync-MBAutoApproveFromWpf } catch {}
 	try { Sync-MBAutoCompactFromWpf } catch {}
+	try { Sync-MBActiveModelFromWpf } catch {}
+	try {
+		if ($script:MB.Wpf -and [bool]$script:MB.Wpf.RemoteModelsRefreshWanted) {
+			$script:MB.Wpf.RemoteModelsRefreshWanted = $false
+			$null = Refresh-MBRemoteModels -Force
+			try { Update-MBWpfWindowTitle } catch {}
+		}
+	} catch {}
 	$dot = [string][char]0x00B7
 	$parts = New-Object System.Collections.ArrayList
 	$n = 0
@@ -22488,7 +29029,7 @@ function Get-MBWpfAutoCompactLine {
 }
 
 function Update-MBWpfWindowTitle {
-	# Update custom titlebar brand, path, and PoweredBy
+	# Update custom titlebar brand, path, and model picker label
 	if (-not (Test-MBWpfActive)) { return }
 	$W = $script:MB.Wpf
 	if (-not $W) { return }
@@ -22497,14 +29038,13 @@ function Update-MBWpfWindowTitle {
 		$brand = "[{0}-Agent]" -f $agent
 		$path = ''
 		try { $path = Get-MBShortPath -Path $script:MB.WorkingDir -MaxLen 56 } catch { $path = [string]$script:MB.WorkingDir }
-		$alias = ''
-		try { $alias = [string]$ModelAlias } catch { $alias = '' }
-		if ([string]::IsNullOrWhiteSpace($alias)) {
-			try { $alias = [string]$W.ModelAlias } catch { $alias = '' }
-		}
+		$active = ''
+		try { $active = Get-MBActiveModel } catch { $active = '' }
 		$powered = ''
-		if (-not [string]::IsNullOrWhiteSpace($alias)) {
-			$powered = ("PoweredBy: {0}" -f $alias.Trim())
+		if (-not [string]::IsNullOrWhiteSpace($active)) {
+			$powered = ("PoweredBy: {0}" -f $active.Trim())
+		} else {
+			$powered = 'PoweredBy: Select Model'
 		}
 		$dot = [string][char]0x00B7
 		$parts = New-Object System.Collections.ArrayList
@@ -22516,6 +29056,8 @@ function Update-MBWpfWindowTitle {
 		$W.PendingTitleBrandName = $agent
 		$W.PendingTitlePath = $(if ($path) { [string]$path } else { '' })
 		$W.PendingTitlePoweredBy = $powered
+		try { $W.ActiveModel = [string]$script:MB.ActiveModel } catch {}
+		try { $W.RemoteModels = @($script:MB.RemoteModels) } catch {}
 		try { $W.CurrentCwd = [string]$script:MB.WorkingDir } catch {}
 	} catch {}
 }
@@ -22603,7 +29145,7 @@ function Refresh-MBWpfStickyFromSession {
 		if (-not $Hint) {
 			$Hint = "Enter send  {0}  Ctrl+Enter newline  {0}  Esc interrupt  {0}  /help" -f $dot
 		}
-		$st = if ($script:MB.IsCompacting) { 'autocompacting' } `
+		$st = if ($script:MB.IsCompacting) { 'auto-compacting' } `
 			elseif ($script:MB.IsThinking) { 'thinking...' } `
 			elseif ($script:MB.IsWorking) { 'working' } `
 			else { 'ready' }
@@ -22714,6 +29256,15 @@ function Read-MBWpfUserInput {
 				$signaled = $false
 				try { $signaled = $script:MB.Wpf.InputWait.WaitOne(20) } catch { $signaled = $false }
 				try { Sync-MBCwdFromWpf } catch {}
+				# Apply PoweredBy model switch / Add-endpoint while idle (do not wait for next typed line)
+				try { Sync-MBActiveModelFromWpf } catch {}
+				try {
+					if ($script:MB.Wpf -and [bool]$script:MB.Wpf.RemoteModelsRefreshWanted) {
+						$script:MB.Wpf.RemoteModelsRefreshWanted = $false
+						$null = Refresh-MBRemoteModels -Force
+						try { Update-MBWpfWindowTitle } catch {}
+					}
+				} catch {}
 				if ($signaled) {
 					if ($script:MB.Wpf.ExitRequested) {
 						Write-MBDebugLog -Step 'READ_WPF_INPUT_EXIT_AFTER_SIGNAL'
@@ -22746,7 +29297,7 @@ function Restore-MBWpfStickyAfterApproval {
 	$dot = [string][char]0x00B7
 	try {
 		if ($script:MB.IsCompacting) {
-			Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  autocompacting..." -f $dot)
+			Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  auto-compacting..." -f $dot)
 			Update-MBWpfSticky -Status 'compacting'
 		} elseif ($script:MB.IsThinking) {
 			Refresh-MBWpfStickyFromSession -Hint ("esc interrupt  {0}  model thinking..." -f $dot)
@@ -22803,6 +29354,7 @@ function Request-MBWpfConfirmation {
 	try {
 		while ($true) {
 			if ($script:MB.Wpf.ExitRequested) { return $false }
+			try { Sync-MBActiveModelFromWpf } catch {}
 			if ($script:MB.Wpf.InputWait.WaitOne(20)) {
 				$c = ([string]$script:MB.Wpf.InputResult).Trim().ToLowerInvariant()
 				$script:MB.Wpf.InputResult = $null
@@ -22827,7 +29379,7 @@ function Request-MBWpfConfirmation {
 						return $true
 					}
 					default {
-						Write-MBWpfRaw -Text "  Enter Y, N, or A — or use the buttons." -Color Yellow
+						Write-MBWpfRaw -Text "  Enter Y, N, or A - or use the buttons." -Color Yellow
 						Write-MBWpfApprovalButtons
 						Set-MBWpfPromptEnabled -Enabled $true -Focus
 						try { Focus-MBWpfPrompt } catch {}
@@ -23083,6 +29635,7 @@ function Start-MBWpfHost {
 		HdrCenter     = $null
 		HdrRight      = $null
 		HintBar       = $null
+		HintBarBorder = $null
 		StatusDot     = $null
 		LowerCenter   = $null
 		LowerRight    = $null
@@ -23127,6 +29680,26 @@ function Start-MBWpfHost {
 		AgentName     = [string]$AgentName
 		Version       = [string]$Version
 		ModelAlias    = $(try { [string]$ModelAlias } catch { '' })
+		ActiveModel   = $(try { [string]$script:MB.ActiveModel } catch { try { [string]$Model } catch { '' } })
+		ActiveModelBase = $(try { [string]$script:MB.ActiveModelBase } catch { '' })
+		ActiveModelKey = $(try { [string]$script:MB.ActiveModelKey } catch { '' })
+		RemoteModels  = $(try { @($script:MB.RemoteModels) } catch { @() })
+		RemoteModelEntries = $(try { @($script:MB.RemoteModelEntries) } catch { @() })
+		ExtraApiBases = $(try { @($script:MB.ExtraApiBases) } catch { @() })
+		ExtraApiKeys = $(try { if ($script:MB.ExtraApiKeys -is [hashtable]) { $script:MB.ExtraApiKeys } else { @{} } } catch { @{} })
+		ExtraApiAuth = $(try { if ($script:MB.ExtraApiAuth -is [hashtable]) { $script:MB.ExtraApiAuth } else { @{} } } catch { @{} })
+		NpmUser = $(try { [string]$script:MB.NpmUser } catch { '' })
+		NpmPass = $(try { [string]$script:MB.NpmPass } catch { '' })
+		RemoteModelsSeq = 0
+		RemoteModelsSeqApplied = 0
+		RemoteModelsRefreshWanted = $false
+		PendingAddBaseUrl = ''
+		PendingAddBaseApiKey = ''
+		PendingAddBaseAuthMode = 'apikey'
+		PendingAddBaseDirty = $false
+		PendingAddBaseResult = $null
+		ModelDirty    = $false
+		ModelPickerUpdating = $false
 		AutoCompactOn = $(try { [bool]$script:MB.AutoCompact } catch { $true })
 		AutoApproveOn = $(try { [bool]$script:MB.AutoApprove } catch { $false })
 		AutoApproveDirty = $false
@@ -23179,6 +29752,29 @@ function Start-MBWpfHost {
 		DebugLogEnabled = [bool]$(try { [bool]$script:MB.DebugLogEnabled } catch { $false })
 	})
 	$script:MB.Wpf = $wpf
+	# Default OSD volume (0–1); STA AddScript / StartInline read this from the bag
+	try { $wpf['VideoDefaultVolume'] = 1.0 } catch {}
+	# Fresh-bind video helpers as UNBOUND scriptblocks + source text for STA rebuild
+	try {
+		Set-MBVideoScriptGlobals | Out-Null
+		Register-MBVideoApi | Out-Null
+		$apiV = $null
+		try { $apiV = $global:MB_VideoApi } catch {}
+		if ($null -ne $apiV) {
+			if ($null -ne $apiV['StartInline']) { $wpf['VideoStartInline'] = $apiV['StartInline'] }
+			if ($null -ne $apiV['StopInline']) { $wpf['VideoStopInline'] = $apiV['StopInline'] }
+			if ($null -ne $apiV['Toggle']) { $wpf['VideoToggle'] = $apiV['Toggle'] }
+			if ($null -ne $apiV['PopOut']) { $wpf['VideoPopOut'] = $apiV['PopOut'] }
+			if ($null -ne $apiV['Resolve']) { $wpf['VideoResolve'] = $apiV['Resolve'] }
+			$wpf['VideoApi'] = $apiV
+		}
+		# Source text — STA AddScript re-[scriptblock]::Create these so New-Object works there
+		if ($global:MB_Video_StartInlineText) { $wpf['VideoStartInlineText'] = $global:MB_Video_StartInlineText }
+		if ($global:MB_Video_StopInlineText) { $wpf['VideoStopInlineText'] = $global:MB_Video_StopInlineText }
+		if ($global:MB_Video_ToggleText) { $wpf['VideoToggleText'] = $global:MB_Video_ToggleText }
+		if ($global:MB_Video_PopOutText) { $wpf['VideoPopOutText'] = $global:MB_Video_PopOutText }
+		if ($global:MB_Video_ResolveText) { $wpf['VideoResolveText'] = $global:MB_Video_ResolveText }
+	} catch {}
 	# Shared robot path catalog for UI runspace
 	try {
 		$wpf.RobotCatalog = Get-MBRobotPathCatalog
@@ -23204,6 +29800,38 @@ function Start-MBWpfHost {
 			Add-Type -AssemblyName PresentationCore
 			Add-Type -AssemblyName WindowsBase
 			Add-Type -AssemblyName System.Xaml
+
+			# Rebuild video Start/Stop/etc in THIS STA runspace (unbound). Bag scriptblocks from
+			# the main runspace lose New-Object/Test-Path; Create() here fixes that.
+			try {
+				if ($W -is [hashtable]) {
+					if (-not $W.ContainsKey('VideoDefaultVolume') -or $null -eq $W['VideoDefaultVolume']) {
+						$W['VideoDefaultVolume'] = 1.0
+					}
+					foreach ($pair in @(
+						@{ T = 'VideoStartInlineText'; K = 'VideoStartInline' },
+						@{ T = 'VideoStopInlineText';  K = 'VideoStopInline' },
+						@{ T = 'VideoToggleText';      K = 'VideoToggle' },
+						@{ T = 'VideoPopOutText';      K = 'VideoPopOut' },
+						@{ T = 'VideoResolveText';     K = 'VideoResolve' }
+					)) {
+						$txt = $W[$pair.T]
+						if ([string]::IsNullOrWhiteSpace([string]$txt)) { continue }
+						try {
+							$W[$pair.K] = [scriptblock]::Create([string]$txt)
+						} catch {}
+					}
+					try {
+						if ($W['VideoApi'] -is [hashtable]) {
+							if ($W['VideoStartInline']) { $W['VideoApi']['StartInline'] = $W['VideoStartInline'] }
+							if ($W['VideoStopInline'])  { $W['VideoApi']['StopInline']  = $W['VideoStopInline'] }
+							if ($W['VideoToggle'])      { $W['VideoApi']['Toggle']      = $W['VideoToggle'] }
+							if ($W['VideoPopOut'])      { $W['VideoApi']['PopOut']      = $W['VideoPopOut'] }
+							if ($W['VideoResolve'])     { $W['VideoApi']['Resolve']     = $W['VideoResolve'] }
+						}
+					} catch {}
+				}
+			} catch {}
 
 			$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -23505,10 +30133,10 @@ function Start-MBWpfHost {
           </Grid.ColumnDefinitions>
           <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
             <!-- Titlebar robot -->
-            <Grid x:Name="TitleRobotHost" Width="22" Height="22" Margin="4,0,0,0"
+            <Grid x:Name="TitleRobotHost" Width="26" Height="26" Margin="4,0,0,0"
                   VerticalAlignment="Center" ToolTip="MiniBot"
                   shell:WindowChrome.IsHitTestVisibleInChrome="True">
-              <Path x:Name="TitleRobotPath" Width="18" Height="18" Stretch="Uniform"
+              <Path x:Name="TitleRobotPath" Width="22" Height="22" Stretch="Uniform"
                     HorizontalAlignment="Center" VerticalAlignment="Center"
                     Data="M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z">
                 <Path.Fill>
@@ -23600,21 +30228,28 @@ function Start-MBWpfHost {
                          shell:WindowChrome.IsHitTestVisibleInChrome="True"/>
             </Grid>
           </StackPanel>
-          <Grid Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right"
-                Margin="12,0,10,0" MaxWidth="280">
-            <TextBlock x:Name="TitlePoweredByShadow" Text="" Foreground="#000000" FontSize="12"
-                       VerticalAlignment="Center" HorizontalAlignment="Right"
-                       Margin="1.2,1.2,0,0" Opacity="0.9"
-                       TextTrimming="CharacterEllipsis" MaxWidth="280" IsHitTestVisible="False">
-              <TextBlock.Effect>
-                <DropShadowEffect Color="#000000" BlurRadius="3.5" ShadowDepth="0"
-                                  Opacity="0.85" Direction="0"/>
-              </TextBlock.Effect>
-            </TextBlock>
-            <TextBlock x:Name="TitlePoweredBy" Text="" Foreground="#8A8A96" FontSize="12"
-                       VerticalAlignment="Center" HorizontalAlignment="Right"
-                       TextTrimming="CharacterEllipsis" MaxWidth="280"/>
-          </Grid>
+          <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center"
+                      HorizontalAlignment="Right" Margin="12,0,10,0" MaxWidth="320">
+            <TextBlock x:Name="TitlePoweredByLabel" Text="PoweredBy: " Foreground="#8A8A96" FontSize="12"
+                       VerticalAlignment="Center" Margin="0,0,4,0"/>
+            <!-- Themed model chip (tool-group style): click toggles dark ContextMenu -->
+            <Border x:Name="TitleModelPicker" Background="#3A3A42" BorderBrush="#4A4A56"
+                    BorderThickness="1" CornerRadius="3" Padding="7,2,6,2"
+                    VerticalAlignment="Center" Cursor="Hand" MaxWidth="230"
+                    SnapsToDevicePixels="True"
+                    shell:WindowChrome.IsHitTestVisibleInChrome="True">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock x:Name="TitleModelPickerText" Text="Select Model"
+                           Foreground="#BB9AF7" FontSize="11" FontWeight="SemiBold"
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                           MaxWidth="195"/>
+                <TextBlock Text=" &#x25BE;" Foreground="#8A8A96" FontSize="10"
+                           VerticalAlignment="Center" Margin="1,0,0,0"/>
+              </StackPanel>
+            </Border>
+            <TextBlock x:Name="TitlePoweredBy" Visibility="Collapsed"/>
+            <TextBlock x:Name="TitlePoweredByShadow" Visibility="Collapsed"/>
+          </StackPanel>
           <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Stretch">
             <!-- Window buttons -->
             <Button x:Name="TitleBtnMin" Width="46" Height="36"
@@ -23652,6 +30287,7 @@ function Start-MBWpfHost {
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="*"/>
+          <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
@@ -23725,10 +30361,47 @@ function Start-MBWpfHost {
                         FontFamily="Consolas, Cascadia Mono, Segoe UI Emoji, Segoe UI Symbol, Courier New"/>
         </RichTextBox>
 
+ <!-- Speech visualizer (real TTS PCM from SAPI WaveStream - no WASAPI) -->
+        <Border x:Name="SpeechWaveBox" Grid.Row="3" Visibility="Collapsed"
+                Background="#1A1A1E" BorderBrush="#3A3A42" BorderThickness="1"
+                CornerRadius="6" Margin="12,8,12,6" HorizontalAlignment="Stretch"
+                SnapsToDevicePixels="True" ClipToBounds="True">
+          <Grid>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="84"/>
+            </Grid.RowDefinitions>
+            <Border Grid.Row="0" Background="#252530" Padding="10,5,10,5"
+                    CornerRadius="5,5,0,0" SnapsToDevicePixels="True">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="SpeechWaveLang" Grid.Column="0" Text="speech"
+                           Foreground="#8A8A96" FontSize="11"
+                           FontFamily="Consolas, Cascadia Mono, Courier New"
+                           VerticalAlignment="Center"/>
+                <TextBlock x:Name="SpeechWaveStatus" Grid.Column="1" Text="idle"
+                           Foreground="#6A6A76" FontSize="11"
+                           FontFamily="Consolas, Cascadia Mono, Courier New"
+                           VerticalAlignment="Center" Margin="12,0,0,0"/>
+              </Grid>
+            </Border>
+            <Border Grid.Row="1" Background="#121216" CornerRadius="0,0,5,5" ClipToBounds="True">
+              <Canvas x:Name="SpeechWaveCanvas" Background="Transparent" ClipToBounds="True">
+                <Polyline x:Name="SpeechWaveLine" Stroke="#00BFFF" StrokeThickness="1.35"
+                          StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                          SnapsToDevicePixels="False"/>
+              </Canvas>
+            </Border>
+          </Grid>
+        </Border>
+
  <!-- Lower status: status+timer (dynamic width by mode) | ctx | meta
              ready → compact (ctx far left); thinking/working → same reserved band + timer;
-             autocompacting → label may grow and shift ctx once. -->
-        <Border Grid.Row="3" Background="#1E1E24" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="12,4">
+             auto-compacting → label may grow and shift ctx once. -->
+        <Border Grid.Row="4" Background="#1E1E24" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="12,4">
           <Grid>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="Auto"/>
@@ -23760,7 +30433,7 @@ function Start-MBWpfHost {
         </Border>
 
  <!-- Prompt -->
-        <Border Grid.Row="4" Background="#1A1A1E" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="10,8">
+        <Border Grid.Row="5" Background="#1A1A1E" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="10,8">
           <Grid>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="Auto"/>
@@ -23780,7 +30453,7 @@ function Start-MBWpfHost {
             <Button x:Name="SendBtn" Grid.Column="2" Width="88" MinHeight="41"
                     VerticalAlignment="Stretch" Cursor="Hand" ToolTip="Send"
                     HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
-                    Background="#3A3A42" Foreground="#8A8A96" BorderBrush="#52525C" BorderThickness="1"
+                    Background="#2A2A30" Foreground="#8A8A96" BorderBrush="#3A3A42" BorderThickness="1"
                     Padding="6,0" Margin="0,0,3,1" IsEnabled="False"
                     Template="{StaticResource NoMouseOverButtonTemplate}">
               <!-- Send icon -->
@@ -23803,8 +30476,10 @@ function Start-MBWpfHost {
           </Grid>
         </Border>
 
- <!-- Hints -->
-        <Border Grid.Row="5" Background="#16161A" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="12,4">
+ <!-- Hints (bottom corners match chrome when restored) -->
+        <Border x:Name="HintBarBorder" Grid.Row="6" Background="#16161A" BorderBrush="#2A2A30"
+                BorderThickness="0,1,0,0" Padding="12,4"
+                CornerRadius="0,0,8,8" SnapsToDevicePixels="True">
           <TextBlock x:Name="HintBar" Text="enter send  |  Ctrl+Enter newline  |  Esc / Stop interrupt  |  /help"
                      Foreground="#5A5A66" FontSize="11"/>
         </Border>
@@ -23832,9 +30507,16 @@ function Start-MBWpfHost {
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                   <TextBlock VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold">
-                    <Run Text="[" Foreground="#A0A0AA"/><Run Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
+                    <Run Text="[" Foreground="#A0A0AA"/><Run x:Name="AuthBarBrandName" Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
                   </TextBlock>
-                  <TextBlock Text="Login" Foreground="#C8C8D0" FontSize="12" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                  <Ellipse Width="3.5" Height="3.5" Fill="#8A8A96"
+                           Margin="9,1,9,0" VerticalAlignment="Center" Opacity="0.9"
+                           SnapsToDevicePixels="False">
+                    <Ellipse.Effect>
+                      <DropShadowEffect Color="#000000" BlurRadius="1.5" ShadowDepth="0.5" Opacity="0.45" Direction="270"/>
+                    </Ellipse.Effect>
+                  </Ellipse>
+                  <TextBlock Text="Login" Foreground="#C8C8D0" FontSize="12" VerticalAlignment="Center"/>
                 </StackPanel>
                 <Button x:Name="AuthTitleClose" Grid.Column="1" Width="46" Height="36"
                         Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
@@ -23844,7 +30526,8 @@ function Start-MBWpfHost {
                 </Button>
               </Grid>
             </Border>
-            <Border Grid.Row="1" Background="#121216" Padding="22,18,22,14">
+            <Border Grid.Row="1" Background="#121216" Padding="22,18,22,14"
+                    CornerRadius="0,0,8,8" SnapsToDevicePixels="True">
               <Grid>
                 <Grid.RowDefinitions>
                   <RowDefinition Height="Auto"/>
@@ -23910,9 +30593,16 @@ function Start-MBWpfHost {
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                   <TextBlock VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold">
-                    <Run Text="[" Foreground="#A0A0AA"/><Run Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
+                    <Run Text="[" Foreground="#A0A0AA"/><Run x:Name="ConfirmBarBrandName" Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
                   </TextBlock>
-                  <TextBlock Text="Confirm" Foreground="#C8C8D0" FontSize="12" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                  <Ellipse Width="3.5" Height="3.5" Fill="#8A8A96"
+                           Margin="9,1,9,0" VerticalAlignment="Center" Opacity="0.9"
+                           SnapsToDevicePixels="False">
+                    <Ellipse.Effect>
+                      <DropShadowEffect Color="#000000" BlurRadius="1.5" ShadowDepth="0.5" Opacity="0.45" Direction="270"/>
+                    </Ellipse.Effect>
+                  </Ellipse>
+                  <TextBlock Text="Confirm" Foreground="#C8C8D0" FontSize="12" VerticalAlignment="Center"/>
                 </StackPanel>
                 <Button x:Name="ConfirmTitleClose" Grid.Column="1" Width="46" Height="36"
                         Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
@@ -23922,7 +30612,8 @@ function Start-MBWpfHost {
                 </Button>
               </Grid>
             </Border>
-            <Border Grid.Row="1" Background="#121216" Padding="22,18,22,16">
+            <Border Grid.Row="1" Background="#121216" Padding="22,18,22,16"
+                    CornerRadius="0,0,8,8" SnapsToDevicePixels="True">
               <Grid>
                 <Grid.RowDefinitions>
                   <RowDefinition Height="Auto"/>
@@ -23979,10 +30670,17 @@ function Start-MBWpfHost {
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                   <TextBlock VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold">
-                    <Run Text="[" Foreground="#A0A0AA"/><Run Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
+                    <Run Text="[" Foreground="#A0A0AA"/><Run x:Name="SessionBarBrandName" Text="MiniBot" Foreground="#B80F0A"/><Run Text="-" Foreground="#A0A0AA"/><Run Text="Agent" Foreground="#B80F0A"/><Run Text="]" Foreground="#A0A0AA"/>
                   </TextBlock>
+                  <Ellipse Width="3.5" Height="3.5" Fill="#8A8A96"
+                           Margin="9,1,9,0" VerticalAlignment="Center" Opacity="0.9"
+                           SnapsToDevicePixels="False">
+                    <Ellipse.Effect>
+                      <DropShadowEffect Color="#000000" BlurRadius="1.5" ShadowDepth="0.5" Opacity="0.45" Direction="270"/>
+                    </Ellipse.Effect>
+                  </Ellipse>
                   <TextBlock x:Name="SessionPickerTitle" Text="Load session" Foreground="#C8C8D0" FontSize="12"
-                             Margin="12,0,0,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="420"/>
+                             VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="420"/>
                 </StackPanel>
                 <Button x:Name="SessionPickerTitleClose" Grid.Column="1" Width="46" Height="36"
                         Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
@@ -23992,7 +30690,8 @@ function Start-MBWpfHost {
                 </Button>
               </Grid>
             </Border>
-            <Grid Grid.Row="1" Margin="16,14,16,14">
+            <Border Grid.Row="1" Background="#121216" CornerRadius="0,0,8,8" SnapsToDevicePixels="True">
+            <Grid Margin="16,14,16,14">
             <Grid.RowDefinitions>
               <RowDefinition Height="Auto"/>
               <RowDefinition Height="Auto"/>
@@ -24061,6 +30760,7 @@ function Start-MBWpfHost {
                       IsCancel="False"/>
             </StackPanel>
             </Grid>
+            </Border>
           </Grid>
         </Border>
       </Grid>
@@ -24338,6 +31038,1039 @@ function Start-MBWpfHost {
 			$W.TitlePathShadow = $window.FindName('TitlePathShadow')
 			$W.TitlePoweredBy = $window.FindName('TitlePoweredBy')
 			$W.TitlePoweredByShadow = $window.FindName('TitlePoweredByShadow')
+			$W.TitlePoweredByLabel = $window.FindName('TitlePoweredByLabel')
+			$W.TitleModelPicker = $window.FindName('TitleModelPicker')
+			$W.TitleModelPickerText = $window.FindName('TitleModelPickerText')
+			$W.RemoteModelsSeqApplied = 0
+			$W.ModelPickerUpdating = $false
+			$W.ActiveModel = $(try { [string]$W.ActiveModel } catch { '' })
+			$W.ModelDirty = $false
+			if (-not $W.RemoteModels) { $W.RemoteModels = @() }
+			$W.ShortModelLabel = {
+				param([string]$Id, [int]$MaxLen = 36)
+				$m = ([string]$Id).Trim()
+				if ([string]::IsNullOrWhiteSpace($m)) { return 'Select Model' }
+				if ($m.Length -le $MaxLen) { return $m }
+				$m2 = $m -replace '\.gguf$', ''
+				if ($m2.Length -le $MaxLen) { return $m2 }
+				return ($m2.Substring(0, [math]::Max(1, $MaxLen - 3)) + '...')
+			}.GetNewClosure()
+			# Dark themed ToolTip (matches tool-group chips / menus)
+			$W.MakeThemedToolTip = {
+				param([string]$Text, [double]$MaxWidth = 340)
+				if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+				try {
+					$bc = New-Object System.Windows.Media.BrushConverter
+					foreach ($hx in @('#1A1A1E', '#C8C8D0', '#3A3A42')) {
+						if (-not $W.BrushCache.ContainsKey($hx)) {
+							try { $W.BrushCache[$hx] = $bc.ConvertFromString($hx) } catch {}
+						}
+					}
+					$tipBg = $W.BrushCache['#1A1A1E']
+					$tipFg = $W.BrushCache['#C8C8D0']
+					$tipBd = $W.BrushCache['#3A3A42']
+					$tip = New-Object System.Windows.Controls.ToolTip
+					$tip.Background = $tipBg
+					$tip.Foreground = $tipFg
+					$tip.BorderBrush = $tipBd
+					$tip.BorderThickness = New-Object System.Windows.Thickness(1)
+					$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
+					$tip.HasDropShadow = $true
+					try { $tip.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Mouse } catch {}
+					$ttb = New-Object System.Windows.Controls.TextBlock
+					$ttb.Text = [string]$Text
+					$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+					$ttb.MaxWidth = [double]$MaxWidth
+					$ttb.Foreground = $tipFg
+					$ttb.FontSize = 12
+					$ttb.LineHeight = 16
+					try {
+						if ($W.MonoFont) { $ttb.FontFamily = $W.MonoFont }
+					} catch {}
+					$tip.Content = $ttb
+					return $tip
+				} catch {
+					return [string]$Text
+				}
+			}.GetNewClosure()
+			$W.SetThemedToolTip = {
+				param($Target, [string]$Text, [double]$MaxWidth = 340)
+				if ($null -eq $Target) { return }
+				try {
+					$obj = $null
+					if ($W.MakeThemedToolTip) { $obj = & $W.MakeThemedToolTip $Text $MaxWidth }
+					if ($null -ne $obj) {
+						$Target.ToolTip = $obj
+						try {
+							[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($Target, 350)
+							[System.Windows.Controls.ToolTipService]::SetShowDuration($Target, 20000)
+						} catch {}
+					} else {
+						$Target.ToolTip = [string]$Text
+					}
+				} catch {
+					try { $Target.ToolTip = [string]$Text } catch {}
+				}
+			}.GetNewClosure()
+			$W.BuildModelMenu = {
+				param([object[]]$Models = @(), [string]$Selected = '')
+				try {
+					$chip = $W.TitleModelPicker
+					$lbl = $W.TitleModelPickerText
+					if (-not $chip) { return }
+					$bc = New-Object System.Windows.Media.BrushConverter
+					foreach ($hx in @('#1A1A1E', '#C8C8D0', '#3A3A42', '#BB9AF7', '#8A8A96', '#B8F07A')) {
+						if (-not $W.BrushCache.ContainsKey($hx)) {
+							try { $W.BrushCache[$hx] = $bc.ConvertFromString($hx) } catch {}
+						}
+					}
+					$menuBg = $W.BrushCache['#1A1A1E']
+					$menuFg = $W.BrushCache['#C8C8D0']
+					$chipBg = $W.BrushCache['#3A3A42']
+					$accent = $W.BrushCache['#BB9AF7']
+					$muted = $W.BrushCache['#8A8A96']
+					$selFg = $W.BrushCache['#B8F07A']
+					$entries = @()
+					try { $entries = @($W.RemoteModelEntries) } catch { $entries = @() }
+					if ($entries.Count -eq 0 -and $Models -and @($Models).Count -gt 0) {
+						# Fallback: plain id list (primary only)
+						$entries = @($Models | ForEach-Object {
+							[pscustomobject]@{ Key = [string]$_; Id = [string]$_; Base = ''; Host = ''; Label = [string]$_ }
+						})
+					}
+					$sel = ([string]$Selected).Trim()
+					$selKey = ''
+					try { $selKey = [string]$W.ActiveModelKey } catch { $selKey = '' }
+					if ($entries.Count -eq 1) {
+						$sel = [string]$entries[0].Id
+						$selKey = [string]$entries[0].Key
+						$curKey = ''
+						try { $curKey = [string]$W.ActiveModelKey } catch { $curKey = '' }
+						$W.ActiveModel = $sel
+						$W.ActiveModelBase = [string]$entries[0].Base
+						$W.ActiveModelKey = $selKey
+						# Only mark dirty when selection actually changes (avoids switch/save loops)
+						if ($curKey -ne $selKey) { $W.ModelDirty = $true }
+					} elseif ($entries.Count -gt 1) {
+						$hit = $null
+						if ($selKey) { $hit = @($entries | Where-Object { $_.Key -eq $selKey } | Select-Object -First 1) }
+						if (-not $hit -and $sel) { $hit = @($entries | Where-Object { $_.Id -eq $sel } | Select-Object -First 1) }
+						if ($hit) {
+							$sel = [string]$hit.Id
+							$selKey = [string]$hit.Key
+						} else {
+							$sel = ''
+							$selKey = ''
+						}
+					}
+					$display = if ($sel) { (& $W.ShortModelLabel $sel 36) } else { 'Select Model' }
+					if ($lbl) {
+						$lbl.Text = $display
+						$lbl.Foreground = $(if ($sel) { $accent } else { $muted })
+					}
+					if ($entries.Count -eq 0) {
+						$chip.Opacity = 0.55
+						$chip.IsEnabled = $true
+						if ($W.SetThemedToolTip) {
+							& $W.SetThemedToolTip $chip 'No models yet - click to refresh or add an endpoint'
+						} else {
+							$chip.ToolTip = 'No models yet - click to refresh or add an endpoint'
+						}
+					} else {
+						$chip.Opacity = 1.0
+						$chip.IsEnabled = $true
+						$tipBase = ''
+						try {
+							if ($selKey) {
+								$he = @($entries | Where-Object { $_.Key -eq $selKey } | Select-Object -First 1)
+								if ($he -and $he.Host) { $tipBase = "`nEndpoint: $($he.Host)" }
+							}
+						} catch {}
+						$tipTxt = if ($sel) {
+							"Model: $sel$tipBase`nClick to open/close model list or add endpoint"
+						} else {
+							'Click to open/close model list or add endpoint'
+						}
+						if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $chip $tipTxt }
+						else { $chip.ToolTip = $tipTxt }
+					}
+					$cm = New-Object System.Windows.Controls.ContextMenu
+					try {
+						$cm.Background = $menuBg
+						$cm.Foreground = $menuFg
+						$cm.BorderBrush = $chipBg
+						$cm.BorderThickness = New-Object System.Windows.Thickness(1)
+						$cm.Padding = New-Object System.Windows.Thickness(2)
+						if ($null -eq $cm.Resources) { $cm.Resources = New-Object System.Windows.ResourceDictionary }
+						try { $cm.Resources[[System.Windows.SystemColors]::MenuBrushKey] = $menuBg } catch {}
+						try { $cm.Resources[[System.Windows.SystemColors]::MenuBarBrushKey] = $menuBg } catch {}
+						try { $cm.Resources[[System.Windows.SystemColors]::ControlBrushKey] = $menuBg } catch {}
+						try { $cm.Resources[[System.Windows.SystemColors]::MenuTextBrushKey] = $menuFg } catch {}
+						try { $cm.Resources[[System.Windows.SystemColors]::HighlightBrushKey] = $chipBg } catch {}
+						try { $cm.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = $menuFg } catch {}
+						try {
+							$cmTplXaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ContextMenu">
+  <Border Background="{TemplateBinding Background}"
+          BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}"
+          CornerRadius="4" Padding="{TemplateBinding Padding}"
+          SnapsToDevicePixels="True">
+    <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+  </Border>
+</ControlTemplate>
+'@
+							$cmTpl = [Windows.Markup.XamlReader]::Parse($cmTplXaml)
+							if ($null -ne $cmTpl) { $cm.Template = $cmTpl }
+						} catch {}
+						try {
+							$miStyle = New-Object System.Windows.Style ([System.Windows.Controls.MenuItem])
+							$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::BackgroundProperty, $menuBg)))
+							$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::BorderThicknessProperty, (New-Object System.Windows.Thickness(0)))))
+							$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::PaddingProperty, (New-Object System.Windows.Thickness(10, 5, 14, 5)))))
+							$miTplXaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="MenuItem">
+  <Border x:Name="Bd" Background="{TemplateBinding Background}"
+          BorderThickness="0" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True"
+          TextElement.Foreground="{TemplateBinding Foreground}">
+    <ContentPresenter ContentSource="Header" RecognizesAccessKey="True"
+                      VerticalAlignment="Center" HorizontalAlignment="Left"
+                      TextElement.Foreground="{TemplateBinding Foreground}"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsHighlighted" Value="True">
+      <Setter TargetName="Bd" Property="Background" Value="#3A3A42"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+							$miTpl = [Windows.Markup.XamlReader]::Parse($miTplXaml)
+							if ($null -ne $miTpl) {
+								$miStyle.Setters.Add((New-Object System.Windows.Setter([System.Windows.Controls.Control]::TemplateProperty, $miTpl)))
+							}
+							$cm.Resources[[System.Windows.Controls.MenuItem]] = $miStyle
+						} catch {}
+					} catch {}
+					if ($entries.Count -eq 0) {
+						$mi = New-Object System.Windows.Controls.MenuItem
+						$mi.Header = 'No models . click chip to refresh'
+						$mi.IsEnabled = $false
+						$mi.Foreground = $muted
+						[void]$cm.Items.Add($mi)
+					} else {
+						$menuCount = 0
+						foreach ($ent in $entries) {
+							$mid = [string]$ent.Id
+							$ekey = [string]$ent.Key
+							$elabel = if ($ent.Label) { [string]$ent.Label } else { $mid }
+							# Active model stays on the chip only - never list it in the switch menu
+							$isSel = ($selKey -and $ekey -eq $selKey) -or ((-not $selKey) -and $sel -and $mid -eq $sel)
+							if ($isSel) { continue }
+							$mi = New-Object System.Windows.Controls.MenuItem
+							$mi.IsEnabled = $true
+							$mi.Focusable = $false
+							try { $mi.StaysOpenOnClick = $false } catch {}
+							$hdr = New-Object System.Windows.Controls.TextBlock
+							$hdr.Text = "  $elabel"
+							$hdr.FontSize = 12
+							$hdr.Foreground = $menuFg
+							$mi.Header = $hdr
+							$mi.Tag = [pscustomobject]@{ Id = $mid; Base = [string]$ent.Base; Key = $ekey }
+							$mi.Background = $menuBg
+							$mi.Foreground = $menuFg
+							$null = $mi.Add_Click({
+								param($s2, $e2)
+								try {
+									$tag = $null
+									try { $tag = $s2.Tag } catch { $tag = $null }
+									$id = ''; $b = ''; $k = ''
+									if ($tag -is [string]) { $id = [string]$tag }
+									else {
+										try { $id = [string]$tag.Id } catch {}
+										try { $b = [string]$tag.Base } catch {}
+										try { $k = [string]$tag.Key } catch {}
+									}
+									if ([string]::IsNullOrWhiteSpace($id)) { return }
+									$W.ActiveModel = $id
+									$W.ActiveModelBase = $b
+									$W.ActiveModelKey = $k
+									$W.ModelDirty = $true
+									if ($W.TitleModelPickerText) {
+										$W.TitleModelPickerText.Text = (& $W.ShortModelLabel $id 36)
+										$W.TitleModelPickerText.Foreground = $W.BrushCache['#BB9AF7']
+									}
+									if ($W.TitleModelPicker) {
+										$tipTxt = "Model: $id`nClick to change or add endpoint"
+										if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $W.TitleModelPicker $tipTxt }
+										else { $W.TitleModelPicker.ToolTip = $tipTxt }
+									}
+									try {
+										if ($W.BuildModelMenu) { & $W.BuildModelMenu @($W.RemoteModels) $id }
+									} catch {}
+								} catch {}
+							}.GetNewClosure())
+							[void]$cm.Items.Add($mi)
+							$menuCount++
+						}
+						if ($menuCount -eq 0 -and $entries.Count -gt 0) {
+							$mi = New-Object System.Windows.Controls.MenuItem
+							$mi.Header = '(active model - add another endpoint to switch)'
+							$mi.IsEnabled = $false
+							$mi.Foreground = $muted
+							[void]$cm.Items.Add($mi)
+						}
+					}
+					# Separator + add endpoint
+					try {
+						$sep = New-Object System.Windows.Controls.Separator
+						try { $sep.Background = $chipBg } catch {}
+						try { $sep.Margin = New-Object System.Windows.Thickness(4, 4, 4, 4) } catch {}
+						[void]$cm.Items.Add($sep)
+					} catch {}
+					$addMi = New-Object System.Windows.Controls.MenuItem
+					$addMi.IsEnabled = $true
+					$addMi.Focusable = $false
+					$addHdr = New-Object System.Windows.Controls.TextBlock
+					$addHdr.Text = '+  Add endpoint...'
+					$addHdr.FontSize = 12
+					$addHdr.Foreground = $accent
+					$addMi.Header = $addHdr
+					$addMi.Background = $menuBg
+					$addMi.Foreground = $accent
+					$null = $addMi.Add_Click({
+						param($s2, $e2)
+						try {
+							if ($W.ShowAddEndpointDialog) { & $W.ShowAddEndpointDialog }
+						} catch {}
+					}.GetNewClosure())
+					[void]$cm.Items.Add($addMi)
+					try {
+						$cm.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+						$cm.PlacementTarget = $chip
+						$cm.HorizontalOffset = 0
+						$cm.VerticalOffset = 2
+					} catch {}
+					# Keep open state if rebuild happens while menu is visible
+					$wasShowing = $false
+					try { $wasShowing = [bool]$W.ModelMenuIsShowing } catch { $wasShowing = $false }
+					try {
+						$oldCm = $chip.ContextMenu
+						if ($oldCm -and [bool]$oldCm.IsOpen) {
+							$wasShowing = $true
+							try { $oldCm.IsOpen = $false } catch {}
+						}
+					} catch {}
+					$chip.ContextMenu = $cm
+					$null = $cm.Add_Closed({
+						try { $W.ModelMenuIsShowing = $false } catch {}
+						# Same left-click that dismisses the menu is delivered to the chip next —
+						# stamp close time so PreviewMouseLeftButtonDown does not reopen it.
+						try { $W.ModelMenuClosedTick = [Environment]::TickCount } catch {}
+					}.GetNewClosure())
+					# One-time click toggle (open on first click, close on second)
+					if (-not $W.ModelPickerClickHooked) {
+						$W.ModelPickerClickHooked = $true
+						try { $W.ModelMenuIsShowing = $false } catch {}
+						try { $W.ModelMenuClosedTick = 0 } catch {}
+						$null = $chip.Add_PreviewMouseLeftButtonDown({
+							param($sender, $e)
+							try {
+								if (-not $sender) { return }
+								$m = $null
+								try { $m = $sender.ContextMenu } catch { $m = $null }
+								if (-not $m) { return }
+								$e.Handled = $true
+								$now = [Environment]::TickCount
+
+								# Click that just closed the menu (WPF closes first, then raises this on the chip)
+								$closedTick = 0
+								try { $closedTick = [int]$W.ModelMenuClosedTick } catch { $closedTick = 0 }
+								if ($closedTick -ne 0) {
+									$dt = ($now - $closedTick) -band 0x7fffffff
+									if ($dt -lt 500) {
+										try { $W.ModelMenuClosedTick = 0 } catch {}
+										try { $W.ModelMenuIsShowing = $false } catch {}
+										try { $m.IsOpen = $false } catch {}
+										return
+									}
+								}
+
+								$isOpen = $false
+								try { if ([bool]$m.IsOpen) { $isOpen = $true } } catch {}
+								try { if ([bool]$W.ModelMenuIsShowing) { $isOpen = $true } } catch {}
+								if ($isOpen) {
+									try { $W.ModelMenuIsShowing = $false } catch {}
+									try { $W.ModelMenuClosedTick = $now } catch {}
+									try { $m.IsOpen = $false } catch {}
+									return
+								}
+
+								# Open (refresh list only when empty — rebuild while open breaks toggle)
+								try {
+									$needRefresh = $false
+									$ents = $null
+									try { $ents = @($W.RemoteModelEntries) } catch { $ents = @() }
+									if (-not $ents -or $ents.Count -eq 0) { $needRefresh = $true }
+									if ($needRefresh) { $W.RemoteModelsRefreshWanted = $true }
+								} catch {}
+								try {
+									$m.PlacementTarget = $sender
+									$m.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+									$m.HorizontalOffset = 0
+									$m.VerticalOffset = 2
+								} catch {}
+								try { $W.ModelMenuClosedTick = 0 } catch {}
+								try { $W.ModelMenuIsShowing = $true } catch {}
+								$m.IsOpen = $true
+							} catch {}
+						}.GetNewClosure())
+					}
+					if ($wasShowing) {
+						try {
+							$W.ModelMenuIsShowing = $true
+							$cm.IsOpen = $true
+						} catch {}
+					}
+				} catch {}
+			}.GetNewClosure()
+			$W.ApplyModelPicker = {
+				param([object[]]$Models = @(), [string]$Selected = '')
+				try {
+					if ($W.BuildModelMenu) { & $W.BuildModelMenu $Models $Selected }
+				} catch {}
+			}.GetNewClosure()
+			$W.ShowAddEndpointDialog = {
+				try {
+					$owner = $W.Window
+					if (-not $owner) { return }
+					$bc = New-Object System.Windows.Media.BrushConverter
+					$dlg = New-Object System.Windows.Window
+					$dlg.Title = 'MiniBot - Add endpoint'
+					$dlg.Width = 480
+					$dlg.Height = 380
+					$dlg.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterOwner
+					$dlg.Owner = $owner
+					$dlg.ResizeMode = [System.Windows.ResizeMode]::NoResize
+					$dlg.WindowStyle = [System.Windows.WindowStyle]::None
+					$dlg.AllowsTransparency = $true
+					$dlg.Background = [System.Windows.Media.Brushes]::Transparent
+					$dlg.Foreground = $bc.ConvertFromString('#C8C8D0')
+					try {
+						if ($W.Window -and $W.Window.Icon) { $dlg.Icon = $W.Window.Icon }
+					} catch {}
+					$outer = New-Object System.Windows.Controls.Border
+					$outer.Background = $bc.ConvertFromString('#121216')
+					$outer.BorderBrush = $bc.ConvertFromString('#2A2A30')
+					$outer.BorderThickness = New-Object System.Windows.Thickness(1)
+					$outer.CornerRadius = New-Object System.Windows.CornerRadius(8)
+					$outer.SnapsToDevicePixels = $true
+					try { $outer.ClipToBounds = $true } catch {}
+					$shell = New-Object System.Windows.Controls.Grid
+					$rTitle = New-Object System.Windows.Controls.RowDefinition
+					$rTitle.Height = New-Object System.Windows.GridLength(36)
+					$rBody = New-Object System.Windows.Controls.RowDefinition
+					$rBody.Height = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+					[void]$shell.RowDefinitions.Add($rTitle)
+					[void]$shell.RowDefinitions.Add($rBody)
+					# Title bar
+					$titleBar = New-Object System.Windows.Controls.Border
+					$titleBar.Background = $bc.ConvertFromString('#2A2A30')
+					$titleBar.BorderBrush = $bc.ConvertFromString('#3A3A42')
+					$titleBar.BorderThickness = New-Object System.Windows.Thickness(0, 0, 0, 1)
+					$titleBar.CornerRadius = New-Object System.Windows.CornerRadius(8, 8, 0, 0)
+					$titleBar.Cursor = [System.Windows.Input.Cursors]::SizeAll
+					$titleGrid = New-Object System.Windows.Controls.Grid
+					$c0 = New-Object System.Windows.Controls.ColumnDefinition
+					$c0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+					$c1 = New-Object System.Windows.Controls.ColumnDefinition
+					$c1.Width = [System.Windows.GridLength]::Auto
+					[void]$titleGrid.ColumnDefinitions.Add($c0)
+					[void]$titleGrid.ColumnDefinitions.Add($c1)
+					$titleLeft = New-Object System.Windows.Controls.StackPanel
+					$titleLeft.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+					$titleLeft.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+					$titleLeft.Margin = New-Object System.Windows.Thickness(10, 0, 8, 0)
+					$mkTitleDot = {
+						$el = New-Object System.Windows.Shapes.Ellipse
+						$el.Width = 3.5
+						$el.Height = 3.5
+						$el.Fill = $bc.ConvertFromString('#8A8A96')
+						$el.Margin = New-Object System.Windows.Thickness(9, 1, 9, 0)
+						$el.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+						$el.Opacity = 0.9
+						$el.SnapsToDevicePixels = $false
+						try {
+							$de = New-Object System.Windows.Media.Effects.DropShadowEffect
+							$de.Color = [System.Windows.Media.Colors]::Black
+							$de.BlurRadius = 1.5
+							$de.ShadowDepth = 0.5
+							$de.Opacity = 0.45
+							$de.Direction = 270
+							$el.Effect = $de
+						} catch {}
+						return $el
+					}.GetNewClosure()
+					try {
+						$iconPath = New-Object System.Windows.Shapes.Path
+						$iconPath.Width = 22
+						$iconPath.Height = 22
+						$iconPath.Stretch = [System.Windows.Media.Stretch]::Uniform
+						$iconPath.Margin = New-Object System.Windows.Thickness(4, 0, 0, 0)
+						$iconPath.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+						$iconData = 'M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z'
+						$iconPath.Data = [System.Windows.Media.Geometry]::Parse($iconData)
+						$ibrush = New-Object System.Windows.Media.LinearGradientBrush
+						$ibrush.StartPoint = New-Object System.Windows.Point(0.15, 0)
+						$ibrush.EndPoint = New-Object System.Windows.Point(0.9, 1)
+						[void]$ibrush.GradientStops.Add((New-Object System.Windows.Media.GradientStop(($bc.ConvertFromString('#C8C8D0')).Color, 0)))
+						[void]$ibrush.GradientStops.Add((New-Object System.Windows.Media.GradientStop(($bc.ConvertFromString('#6A6A74')).Color, 0.48)))
+						[void]$ibrush.GradientStops.Add((New-Object System.Windows.Media.GradientStop(($bc.ConvertFromString('#3A3A42')).Color, 1)))
+						$iconPath.Fill = $ibrush
+						[void]$titleLeft.Children.Add($iconPath)
+					} catch {}
+					try { [void]$titleLeft.Children.Add((& $mkTitleDot)) } catch {}
+					$agentNm = 'MiniBot'
+					try {
+						if ($W.AgentName) { $agentNm = [string]$W.AgentName }
+						elseif ($AgentName) { $agentNm = [string]$AgentName }
+					} catch {}
+					if ([string]::IsNullOrWhiteSpace($agentNm)) { $agentNm = 'MiniBot' }
+					$brandSp = New-Object System.Windows.Controls.StackPanel
+					$brandSp.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+					$brandSp.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+					$mkBrandRun = {
+						param([string]$Txt, [string]$Hex, [double]$GlowOp = 0)
+						$tb = New-Object System.Windows.Controls.TextBlock
+						$tb.Text = $Txt
+						$tb.FontSize = 13
+						$tb.FontWeight = [System.Windows.FontWeights]::SemiBold
+						$tb.Foreground = $bc.ConvertFromString($Hex)
+						$tb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+						if ($GlowOp -gt 0) {
+							try {
+								$glow = New-Object System.Windows.Media.Effects.DropShadowEffect
+								$glow.Color = ($bc.ConvertFromString('#FF3A1A')).Color
+								$glow.BlurRadius = 10
+								$glow.ShadowDepth = 0
+								$glow.Opacity = $GlowOp
+								$tb.Effect = $glow
+							} catch {}
+						}
+						return $tb
+					}.GetNewClosure()
+					[void]$brandSp.Children.Add((& $mkBrandRun '[' '#A0A0AA' 0))
+					[void]$brandSp.Children.Add((& $mkBrandRun $agentNm '#B80F0A' 0.72))
+					[void]$brandSp.Children.Add((& $mkBrandRun '-' '#A0A0AA' 0))
+					[void]$brandSp.Children.Add((& $mkBrandRun 'Agent' '#B80F0A' 0.55))
+					[void]$brandSp.Children.Add((& $mkBrandRun ']' '#A0A0AA' 0))
+					[void]$titleLeft.Children.Add($brandSp)
+					try { [void]$titleLeft.Children.Add((& $mkTitleDot)) } catch {}
+					$titleTb = New-Object System.Windows.Controls.TextBlock
+					$titleTb.Text = 'Add endpoint'
+					$titleTb.FontSize = 12
+					$titleTb.Foreground = $bc.ConvertFromString('#C8C8D0')
+					$titleTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+					[void]$titleLeft.Children.Add($titleTb)
+					[System.Windows.Controls.Grid]::SetColumn($titleLeft, 0)
+					[void]$titleGrid.Children.Add($titleLeft)
+					$closeBtn = New-Object System.Windows.Controls.Border
+					$closeBtn.Width = 46
+					$closeBtn.Height = 36
+					$closeBtn.Background = [System.Windows.Media.Brushes]::Transparent
+					$closeBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+					# Match outer top-right radius so red hover does not square the window corner
+					$closeBtn.CornerRadius = New-Object System.Windows.CornerRadius(0, 8, 0, 0)
+					try { $closeBtn.SnapsToDevicePixels = $true } catch {}
+					$closePath = New-Object System.Windows.Shapes.Path
+					$closePath.Width = 10
+					$closePath.Height = 10
+					$closePath.Stretch = [System.Windows.Media.Stretch]::Uniform
+					$closePath.Stroke = $bc.ConvertFromString('#C8C8D0')
+					$closePath.StrokeThickness = 1.15
+					$closePath.Data = [System.Windows.Media.Geometry]::Parse('M0,0 L10,10 M10,0 L0,10')
+					$closePath.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+					$closePath.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+					$closeBtn.Child = $closePath
+					[System.Windows.Controls.Grid]::SetColumn($closeBtn, 1)
+					[void]$titleGrid.Children.Add($closeBtn)
+					$titleBar.Child = $titleGrid
+					try { $titleBar.ClipToBounds = $true } catch {}
+					[System.Windows.Controls.Grid]::SetRow($titleBar, 0)
+					[void]$shell.Children.Add($titleBar)
+					$titleBar.add_MouseLeftButtonDown({
+						param($s, $e)
+						try {
+							if ($null -ne $closeBtn -and $closeBtn.IsMouseOver) { return }
+							if ($e.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) { $dlg.DragMove() }
+						} catch {}
+					}.GetNewClosure())
+					$closeBtn.add_MouseEnter({
+						try {
+							$closeBtn.Background = $bc.ConvertFromString('#E81123')
+							$closeBtn.CornerRadius = New-Object System.Windows.CornerRadius(0, 8, 0, 0)
+							$closePath.Stroke = $bc.ConvertFromString('#FFFFFF')
+						} catch {}
+					}.GetNewClosure())
+					$closeBtn.add_MouseLeave({
+						try {
+							$closeBtn.Background = [System.Windows.Media.Brushes]::Transparent
+							$closeBtn.CornerRadius = New-Object System.Windows.CornerRadius(0, 8, 0, 0)
+							$closePath.Stroke = $bc.ConvertFromString('#C8C8D0')
+						} catch {}
+					}.GetNewClosure())
+					$closeBtn.add_PreviewMouseLeftButtonDown({
+						param($s, $e)
+						try { $e.Handled = $true } catch {}
+						try {
+							$dlg.DialogResult = $false
+							$dlg.Close()
+						} catch {
+							try { $dlg.Close() } catch {}
+						}
+					}.GetNewClosure())
+					$bodyHost = New-Object System.Windows.Controls.Border
+					$bodyHost.Background = $bc.ConvertFromString('#121216')
+					$bodyHost.CornerRadius = New-Object System.Windows.CornerRadius(0, 0, 8, 8)
+					$bodyHost.SnapsToDevicePixels = $true
+					try { $bodyHost.ClipToBounds = $true } catch {}
+					$body = New-Object System.Windows.Controls.Grid
+					$body.Margin = New-Object System.Windows.Thickness(14, 12, 14, 14)
+					foreach ($i in 0..7) {
+						$rd = New-Object System.Windows.Controls.RowDefinition
+						$rd.Height = [System.Windows.GridLength]::Auto
+						[void]$body.RowDefinitions.Add($rd)
+					}
+					# ASCII-only UI strings (avoid ellipsis/em-dash mojibake in PS 5.1 WPF)
+					$hint = New-Object System.Windows.Controls.TextBlock
+					$hint.Text = 'OpenAI-compatible base (vLLM, Unsloth, llama.cpp). Prefer .../v1.'
+					$hint.TextWrapping = [System.Windows.TextWrapping]::Wrap
+					$hint.Foreground = $bc.ConvertFromString('#8A8A96')
+					$hint.FontSize = 12
+					$hint.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+					[System.Windows.Controls.Grid]::SetRow($hint, 0)
+					[void]$body.Children.Add($hint)
+					$urlLbl = New-Object System.Windows.Controls.TextBlock
+					$urlLbl.Text = 'Base URL'
+					$urlLbl.FontSize = 11
+					$urlLbl.Foreground = $bc.ConvertFromString('#8A8A96')
+					$urlLbl.Margin = New-Object System.Windows.Thickness(0, 0, 0, 3)
+					[System.Windows.Controls.Grid]::SetRow($urlLbl, 1)
+					[void]$body.Children.Add($urlLbl)
+					$box = New-Object System.Windows.Controls.TextBox
+					$box.Text = 'http://127.0.0.1:8000/v1'
+					$box.FontSize = 13
+					$box.Padding = New-Object System.Windows.Thickness(8, 6, 8, 6)
+					$box.Background = $bc.ConvertFromString('#1A1A1E')
+					$box.Foreground = $bc.ConvertFromString('#E0E0E8')
+					$box.BorderBrush = $bc.ConvertFromString('#3A3A42')
+					$box.CaretBrush = $bc.ConvertFromString('#C8C8D0')
+					$box.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+					[System.Windows.Controls.Grid]::SetRow($box, 2)
+					[void]$body.Children.Add($box)
+					# Auth mode: API key | NPM | None
+					$authLbl = New-Object System.Windows.Controls.TextBlock
+					$authLbl.Text = 'Auth mode (HTTP header for this endpoint only)'
+					$authLbl.FontSize = 11
+					$authLbl.Foreground = $bc.ConvertFromString('#8A8A96')
+					$authLbl.Margin = New-Object System.Windows.Thickness(0, 0, 0, 4)
+					[System.Windows.Controls.Grid]::SetRow($authLbl, 3)
+					[void]$body.Children.Add($authLbl)
+					$authRow = New-Object System.Windows.Controls.StackPanel
+					$authRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+					$authRow.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+					$rbKey = New-Object System.Windows.Controls.RadioButton
+					$rbKey.Content = 'API key'
+					$rbKey.GroupName = 'MbEndpointAuth'
+					$rbKey.IsChecked = $true
+					$rbKey.Foreground = $bc.ConvertFromString('#C8C8D0')
+					$rbKey.FontSize = 12
+					$rbKey.Margin = New-Object System.Windows.Thickness(0, 0, 16, 0)
+					$rbKey.Cursor = [System.Windows.Input.Cursors]::Hand
+					$rbNpm = New-Object System.Windows.Controls.RadioButton
+					$rbNpm.Content = 'NPM'
+					$rbNpm.GroupName = 'MbEndpointAuth'
+					$rbNpm.IsChecked = $false
+					$rbNpm.Foreground = $bc.ConvertFromString('#C8C8D0')
+					$rbNpm.FontSize = 12
+					$rbNpm.Margin = New-Object System.Windows.Thickness(0, 0, 16, 0)
+					$rbNpm.Cursor = [System.Windows.Input.Cursors]::Hand
+					$rbNone = New-Object System.Windows.Controls.RadioButton
+					$rbNone.Content = 'None'
+					$rbNone.GroupName = 'MbEndpointAuth'
+					$rbNone.IsChecked = $false
+					$rbNone.Foreground = $bc.ConvertFromString('#C8C8D0')
+					$rbNone.FontSize = 12
+					$rbNone.Cursor = [System.Windows.Input.Cursors]::Hand
+					try { $rbNone.ToolTip = 'No Authorization header (open LAN servers).' } catch {}
+					[void]$authRow.Children.Add($rbKey)
+					[void]$authRow.Children.Add($rbNpm)
+					[void]$authRow.Children.Add($rbNone)
+					[System.Windows.Controls.Grid]::SetRow($authRow, 4)
+					[void]$body.Children.Add($authRow)
+					$keyLbl = New-Object System.Windows.Controls.TextBlock
+					$keyLbl.Text = 'API key (Unsloth sk-unsloth-..., vLLM --api-key; unused for NPM / None)'
+					$keyLbl.FontSize = 11
+					$keyLbl.Foreground = $bc.ConvertFromString('#8A8A96')
+					$keyLbl.Margin = New-Object System.Windows.Thickness(0, 0, 0, 3)
+					[System.Windows.Controls.Grid]::SetRow($keyLbl, 5)
+					[void]$body.Children.Add($keyLbl)
+					$keyBox = New-Object System.Windows.Controls.PasswordBox
+					$keyBox.FontSize = 13
+					$keyBox.Padding = New-Object System.Windows.Thickness(8, 6, 8, 6)
+					$keyBox.Background = $bc.ConvertFromString('#1A1A1E')
+					$keyBox.Foreground = $bc.ConvertFromString('#E0E0E8')
+					$keyBox.BorderBrush = $bc.ConvertFromString('#3A3A42')
+					$keyBox.CaretBrush = $bc.ConvertFromString('#C8C8D0')
+					try { $keyBox.PasswordChar = '*' } catch {}
+					[System.Windows.Controls.Grid]::SetRow($keyBox, 6)
+					[void]$body.Children.Add($keyBox)
+					$syncAuthUi = {
+						try {
+							$useKey = [bool]$rbKey.IsChecked
+							$keyBox.IsEnabled = $useKey
+							$keyBox.Opacity = $(if ($useKey) { 1.0 } else { 0.45 })
+							$keyLbl.Opacity = $(if ($useKey) { 1.0 } else { 0.55 })
+						} catch {}
+					}.GetNewClosure()
+					$null = $rbKey.Add_Checked({ & $syncAuthUi }.GetNewClosure())
+					$null = $rbNpm.Add_Checked({ & $syncAuthUi }.GetNewClosure())
+					$null = $rbNone.Add_Checked({ & $syncAuthUi }.GetNewClosure())
+					& $syncAuthUi
+					$status = New-Object System.Windows.Controls.TextBlock
+					$status.Text = ''
+					$status.FontSize = 11
+					$status.Margin = New-Object System.Windows.Thickness(0, 8, 0, 8)
+					$status.TextWrapping = [System.Windows.TextWrapping]::Wrap
+					$status.Foreground = $bc.ConvertFromString('#8A8A96')
+					[System.Windows.Controls.Grid]::SetRow($status, 7)
+					[void]$body.Children.Add($status)
+					# buttons row
+					$rdBtns = New-Object System.Windows.Controls.RowDefinition
+					$rdBtns.Height = [System.Windows.GridLength]::Auto
+					[void]$body.RowDefinitions.Add($rdBtns)
+					$btns = New-Object System.Windows.Controls.StackPanel
+					$btns.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+					$btns.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+					$testBtn = New-Object System.Windows.Controls.Button
+					$testBtn.Content = 'Test & add'
+					$testBtn.Padding = New-Object System.Windows.Thickness(12, 5, 12, 5)
+					$testBtn.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+					$testBtn.MinWidth = 96
+					$testBtn.Height = 30
+					$testBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+					$testBtn.Focusable = $true
+					$cancelBtn = New-Object System.Windows.Controls.Button
+					$cancelBtn.Content = 'Cancel'
+					$cancelBtn.Padding = New-Object System.Windows.Thickness(12, 5, 12, 5)
+					$cancelBtn.MinWidth = 88
+					$cancelBtn.Height = 30
+					$cancelBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+					$cancelBtn.Focusable = $true
+					# Prefer themed styles from main window (custom brushes, no system chrome)
+					$usedThemeStyle = $false
+					try {
+						$pri = $owner.TryFindResource('MbAuthPrimaryBtn')
+						$sec = $owner.TryFindResource('MbAuthSecondaryBtn')
+						if ($null -ne $pri) { $testBtn.Style = $pri; $usedThemeStyle = $true }
+						if ($null -ne $sec) { $cancelBtn.Style = $sec; $usedThemeStyle = $true }
+					} catch { $usedThemeStyle = $false }
+					if (-not $usedThemeStyle) {
+						$noMo = $null
+						try { $noMo = $owner.TryFindResource('NoMouseOverButtonTemplate') } catch {}
+						if ($null -eq $noMo) {
+							try {
+								$noMoXaml = '<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}" CornerRadius="3" SnapsToDevicePixels="True"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
+								$noMo = [System.Windows.Markup.XamlReader]::Parse($noMoXaml)
+							} catch {}
+						}
+						if ($null -ne $noMo) {
+							try { $testBtn.Template = $noMo } catch {}
+							try { $cancelBtn.Template = $noMo } catch {}
+						}
+						$testBtn.Background = $bc.ConvertFromString('#4A4A56')
+						$testBtn.Foreground = $bc.ConvertFromString('#E0E0E8')
+						$testBtn.BorderThickness = New-Object System.Windows.Thickness(0)
+						$testBtn.FontWeight = [System.Windows.FontWeights]::Bold
+						$cancelBtn.Background = $bc.ConvertFromString('#2A2A30')
+						$cancelBtn.Foreground = $bc.ConvertFromString('#C8C8D0')
+						$cancelBtn.BorderBrush = $bc.ConvertFromString('#3A3A42')
+						$cancelBtn.BorderThickness = New-Object System.Windows.Thickness(1)
+						$testBtn.add_MouseEnter({ try { $testBtn.Background = $bc.ConvertFromString('#5C5C6A') } catch {} }.GetNewClosure())
+						$testBtn.add_MouseLeave({ try { $testBtn.Background = $bc.ConvertFromString('#4A4A56') } catch {} }.GetNewClosure())
+						$cancelBtn.add_MouseEnter({ try { $cancelBtn.Background = $bc.ConvertFromString('#3A3A42') } catch {} }.GetNewClosure())
+						$cancelBtn.add_MouseLeave({ try { $cancelBtn.Background = $bc.ConvertFromString('#2A2A30') } catch {} }.GetNewClosure())
+					}
+					[void]$btns.Children.Add($testBtn)
+					[void]$btns.Children.Add($cancelBtn)
+					[System.Windows.Controls.Grid]::SetRow($btns, 8)
+					[void]$body.Children.Add($btns)
+					$bodyHost.Child = $body
+					[System.Windows.Controls.Grid]::SetRow($bodyHost, 1)
+					[void]$shell.Children.Add($bodyHost)
+					$outer.Child = $shell
+					$dlg.Content = $outer
+					$cancelBtn.add_Click({ try { $dlg.DialogResult = $false; $dlg.Close() } catch { try { $dlg.Close() } catch {} } }.GetNewClosure())
+					$testBtn.add_Click({
+						try {
+							$url = [string]$box.Text
+							$apiKeyIn = ''
+							try { $apiKeyIn = [string]$keyBox.Password } catch { $apiKeyIn = '' }
+							$authMode = 'apikey'
+							try {
+								if ([bool]$rbNpm.IsChecked) { $authMode = 'npm' }
+								elseif ([bool]$rbNone.IsChecked) { $authMode = 'none' }
+								else { $authMode = 'apikey' }
+							} catch { $authMode = 'apikey' }
+							$status.Foreground = $bc.ConvertFromString('#8A8A96')
+							$status.Text = 'Testing connection...'
+							$dlg.IsEnabled = $false
+							try { $dlg.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background) } catch {}
+							$ok = $false
+							$msg = ''
+							try {
+								$testUrl = [string]$url
+								if ($testUrl -notmatch '^(?i)https?://') {
+									if ($testUrl -match '^\d+$') { $testUrl = "http://127.0.0.1:$testUrl" }
+									else { $testUrl = "http://$testUrl" }
+								}
+								while ($testUrl.EndsWith('/')) { $testUrl = $testUrl.Substring(0, $testUrl.Length - 1) }
+								$testUrl = $testUrl -replace '/chat/completions\s*$', '' -replace '/models\s*$', ''
+								$testUrl = $testUrl -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
+								$candidates = New-Object System.Collections.ArrayList
+								# Prefer /v1 first (vLLM / Unsloth / OpenAI-compat)
+								if ($testUrl -match '/v1$') {
+									[void]$candidates.Add($testUrl)
+									$rootCand = $testUrl -replace '/v1$', ''
+									if ($rootCand) { [void]$candidates.Add($rootCand) }
+								} else {
+									[void]$candidates.Add($testUrl + '/v1')
+									[void]$candidates.Add($testUrl)
+								}
+								$headers = @{}
+								try {
+									if ($authMode -eq 'apikey' -and -not [string]::IsNullOrWhiteSpace($apiKeyIn) -and $apiKeyIn -notin @('none','null','-')) {
+										$headers['Authorization'] = 'Bearer ' + $apiKeyIn.Trim()
+									} elseif ($authMode -eq 'npm') {
+										if ($W.NpmUser -and $W.NpmPass) {
+											$b64 = [System.Text.Encoding]::UTF8.GetBytes(("{0}:{1}" -f $W.NpmUser, $W.NpmPass))
+											$headers['Authorization'] = 'Basic ' + [Convert]::ToBase64String($b64)
+										} else {
+											throw 'NPM auth selected but session has no NPM credentials (log in first).'
+										}
+									}
+									# authMode 'none' → no Authorization header
+								} catch {
+									$lastErr = $_.Exception.Message
+									throw
+								}
+								$foundBase = ''
+								$foundIds = New-Object System.Collections.ArrayList
+								$lastErr = ''
+								foreach ($base in $candidates) {
+									try {
+										$resp = Invoke-WebRequest -Uri "$base/models" -Method GET -Headers $headers -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
+										if ([int]$resp.StatusCode -ne 200) { continue }
+										$bodyTxt = [string]$resp.Content
+										if ($bodyTxt.TrimStart().StartsWith('<')) { continue }
+										$obj = $bodyTxt | ConvertFrom-Json -ErrorAction Stop
+										$ids = New-Object System.Collections.ArrayList
+										$rows = @()
+										if ($obj.data) { $rows = @($obj.data) }
+										elseif ($obj.models) { $rows = @($obj.models) }
+										elseif ($obj -is [System.Array]) { $rows = @($obj) }
+										elseif ($obj.id) { $rows = @($obj) }
+										foreach ($row in $rows) {
+											$sid = ''
+											if ($row -is [string]) { $sid = $row }
+											else {
+												try { $sid = [string]$row.id } catch {}
+												if (-not $sid) { try { $sid = [string]$row.model } catch {} }
+												if (-not $sid) { try { $sid = [string]$row.name } catch {} }
+												if (-not $sid) { try { $sid = [string]$row.display_name } catch {} }
+											}
+											$sid = ([string]$sid).Trim()
+											if ($sid -and $ids -notcontains $sid) { [void]$ids.Add($sid) }
+										}
+										if ($ids.Count -gt 0) {
+											$foundBase = $base
+											$foundIds = $ids
+											break
+										}
+									} catch {
+										$lastErr = $_.Exception.Message
+										continue
+									}
+								}
+								if ($foundBase -and $foundIds.Count -gt 0) {
+									$ok = $true
+									$modeLabel = switch ($authMode) { 'npm' { 'NPM' } 'none' { 'None' } default { 'API key' } }
+									$msg = ("OK - {0} model(s) at {1} ({2})" -f $foundIds.Count, $foundBase, $modeLabel)
+									try {
+										$lst = New-Object System.Collections.ArrayList
+										foreach ($x in @($W.ExtraApiBases)) {
+											if ($x) { [void]$lst.Add([string]$x) }
+										}
+										$haveBase = $false
+										foreach ($x in @($lst)) {
+											if ([string]::Equals([string]$x, $foundBase, [StringComparison]::OrdinalIgnoreCase)) { $haveBase = $true; break }
+										}
+										if (-not $haveBase) { [void]$lst.Add($foundBase) }
+										$W.ExtraApiBases = @($lst)
+										# Per-endpoint auth mode + optional Bearer key
+										try {
+											if ($null -eq $W.ExtraApiAuth -or -not ($W.ExtraApiAuth -is [hashtable])) {
+												$W.ExtraApiAuth = @{}
+											}
+											$W.ExtraApiAuth[$foundBase] = $authMode
+											$rootAuth = $foundBase -replace '/v1$', ''
+											if ($rootAuth) { $W.ExtraApiAuth[$rootAuth] = $authMode }
+											if ($foundBase -notmatch '/v1$') { $W.ExtraApiAuth[($foundBase + '/v1')] = $authMode }
+										} catch {}
+										if ($authMode -eq 'apikey' -and -not [string]::IsNullOrWhiteSpace($apiKeyIn) -and $apiKeyIn -notin @('none','null','-')) {
+											try {
+												if ($null -eq $W.ExtraApiKeys -or -not ($W.ExtraApiKeys -is [hashtable])) {
+													$W.ExtraApiKeys = @{}
+												}
+												$W.ExtraApiKeys[$foundBase] = $apiKeyIn.Trim()
+												$rootB = $foundBase -replace '/v1$', ''
+												if ($rootB) { $W.ExtraApiKeys[$rootB] = $apiKeyIn.Trim() }
+												if ($foundBase -notmatch '/v1$') { $W.ExtraApiKeys[($foundBase + '/v1')] = $apiKeyIn.Trim() }
+											} catch {}
+											$W.PendingAddBaseApiKey = $apiKeyIn.Trim()
+										} else {
+											$W.PendingAddBaseApiKey = ''
+										}
+										$W.PendingAddBaseAuthMode = $authMode
+										# Queue for main runspace: merge bases, re-probe, select model, reload banner text
+										$W.PendingAddBaseUrl = $foundBase
+										$W.PendingAddBaseDirty = $true
+										$W.RemoteModelsRefreshWanted = $true
+										# Optimistic: put new models into PoweredBy list immediately so they survive
+										# switching back to primary llama.cpp before main refresh finishes
+										try {
+											$hostLab = $foundBase
+											try {
+												$uTmp = [uri]$foundBase
+												if ($uTmp.IsDefaultPort) { $hostLab = $uTmp.Host }
+												else { $hostLab = ("{0}:{1}" -f $uTmp.Host, $uTmp.Port) }
+											} catch {}
+											$entList = New-Object System.Collections.ArrayList
+											$seenKeys = @{}
+											foreach ($ex in @($W.RemoteModelEntries)) {
+												if (-not $ex) { continue }
+												$ek = [string]$ex.Key
+												if ($ek -and -not $seenKeys.ContainsKey($ek)) {
+													$seenKeys[$ek] = $true
+													[void]$entList.Add($ex)
+												}
+											}
+											$idList = New-Object System.Collections.ArrayList
+											foreach ($xid in @($W.RemoteModels)) {
+												if ($xid -and $idList -notcontains [string]$xid) { [void]$idList.Add([string]$xid) }
+											}
+											$multi = ($entList.Count -gt 0) -or ($foundIds.Count -gt 0)
+											foreach ($nid in @($foundIds)) {
+												$nid = [string]$nid
+												if ([string]::IsNullOrWhiteSpace($nid)) { continue }
+												$nkey = ('{0}|{1}' -f $nid, $foundBase)
+												if ($seenKeys.ContainsKey($nkey)) { continue }
+												$seenKeys[$nkey] = $true
+												$lab = if ($multi) { "{0}  @  {1}" -f $nid, $hostLab } else { $nid }
+												[void]$entList.Add([pscustomobject]@{
+													Key = $nkey; Id = $nid; Base = $foundBase
+													Host = $hostLab; Label = $lab
+													NCtx = 0; NCtxTrain = 0; NParams = 0; Size = 0; Vision = $false
+												})
+												if ($idList -notcontains $nid) { [void]$idList.Add($nid) }
+											}
+											# Multi-endpoint labels for pre-existing entries too
+											if ($entList.Count -gt 1) {
+												$relabeled = New-Object System.Collections.ArrayList
+												foreach ($ex in @($entList)) {
+													$hid = if ($ex.Host) { [string]$ex.Host } else { 'endpoint' }
+													$lab2 = "{0}  @  {1}" -f [string]$ex.Id, $hid
+													[void]$relabeled.Add([pscustomobject]@{
+														Key = [string]$ex.Key; Id = [string]$ex.Id; Base = [string]$ex.Base
+														Host = $hid; Label = $lab2
+														NCtx = $(try { [int]$ex.NCtx } catch { 0 })
+														NCtxTrain = $(try { [int]$ex.NCtxTrain } catch { 0 })
+														NParams = $(try { [double]$ex.NParams } catch { 0 })
+														Size = $(try { [double]$ex.Size } catch { 0 })
+														Vision = $(try { [bool]$ex.Vision } catch { $false })
+													})
+												}
+												$entList = $relabeled
+											}
+											$W.RemoteModelEntries = @($entList)
+											$W.RemoteModels = @($idList)
+											$W.RemoteModelsSeq = (Get-Date).Ticks
+										} catch {}
+										# Optimistic PoweredBy label until main finishes refresh
+										try {
+											$firstId = [string](@($foundIds)[0])
+											if ($firstId) {
+												$W.ActiveModel = $firstId
+												$W.ActiveModelBase = $foundBase
+												$W.ActiveModelKey = ('{0}|{1}' -f $firstId, $foundBase)
+												$W.ModelDirty = $true
+												if ($W.TitleModelPickerText) {
+													$short = $firstId
+													if ($short.Length -gt 36) { $short = $short.Substring(0, 33) + '...' }
+													$W.TitleModelPickerText.Text = $short
+													$W.TitleModelPickerText.Foreground = $W.BrushCache['#BB9AF7']
+												}
+												if ($W.BuildModelMenu) {
+													& $W.BuildModelMenu @($W.RemoteModels) $firstId
+												}
+											}
+										} catch {}
+									} catch {}
+								} else {
+									$ok = $false
+									if ($lastErr -match '(?i)401|Not authenticated|Invalid token|Unauthorized') {
+										$msg = 'Auth failed - pick API key and enter Bearer token, or pick NPM if this host is behind the same proxy login.'
+									} elseif ($lastErr) {
+										$msg = $lastErr
+									} else {
+										$msg = 'Connection failed or no models at that endpoint'
+									}
+								}
+							} catch {
+								$ok = $false
+								$msg = $_.Exception.Message
+							}
+							$dlg.IsEnabled = $true
+							if ($ok) {
+								$status.Foreground = $bc.ConvertFromString('#9ECE6A')
+								$status.Text = $msg
+								# Do not rebuild menu from stale RemoteModels — wait for RemoteModelsSeq after main refresh
+								Start-Sleep -Milliseconds 250
+								try { $dlg.DialogResult = $true } catch {}
+								$dlg.Close()
+							} else {
+								$status.Foreground = $bc.ConvertFromString('#F05C5C')
+								$status.Text = $(if ($msg) { $msg } else { 'Connection failed' })
+							}
+						} catch {
+							try { $dlg.IsEnabled = $true } catch {}
+							try {
+								$status.Foreground = $bc.ConvertFromString('#F05C5C')
+								$status.Text = $_.Exception.Message
+							} catch {}
+						}
+					}.GetNewClosure())
+					try { $box.Focus() } catch {}
+					try { $box.SelectAll() } catch {}
+					[void]$dlg.ShowDialog()
+				} catch {}
+			}.GetNewClosure()
+			try {
+				$initModels = @()
+				try { $initModels = @($W.RemoteModels) } catch { $initModels = @() }
+				$initSel = ''
+				try { $initSel = [string]$W.ActiveModel } catch { $initSel = '' }
+				if ($W.ApplyModelPicker) { & $W.ApplyModelPicker $initModels $initSel }
+			} catch {}
 			$W.TitleBtnMin = $window.FindName('TitleBtnMin')
 			$W.TitleBtnMax = $window.FindName('TitleBtnMax')
 			$W.TitleBtnClose = $window.FindName('TitleBtnClose')
@@ -24427,7 +32160,7 @@ function Start-MBWpfHost {
 					} catch {}
 				}.GetNewClosure()
 				$W.ToggleWorkAreaMax = $toggleWorkAreaMax
-				# Hover: exit red, min/max lighter grey (NoMouseOver — Background only)
+				# Hover: exit red, min/max lighter grey (NoMouseOver - Background only)
 				$bcTitle = New-Object System.Windows.Media.BrushConverter
 				$hoverGrey = $bcTitle.ConvertFromString('#3A3A42')
 				$hoverRed = $bcTitle.ConvertFromString('#E81123')
@@ -24704,6 +32437,15 @@ function Start-MBWpfHost {
 			$W.CtxTokText = $window.FindName('CtxTokText')
 			$W.CtxBarMaxW = 120
 			$W.HintBar = $window.FindName('HintBar')
+			$W.HintBarBorder = $window.FindName('HintBarBorder')
+			$W.SpeechWaveBox = $window.FindName('SpeechWaveBox')
+			$W.SpeechWaveCanvas = $window.FindName('SpeechWaveCanvas')
+			$W.SpeechWaveLine = $window.FindName('SpeechWaveLine')
+			$W.SpeechWaveStatus = $window.FindName('SpeechWaveStatus')
+			$W.SpeechWaveLang = $window.FindName('SpeechWaveLang')
+			$W.SpeechWaveTimer = $null
+			$W.SpeechWavePhase = 0.0
+			$W.SpeechWaveSeed = 1
 			$W.StatusDot = $window.FindName('StatusDot')
 			$W.StatusTimer = $window.FindName('StatusTimer')
 			$W.StatusBand = $window.FindName('StatusBand')
@@ -24734,6 +32476,20 @@ function Start-MBWpfHost {
 			$W.SessionPickerOverlay = $window.FindName('SessionPickerOverlay')
 			$W.SessionPickerTitle = $window.FindName('SessionPickerTitle')
 			$W.SessionPickerTitleClose = $window.FindName('SessionPickerTitleClose')
+			try {
+				$barAgent = ''
+				try { $barAgent = [string]$W.AgentName } catch {}
+				if ([string]::IsNullOrWhiteSpace($barAgent)) {
+					try { $barAgent = [string]$AgentName } catch { $barAgent = 'MiniBot' }
+				}
+				if ([string]::IsNullOrWhiteSpace($barAgent)) { $barAgent = 'MiniBot' }
+				foreach ($barNm in @('AuthBarBrandName', 'ConfirmBarBrandName', 'SessionBarBrandName')) {
+					try {
+						$barEl = $window.FindName($barNm)
+						if ($null -ne $barEl) { $barEl.Text = $barAgent }
+					} catch {}
+				}
+			} catch {}
 			$W.SessionPickerPath = $window.FindName('SessionPickerPath')
 			$W.SessionPickerGo = $window.FindName('SessionPickerGo')
 			$W.SessionPickerUp = $window.FindName('SessionPickerUp')
@@ -25047,9 +32803,16 @@ function Start-MBWpfHost {
 			$W.Dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
 			try {
 				$bootTitle = "[{0}-Agent]" -f $(if ($W.AgentName) { [string]$W.AgentName } else { 'MiniBot' })
-				if ($W.ModelAlias) {
-					$sep = ("  {0}  " -f [string][char]0x00B7)
-					$bootTitle = ("{0}{1}PoweredBy: {2}" -f $bootTitle, $sep, ([string]$W.ModelAlias).Trim())
+				$bootModel = ''
+				try { $bootModel = [string]$W.ActiveModel } catch { $bootModel = '' }
+				if ([string]::IsNullOrWhiteSpace($bootModel)) {
+					try { $bootModel = @($W.RemoteModels)[0] } catch { $bootModel = '' }
+				}
+				$sep = ("  {0}  " -f [string][char]0x00B7)
+				if (-not [string]::IsNullOrWhiteSpace($bootModel)) {
+					$bootTitle = ("{0}{1}PoweredBy: {2}" -f $bootTitle, $sep, $bootModel.Trim())
+				} else {
+					$bootTitle = ("{0}{1}PoweredBy: Select Model" -f $bootTitle, $sep)
 				}
 				$window.Title = $bootTitle
 			} catch {
@@ -25395,6 +33158,17 @@ public const int ICON_BIG = 1;
 							$title.CornerRadius = New-Object System.Windows.CornerRadius($r, $r, 0, 0)
 						}
 					}
+					# Bottom chrome strip (hint bar) matches top radius when restored
+					$hintBar = $null
+					try { $hintBar = $bag.HintBarBorder } catch { $hintBar = $null }
+					if (-not $hintBar) { try { $hintBar = $win.FindName('HintBarBorder') } catch {} }
+					if ($hintBar) {
+						if ($maximized) {
+							$hintBar.CornerRadius = New-Object System.Windows.CornerRadius(0)
+						} else {
+							$hintBar.CornerRadius = New-Object System.Windows.CornerRadius(0, 0, $r, $r)
+						}
+					}
 					# Keep WindowChrome radius in sync
 					try {
 						$chrome = [System.Windows.Shell.WindowChrome]::GetWindowChrome($win)
@@ -25448,6 +33222,53 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				$W.MainChromeBorder = $window.FindName('MainChromeBorder')
 				$W.ApplyWindowChromeCorners = $applyWindowChromeCorners
 			} catch {}
+			# IPScanner-style vague border pulse: Base ↔ soft cyan, 6s forever on BorderBrush only.
+			$W.StartChromeGlow = {
+				try {
+					if ($W.ChromeGlowStory) { return }
+					$border = $W.MainChromeBorder
+					if (-not $border) {
+						try { $border = $window.FindName('MainChromeBorder') } catch {}
+						$W.MainChromeBorder = $border
+					}
+					if (-not $border) { return }
+					# Unfrozen SolidColorBrush so Color can animate (frozen brushes cannot)
+					$brush = New-Object System.Windows.Media.SolidColorBrush
+					$cBase = [System.Windows.Media.ColorConverter]::ConvertFromString('#2A2A30')
+					# Soft deep-sky lift - IPScanner-style #CCCCCC↔#00BFFF, dialed for dark chrome (readable but not loud)
+					$cPeak = [System.Windows.Media.ColorConverter]::ConvertFromString('#4A8AB8')
+					$brush.Color = $cBase
+					$border.BorderBrush = $brush
+					try { $border.BorderThickness = New-Object System.Windows.Thickness 1 } catch {}
+					$sb = New-Object System.Windows.Media.Animation.Storyboard
+					$sb.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+					$anim = New-Object System.Windows.Media.Animation.ColorAnimationUsingKeyFrames
+					$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromSeconds(6.0))
+					$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+					$mkKf = {
+						param([System.Windows.Media.Color]$C, [double]$Sec)
+						$kf = New-Object System.Windows.Media.Animation.LinearColorKeyFrame
+						$kf.Value = $C
+						$kf.KeyTime = [System.Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromSeconds($Sec))
+						return $kf
+					}
+					[void]$anim.KeyFrames.Add((& $mkKf $cBase 0.0))
+					[void]$anim.KeyFrames.Add((& $mkKf $cPeak 3.0))
+					[void]$anim.KeyFrames.Add((& $mkKf $cBase 6.0))
+					[System.Windows.Media.Animation.Storyboard]::SetTarget($anim, $brush)
+					[System.Windows.Media.Animation.Storyboard]::SetTargetProperty($anim, (New-Object System.Windows.PropertyPath('Color')))
+					[void]$sb.Children.Add($anim)
+					$W.ChromeGlowBrush = $brush
+					$W.ChromeGlowStory = $sb
+					$sb.Begin()
+				} catch {}
+			}.GetNewClosure()
+			$W.SyncChromeGlow = {
+				# No geometry - pulse is on BorderBrush; re-arm only if storyboard was lost
+				try {
+					if (-not $W.ChromeGlowStory -and $W.StartChromeGlow) { & $W.StartChromeGlow }
+				} catch {}
+			}.GetNewClosure()
 			$window.add_SourceInitialized({
 				param($s, $e)
 				try { & $applyDarkTitle $s } catch {}
@@ -25457,11 +33278,11 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				param($s, $e)
 				try { & $applyDarkTitle $s } catch {}
 				try { & $applyWindowChromeCorners $s $W } catch {}
+				try { if ($W.StartChromeGlow) { & $W.StartChromeGlow } } catch {}
 			}.GetNewClosure())
 			$window.add_StateChanged({
 				param($s, $e)
 				try { & $applyWindowChromeCorners $s $W } catch {}
-				# Max icon is driven by IsWorkAreaMaximized (not WindowState.Maximized)
 				try {
 					if ($W.SetMaxIcon) { & $W.SetMaxIcon ([bool]$W.IsWorkAreaMaximized) }
 				} catch {}
@@ -26274,7 +34095,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 			$timer.Interval = [TimeSpan]::FromMilliseconds(16)
 			$timer.add_Tick({
 				try {
-					# Session picker / modal open — freeze host UI work for smooth dialog
+					# Session picker / modal open - freeze host UI work for smooth dialog
 					try { if ([bool]$W.ModalUi) { return } } catch {}
 					$rtb = $W.Log
 					$q = $W.WriteQueue
@@ -26509,7 +34330,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$outer.BorderThickness = New-Object System.Windows.Thickness(1)
 								$outer.CornerRadius = New-Object System.Windows.CornerRadius(6)
 								$outer.Padding = New-Object System.Windows.Thickness(0)
-								$outer.Margin = New-Object System.Windows.Thickness(0, 8, 0, 10)
+								$outer.Margin = New-Object System.Windows.Thickness(0, 8, 0, 8)
 								$outer.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
 								$outer.SnapsToDevicePixels = $true
 								$outer.Width = $stretchW
@@ -26751,7 +34572,14 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$bc = $null
 										try { $bc = $W['BrushCache'] } catch { try { $bc = $W.BrushCache } catch {} }
 										if ($null -eq $bc) { $bc = @{}; try { $W['BrushCache'] = $bc } catch {} }
-										& $paintCodeHighlight $box ([string]$meta['Plain']) ([string]$meta['Lang']) $conv $bc $W.MonoFont
+										$plainClose = [string]$meta['Plain']
+										if ($plainClose.EndsWith("`r`n")) {
+											$plainClose = $plainClose.Substring(0, $plainClose.Length - 2)
+										} elseif ($plainClose.EndsWith("`n")) {
+											$plainClose = $plainClose.Substring(0, $plainClose.Length - 1)
+										}
+										$meta['Plain'] = $plainClose
+										& $paintCodeHighlight $box $plainClose ([string]$meta['Lang']) $conv $bc $W.MonoFont
 									}
 								}
 								if ($W -is [hashtable]) {
@@ -26762,6 +34590,1043 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									try { $W.ActiveCodeBorder = $null } catch {}
 								}
 								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {}
+							continue
+						}
+
+						# Inline image / video / audio (markdown ![alt](path) — spaces in path AND label ok)
+						if ($kind -eq 'md-media') {
+							try {
+								& $trimTrailingEmptyParas
+								$mediaUri = ''
+								$mediaKind = 'image'
+								$mediaAlt = ''
+								$mediaDisp = ''
+								try { $mediaUri = [string]$item.MediaUri } catch {}
+								try { $mediaKind = ([string]$item.MediaKind).ToLowerInvariant() } catch {}
+								try { $mediaAlt = [string]$item.MediaAlt } catch {}
+								try { $mediaDisp = [string]$item.Text } catch {}
+								if ([string]::IsNullOrWhiteSpace($mediaUri)) { continue }
+								if ($mediaKind -notin @('video', 'audio', 'image')) { $mediaKind = 'image' }
+								# STA-local helpers (main-runspace functions are not visible here)
+								$normMediaPath = {
+									param([string]$Raw)
+									$p = [string]$Raw
+									if ([string]::IsNullOrWhiteSpace($p)) { return '' }
+									$p = $p.Trim().Trim('"').Trim("'")
+									if ($p -match '^(.*?)\s+"[^"]*"\s*$') { $p = [string]$Matches[1].Trim() }
+									if ($p.Length -ge 2 -and $p[0] -eq [char]'<' -and $p[$p.Length - 1] -eq [char]'>') {
+										$p = $p.Substring(1, $p.Length - 2).Trim()
+									}
+									if ($p -match '^(?i)file://') {
+										try { $p = ([Uri]$p).LocalPath } catch {}
+										try { $p = [Uri]::UnescapeDataString($p) } catch {}
+									}
+									$p = $p -replace '/', '\'
+									if ($p -match '(?i)(?:^[A-Za-z]:\\)?Windows\\System32\\(Users\\.+)$') { $p = 'C:\' + $Matches[1] }
+									elseif ($p -match '(?i)\\Windows\\System32\\(Users\\.+)$') { $p = 'C:\' + $Matches[1] }
+									if ($p -match '^(?i)Users\\') { $p = 'C:\' + $p }
+									return $p
+								}.GetNewClosure()
+								# Preserve multi-word titles: ![My Song Title](...) / filenames with spaces
+								$fmtMediaLabel = {
+									param([string]$Alt, [string]$PathOrDisplay, [string]$Fallback, [int]$MaxLen)
+									$name = ''
+									if (-not [string]::IsNullOrWhiteSpace($Alt)) {
+										$name = [string]$Alt
+										try { $name = [regex]::Replace($name, '\\([\\\[\]\(\)!])', '$1') } catch {}
+									} elseif (-not [string]::IsNullOrWhiteSpace($PathOrDisplay)) {
+										$p = & $normMediaPath $PathOrDisplay
+										try {
+											if ($p -match '^(?i)https?://') {
+												$leaf = [System.IO.Path]::GetFileName(([Uri]$p).AbsolutePath)
+												try { $leaf = [Uri]::UnescapeDataString($leaf) } catch {}
+												$name = [System.IO.Path]::GetFileNameWithoutExtension($leaf)
+												if ([string]::IsNullOrWhiteSpace($name)) { $name = $leaf }
+											} else {
+												$name = [System.IO.Path]::GetFileNameWithoutExtension($p)
+												if ([string]::IsNullOrWhiteSpace($name)) { $name = [System.IO.Path]::GetFileName($p) }
+											}
+										} catch { $name = [string]$PathOrDisplay }
+									}
+									$name = [regex]::Replace([string]$name, '[\r\n\t]+', ' ')
+									$name = [regex]::Replace($name, ' {2,}', ' ').Trim()
+									if ([string]::IsNullOrWhiteSpace($name)) {
+										if ([string]::IsNullOrWhiteSpace($Fallback)) { return '' }
+										return [string]$Fallback
+									}
+									if ($MaxLen -gt 0 -and $name.Length -gt $MaxLen) {
+										$name = $name.Substring(0, [Math]::Max(1, $MaxLen - 3)).TrimEnd() + '...'
+									}
+									return $name
+								}.GetNewClosure()
+								# Normalize display path (spaces / file:// / System32 glue) for all kinds
+								try {
+									if (-not [string]::IsNullOrWhiteSpace($mediaDisp)) {
+										$mediaDisp = & $normMediaPath $mediaDisp
+									}
+								} catch {}
+								# Keep spaces in labels coming from markdown ![label with spaces](...)
+								try {
+									if (-not [string]::IsNullOrWhiteSpace($mediaAlt)) {
+										$mediaAlt = [regex]::Replace([string]$mediaAlt, '[\r\n\t]+', ' ')
+										$mediaAlt = [regex]::Replace($mediaAlt, ' {2,}', ' ').Trim()
+									}
+								} catch {}
+
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								foreach ($hx in @('#1A1A1E', '#252530', '#3A3A42', '#8A8A96', '#C8C8D0', '#2A2A30', '#7DCFFF', '#6A6A76', '#F05C5C')) {
+									if (-not $brushCache.ContainsKey($hx)) {
+										try { $brushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+									}
+								}
+
+								$outer = New-Object System.Windows.Controls.Border
+								$outer.Background = $brushCache['#1A1A1E']
+								$outer.BorderBrush = $brushCache['#3A3A42']
+								$outer.BorderThickness = New-Object System.Windows.Thickness(1)
+								$outer.CornerRadius = New-Object System.Windows.CornerRadius(6)
+								$outer.Margin = New-Object System.Windows.Thickness(0, 8, 0, 8)
+								$outer.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+								$outer.SnapsToDevicePixels = $true
+								$outer.Width = $stretchW
+								$outer.MaxWidth = $stretchW
+
+								$root = New-Object System.Windows.Controls.Grid
+								$rowHdr = New-Object System.Windows.Controls.RowDefinition
+								$rowHdr.Height = [System.Windows.GridLength]::Auto
+								$rowBody = New-Object System.Windows.Controls.RowDefinition
+								$rowBody.Height = [System.Windows.GridLength]::Auto
+								[void]$root.RowDefinitions.Add($rowHdr)
+								[void]$root.RowDefinitions.Add($rowBody)
+
+								$hdr = New-Object System.Windows.Controls.Border
+								$hdr.Background = $brushCache['#252530']
+								$hdr.Padding = New-Object System.Windows.Thickness(10, 5, 10, 5)
+								$hdr.CornerRadius = New-Object System.Windows.CornerRadius(6, 6, 0, 0)
+								$hdrGrid = New-Object System.Windows.Controls.Grid
+								$c0 = New-Object System.Windows.Controls.ColumnDefinition
+								$c0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+								$c1 = New-Object System.Windows.Controls.ColumnDefinition
+								$c1.Width = [System.Windows.GridLength]::Auto
+								[void]$hdrGrid.ColumnDefinitions.Add($c0)
+								[void]$hdrGrid.ColumnDefinitions.Add($c1)
+								# ASCII-safe label build (avoid source-file middot mojibake under PS 5.1)
+								# Titles/labels may contain spaces: ![My Song Title](...), ![Lake Day](...)
+								$dot = [string][char]0x00B7
+								$lab = switch ($mediaKind) { 'video' { 'video' } 'audio' { 'audio' } default { 'image' } }
+								$tail = & $fmtMediaLabel $mediaAlt $mediaDisp '' 96
+								if (-not [string]::IsNullOrWhiteSpace($tail)) {
+									$lab = ('{0} {1} {2}' -f $lab, $dot, $tail)
+								}
+								$langTb = New-Object System.Windows.Controls.TextBlock
+								$langTb.Text = $lab
+								$langTb.Foreground = $brushCache['#8A8A96']
+								# UI font for labels (mono can mis-render some Unicode paths)
+								try {
+									$langTb.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI, Consolas, Cascadia Mono, Courier New')
+								} catch {
+									$langTb.FontFamily = $W.MonoFont
+								}
+								$langTb.FontSize = 11
+								$langTb.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
+								$langTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								[System.Windows.Controls.Grid]::SetColumn($langTb, 0)
+								[void]$hdrGrid.Children.Add($langTb)
+								$hdr.Child = $hdrGrid
+								[System.Windows.Controls.Grid]::SetRow($hdr, 0)
+								[void]$root.Children.Add($hdr)
+
+								$body = New-Object System.Windows.Controls.Border
+								$body.Background = $brushCache['#121216']
+								try {
+									if (-not $brushCache.ContainsKey('#121216')) {
+										$brushCache['#121216'] = $conv.ConvertFromString('#121216')
+									}
+									$body.Background = $brushCache['#121216']
+								} catch {}
+								$body.Padding = New-Object System.Windows.Thickness(8)
+								$body.CornerRadius = New-Object System.Windows.CornerRadius(0, 0, 5, 5)
+
+								$maxH = [Math]::Min(420.0, [Math]::Max(120.0, $stretchW * 0.62))
+								$mediaHost = New-Object System.Windows.Controls.Grid
+								$mediaHost.MaxWidth = [Math]::Max(40.0, $stretchW - 18.0)
+								$mediaHost.MaxHeight = $maxH
+								$mediaHost.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+
+								$uriObj = $null
+								try { $uriObj = [Uri]$mediaUri } catch { $uriObj = $null }
+								if ($null -eq $uriObj) {
+									$errTb = New-Object System.Windows.Controls.TextBlock
+									$errTb.Text = 'Invalid media URI'
+									$errTb.Foreground = $brushCache['#F05C5C']
+									$errTb.FontFamily = $W.MonoFont
+									$errTb.FontSize = 12
+									$body.Child = $errTb
+								} elseif ($mediaKind -eq 'audio') {
+									# Minimal inline audio player (PowerPlayer-inspired: progress + volume 0-1 + mute + play/pause icons)
+									$filePath = ''
+									try {
+										if ($null -ne $uriObj -and $uriObj.IsFile) {
+											$filePath = [string]$uriObj.LocalPath
+											try { $filePath = [Uri]::UnescapeDataString($filePath) } catch {}
+										}
+									} catch {}
+									if ([string]::IsNullOrWhiteSpace($filePath)) { $filePath = [string]$mediaDisp }
+									if ([string]::IsNullOrWhiteSpace($filePath)) { $filePath = [string]$mediaUri }
+									$filePath = ([string]$filePath).Trim().Trim('"').Trim("'")
+									if ($filePath -match '^(?i)file://') {
+										try { $filePath = ([Uri]$filePath).LocalPath } catch {}
+										try { $filePath = [Uri]::UnescapeDataString($filePath) } catch {}
+									}
+									$filePath = $filePath -replace '/', '\'
+									# Unglue elevated System32 CWD joins (STA-safe; do not rely on Get-MBPathCandidates)
+									if ($filePath -match '(?i)(?:^[A-Za-z]:\\)?Windows\\System32\\(Users\\.+)$') {
+										$filePath = 'C:\' + $Matches[1]
+									} elseif ($filePath -match '(?i)\\Windows\\System32\\(Users\\.+)$') {
+										$filePath = 'C:\' + $Matches[1]
+									}
+									if ($filePath -match '^(?i)Users\\') { $filePath = 'C:\' + $filePath }
+									if ($filePath -match '^\\Users\\') { $filePath = 'C:' + $filePath }
+
+									# Multi-word song titles ok: ![My Song Title](C:\...\My Song.mp3)
+									$songName = & $fmtMediaLabel $mediaAlt $filePath 'Audio' 96
+
+									# Resolve local path for MediaElement (STA-safe Test-Path only)
+									$audioSrc = $filePath
+									$audioIsHttp = ($filePath -match '^(?i)https?://')
+									if (-not $audioIsHttp) {
+										$foundAudio = $null
+										try {
+											if (Test-Path -LiteralPath $filePath -PathType Leaf) {
+												$foundAudio = [System.IO.Path]::GetFullPath($filePath)
+											}
+										} catch {}
+										if (-not $foundAudio) {
+											try {
+												if ($env:USERPROFILE -and $filePath -notmatch '^[A-Za-z]:' -and $filePath -notmatch '^\\\\') {
+													$tryHome = Join-Path $env:USERPROFILE $filePath
+													if (Test-Path -LiteralPath $tryHome -PathType Leaf) {
+														$foundAudio = [System.IO.Path]::GetFullPath($tryHome)
+													}
+												}
+											} catch {}
+										}
+										if (-not $foundAudio) {
+											try {
+												foreach ($c in @(Get-MBPathCandidates -Path $filePath)) {
+													if (Test-Path -LiteralPath $c -PathType Leaf) {
+														$foundAudio = [System.IO.Path]::GetFullPath($c)
+														break
+													}
+												}
+											} catch {}
+										}
+										if ($foundAudio) { $audioSrc = $foundAudio }
+									}
+
+									$panelW = [Math]::Max(300.0, [Math]::Min(520.0, $stretchW - 24.0))
+
+									# NoMouseOver template
+									$noMo = $null
+									try {
+										$own = $null
+										try { if ($W -and $W.Window) { $own = $W.Window } } catch {}
+										try { if ($null -eq $own -and $W -is [hashtable]) { $own = $W['Window'] } } catch {}
+										if ($null -ne $own) { $noMo = $own.TryFindResource('NoMouseOverButtonTemplate') }
+									} catch {}
+									if ($null -eq $noMo) {
+										try {
+											$noMoXaml = '<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}" CornerRadius="3" SnapsToDevicePixels="True"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
+											$noMo = [System.Windows.Markup.XamlReader]::Parse($noMoXaml)
+										} catch {}
+									}
+
+									$playerHost = New-Object System.Windows.Controls.Border
+									$playerHost.Background = $brushCache['#121216']
+									$playerHost.BorderBrush = $brushCache['#3A3A42']
+									$playerHost.BorderThickness = New-Object System.Windows.Thickness(1)
+									$playerHost.CornerRadius = New-Object System.Windows.CornerRadius(4)
+									$playerHost.Padding = New-Object System.Windows.Thickness(12, 10, 12, 10)
+									$playerHost.Width = $panelW
+									$playerHost.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+
+									$sp = New-Object System.Windows.Controls.StackPanel
+									$sp.Orientation = [System.Windows.Controls.Orientation]::Vertical
+
+									$titleTb = New-Object System.Windows.Controls.TextBlock
+									$titleTb.Text = $songName
+									$titleTb.Foreground = $brushCache['#C8C8D0']
+									$titleTb.FontSize = 13
+									try { $titleTb.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+									$titleTb.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
+									$titleTb.Margin = New-Object System.Windows.Thickness(0, 0, 0, 4)
+									try { $titleTb.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI, Consolas, Cascadia Mono, Courier New') } catch {}
+									[void]$sp.Children.Add($titleTb)
+
+									$pathTb = New-Object System.Windows.Controls.TextBlock
+									$pathTb.Text = $audioSrc
+									$pathTb.Foreground = $brushCache['#6A6A76']
+									$pathTb.FontSize = 10
+									$pathTb.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
+									$pathTb.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+									$pathTb.FontFamily = $W.MonoFont
+									[void]$sp.Children.Add($pathTb)
+
+									# MediaElement (audio-only). Must stay Visible in the tree — Collapsed/0x0
+									# often never opens the media clock in WPF FlowDocument hosts.
+									$me = New-Object System.Windows.Controls.MediaElement
+									$me.LoadedBehavior = [System.Windows.Controls.MediaState]::Manual
+									$me.UnloadedBehavior = [System.Windows.Controls.MediaState]::Manual
+									$me.Volume = 0.75
+									$me.ScrubbingEnabled = $true
+									$me.Width = 1
+									$me.Height = 1
+									$me.Opacity = 0
+									$me.IsHitTestVisible = $false
+									$me.IsMuted = $false
+									$me.Visibility = [System.Windows.Visibility]::Visible
+									try {
+										if ($audioIsHttp) {
+											$me.Source = [Uri]$audioSrc
+										} else {
+											$me.Source = New-Object System.Uri -ArgumentList ([string]$audioSrc), ([System.UriKind]::Absolute)
+										}
+									} catch {
+										try { $me.Source = [Uri]$audioSrc } catch {}
+									}
+
+									# Progress slider (0-100%)
+									$posSlider = New-Object System.Windows.Controls.Slider
+									$posSlider.Minimum = 0
+									$posSlider.Maximum = 100
+									$posSlider.Value = 0
+									$posSlider.Height = 18
+									$posSlider.IsMoveToPointEnabled = $true
+									$posSlider.Cursor = [System.Windows.Input.Cursors]::Hand
+									$posSlider.Margin = New-Object System.Windows.Thickness(0, 0, 0, 2)
+									[void]$sp.Children.Add($posSlider)
+
+									$timeRow = New-Object System.Windows.Controls.Grid
+									$tc0 = New-Object System.Windows.Controls.ColumnDefinition
+									$tc0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+									$tc1 = New-Object System.Windows.Controls.ColumnDefinition
+									$tc1.Width = [System.Windows.GridLength]::Auto
+									[void]$timeRow.ColumnDefinitions.Add($tc0)
+									[void]$timeRow.ColumnDefinitions.Add($tc1)
+									$timeLeft = New-Object System.Windows.Controls.TextBlock
+									$timeLeft.Text = '0:00'
+									$timeLeft.Foreground = $brushCache['#8A8A96']
+									$timeLeft.FontSize = 11
+									$timeRight = New-Object System.Windows.Controls.TextBlock
+									$timeRight.Text = '0:00'
+									$timeRight.Foreground = $brushCache['#8A8A96']
+									$timeRight.FontSize = 11
+									[System.Windows.Controls.Grid]::SetColumn($timeLeft, 0)
+									[System.Windows.Controls.Grid]::SetColumn($timeRight, 1)
+									[void]$timeRow.Children.Add($timeLeft)
+									[void]$timeRow.Children.Add($timeRight)
+									$timeRow.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+									[void]$sp.Children.Add($timeRow)
+
+									$ctrlRow = New-Object System.Windows.Controls.StackPanel
+									$ctrlRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+									$ctrlRow.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+
+									# Shared state (PowerPlayer-style mute volume)
+									$flags = [System.Collections.Hashtable]::Synchronized(@{
+										Playing        = $true
+										Failed         = $false
+										Player         = $me
+										Muted          = $false
+										UnMutedVolume  = 0.75
+										Scrubbing      = $false
+										PosSlider      = $posSlider
+										TimeLeft       = $timeLeft
+										TimeRight      = $timeRight
+										Path           = [string]$audioSrc
+										Title          = [string]$songName
+										PathTb         = $pathTb
+										PlayPath       = $null
+										PausePath      = $null
+										MutedPath      = $null
+										UnMutedPath    = $null
+										VolSlider      = $null
+										VolPct         = $null
+										ProgTimer      = $null
+									})
+									$me.Tag = $flags
+
+									$fmtTime = {
+										param([double]$sec)
+										if ($sec -lt 0) { $sec = 0 }
+										$ts = [TimeSpan]::FromSeconds([Math]::Floor($sec))
+										if ($ts.TotalHours -ge 1) { return ('{0:h\:mm\:ss}' -f $ts) }
+										return ('{0:m\:ss}' -f $ts)
+									}.GetNewClosure()
+									$flags['FmtTime'] = $fmtTime
+
+									# Icon button helper (play/pause/mute use Path content)
+									$mkIconBtn = {
+										param([double]$Wdt, [double]$Hgt)
+										$b = New-Object System.Windows.Controls.Button
+										$b.Width = $Wdt
+										$b.Height = $Hgt
+										$b.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+										$b.Padding = New-Object System.Windows.Thickness(4)
+										$b.Cursor = [System.Windows.Input.Cursors]::Hand
+										$b.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x3A, 0x3A, 0x48))
+										$b.BorderBrush = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x4A, 0x8A, 0xB8))
+										$b.BorderThickness = New-Object System.Windows.Thickness(1)
+										$b.Focusable = $true
+										if ($null -ne $noMo) { try { $b.Template = $noMo } catch {} }
+										$bgN = $b.Background
+										$bgH = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x4A, 0x4A, 0x5A))
+										$b.Add_MouseEnter({ param($s,$e) try { $s.Background = $bgH } catch {} }.GetNewClosure())
+										$b.Add_MouseLeave({ param($s,$e) try { $s.Background = $bgN } catch {} }.GetNewClosure())
+										return $b
+									}.GetNewClosure()
+
+									# Play / Pause icons (do NOT name these $playPath — that was the file path var)
+									$btnPlay = & $mkIconBtn 34 28
+									$iconGrid = New-Object System.Windows.Controls.Grid
+									$playIcon = New-Object System.Windows.Shapes.Path
+									$playIcon.Data = [System.Windows.Media.Geometry]::Parse('M8,5.14V19.14L19,12.14L8,5.14Z')
+									$playIcon.Fill = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xE0, 0xE0, 0xE8))
+									$playIcon.Stretch = [System.Windows.Media.Stretch]::Uniform
+									$playIcon.Margin = New-Object System.Windows.Thickness(2)
+									$playIcon.Visibility = [System.Windows.Visibility]::Collapsed
+									$pauseIcon = New-Object System.Windows.Shapes.Path
+									$pauseIcon.Data = [System.Windows.Media.Geometry]::Parse('M14,19H18V5H14M6,19H10V5H6V19Z')
+									$pauseIcon.Fill = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xE0, 0xE0, 0xE8))
+									$pauseIcon.Stretch = [System.Windows.Media.Stretch]::Uniform
+									$pauseIcon.Margin = New-Object System.Windows.Thickness(2)
+									$pauseIcon.Visibility = [System.Windows.Visibility]::Visible
+									[void]$iconGrid.Children.Add($playIcon)
+									[void]$iconGrid.Children.Add($pauseIcon)
+									$btnPlay.Content = $iconGrid
+									$flags['PlayPath'] = $playIcon
+									$flags['PausePath'] = $pauseIcon
+									$btnPlay.Tag = $flags
+									$btnPlay.Add_Click({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											$player = $f['Player']
+											if ($null -eq $player) { return }
+											if ([bool]$f['Playing']) {
+												$player.Pause()
+												$f['Playing'] = $false
+												try { $f['PlayPath'].Visibility = [System.Windows.Visibility]::Visible } catch {}
+												try { $f['PausePath'].Visibility = [System.Windows.Visibility]::Collapsed } catch {}
+											} else {
+												try {
+													if ($null -eq $player.Source -and $f['Path']) {
+														$player.Source = New-Object System.Uri -ArgumentList ([string]$f['Path']), ([System.UriKind]::Absolute)
+													}
+												} catch {}
+												$player.Play()
+												$f['Playing'] = $true
+												try { $f['PlayPath'].Visibility = [System.Windows.Visibility]::Collapsed } catch {}
+												try { $f['PausePath'].Visibility = [System.Windows.Visibility]::Visible } catch {}
+											}
+											if ($e) { $e.Handled = $true }
+										} catch {}
+									}.GetNewClosure())
+									[void]$ctrlRow.Children.Add($btnPlay)
+
+									# Stop
+									$btnStop = New-Object System.Windows.Controls.Button
+									$btnStop.Content = 'Stop'
+									$btnStop.Padding = New-Object System.Windows.Thickness(10, 3, 10, 3)
+									$btnStop.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+									$btnStop.Cursor = [System.Windows.Input.Cursors]::Hand
+									$btnStop.FontSize = 11
+									$btnStop.Foreground = $brushCache['#C8C8D0']
+									$btnStop.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x3A, 0x3A, 0x48))
+									$btnStop.BorderBrush = $brushCache['#3A3A42']
+									$btnStop.BorderThickness = New-Object System.Windows.Thickness(1)
+									if ($null -ne $noMo) { try { $btnStop.Template = $noMo } catch {} }
+									$btnStop.Tag = $flags
+									$btnStop.Add_Click({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											$player = $f['Player']
+											if ($null -eq $player) { return }
+											$player.Stop()
+											try { $player.Position = [TimeSpan]::Zero } catch {}
+											$f['Playing'] = $false
+											try { $f['PlayPath'].Visibility = [System.Windows.Visibility]::Visible } catch {}
+											try { $f['PausePath'].Visibility = [System.Windows.Visibility]::Collapsed } catch {}
+											try { $f['PosSlider'].Value = 0 } catch {}
+											try { $f['TimeLeft'].Text = '0:00' } catch {}
+											if ($e) { $e.Handled = $true }
+										} catch {}
+									}.GetNewClosure())
+									[void]$ctrlRow.Children.Add($btnStop)
+
+									# Volume icons (workspace xaml): mute / low / medium / high
+									$volIconData = @{
+										volMute = 'M3,9H7L12,4V20L7,15H3V9M16.59,12L14,9.41L15.41,8L18,10.59L20.59,8L22,9.41L19.41,12L22,14.59L20.59,16L18,13.41L15.41,16L14,14.59L16.59,12Z'
+										volLow  = 'M7,9V15H11L16,20V4L11,9H7Z'
+										volMed  = 'M5,9V15H9L14,20V4L9,9M18.5,12C18.5,10.23 17.5,8.71 16,7.97V16C17.5,15.29 18.5,13.76 18.5,12Z'
+										volHigh = 'M14,3.23V5.29C16.89,6.15 19,8.83 19,12C19,15.17 16.89,17.84 14,18.7V20.77C18,19.86 21,16.28 21,12C21,7.72 18,4.14 14,3.23M16.5,12C16.5,10.23 15.5,8.71 14,7.97V16C15.5,15.29 16.5,13.76 16.5,12M3,9V15H7L12,20V4L7,9H3Z'
+										stop    = 'M18,18H6V6H18V18Z'
+										openNew = 'M14,3V5H17.59L7.76,14.83L9.17,16.24L19,6.41V10H21V3M19,19H5V5H12V3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V12H19V19Z'
+									}
+									$audioIconFg = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xE0, 0xE0, 0xE8))
+									$mkAudioPath = {
+										param([string]$Data)
+										$pp = New-Object System.Windows.Shapes.Path
+										$pp.Width = 14; $pp.Height = 14
+										$pp.Stretch = [System.Windows.Media.Stretch]::Uniform
+										$pp.Data = [System.Windows.Media.Geometry]::Parse([string]$Data)
+										$pp.Fill = $audioIconFg
+										$pp.IsHitTestVisible = $false
+										return $pp
+									}.GetNewClosure()
+									$volKeyFromLevel = {
+										param([double]$Level, [bool]$Muted = $false)
+										if ($Muted -or $Level -le 0.001) { return 'volMute' }
+										if ($Level -le 0.33) { return 'volLow' }
+										if ($Level -le 0.66) { return 'volMed' }
+										return 'volHigh'
+									}.GetNewClosure()
+									$setAudioVolIcon = {
+										param($f, [double]$Level)
+										try {
+											$btn = $f['MuteBtn']
+											if ($null -eq $btn) { return }
+											$muted = [bool]$f['Muted'] -or ($Level -le 0.001)
+											$k = [string](& $volKeyFromLevel $Level $muted)
+											$data = [string]$volIconData[$k]
+											if ($data) { $btn.Content = (& $mkAudioPath $data) }
+											try {
+												$tip = if ($muted) { 'Unmute' } else { 'Mute / volume' }
+												if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $btn $tip 220 }
+												else { $btn.ToolTip = $tip }
+											} catch {}
+										} catch {}
+									}.GetNewClosure()
+									$flags['SetAudioVolIcon'] = $setAudioVolIcon
+									$flags['VolIconData'] = $volIconData
+
+									$btnMute = & $mkIconBtn 30 28
+									$btnMute.Content = (& $mkAudioPath ([string]$volIconData['volHigh']))
+									$btnMute.Tag = $flags
+									$flags['MuteBtn'] = $btnMute
+									try {
+										if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $btnMute 'Mute / unmute' 220 }
+										else { $btnMute.ToolTip = 'Mute / unmute' }
+									} catch {}
+									$btnMute.Add_Click({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											$player = $f['Player']
+											if ($null -eq $player) { return }
+											$setV = $f['SetAudioVolIcon']
+											if (-not [bool]$f['Muted']) {
+												$f['UnMutedVolume'] = [double]$player.Volume
+												if ([double]$f['UnMutedVolume'] -le 0) { $f['UnMutedVolume'] = 0.5 }
+												$player.Volume = 0
+												$f['Muted'] = $true
+												try { $f['VolSlider'].Value = 0 } catch {}
+												try { $f['VolPct'].Text = '0%' } catch {}
+												if ($null -ne $setV) { & $setV $f 0.0 }
+											} else {
+												$v = [double]$f['UnMutedVolume']
+												if ($v -le 0) { $v = 0.5 }
+												$player.Volume = $v
+												$f['Muted'] = $false
+												try { $f['VolSlider'].Value = $v } catch {}
+												try { $f['VolPct'].Text = ([double]$v).ToString('P0') } catch {}
+												if ($null -ne $setV) { & $setV $f $v }
+											}
+											if ($e) { $e.Handled = $true }
+										} catch {}
+									}.GetNewClosure())
+									[void]$ctrlRow.Children.Add($btnMute)
+
+									# Volume slider 0-1 (PowerPlayer style)
+									$volSlider = New-Object System.Windows.Controls.Slider
+									$volSlider.Minimum = 0
+									$volSlider.Maximum = 1
+									$volSlider.SmallChange = 0.01
+									$volSlider.LargeChange = 0.1
+									$volSlider.Value = 0.75
+									$volSlider.Width = 100
+									$volSlider.Height = 18
+									$volSlider.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+									$volSlider.Margin = New-Object System.Windows.Thickness(0, 0, 6, 0)
+									$volSlider.Cursor = [System.Windows.Input.Cursors]::Hand
+									$volSlider.IsMoveToPointEnabled = $true
+									$volSlider.Tag = $flags
+									$flags['VolSlider'] = $volSlider
+									$volSlider.Add_ValueChanged({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											$player = $f['Player']
+											if ($null -eq $player) { return }
+											$v = [double]$s.Value
+											$player.Volume = $v
+											if ($v -gt 0.001) {
+												$f['UnMutedVolume'] = $v
+												$f['Muted'] = $false
+											} else {
+												$f['Muted'] = $true
+											}
+											try { $f['VolPct'].Text = $v.ToString('P0') } catch {}
+											try {
+												$setV = $f['SetAudioVolIcon']
+												if ($null -ne $setV) { & $setV $f $v }
+											} catch {}
+										} catch {}
+									}.GetNewClosure())
+									# PreviewMouseUp also sets UnMutedVolume like PowerPlayer
+									$volSlider.Add_PreviewMouseUp({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											$v = [double]$s.Value
+											$f['UnMutedVolume'] = $v
+											if ($v -gt 0.001) { $f['Muted'] = $false }
+										} catch {}
+									}.GetNewClosure())
+									[void]$ctrlRow.Children.Add($volSlider)
+									try { & $setAudioVolIcon $flags 0.75 } catch {}
+
+									$volPct = New-Object System.Windows.Controls.TextBlock
+									$volPct.Text = '75%'
+									$volPct.Foreground = $brushCache['#8A8A96']
+									$volPct.FontSize = 11
+									$volPct.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+									$volPct.Width = 36
+									$volPct.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+									$flags['VolPct'] = $volPct
+									[void]$ctrlRow.Children.Add($volPct)
+
+									# Stop icon
+									$btnStop.Content = (& $mkAudioPath ([string]$volIconData['stop']))
+									try {
+										$btnStop.Width = 30; $btnStop.Height = 28
+										$btnStop.Padding = New-Object System.Windows.Thickness(4)
+										if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $btnStop 'Stop and return to start' 220 }
+										else { $btnStop.ToolTip = 'Stop and return to start' }
+									} catch {}
+
+									# External / open-in-new icon
+									$btnExt = & $mkIconBtn 30 28
+									$btnExt.Content = (& $mkAudioPath ([string]$volIconData['openNew']))
+									$btnExt.Tag = $flags
+									try {
+										if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $btnExt 'Open in external player' 220 }
+										else { $btnExt.ToolTip = 'Open in external player' }
+									} catch {}
+									$btnExt.Add_Click({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											$p = [string]$f['Path']
+											if ($p -and (Test-Path -LiteralPath $p)) { Start-Process -FilePath $p | Out-Null }
+											elseif ($p -match '^(?i)https?://') { Start-Process -FilePath $p | Out-Null }
+											if ($e) { $e.Handled = $true }
+										} catch {}
+									}.GetNewClosure())
+									[void]$ctrlRow.Children.Add($btnExt)
+
+									[void]$sp.Children.Add($ctrlRow)
+									# Keep MediaElement in tree
+									[void]$sp.Children.Add($me)
+									$playerHost.Child = $sp
+
+									# Progress timer
+									$posSlider.Tag = $flags
+									$posSlider.Add_PreviewMouseLeftButtonDown({
+										param($s, $e)
+										try { $s.Tag['Scrubbing'] = $true } catch {}
+									}.GetNewClosure())
+									$posSlider.Add_PreviewMouseLeftButtonUp({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											$player = $f['Player']
+											if ($null -ne $player -and $player.NaturalDuration.HasTimeSpan) {
+												$dur = $player.NaturalDuration.TimeSpan.TotalSeconds
+												if ($dur -gt 0) {
+													$player.Position = [TimeSpan]::FromSeconds(($s.Value / 100.0) * $dur)
+												}
+											}
+											$f['Scrubbing'] = $false
+										} catch {
+											try { $s.Tag['Scrubbing'] = $false } catch {}
+										}
+									}.GetNewClosure())
+
+									$progTimer = New-Object System.Windows.Threading.DispatcherTimer
+									$progTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+									$progTimer.Tag = $flags
+									$progTimer.Add_Tick({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											if ([bool]$f['Scrubbing']) { return }
+											$player = $f['Player']
+											if ($null -eq $player) { return }
+											$fmt = $f['FmtTime']
+											if ($player.NaturalDuration.HasTimeSpan) {
+												$dur = $player.NaturalDuration.TimeSpan.TotalSeconds
+												$pos = $player.Position.TotalSeconds
+												if ($dur -gt 0) {
+													try { $f['PosSlider'].Value = ($pos / $dur) * 100.0 } catch {}
+												}
+												try { $f['TimeLeft'].Text = (& $fmt $pos) } catch {}
+												try { $f['TimeRight'].Text = (& $fmt $dur) } catch {}
+											} else {
+												try { $f['TimeLeft'].Text = (& $fmt $player.Position.TotalSeconds) } catch {}
+											}
+										} catch {}
+									}.GetNewClosure())
+									$flags['ProgTimer'] = $progTimer
+									$progTimer.Start()
+
+									$me.Add_MediaOpened({
+										param($s, $e)
+										try {
+											$s.Play()
+											$f = $s.Tag
+											if ($f -is [hashtable]) {
+												$f['Playing'] = $true
+												$f['Failed'] = $false
+												try { $f['PlayPath'].Visibility = [System.Windows.Visibility]::Collapsed } catch {}
+												try { $f['PausePath'].Visibility = [System.Windows.Visibility]::Visible } catch {}
+											}
+										} catch {}
+									}.GetNewClosure())
+									$me.Add_MediaEnded({
+										param($s, $e)
+										try {
+											$s.Stop()
+											try { $s.Position = [TimeSpan]::Zero } catch {}
+											$f = $s.Tag
+											if ($f -is [hashtable]) {
+												$f['Playing'] = $false
+												try { $f['PlayPath'].Visibility = [System.Windows.Visibility]::Visible } catch {}
+												try { $f['PausePath'].Visibility = [System.Windows.Visibility]::Collapsed } catch {}
+												try { $f['PosSlider'].Value = 0 } catch {}
+											}
+										} catch {}
+									}.GetNewClosure())
+									$me.Add_MediaFailed({
+										param($s, $e)
+										try {
+											$why = ''
+											try { if ($e.ErrorException) { $why = [string]$e.ErrorException.Message } } catch {}
+											if (-not $why) { $why = 'codec not supported / cannot open' }
+											$f = $s.Tag
+											if ($f -is [hashtable]) {
+												$f['Playing'] = $false
+												$f['Failed'] = $true
+												try { $f['TimeLeft'].Text = 'failed' } catch {}
+												try { $f['TimeRight'].Text = $why } catch {}
+												try { $f['PlayPath'].Visibility = [System.Windows.Visibility]::Visible } catch {}
+												try { $f['PausePath'].Visibility = [System.Windows.Visibility]::Collapsed } catch {}
+												try {
+													if ($f['PathTb']) {
+														$f['PathTb'].Text = ("(playback failed: {0}) {1}" -f $why, [string]$f['Path'])
+														$f['PathTb'].Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(240, 92, 92))
+													}
+												} catch {}
+											}
+										} catch {}
+									}.GetNewClosure())
+									# Also kick play once element is in the live tree
+									$me.Add_Loaded({
+										param($s, $e)
+										try {
+											$f = $s.Tag
+											if ($f -is [hashtable] -and [bool]$f['Failed']) { return }
+											$s.Play()
+											if ($f -is [hashtable]) { $f['Playing'] = $true }
+										} catch {}
+									}.GetNewClosure())
+
+									# Stop previous audio on this bag if any
+									try {
+										$prev = $null
+										if ($W -is [hashtable]) { $prev = $W['ActiveAudioFlags'] }
+										elseif ($W) { $prev = $W.ActiveAudioFlags }
+										if ($prev -is [hashtable] -and $prev['Player'] -and $prev['Player'] -ne $me) {
+											try { $prev['Player'].Stop() } catch {}
+											try { $prev['Player'].Close() } catch {}
+											try { if ($prev['ProgTimer']) { $prev['ProgTimer'].Stop() } } catch {}
+										}
+										if ($W -is [hashtable]) { $W['ActiveAudioFlags'] = $flags }
+										else { try { $W.ActiveAudioFlags = $flags } catch {} }
+									} catch {}
+
+									$flags['PathTb'] = $pathTb
+									# Show missing-file hint up front (before MediaFailed)
+									if (-not $audioIsHttp) {
+										try {
+											if (-not (Test-Path -LiteralPath $audioSrc -PathType Leaf)) {
+												$pathTb.Text = ("(file not found) {0}" -f $audioSrc)
+												$pathTb.Foreground = $brushCache['#F05C5C']
+												$flags['Failed'] = $true
+												$flags['Playing'] = $false
+												try { $playIcon.Visibility = [System.Windows.Visibility]::Visible } catch {}
+												try { $pauseIcon.Visibility = [System.Windows.Visibility]::Collapsed } catch {}
+											}
+										} catch {}
+									}
+
+									$body.Child = $playerHost
+									# Play after attach so the element is parented
+									try {
+										if (-not [bool]$flags['Failed']) { $me.Play() }
+									} catch {}
+
+									$lab = 'audio'
+									if (-not [string]::IsNullOrWhiteSpace($songName)) {
+										$lab = ('audio - {0}' -f $songName)
+									}
+									try { $langTb.Text = $lab } catch {}
+
+								} elseif ($mediaKind -eq 'video') {
+									# Play / Pop out use $script:MB.Video API (WPF clicks cannot see script functions by name).
+									# Paths may contain spaces — always Unescape + LiteralPath-friendly strings.
+									$playPath = ''
+									try {
+										if ($null -ne $uriObj -and $uriObj.IsFile) {
+											$playPath = [string]$uriObj.LocalPath
+											try { $playPath = [Uri]::UnescapeDataString($playPath) } catch {}
+										}
+									} catch {}
+									if ([string]::IsNullOrWhiteSpace($playPath)) { $playPath = [string]$mediaDisp }
+									if ([string]::IsNullOrWhiteSpace($playPath)) { $playPath = [string]$mediaUri }
+									try { $playPath = & $normMediaPath $playPath } catch {}
+									# Prefer a verified existing path (spaces ok via LiteralPath)
+									try {
+										if ($playPath -notmatch '^(?i)https?://' -and -not (Test-Path -LiteralPath $playPath -PathType Leaf)) {
+											foreach ($c in @(Get-MBPathCandidates -Path $playPath -ErrorAction SilentlyContinue)) {
+												if (Test-Path -LiteralPath $c -PathType Leaf) { $playPath = $c; break }
+											}
+										} elseif ($playPath -notmatch '^(?i)https?://' -and (Test-Path -LiteralPath $playPath -PathType Leaf)) {
+											$playPath = [System.IO.Path]::GetFullPath($playPath)
+										}
+									} catch {}
+									# Multi-word video titles ok: ![My Holiday Clip](C:\...\My Clip.mp4)
+									$playTitle = & $fmtMediaLabel $mediaAlt $playPath 'Video' 96
+									if ([string]::IsNullOrWhiteSpace($playTitle) -and -not [string]::IsNullOrWhiteSpace($mediaDisp)) {
+										$playTitle = & $fmtMediaLabel '' $mediaDisp 'Video' 96
+									}
+
+									$boxW = [Math]::Max(280.0, [Math]::Min(560.0, $stretchW - 24.0))
+									$boxH = [Math]::Round($boxW * 0.56)
+									try {
+										$rsz = Get-MBVideoFrameSize -Source $playPath
+										if ([int]$rsz.Width -gt 0 -and [int]$rsz.Height -gt 0) {
+											$ar = [double]$rsz.Width / [double]$rsz.Height
+											$boxH = [Math]::Round($boxW / [Math]::Max(0.1, $ar))
+											if ($boxH -gt 420) { $boxH = 420.0; $boxW = [Math]::Round($boxH * $ar) }
+											if ($boxH -lt 140) { $boxH = 140.0 }
+										}
+									} catch {}
+
+									# StartFn from $W bag only - do NOT call Register-MBVideoApi here (STA can wipe bag with nulls)
+									$startFn = $null
+									try {
+										if ($W -is [hashtable]) {
+											$startFn = $W['VideoStartInline']
+											if ($null -eq $startFn -and $W['VideoApi']) { $startFn = $W['VideoApi']['StartInline'] }
+										}
+									} catch {}
+									try { if ($null -eq $startFn -and $W) { $startFn = $W.VideoStartInline } } catch {}
+									$vstate = [hashtable]@{
+										Path         = [string]$playPath
+										Title        = [string]$playTitle
+										Playing      = $false
+										Started      = $false
+										Failed       = $false
+										MediaElement = $null
+										Popup        = $null
+										Mode         = ''
+										Host         = $null
+										Width        = $boxW
+										Height       = $boxH
+										StartFn      = $startFn
+										WpfBag      = $W
+									}
+
+									$card = New-Object System.Windows.Controls.StackPanel
+									$card.Orientation = [System.Windows.Controls.Orientation]::Vertical
+									$card.Margin = New-Object System.Windows.Thickness(2)
+
+									# Black host only - no "PLAY VIDEO" text. Autoplay injects player+OSD.
+									$preview = New-Object System.Windows.Controls.Border
+									$preview.Background = [System.Windows.Media.Brushes]::Black
+									$preview.BorderBrush = $brushCache['#3A3A42']
+									$preview.BorderThickness = New-Object System.Windows.Thickness(1)
+									$preview.CornerRadius = New-Object System.Windows.CornerRadius(4)
+									$preview.Width = $boxW
+									$preview.Height = $boxH
+									$preview.MinHeight = $boxH
+									$preview.Cursor = [System.Windows.Input.Cursors]::Arrow
+									$preview.ClipToBounds = $true
+									$preview.Child = $null
+									$vstate['Host'] = $preview
+									$preview.Tag = $vstate
+
+									$pathTb = New-Object System.Windows.Controls.TextBlock
+									$pathTb.Text = $playPath
+									$pathTb.Foreground = $brushCache['#8A8A96']
+									$pathTb.FontFamily = $W.MonoFont
+									$pathTb.FontSize = 10
+									$pathTb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+									$pathTb.Margin = New-Object System.Windows.Thickness(0, 8, 0, 0)
+									$pathTb.MaxWidth = [Math]::Max(280.0, $stretchW - 24.0)
+
+									[void]$card.Children.Add($preview)
+									[void]$card.Children.Add($pathTb)
+									$body.Child = $card
+
+									# AUTOPLAY: only full StartInline (player + OSD). Never inject a bare MediaElement
+									# fallback — that was wiping the OSD controls after a false-negative start.
+									$autoOk = $false
+									$autoErr = ''
+									try {
+										if ($playPath -match '(?i)^[A-Za-z]:\\Windows\\System32\\(Users\\.+)$') {
+											$playPath = 'C:\' + $Matches[1]
+											$vstate['Path'] = $playPath
+										}
+									} catch {}
+									try {
+										$fn = $startFn
+										if ($null -eq $fn -and $W -is [hashtable]) { $fn = $W['VideoStartInline'] }
+										if ($null -eq $fn -and $W -is [hashtable] -and $W['VideoApi']) {
+											try { $fn = $W['VideoApi']['StartInline'] } catch {}
+										}
+										if ($null -ne $fn) {
+											try {
+												# Named params for Start-MBInlineVideoInHost (HostElement, Path, Width, Height, State)
+												$null = & $fn -HostElement $preview -Path ([string]$playPath) -Width ([double]$boxW) -Height ([double]$boxH) -State $vstate
+											} catch {
+												$autoErr = $_.Exception.Message
+											}
+										} else {
+											$autoErr = 'VideoStartInline missing (restart MiniBot)'
+										}
+										# Success = full OSD tree (Grid) or Started/MediaElement from StartInline
+										if ($vstate['Started'] -or $vstate['MediaElement']) { $autoOk = $true }
+										if ($preview.Child -is [System.Windows.Controls.Grid]) {
+											$autoOk = $true
+											$vstate['Started'] = $true
+											$vstate['Failed'] = $false
+										}
+										if (-not $autoOk) {
+											if ($vstate['LastError']) { $autoErr = [string]$vstate['LastError'] }
+											elseif (-not $autoErr) { $autoErr = 'StartInline returned false' }
+										}
+									} catch {
+										$autoErr = $_.Exception.Message
+									}
+									if (-not $autoOk) {
+										$vstate['Failed'] = $true
+										try {
+											$msg = if ($autoErr) { $autoErr } else { 'autoplay failed' }
+											$pathTb.Text = ("(autoplay failed: {0}) {1}" -f $msg, $playPath)
+											$pathTb.Foreground = $brushCache['#F05C5C']
+										} catch {}
+									}
+									# Click host to retry full StartInline (OSD) if not started
+									$preview.Add_MouseLeftButtonUp({
+										param($s, $e)
+										try {
+											$st = $s.Tag
+											if (-not ($st -is [hashtable])) { return }
+											# Already has full player+OSD
+											if ([bool]$st['Started'] -and -not [bool]$st['Failed']) { return }
+											if ($s.Child -is [System.Windows.Controls.Grid]) { return }
+											$fn2 = $null
+											try { $fn2 = $st['StartFn'] } catch {}
+											try {
+												if ($null -eq $fn2 -and $W -is [hashtable]) { $fn2 = $W['VideoStartInline'] }
+											} catch {}
+											if ($null -ne $fn2) {
+												try {
+													$null = & $fn2 -HostElement $st['Host'] -Path ([string]$st['Path']) -Width ([double]$st['Width']) -Height ([double]$st['Height']) -State $st
+												} catch {}
+												if ($st['Started'] -or $st['MediaElement'] -or ($st['Host'] -and $st['Host'].Child -is [System.Windows.Controls.Grid])) {
+													$st['Failed'] = $false
+													$st['Started'] = $true
+												}
+											}
+											if ($e) { $e.Handled = $true }
+										} catch {}
+									}.GetNewClosure())
+								} else {
+									$img = New-Object System.Windows.Controls.Image
+									$img.Stretch = [System.Windows.Media.Stretch]::Uniform
+									$img.MaxWidth = [Math]::Max(40.0, $stretchW - 18.0)
+									$img.MaxHeight = $maxH
+									$img.SnapsToDevicePixels = $true
+									try {
+										$bmp = New-Object System.Windows.Media.Imaging.BitmapImage
+										$bmp.BeginInit()
+										$bmp.UriSource = $uriObj
+										$bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+										$dw = [int][Math]::Max(80, [Math]::Min(1600, $stretchW * 2))
+										try { $bmp.DecodePixelWidth = $dw } catch {}
+										$bmp.EndInit()
+										if ($bmp.CanFreeze) { $bmp.Freeze() }
+										$img.Source = $bmp
+									} catch {
+										$tb = New-Object System.Windows.Controls.TextBlock
+										$tb.Text = "Image failed to load.`n$mediaDisp"
+										$tb.Foreground = $brushCache['#F05C5C']
+										$tb.FontFamily = $W.MonoFont
+										$tb.FontSize = 12
+										$tb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+										$body.Child = $tb
+										$img = $null
+									}
+									if ($null -ne $img) {
+										$img.ToolTip = $mediaDisp
+										$body.Child = $img
+									}
+								}
+
+								[System.Windows.Controls.Grid]::SetRow($body, 1)
+								[void]$root.Children.Add($body)
+								$outer.Child = $root
+								$outer.Tag = @{ Kind = 'md-media'; MediaKind = $mediaKind; Uri = $mediaUri }
+
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($outer)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+								try {
+									$sl = $null
+									if ($W -is [hashtable]) {
+										if (-not $W.ContainsKey('MdStretchElements') -or $null -eq $W['MdStretchElements']) {
+											$W['MdStretchElements'] = New-Object System.Collections.ArrayList
+										}
+										$sl = $W['MdStretchElements']
+									} else {
+										try { $sl = $W.MdStretchElements } catch { $sl = $null }
+										if ($null -eq $sl) {
+											$sl = New-Object System.Collections.ArrayList
+											try { $W | Add-Member -NotePropertyName MdStretchElements -NotePropertyValue $sl -Force } catch {}
+										}
+									}
+									if ($null -ne $sl) { [void]$sl.Add($outer) }
+								} catch {}
+								try { $W.LogLineCharRun = 0 } catch {}
+								# trailing empty para so following text continues cleanly
+								$doc.Blocks.Add((& $newPara))
 							} catch {}
 							continue
 						}
@@ -26779,7 +35644,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									if (-not $brushCache.ContainsKey($hx)) {
 										$brushCache[$hx] = $conv.ConvertFromString($hx)
 									}
-									# Timing stamp spacing
+									# Timing stamp spacing (Thought/Worked) - top margin lifts both ~4px
 									$doc.Blocks.Add((& $newPara))
 									$tb = New-Object System.Windows.Controls.TextBlock
 									$tb.Text = $tline
@@ -26787,7 +35652,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$tb.FontFamily = $W.MonoFont
 									$tb.FontSize = 10
 									$tb.FontStyle = [System.Windows.FontStyles]::Italic
-									$tb.Margin = New-Object System.Windows.Thickness(5, -7, 0, 10)
+									$tb.Margin = New-Object System.Windows.Thickness(5, -14, 0, 10)
 									$tb.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
 									$tb.TextWrapping = [System.Windows.TextWrapping]::Wrap
 									$buc = New-Object System.Windows.Documents.BlockUIContainer ($tb)
@@ -26796,6 +35661,18 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$doc.Blocks.Add((& $newPara))
 									try { $W.LogLineCharRun = 0 } catch {}
 								}
+							} catch {}
+							continue
+						}
+
+						if ($kind -eq 'md-list-lead') {
+							try {
+								& $trimTrailingEmptyParas
+								$p = & $newPara
+								$p.Margin = New-Object System.Windows.Thickness(0, 8, 0, 0)
+								$p.LineHeight = 16
+								$doc.Blocks.Add($p)
+								try { $W.LogLineCharRun = 0 } catch {}
 							} catch {}
 							continue
 						}
@@ -26813,7 +35690,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$border = New-Object System.Windows.Controls.Border
 								$border.Height = 1
 								$border.Background = $brushCache[$ruleHex]
-								$border.Margin = New-Object System.Windows.Thickness(0, 2, 0, 2)
+								$border.Margin = New-Object System.Windows.Thickness(0, 10, 0, 10)
 								$border.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
 								$border.SnapsToDevicePixels = $true
 								$border.Width = $stretchW
@@ -27728,45 +36605,21 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								}
 							} catch {}
 						}
-						$pw = [string]$W.PendingTitlePoweredBy
-						if ($W.TitlePoweredBy) {
-							if ([string]::IsNullOrWhiteSpace($pw)) {
-								$W.TitlePoweredBy.Text = ''
-								$W.TitlePoweredBy.Visibility = [System.Windows.Visibility]::Collapsed
-								try {
-									if ($W.TitlePoweredByShadow) {
-										$W.TitlePoweredByShadow.Text = ''
-										$W.TitlePoweredByShadow.Visibility = [System.Windows.Visibility]::Collapsed
-									}
-								} catch {}
-							} else {
-								try {
-									if ($W.TitlePoweredByShadow) {
-										$W.TitlePoweredByShadow.Text = $pw
-										$W.TitlePoweredByShadow.Visibility = [System.Windows.Visibility]::Visible
-									}
-								} catch {}
-								# muted prefix + accent alias
-								try {
-									$m = [regex]::Match($pw, '^(PoweredBy:\s*)(.+)$')
-									if ($m.Success) {
-										if (-not $W.BrushCache.ContainsKey('#8A8A96')) { $W.BrushCache['#8A8A96'] = $conv.ConvertFromString('#8A8A96') }
-										if (-not $W.BrushCache.ContainsKey('#BB9AF7')) { $W.BrushCache['#BB9AF7'] = $conv.ConvertFromString('#BB9AF7') }
-										$W.TitlePoweredBy.Inlines.Clear()
-										$r1 = New-Object System.Windows.Documents.Run ($m.Groups[1].Value)
-										$r1.Foreground = $W.BrushCache['#8A8A96']
-										$r2 = New-Object System.Windows.Documents.Run ($m.Groups[2].Value)
-										$r2.Foreground = $W.BrushCache['#BB9AF7']
-										$r2.FontWeight = [System.Windows.FontWeights]::SemiBold
-										[void]$W.TitlePoweredBy.Inlines.Add($r1)
-										[void]$W.TitlePoweredBy.Inlines.Add($r2)
-									} else {
-										$W.TitlePoweredBy.Text = $pw
-									}
-								} catch { $W.TitlePoweredBy.Text = $pw }
-								$W.TitlePoweredBy.Visibility = [System.Windows.Visibility]::Visible
+						# Model picker (PoweredBy section)
+						try {
+							$seq = 0
+							try { $seq = [int64]$W.RemoteModelsSeq } catch { $seq = 0 }
+							$applied = 0
+							try { $applied = [int64]$W.RemoteModelsSeqApplied } catch { $applied = 0 }
+							if ($seq -ne 0 -and $seq -ne $applied -and $W.ApplyModelPicker) {
+								$models = @()
+								try { $models = @($W.RemoteModels) } catch { $models = @() }
+								$sel = ''
+								try { $sel = [string]$W.ActiveModel } catch { $sel = '' }
+								& $W.ApplyModelPicker $models $sel
+								$W.RemoteModelsSeqApplied = $seq
 							}
-						}
+						} catch {}
 					} catch {}
 					$pend = $W.PendingSticky
 					if ($pend) {
@@ -28358,25 +37211,31 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							if ($null -eq $toolTipsMap) { $toolTipsMap = @{} }
 							$limeHex = '#9ECE6A'
 							$grayHex = '#8A8A96'
+							$orangeHex = '#FF9E64'
 							$chipBgHex = '#3A3A42'
 							$menuBgHex = '#1E1E24'
 							$menuFgHex = '#C8C8D0'
 							$tipBgHex = '#1A1A1E'
 							$tipBdHex = '#3A3A42'
 							$sepHex = '#3A3A42'
-							foreach ($hx in @($limeHex, $grayHex, $chipBgHex, $menuBgHex, $menuFgHex, $tipBgHex, $tipBdHex, $sepHex)) {
+							foreach ($hx in @($limeHex, $grayHex, $orangeHex, $chipBgHex, $menuBgHex, $menuFgHex, $tipBgHex, $tipBdHex, $sepHex)) {
 								if (-not $W.BrushCache.ContainsKey($hx)) {
 									try { $W.BrushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
 								}
 							}
 							$limeB = $W.BrushCache[$limeHex]
 							$grayB = $W.BrushCache[$grayHex]
+							$orangeB = $W.BrushCache[$orangeHex]
+							if (-not $orangeB) { $orangeB = $grayB }
 							$chipBg = $W.BrushCache[$chipBgHex]
 							$menuBg = $W.BrushCache[$menuBgHex]
 							$menuFg = $W.BrushCache[$menuFgHex]
 							$tipBg = $W.BrushCache[$tipBgHex]
 							$tipBd = $W.BrushCache[$tipBdHex]
 							$sepB = $W.BrushCache[$sepHex]
+							$visionBlockedMap = @{}
+							try { $visionBlockedMap = $td.visionBlocked } catch { $visionBlockedMap = @{} }
+							if ($null -eq $visionBlockedMap) { $visionBlockedMap = @{} }
 							$mono = $null
 							try { $mono = $W.MonoFont } catch {}
 							$mkThemedTip = {
@@ -28618,6 +37477,26 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											}
 										} catch { $tTip = '' }
 										if ([string]::IsNullOrWhiteSpace($tTip)) { $tTip = $tName }
+										$noVision = $false
+										try {
+											if ($visionBlockedMap -is [hashtable]) {
+												if ($visionBlockedMap.ContainsKey($tName)) { $noVision = $true }
+												elseif ($visionBlockedMap.Contains($tName)) { $noVision = $true }
+												else {
+													foreach ($vk in @($visionBlockedMap.Keys)) {
+														if ([string]::Equals([string]$vk, $tName, [StringComparison]::OrdinalIgnoreCase)) {
+															$noVision = $true
+															break
+														}
+													}
+												}
+											}
+										} catch { $noVision = $false }
+										if ($noVision) {
+											if ($tTip -notmatch '(?i)does not support vision|no ''vision'' in Abilities') {
+												$tTip = ("{0}`n`nUnavailable: current model does not support vision (no 'vision' in Abilities)." -f $tTip.TrimEnd())
+											}
+										}
 										$wasUsed = $false
 										try {
 											if ($usedSet.ContainsKey($tName)) { $wasUsed = $true }
@@ -28631,10 +37510,13 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												}
 											}
 										} catch { $wasUsed = $false }
-										if ($wasUsed -and $tTip -notmatch '(?i)used this session') {
+										if ($wasUsed -and -not $noVision -and $tTip -notmatch '(?i)used this session') {
 											$tTip = ("{0}`n`nUsed this session." -f $tTip.TrimEnd())
 										}
-										[void]$cm.Items.Add((& $addToolItem $tName $itemFg $menuBg $tTip $wasUsed))
+										$toolFg = $itemFg
+										if ($noVision -and $orangeB) { $toolFg = $orangeB }
+										# Vision-blocked: orange, never "used" highlight
+										[void]$cm.Items.Add((& $addToolItem $tName $toolFg $menuBg $tTip $(if ($noVision) { $false } else { $wasUsed })))
 									}
 								}
 								if ([string]$g -eq 'installers' -and $installerPkgs.Count -gt 0) {
@@ -28847,14 +37729,14 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							$label = switch ($mode) {
 								'thinking'    { 'thinking...' }
 								'working'     { 'working...' }
-								'compacting'  { 'autocompacting...' }
+								'compacting'  { 'auto-compacting...' }
 								'error'       { 'error' }
 								default       { 'ready' }
 							}
 						} else {
 							if ($mode -eq 'thinking' -and $label -notmatch '\.\.\.$') { $label = 'thinking...' }
 							elseif ($mode -eq 'working' -and $label -notmatch '\.\.\.$') { $label = 'working...' }
-							elseif ($mode -eq 'compacting' -and $label -notmatch '\.\.\.$') { $label = 'autocompacting...' }
+							elseif ($mode -eq 'compacting' -and $label -notmatch '\.\.\.$') { $label = 'auto-compacting...' }
 							elseif ($mode -eq 'error') { $label = 'error' }
 						}
 						# Sync titlebar robot with status
@@ -28870,7 +37752,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 						$bandRight = 10.0
 						if ($mode -eq 'thinking' -or $mode -eq 'working') {
 							$labelMinW = 98.0    # thinking/working label width
-							$timerW = 32.0       # "0.0s"…"9999s"
+							$timerW = 32.0       # "0.0s"..."9999s"
 							$dotRight = 0.0      # no gap between label and timer
 							$bandRight = 5.0     # +3px after counter before ctx
 						} elseif ($mode -eq 'compacting') {
@@ -29073,26 +37955,26 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					try { $mode = [string]$W.SendMode } catch {}
 					if ($hover -and $btn.IsEnabled) {
 						if ($mode -eq 'send') {
-							$btn.Background = $bc.ConvertFromString('#243D2A')
-							$btn.BorderBrush = $bc.ConvertFromString('#9ECE6A')
-							$btn.Foreground = $bc.ConvertFromString('#C3E6A0')
+							$btn.Background = $bc.ConvertFromString('#32323A')
+							$btn.BorderBrush = $bc.ConvertFromString('#4A4A56')
+							$btn.Foreground = $bc.ConvertFromString('#C8C8D0')
 							if ($W.SetSendBtnIconGrad) {
 								& $W.SetSendBtnIconGrad @('#D0D0D8', '#9A9AA6', '#6A6A76')
 							}
 						} else {
-							$btn.Background = $bc.ConvertFromString('#4A2C2C')
-							$btn.BorderBrush = $bc.ConvertFromString('#FF8585')
-							$btn.Foreground = $bc.ConvertFromString('#FFAAAA')
+							$btn.Background = $bc.ConvertFromString('#3A2222')
+							$btn.BorderBrush = $bc.ConvertFromString('#6B3838')
+							$btn.Foreground = $bc.ConvertFromString('#A85858')
 							if ($W.SetSendBtnIconGrad) {
-								& $W.SetSendBtnIconGrad @('#FFD0D0', '#FF8585', '#F05C5C')
+								& $W.SetSendBtnIconGrad @('#B86868', '#8B4040', '#5A2828')
 							}
 						}
 					} else {
 						$bg = [string]$W.SendBtnBaseBg
 						$bd = [string]$W.SendBtnBaseBorder
 						$fg = [string]$W.SendBtnBaseFg
-						if ([string]::IsNullOrWhiteSpace($bg)) { $bg = '#3A3A42' }
-						if ([string]::IsNullOrWhiteSpace($bd)) { $bd = '#52525C' }
+						if ([string]::IsNullOrWhiteSpace($bg)) { $bg = '#2A2A30' }
+						if ([string]::IsNullOrWhiteSpace($bd)) { $bd = '#3A3A42' }
 						if ([string]::IsNullOrWhiteSpace($fg)) { $fg = '#8A8A96' }
 						$btn.Background = $bc.ConvertFromString($bg)
 						$btn.BorderBrush = $bc.ConvertFromString($bd)
@@ -29103,7 +37985,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							}
 						} else {
 							if ($W.SetSendBtnIconGrad) {
-								& $W.SetSendBtnIconGrad @('#FFAAAA', '#F05C5C', '#C04040')
+								& $W.SetSendBtnIconGrad @('#A05050', '#7A3535', '#4A2020')
 							}
 						}
 					}
@@ -29119,9 +38001,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 						$W.SendMode = 'send'
 						$btn.ToolTip = 'Send'
 						$btn.IsEnabled = $true
-						$W.SendBtnBaseBg = '#4A4A56'
-						$W.SendBtnBaseFg = '#E0E0E8'
-						$W.SendBtnBaseBorder = '#6A6A76'
+						$W.SendBtnBaseBg = '#2A2A30'
+						$W.SendBtnBaseFg = '#C8C8D0'
+						$W.SendBtnBaseBorder = '#3A3A42'
 						try {
 							if ($W.SendBtnPath -and $W.SendGeomData) {
 								$W.SendBtnPath.Data = [System.Windows.Media.Geometry]::Parse([string]$W.SendGeomData)
@@ -29131,9 +38013,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 						$W.SendMode = 'stop'
 						$btn.ToolTip = 'Stop'
 						$btn.IsEnabled = $true
-						$W.SendBtnBaseBg = '#3D2626'
-						$W.SendBtnBaseFg = '#F05C5C'
-						$W.SendBtnBaseBorder = '#F05C5C'
+						$W.SendBtnBaseBg = '#2A1A1A'
+						$W.SendBtnBaseFg = '#8B4040'
+						$W.SendBtnBaseBorder = '#5A2E2E'
 						try {
 							if ($W.SendBtnPath -and $W.StopGeomData) {
 								$W.SendBtnPath.Data = [System.Windows.Media.Geometry]::Parse([string]$W.StopGeomData)
@@ -29399,6 +38281,8 @@ function Stop-MBWpfHost {
 		[switch]$Soft
 	)
 	Write-MBDebugLog -Step 'WPF_STOP_BEGIN'
+	# Ensure sandbox/RunCommand trees die with the host
+	try { Stop-MBTrackedChildProcesses } catch {}
 	if (-not $script:MB.Wpf) { return }
 	try {
 		# hard-exit; release single-instance lock
@@ -29406,6 +38290,7 @@ function Stop-MBWpfHost {
 		$script:MB.Wpf.CloseKind = 'user_x'
 		$script:MB.Wpf.ForceProcessExit = $true
 		$script:MB.Wpf.ExitRequested = $true
+		try { $script:MB.Wpf.InterruptFlag = $true } catch {}
 		try { [void]$script:MB.Wpf.InputWait.Set() } catch {}
 		try { [void]$script:MB.Wpf.CredWait.Set() } catch {}
 		try { [void]$script:MB.Wpf.ConfirmWait.Set() } catch {}
@@ -29477,6 +38362,12 @@ function Start-LocalAgent {
 	$auth = Connect-MBModelEndpoint -TimeoutSeconds 8
 	$connTest = $auth.ConnTest
 	Write-MBDebugLog -Step 'AGENT_AUTH_DONE' -Detail ("ok={0} exit={1}" -f $auth.Success, $auth.Exit)
+	if ($auth.Success) {
+		try {
+			$null = Refresh-MBRemoteModels -Force
+			Write-MBDebugLog -Step 'AGENT_MODELS' -Detail ("count={0} active={1}" -f @($script:MB.RemoteModels).Count, (Get-MBActiveModel))
+		} catch {}
+	}
 
 	if ($auth.Exit -or -not $auth.Success) {
 		$msg = $null
@@ -29546,6 +38437,11 @@ function Start-LocalAgent {
 	}
 	Write-MBDebugLog -Step 'AGENT_WPF_READY' -Detail (Get-MBDebugLogPath)
 	$script:MB.PreferWpfLogin = $false
+	# Push model list into UI bag after host is ready
+	try {
+		$null = Refresh-MBRemoteModels -Force
+		try { Update-MBWpfWindowTitle } catch {}
+	} catch {}
 
 	# Hard-exit on post-host failure (STA / instance lock)
 	try {
@@ -29562,23 +38458,14 @@ function Start-LocalAgent {
 		}
 	}
 
-	Show-MBBanner
-	Write-MBOk "Connected ($($connTest.AuthType), $($connTest.ElapsedMs) ms)"
-	$nativeBits = New-Object System.Collections.ArrayList
-	if ($script:HasNative) {
-		[void]$nativeBits.Add('ProcHelper')
-		[void]$nativeBits.Add('HTML extract')
-	}
-	if ($script:HasCredMan) { [void]$nativeBits.Add('CredMan') }
-	if ($script:HasDiskWalk) { [void]$nativeBits.Add('DiskWalk') }
-	if ($script:HasDpiScreen) { [void]$nativeBits.Add('VisionHelper') }
-	if ($nativeBits.Count -gt 0) {
-		Write-MBInfo ("Native helpers loaded ({0})" -f ($nativeBits -join ', '))
-	}
-	if ($script:MB.SpeechEnabled -and (Test-MBSpeechUiOk)) {
-		$dict = if ($script:MB.SpeechEngine) { 'PTT+TTS' } elseif ($script:MB.SpeechReady) { 'TTS only' } else { 'init failed' }
-		Write-MBInfo ("Speech: ON ({0}) - hold Right-Ctrl to talk" -f $dict)
-		if ($script:MB.SpeechInitError) { Write-MBWarn $script:MB.SpeechInitError }
+	# First banner (default model): no divider above
+	$script:MB.BannerShown = $true
+	try {
+		Show-MBActiveEndpointBanner -AuthType ([string]$connTest.AuthType) -ElapsedMs ([int]$connTest.ElapsedMs) `
+			-IncludeNativeHelpers -IncludeTypeHint
+	} catch {
+		Show-MBBanner
+		Write-MBOk ("Connected ({0}, {1} ms)" -f $connTest.AuthType, $connTest.ElapsedMs)
 	}
 
 	$script:Messages = @(Sync-MBSystemMessages -Messages @())
@@ -29664,7 +38551,8 @@ function Start-LocalAgent {
 						Write-MBInfo "Model id: $Model"
 					}
 					Write-MBInfo "Endpoint: $BaseUrl"
-					Write-MBInfo ("ContextWindowTokens: {0}" -f $script:MB.ContextWindow)
+					Write-MBInfo ("n_ctx: {0} ({1})" -f $script:MB.ContextWindow, $(try { [string]$script:MB.ContextSource } catch { '?' }))
+					Write-MBInfo ("max_out: {0}" -f (Get-MBEffectiveMaxTokens))
 					continue
 				}
 				'^/tools$' {
@@ -29771,7 +38659,7 @@ function Start-LocalAgent {
 						Write-Host ("  Auto-reply  : {0}  (TTS final model answers)" -f $auto) -ForegroundColor Gray
 						Write-Host "  Record      : hold Right-Ctrl to talk, release to stop (PTT)" -ForegroundColor Gray
 						Write-Host "  Typing      : works anytime Right-Ctrl is not held (Left-Ctrl+Enter still multi-line)" -ForegroundColor DarkGray
-						Write-Host "  Status shows on the input line (● REC …). Esc cancels mid-PTT." -ForegroundColor Gray
+						Write-Host "  Status shows on the input line (● REC ...). Esc cancels mid-PTT." -ForegroundColor Gray
 						Write-Host "  Model tool  : SpeakText (group senses; enabled with /speech on)" -ForegroundColor Gray
 						if ($script:MB.SpeechInitError) {
 							Write-Host ("  Last error  : {0}" -f $script:MB.SpeechInitError) -ForegroundColor DarkYellow
@@ -30115,7 +39003,7 @@ function Start-LocalAgent {
 						$cont++
 						Write-MBReplyStatus -Title 'continuing truncated reply' -Meta @(
 							('{0}/{1}' -f $cont, $maxCont)
-							('max_tokens {0}' -f $(try { [int]$script:MB.LastRequestMaxTokens } catch { [int]$MaxTokens }))
+							('max_tokens {0}' -f $(try { [int]$script:MB.LastRequestMaxTokens } catch { [int](Get-MBEffectiveMaxTokens) }))
 						) -Muted -DebugOnly
 						$script:Messages += @{
 							role    = 'user'
