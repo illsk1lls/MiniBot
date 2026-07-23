@@ -16,8 +16,8 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 |------|------------|
 | **Models** | llama.cpp, vLLM, Unsloth Studio, and other OpenAI-compatible `/v1` servers |
 | **Endpoints** | Primary `-BaseUrl` plus optional extra bases; per-endpoint auth: **API key**, **NPM Basic**, or **none** |
-| **UI** | Borderless dark WPF chrome, sticky status, tool-group chips, PoweredBy model picker, approval strips |
-| **Media** | Inline images, video, and audio in chat via `![label](path)` — external players only as a last resort |
+| **UI** | Borderless dark WPF chrome, sticky status, tool-group chips, model picker, approval strips |
+| **Media** | Inline images, video, and audio in chat |
 | **Safety** | Auto-approve off by default; mutating actions require Yes / No / All |
 | **Tools** | Files, shell, diagnostics, shares, installers, sandbox lab, ISO/CAB, registry, web, and more |
 | **Deploy** | One `.ps1` (or hybrid `.cmd`), optional elevation, single-instance lock |
@@ -32,7 +32,7 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 | **Windows PowerShell 5.1** | `%SystemRoot%\System32\WindowsPowerShell\v1.0` |
 | **OpenAI-compatible API** | Chat completions endpoint (default `http://127.0.0.1:8080`) |
 | **Elevation** | Re-launches elevated when repair, setup, or share tools need it |
-| **Optional** | `System.Speech` for voice; **PSWindowsUpdate** for update status; Poppler / ImageMagick / Ghostscript for richer PDF rendering |
+| **Optional** | `System.Speech` for basic voice; **PSWindowsUpdate** for update status; Poppler / ImageMagick / Ghostscript for richer PDF rendering |
 
 ---
 
