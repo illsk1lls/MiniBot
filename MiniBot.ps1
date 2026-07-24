@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.30.1 - Mini Repair-Bot
+	MiniBot v2.30.2 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -18,26 +18,26 @@ param(
 	# Prefer …/v1 when the server is OpenAI-compat (vLLM, Unsloth Studio). llama.cpp often uses bare :8080.
 	# Port stays in the URL (not a separate param) so multi-endpoint bases, HTTPS, and /v1 paths stay simple.
 	[string]$BaseUrl = "http://127.0.0.1:8080",
-	# Optional preferred model id. Leave empty to auto-pick from /models (single model)
-	# or the PoweredBy picker (multiple). Only used when set / -Model is passed.
-	# HF/Unsloth-style ids with a slash are OK: unsloth/Qwen3.5-4B-MTP-GGUF
-	[string]$Model = "",
-	# Max completion tokens. 0 = auto (n_ctx/8 from server). Set a value or pass -MaxTokens to lock.
-	[int]$MaxTokens = 0,
-	# Optional n_ctx fallback. 0 = use server /props + /models only. Set / -ContextWindowTokens if needed.
-	[int]$ContextWindowTokens = 0,
-	# Optional display override. Leave empty to use the live server model id.
-	[string]$ModelAlias = "",
 	# Primary HTTP auth Bearer key (NOT chat prompt text). Use "none" to skip.
 	# Examples: -ApiKey 'sk-…'   |   Unsloth: sk-unsloth-…   |   vLLM: value from --api-key
 	# If you log in with NPM Basic for the primary llama.cpp host, leave this "none" unless the app itself needs Bearer.
 	[string]$ApiKey = "none",
+	# Optional preferred model id. Leave empty to auto-pick from /models (single model)
+	# or the PoweredBy picker (multiple). Only used when set / -Model is passed.
+	# HF/Unsloth-style ids with a slash are OK: unsloth/Qwen3.5-4B-MTP-GGUF
+	[string]$Model = "",
+	# Optional display override. Leave empty to use the live server model id.
+	[string]$ModelAlias = "",
+	# Optional n_ctx fallback. 0 = use server /props + /models only. Set / -ContextWindowTokens if needed.
+	[int]$ContextWindowTokens = 0,
+	# Max completion tokens. 0 = auto (n_ctx/8 from server). Set a value or pass -MaxTokens to lock.
+	[int]$MaxTokens = 0,
 	[double]$Temperature = 0.15,
 	[int]$MaxTurns = 30,
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.30.1",
+	[string]$Version = "2.30.2",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -32089,7 +32089,6 @@ function Start-MBWpfHost {
               <TextBlock x:Name="TitlePath" Text="" Foreground="#C8C8D0" FontSize="12"
                          VerticalAlignment="Center" Cursor="Hand"
                          TextTrimming="CharacterEllipsis" MaxWidth="520"
-                         ToolTip="Click to change working directory"
                          shell:WindowChrome.IsHitTestVisibleInChrome="True"/>
             </Grid>
           </StackPanel>
@@ -32901,6 +32900,13 @@ function Start-MBWpfHost {
 			$W.TitleBrandNameShadow = $window.FindName('TitleBrandNameShadow')
 			$W.TitlePath = $window.FindName('TitlePath')
 			$W.TitlePathShadow = $window.FindName('TitlePathShadow')
+			try {
+				if ($W.TitlePath -and $W.SetThemedToolTip) {
+					& $W.SetThemedToolTip $W.TitlePath 'Click to change working directory' 280
+				} elseif ($W.TitlePath) {
+					$W.TitlePath.ToolTip = 'Click to change working directory'
+				}
+			} catch {}
 			$W.TitlePoweredBy = $window.FindName('TitlePoweredBy')
 			$W.TitlePoweredByShadow = $window.FindName('TitlePoweredByShadow')
 			$W.TitlePoweredByLabel = $window.FindName('TitlePoweredByLabel')
