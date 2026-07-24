@@ -6,7 +6,7 @@
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
 </p>
 
-MiniBot is a single-file agent harness: progressive tools, operator approvals for host changes, multi-endpoint model switching, and a UI built for day-to-day work — not a toy demo.
+MiniBot is a single-file agent harness: progressive tools, operator approvals for host changes, multi-endpoint model switching, and a UI built for day-to-day work.
 
 ---
 
