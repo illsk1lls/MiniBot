@@ -24,17 +24,14 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 
 ---
 
-<br>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Markdown.png" alt="Markdown Support">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Markdown.png" alt="Markdown Support"><br>
   Markdown Support
 </p>
-<br>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-CodeBlock.png" alt="Codeblocks">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-CodeBlock.png" alt="Codeblocks"><br>
   Codeblocks
 </p>
-<br>
 
 ---
 
@@ -123,13 +120,14 @@ Booleans: `-Name:$true` / `-Name:$false`.
 
 ---
 
-## Multi-endpoint & authentication
-
-<br>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Login.png" alt="Basic Auth Support">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Login.png" alt="Basic Auth Support"><br>
   Basic Auth Support
 </p>
+
+---
+
+## Multi-endpoint & authentication
 
 **Primary host** is always `-BaseUrl`. Auth for primary:
 
@@ -184,17 +182,15 @@ Supported inline types include common images, video (`mp4` / `m4v` / `mov` / `wm
 ---
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Video.png" alt="Inline Video Playback">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Video.png" alt="Inline Video Playback"><br>
   Inline Video Playback
 </p>
-<br>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Audio.png" alt="Inline Audio Playback">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Audio.png" alt="Inline Audio Playback"><br>
   Inline Audio Playback
 </p>
-<br>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Image.png" alt="Inline Image Display">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Image.png" alt="Inline Image Display"><br>
   Inline Images
 </p>
 
