@@ -24,6 +24,12 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 
 ---
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Login.png" alt="Basic Auth Support">
+</p>
+
+---
+
 ## Requirements
 
 | Requirement | Notes |
@@ -41,14 +47,14 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\MiniBot.ps1"
 ```
+(or just rename to CMD and double-click to launch)
 
-Point at your server and set a display name for the title bar:
+Hardcode your endpoint at the top of the script for smoother/faster access:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\MiniBot.ps1" `
   -BaseUrl "http://127.0.0.1:8080" `
   -ModelAlias "HomeLab" `
-  -HideConsole:$false
 ```
 
 ### Hybrid launcher
