@@ -1,10 +1,10 @@
-<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
+﻿<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
 @START /MIN "" POWERSHELL -nop -w hidden -c "iex ([io.file]::ReadAllText('%~f0'))">nul&EXIT
 #>
 
 <#
 .SYNOPSIS
-	MiniBot v2.30.0 - Mini Repair-Bot
+	MiniBot v2.30.1 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -16,14 +16,17 @@
 param(
 	# --- Primary OpenAI-compatible API (llama.cpp / main host) ---
 	# Prefer …/v1 when the server is OpenAI-compat (vLLM, Unsloth Studio). llama.cpp often uses bare :8080.
+	# Port stays in the URL (not a separate param) so multi-endpoint bases, HTTPS, and /v1 paths stay simple.
 	[string]$BaseUrl = "http://127.0.0.1:8080",
 	# Optional preferred model id. Leave empty to auto-pick from /models (single model)
+	# or the PoweredBy picker (multiple). Only used when set / -Model is passed.
+	# HF/Unsloth-style ids with a slash are OK: unsloth/Qwen3.5-4B-MTP-GGUF
 	[string]$Model = "",
+	# Max completion tokens. 0 = auto (n_ctx/8 from server). Set a value or pass -MaxTokens to lock.
+	[int]$MaxTokens = 0,
 	# Optional n_ctx fallback. 0 = use server /props + /models only. Set / -ContextWindowTokens if needed.
 	[int]$ContextWindowTokens = 0,
 	# Optional display override. Leave empty to use the live server model id.
-	# Max completion tokens. 0 = auto (n_ctx/8 from server). Set a value or pass -MaxTokens to lock.
-	[int]$MaxTokens = 0,
 	[string]$ModelAlias = "",
 	# Primary HTTP auth Bearer key (NOT chat prompt text). Use "none" to skip.
 	# Examples: -ApiKey 'sk-…'   |   Unsloth: sk-unsloth-…   |   vLLM: value from --api-key
@@ -34,7 +37,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.30.0",
+	[string]$Version = "2.30.1",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -4051,9 +4054,8 @@ function Get-MBNpmBasicAuthHeader {
 }
 
 function Format-MBAuthDisplayLabel {
-	# Human labels for Connected / add-endpoint: NPM | API | Basic
-	# -Short: NPM / API / Basic
-	# default (long): NPM / API key / Basic (None)
+	# Labels: None | API | Basic (NPM)
+	# (Basic = HTTP Basic; NPM note is for reverse-proxy login users)
 	param(
 		[string]$Mode = '',
 		[string]$BaseUrl = '',
@@ -4071,15 +4073,13 @@ function Format-MBAuthDisplayLabel {
 	}
 	# If Basic header came from NPM creds → NPM; plain open = none
 	if ($m -eq 'npm' -or ($AuthHeader -match '^(?i)Basic\s+' -and $script:MB.NpmUser -and $script:MB.NpmPass -and (Get-MBApiAuthModeForBase -BaseUrl $BaseUrl) -eq 'npm')) {
-		return 'NPM'
+		return 'Basic (NPM)'
 	}
 	if ($m -in @('apikey', 'api', 'bearer', 'key') -or $AuthHeader -match '^(?i)Bearer\s+') {
-		if ($Short) { return 'API' }
-		return 'API key'
+		return 'API'
 	}
-	# Open / no Authorization — Connected line uses Basic; radio UI says None
-	if ($Short) { return 'Basic' }
-	return 'Basic (None)'
+	# Open / no Authorization header
+	return 'None'
 }
 
 function Test-MBShouldSendAuthHeader {
@@ -4518,6 +4518,13 @@ function Show-MBWpfAuthOverlay {
 		if ($W.AuthSubtitle) {
 			$W.AuthSubtitle.Text = ("Sign in to access:`n{0}" -f $hint)
 		}
+		try {
+			if ($W.SetThemedToolTip) {
+				if ($W.AuthOk) { & $W.SetThemedToolTip $W.AuthOk 'Sign in with username and password' 260 }
+				if ($W.AuthCancel) { & $W.SetThemedToolTip $W.AuthCancel 'Quit / cancel sign-in' 200 }
+				if ($W.AuthSaveCreds) { & $W.SetThemedToolTip $W.AuthSaveCreds 'Remember credentials for next launch' 260 }
+			}
+		} catch {}
 		if ($W.AuthUser) {
 			$W.AuthUser.Text = ''
 			$W.AuthUser.IsEnabled = $true
@@ -4638,7 +4645,11 @@ function Complete-MBSessionExit {
 
 
 function Start-MBLoginSession {
-	param([string]$ServerHint = '')
+	param(
+		[string]$ServerHint = '',
+		[ValidateSet('login','connect')]
+		[string]$InitialLayer = 'login'
+	)
 	if (-not (Test-MBWpfAvailable)) { throw 'MiniBot requires WPF for login UI (PresentationFramework not available).' }
 	try {
 		if ($script:MB.LoginSession -and -not [bool]$script:MB.LoginSession.Closed) {
@@ -4655,20 +4666,30 @@ function Start-MBLoginSession {
 		Failed       = $false
 		FailMsg      = ''
 		Closed       = $false
-		Cmd          = ''           # show_login | show_confirm | success | close
+		Cmd          = ''           # show_login | show_confirm | show_connect | success | close
 		ConfirmPrompt = ''
 		ConfirmTitle  = 'Invalid Entry'
 		CredResult   = $null
 		ConfirmResult = $null
+		EndpointResult = $null
 		CredWait     = New-Object System.Threading.ManualResetEvent $false
 		ConfirmWait  = New-Object System.Threading.ManualResetEvent $false
+		EndpointWait = New-Object System.Threading.ManualResetEvent $false
 		ReadyWait    = New-Object System.Threading.ManualResetEvent $false
 		Done         = New-Object System.Threading.ManualResetEvent $false
 		Ready        = $false
 		AuthOk       = $false
 		RobotSuccessPainted = $false
 		AgentName    = $agentNm
+		ConnectUrl   = ''
+		ConnectError = ''
+		ConnectMode  = $false
+		InitialLayer = 'login'   # login | connect
+		CanGoBackToConnect = $false  # true after Connect layer used (manual/recovery path)
 	})
+	try {
+		if ($InitialLayer -eq 'connect') { $bag.InitialLayer = 'connect' }
+	} catch {}
 
 	$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
 	$rs.ApartmentState = [System.Threading.ApartmentState]::STA
@@ -4873,17 +4894,69 @@ function Start-MBLoginSession {
                          VerticalAlignment="Center"/>
             </Grid>
           </StackPanel>
-          <Button x:Name="LoginTitleClose" Grid.Column="1" Width="46" Height="36"
-                  Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
-                  Template="{StaticResource NoMouseOverButtonTemplate}" ToolTip="Close">
-            <Path Width="10" Height="10" Stretch="Uniform" Stroke="#C8C8D0" StrokeThickness="1.15"
-                  Data="M0,0 L10,10 M10,0 L0,10" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-          </Button>
+          <StackPanel Grid.Column="1" Orientation="Horizontal">
+            <Button x:Name="LoginTitleBack" Width="46" Height="36" Visibility="Collapsed"
+                    Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
+                    Template="{StaticResource NoMouseOverButtonTemplate}">
+              <!-- arrow-left -->
+              <Path Width="12" Height="12" Stretch="Uniform" Fill="#C8C8D0"
+                    Data="M20,11V13H8L13.5,18.5L12.08,19.92L4.16,12L12.08,4.08L13.5,5.5L8,11H20Z"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Button>
+            <Button x:Name="LoginTitleClose" Width="46" Height="36"
+                    Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
+                    Template="{StaticResource NoMouseOverButtonTemplate}" ToolTip="Close">
+              <Path Width="10" Height="10" Stretch="Uniform" Stroke="#C8C8D0" StrokeThickness="1.15"
+                    Data="M0,0 L10,10 M10,0 L0,10" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Button>
+          </StackPanel>
         </Grid>
       </Border>
       <Border Grid.Row="1" Background="#121216" Padding="22,18,22,14"
               CornerRadius="0,0,8,8" SnapsToDevicePixels="True">
         <Grid>
+          <!-- Connect (endpoint) -->
+          <Grid x:Name="ConnectLayer" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="18"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <StackPanel Grid.Row="0">
+              <TextBlock x:Name="EpHeading" Text="Enter your model endpoint" Foreground="#E0E0E8"
+                         FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+              <TextBlock x:Name="EpSubtitle" Text="" Foreground="#8A8A96" TextWrapping="Wrap"
+                         FontSize="12" Margin="0,0,0,10" MaxHeight="56" TextTrimming="CharacterEllipsis"/>
+              <TextBlock Text="Endpoint URL" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+              <TextBox x:Name="EpUrl" Height="32" Padding="8,6" Margin="0,0,0,8"
+                       Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                       BorderBrush="#3A3A42" BorderThickness="1"
+                       FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
+              <TextBlock Text="Auth mode" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
+              <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                <RadioButton x:Name="EpAuthNone" Content="None" GroupName="MbBootEndpointAuth"
+                             IsChecked="True" Foreground="#C8C8D0" FontSize="12" Margin="0,0,16,0" Cursor="Hand"/>
+                <RadioButton x:Name="EpAuthKey" Content="API" GroupName="MbBootEndpointAuth"
+                             Foreground="#C8C8D0" FontSize="12" Margin="0,0,16,0" Cursor="Hand"/>
+                <RadioButton x:Name="EpAuthNpm" Content="Basic (NPM)" GroupName="MbBootEndpointAuth"
+                             Foreground="#C8C8D0" FontSize="12" Cursor="Hand"/>
+              </StackPanel>
+              <TextBlock x:Name="EpKeyLbl" Text="API token (when Auth = API)" Foreground="#A0A0AA"
+                         FontSize="11" Margin="0,0,0,4"/>
+              <PasswordBox x:Name="EpKey" Height="32" Padding="8,6" Margin="0,0,0,6"
+                           Background="#121216" Foreground="#E0E0E8" CaretBrush="#C8C8D0"
+                           BorderBrush="#3A3A42" BorderThickness="1"
+                           FontFamily="Consolas, Cascadia Mono, Courier New" FontSize="13"/>
+            </StackPanel>
+            <TextBlock x:Name="EpError" Grid.Row="1" Text="" Foreground="#F05C5C" FontSize="11"
+                       TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
+              <Button x:Name="EpConnect" Style="{StaticResource MbAuthPrimaryBtn}"
+                      Content="Connect" Width="96" Height="30" Margin="0,0,8,0"/>
+              <Button x:Name="EpCancel" Style="{StaticResource MbAuthSecondaryBtn}"
+                      Content="Quit" Width="88" Height="30"/>
+            </StackPanel>
+          </Grid>
           <!-- Login -->
           <Grid x:Name="LoginLayer">
             <Grid.RowDefinitions>
@@ -4943,7 +5016,7 @@ function Start-MBLoginSession {
               <Button x:Name="AuthOk" Style="{StaticResource MbAuthPrimaryBtn}"
                       Content="Sign in" Width="96" Height="30" Margin="0,0,8,0" IsDefault="True"/>
               <Button x:Name="AuthCancel" Style="{StaticResource MbAuthSecondaryBtn}"
-                      Content="Cancel" Width="88" Height="30" IsCancel="True"/>
+                      Content="Quit" Width="88" Height="30" IsCancel="True"/>
             </StackPanel>
           </Grid>
           <!-- Confirm -->
@@ -4985,6 +5058,18 @@ function Start-MBLoginSession {
 			$win = [Windows.Markup.XamlReader]::Load($reader)
 			$loginLayer = $win.FindName('LoginLayer')
 			$confirmLayer = $win.FindName('ConfirmLayer')
+			$connectLayer = $win.FindName('ConnectLayer')
+			$epHeading = $win.FindName('EpHeading')
+			$epSub = $win.FindName('EpSubtitle')
+			$epUrl = $win.FindName('EpUrl')
+			$epKey = $win.FindName('EpKey')
+			$epKeyLbl = $win.FindName('EpKeyLbl')
+			$epAuthNone = $win.FindName('EpAuthNone')
+			$epAuthKey = $win.FindName('EpAuthKey')
+			$epAuthNpm = $win.FindName('EpAuthNpm')
+			$epError = $win.FindName('EpError')
+			$epConnect = $win.FindName('EpConnect')
+			$epCancel = $win.FindName('EpCancel')
 			$sub = $win.FindName('AuthSubtitle')
 			$user = $win.FindName('AuthUser')
 			$pass = $win.FindName('AuthPass')
@@ -4999,6 +5084,7 @@ function Start-MBLoginSession {
 			$cBar = $win.FindName('ConfirmAccentBar')
 			$loginTitleBar = $win.FindName('LoginTitleBar')
 			$loginTitleClose = $win.FindName('LoginTitleClose')
+			$loginTitleBack = $win.FindName('LoginTitleBack')
 			$loginTitleLabel = $win.FindName('LoginTitleLabel')
 			$loginTitleLabelShadow = $win.FindName('LoginTitleLabelShadow')
 			$loginBrandName = $win.FindName('LoginBrandName')
@@ -5034,12 +5120,15 @@ function Start-MBLoginSession {
 			}
 			$loginRobotDataDefault = 'M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z'
 			$loginRobotDataHappy = 'M22 14H21C21 10.13 17.87 7 14 7H13V5.73C13.6 5.39 14 4.74 14 4C14 2.9 13.11 2 12 2S10 2.9 10 4C10 4.74 10.4 5.39 11 5.73V7H10C6.13 7 3 10.13 3 14H2C1.45 14 1 14.45 1 15V18C1 18.55 1.45 19 2 19H3V20C3 21.11 3.9 22 5 22H19C20.11 22 21 21.11 21 20V19H22C22.55 19 23 18.55 23 18V15C23 14.45 22.55 14 22 14M9.79 16.5C9.4 15.62 8.53 15 7.5 15S5.6 15.62 5.21 16.5C5.08 16.19 5 15.86 5 15.5C5 14.12 6.12 13 7.5 13S10 14.12 10 15.5C10 15.86 9.92 16.19 9.79 16.5M18.79 16.5C18.4 15.62 17.5 15 16.5 15S14.6 15.62 14.21 16.5C14.08 16.19 14 15.86 14 15.5C14 14.12 15.12 13 16.5 13S19 14.12 19 15.5C19 15.86 18.92 16.19 18.79 16.5Z'
+			$loginRobotDataDead = 'M22 14H21C21 10.13 17.87 7 14 7H13V5.73C13.6 5.39 14 4.74 14 4C14 2.9 13.11 2 12 2S10 2.9 10 4C10 4.74 10.4 5.39 11 5.73V7H10C6.13 7 3 10.13 3 14H2C1.45 14 1 14.45 1 15V18C1 18.55 1.45 19 2 19H3V20C3 21.11 3.9 22 5 22H19C20.11 22 21 21.11 21 20V19H22C22.55 19 23 18.55 23 18V15C23 14.45 22.55 14 22 14M9.86 16.68L8.68 17.86L7.5 16.68L6.32 17.86L5.14 16.68L6.32 15.5L5.14 14.32L6.32 13.14L7.5 14.32L8.68 13.14L9.86 14.32L8.68 15.5L9.86 16.68M18.86 16.68L17.68 17.86L16.5 16.68L15.32 17.86L14.14 16.68L15.32 15.5L14.14 14.32L15.32 13.14L16.5 14.32L17.68 13.14L18.86 14.32L17.68 15.5L18.86 16.68Z'
 			$setLoginRobotFace = {
 				param([string]$Face = 'default')
 				try {
 					if (-not $loginRobotPath) { return }
 					$face = ([string]$Face).ToLowerInvariant()
-					$data = if ($face -eq 'happy') { $loginRobotDataHappy } else { $loginRobotDataDefault }
+					if ($face -eq 'happy') { $data = $loginRobotDataHappy }
+					elseif ($face -eq 'dead') { $data = $loginRobotDataDead }
+					else { $data = $loginRobotDataDefault }
 					$loginRobotPath.Data = [System.Windows.Media.Geometry]::Parse($data)
 					$cols = @('#C8C8D0', '#6A6A74', '#3A3A42')
 					$st = @($loginRobotStop0, $loginRobotStop1, $loginRobotStop2)
@@ -5048,8 +5137,27 @@ function Start-MBLoginSession {
 						try { $st[$i].Color = [System.Windows.Media.ColorConverter]::ConvertFromString([string]$cols[$i]) } catch {}
 					}
 					$dot = [string][char]0x00B7
-					$tip = if ($face -eq 'happy') { "MiniBot $dot signed in" } else { "MiniBot $dot sign in" }
-					if ($loginRobotHost) { $loginRobotHost.ToolTip = $tip }
+					if ($face -eq 'happy') { $tip = "MiniBot $dot signed in" }
+					elseif ($face -eq 'dead') { $tip = "MiniBot $dot offline" }
+					else { $tip = "MiniBot $dot connect" }
+					if ($loginRobotHost) {
+						try {
+							$bcR = New-Object System.Windows.Media.BrushConverter
+							$tt = New-Object System.Windows.Controls.ToolTip
+							$tt.Background = $bcR.ConvertFromString('#1A1A1E')
+							$tt.Foreground = $bcR.ConvertFromString('#C8C8D0')
+							$tt.BorderBrush = $bcR.ConvertFromString('#3A3A42')
+							$tt.BorderThickness = New-Object System.Windows.Thickness(1)
+							$tt.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
+							$tt.HasDropShadow = $true
+							$tbR = New-Object System.Windows.Controls.TextBlock
+							$tbR.Text = $tip
+							$tbR.Foreground = $bcR.ConvertFromString('#C8C8D0')
+							$tbR.FontSize = 12
+							$tt.Content = $tbR
+							$loginRobotHost.ToolTip = $tt
+						} catch { $loginRobotHost.ToolTip = $tip }
+					}
 				} catch {}
 			}.GetNewClosure()
 			# Login window icon
@@ -5120,7 +5228,9 @@ public const int ICON_BIG = 1;
 				param([string]$Face = 'default', [int]$Size = 64)
 				try {
 					if ($Size -lt 16) { $Size = 16 }
-					$data = if ($Face -eq 'happy') { $loginRobotDataHappy } else { $loginRobotDataDefault }
+					if ($Face -eq 'happy') { $data = $loginRobotDataHappy }
+					elseif ($Face -eq 'dead') { $data = $loginRobotDataDead }
+					else { $data = $loginRobotDataDefault }
 					$cols = @('#C8C8D0', '#6A6A74', '#3A3A42')
 					$geom = [System.Windows.Media.Geometry]::Parse($data)
 					$brush = New-Object System.Windows.Media.LinearGradientBrush
@@ -5169,15 +5279,90 @@ public const int ICON_BIG = 1;
 					try { & $setNativeIcon $win $bmp } catch {}
 				} catch {}
 			}.GetNewClosure()
+			$makeThemedToolTip = {
+				param([string]$Text, [double]$MaxWidth = 340)
+				if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+				try {
+					$bcT = New-Object System.Windows.Media.BrushConverter
+					$tip = New-Object System.Windows.Controls.ToolTip
+					$tip.Background = $bcT.ConvertFromString('#1A1A1E')
+					$tip.Foreground = $bcT.ConvertFromString('#C8C8D0')
+					$tip.BorderBrush = $bcT.ConvertFromString('#3A3A42')
+					$tip.BorderThickness = New-Object System.Windows.Thickness(1)
+					$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
+					$tip.HasDropShadow = $true
+					try { $tip.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Mouse } catch {}
+					$ttb = New-Object System.Windows.Controls.TextBlock
+					$ttb.Text = [string]$Text
+					$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+					$ttb.MaxWidth = [double]$MaxWidth
+					$ttb.Foreground = $bcT.ConvertFromString('#C8C8D0')
+					$ttb.FontSize = 12
+					$ttb.LineHeight = 16
+					try { $ttb.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas, Cascadia Mono, Courier New') } catch {}
+					$tip.Content = $ttb
+					return $tip
+				} catch { return [string]$Text }
+			}.GetNewClosure()
+			$setThemedToolTip = {
+				param($Target, [string]$Text, [double]$MaxWidth = 340)
+				if ($null -eq $Target) { return }
+				try {
+					$obj = & $makeThemedToolTip $Text $MaxWidth
+					if ($null -ne $obj) {
+						$Target.ToolTip = $obj
+						try {
+							[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($Target, 350)
+							[System.Windows.Controls.ToolTipService]::SetShowDuration($Target, 20000)
+						} catch {}
+					} else {
+						$Target.ToolTip = [string]$Text
+					}
+				} catch {
+					try { $Target.ToolTip = [string]$Text } catch {}
+				}
+			}.GetNewClosure()
 			try { & $setLoginRobotFace 'default' } catch {}
 			try { & $applyLoginWindowIcon 'default' } catch {}
 			if ($sub) { $sub.Text = ("Sign in to access:`n{0}" -f $Hint) }
+			$setBackVisible = {
+				param([bool]$Show)
+				try {
+					if (-not $loginTitleBack) { return }
+					$loginTitleBack.Visibility = $(if ($Show) {
+						[System.Windows.Visibility]::Visible
+					} else {
+						[System.Windows.Visibility]::Collapsed
+					})
+				} catch {}
+			}.GetNewClosure()
+
+			# Themed tooltips (auth / connect chrome)
+			try {
+				if ($loginTitleClose) { & $setThemedToolTip $loginTitleClose 'Close' 120 }
+				if ($loginTitleBack) { & $setThemedToolTip $loginTitleBack 'Back to endpoint' 200 }
+				if ($loginRobotHost) { & $setThemedToolTip $loginRobotHost 'MiniBot' 140 }
+				if ($epAuthNone) { & $setThemedToolTip $epAuthNone 'No Authorization header (open LAN servers)' 280 }
+				if ($epAuthKey) { & $setThemedToolTip $epAuthKey 'Bearer token (Unsloth, vLLM --api-key, OpenAI-compat keys)' 300 }
+				if ($epAuthNpm) { & $setThemedToolTip $epAuthNpm 'HTTP Basic - use for NPM reverse-proxy / session login credentials' 300 }
+				if ($epConnect) { & $setThemedToolTip $epConnect 'Test endpoint and continue' 220 }
+				if ($epCancel) { & $setThemedToolTip $epCancel 'Quit MiniBot' 160 }
+				if ($ok) { & $setThemedToolTip $ok 'Sign in with username and password' 260 }
+				if ($cancel) { & $setThemedToolTip $cancel 'Quit MiniBot' 160 }
+				if ($saveCb) { & $setThemedToolTip $saveCb 'Remember credentials for next launch' 260 }
+				if ($cYes) { & $setThemedToolTip $cYes 'Yes' 100 }
+				if ($cNo) { & $setThemedToolTip $cNo 'No' 100 }
+				if ($epUrl) { & $setThemedToolTip $epUrl 'OpenAI-compatible API base (prefer .../v1)' 300 }
+				if ($epKey) { & $setThemedToolTip $epKey 'Bearer token used when Auth = API' 260 }
+			} catch {}
 			# Titlebar drag and close hover
 			try {
 				if ($loginTitleBar) {
 					$loginTitleBar.add_MouseLeftButtonDown({
 						param($s, $e)
 						try {
+							if ($loginTitleBack -and $loginTitleBack.IsMouseOver) { return }
+							if ($loginTitleClose -and $loginTitleClose.IsMouseOver) { return }
 							if ($e.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) { $win.DragMove() }
 						} catch {}
 					}.GetNewClosure())
@@ -5189,6 +5374,16 @@ public const int ICON_BIG = 1;
 					}.GetNewClosure())
 					$loginTitleClose.add_MouseLeave({
 						try { $loginTitleClose.Background = [System.Windows.Media.Brushes]::Transparent } catch {}
+					}.GetNewClosure())
+				}
+				# Back: same grey hover as main-window Maximize
+				if ($loginTitleBack) {
+					$bcB = New-Object System.Windows.Media.BrushConverter
+					$loginTitleBack.add_MouseEnter({
+						try { $loginTitleBack.Background = $bcB.ConvertFromString('#3A3A42') } catch {}
+					}.GetNewClosure())
+					$loginTitleBack.add_MouseLeave({
+						try { $loginTitleBack.Background = [System.Windows.Media.Brushes]::Transparent } catch {}
 					}.GetNewClosure())
 				}
 			} catch {}
@@ -5228,11 +5423,31 @@ public const int ICON_BIG = 1;
 			$showLogin = {
 				try {
 					& $stopConfirmPulse
+					if ($connectLayer) { $connectLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Visible }
 					& $setLoginTitleLabel 'Login'
+					# Back only when user reached Login via Connect (manual empty BaseUrl or recovery)
+					$allowBack = $false
+					try { $allowBack = [bool]$B.CanGoBackToConnect } catch {}
+					& $setBackVisible $allowBack
+					try { & $setLoginRobotFace 'default' } catch {}
+					try { & $applyLoginWindowIcon 'default' } catch {}
+					# Refresh host line — ConnectUrl may have changed after a failed first attempt
+					try {
+						$hintUrl = ''
+						try { $hintUrl = [string]$B.ConnectUrl } catch {}
+						if ([string]::IsNullOrWhiteSpace($hintUrl) -and $epUrl) {
+							try { $hintUrl = ([string]$epUrl.Text).Trim() } catch {}
+						}
+						if ([string]::IsNullOrWhiteSpace($hintUrl)) { $hintUrl = [string]$Hint }
+						if ($sub -and -not [string]::IsNullOrWhiteSpace($hintUrl)) {
+							$sub.Text = ("Sign in to access:`n{0}" -f $hintUrl)
+						}
+					} catch {}
 					if ($ok) { $ok.IsDefault = $true }
 					if ($cYes) { $cYes.IsDefault = $false }
+					if ($epConnect) { try { $epConnect.IsDefault = $false } catch {} }
 					if ($err) { $err.Text = '' }
 					try { if ($pass) { $pass.Password = '' } } catch {}
 					try { if ($user) { [void]$user.Focus() } } catch {}
@@ -5242,9 +5457,11 @@ public const int ICON_BIG = 1;
 			$showConfirm = {
 				param([string]$promptText, [string]$titleText)
 				try {
+					if ($connectLayer) { $connectLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Visible }
 					& $setLoginTitleLabel 'Confirm'
+					& $setBackVisible $false
 					if ($cTitle) {
 						try { $cTitle.Inlines.Clear() } catch {}
 						$cTitle.Text = 'Invalid Entry'
@@ -5264,6 +5481,285 @@ public const int ICON_BIG = 1;
 					& $startConfirmPulse
 				} catch {}
 			}.GetNewClosure()
+
+			$syncEpKey = {
+				try {
+					$use = $false
+					try { $use = [bool]$epAuthKey.IsChecked } catch {}
+					if ($epKey) {
+						$epKey.IsEnabled = $use
+						$epKey.Opacity = $(if ($use) { 1.0 } else { 0.45 })
+					}
+					if ($epKeyLbl) { $epKeyLbl.Opacity = $(if ($use) { 1.0 } else { 0.55 }) }
+				} catch {}
+			}.GetNewClosure()
+			try {
+				if ($epAuthNone) { $null = $epAuthNone.Add_Checked({ & $syncEpKey }.GetNewClosure()) }
+				if ($epAuthKey) { $null = $epAuthKey.Add_Checked({ & $syncEpKey }.GetNewClosure()) }
+				if ($epAuthNpm) { $null = $epAuthNpm.Add_Checked({ & $syncEpKey }.GetNewClosure()) }
+			} catch {}
+
+			$probeEndpoint = {
+				param([string]$BaseUrlIn, [string]$Mode, [string]$Key, [int]$TimeoutSec = 8)
+				$raw = ([string]$BaseUrlIn).Trim()
+				while ($raw.EndsWith('/')) { $raw = $raw.Substring(0, $raw.Length - 1) }
+				$raw = $raw -replace '/chat/completions\s*$', '' -replace '/models\s*$', ''
+				$raw = $raw -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
+				while ($raw.EndsWith('/')) { $raw = $raw.Substring(0, $raw.Length - 1) }
+				$bases = New-Object System.Collections.Generic.List[string]
+				if ($raw -match '/v1$') {
+					[void]$bases.Add($raw)
+					$root = $raw -replace '/v1$', ''
+					if ($root -and -not $bases.Contains($root)) { [void]$bases.Add($root) }
+				} else {
+					[void]$bases.Add($raw + '/v1')
+					[void]$bases.Add($raw)
+				}
+				$headers = @{}
+				if ($Mode -eq 'apikey' -and $Key) { $headers['Authorization'] = "Bearer $Key" }
+				try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+				try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
+				$lastMsg = 'No response'
+				$lastCode = 0
+				$pp = $Global:ProgressPreference
+				$Global:ProgressPreference = 'SilentlyContinue'
+				try {
+					foreach ($base in $bases) {
+						$testUrl = "$base/models"
+						try {
+							$response = Invoke-WebRequest -Uri $testUrl -Method GET -Headers $headers -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+							$code = [int]$response.StatusCode
+							if ($code -eq 200) {
+								$body = ''
+								try { $body = [string]$response.Content } catch { $body = '' }
+								if ($body -match '"object"\s*:\s*"list"' -or $body -match '"data"\s*:\s*\[' -or $body.Trim().StartsWith('{') -or $body.Trim().StartsWith('[')) {
+									return @{ Ok = $true; StatusCode = 200; Message = "OK → $base"; BaseUrl = $base }
+								}
+								$lastMsg = "HTTP 200 from $testUrl but body is not a models API"
+								$lastCode = 200
+								continue
+							}
+							$lastMsg = "HTTP $code from $testUrl"
+							$lastCode = $code
+						} catch [System.Net.WebException] {
+							$code = 0
+							try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+							if ($code -in 401, 403) {
+								if ($Mode -eq 'apikey') {
+									return @{ Ok = $false; StatusCode = $code; Message = "Authentication failed ($code) — check API key"; BaseUrl = $base }
+								}
+								return @{ Ok = $true; StatusCode = $code; Message = 'Reachable (auth required)'; BaseUrl = $base; NeedsAuth = $true }
+							}
+							if ($code) { $lastMsg = "Server returned HTTP $code from $testUrl"; $lastCode = $code }
+							else { $lastMsg = "$($_.Exception.Message)"; $lastCode = 0 }
+						} catch {
+							$lastMsg = $_.Exception.Message
+							$lastCode = 0
+						}
+					}
+				} finally { $Global:ProgressPreference = $pp }
+				return @{ Ok = $false; StatusCode = $lastCode; Message = $lastMsg; BaseUrl = $raw }
+			}.GetNewClosure()
+
+			$epBusy = [ref]$false
+			$epWantCancel = [ref]$false
+			$setEpBusy = {
+				param([bool]$On)
+				$epBusy.Value = $On
+				try {
+					if ($epConnect) {
+						$epConnect.IsEnabled = -not $On
+						$epConnect.Content = $(if ($On) { '…' } else { 'Connect' })
+					}
+					if ($epUrl) { $epUrl.IsEnabled = -not $On }
+					if ($epAuthNone) { $epAuthNone.IsEnabled = -not $On }
+					if ($epAuthKey) { $epAuthKey.IsEnabled = -not $On }
+					if ($epAuthNpm) { $epAuthNpm.IsEnabled = -not $On }
+					if (-not $On) { & $syncEpKey } else { if ($epKey) { $epKey.IsEnabled = $false } }
+				} catch {}
+			}.GetNewClosure()
+
+			$showConnect = {
+				try {
+					& $stopConfirmPulse
+					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Collapsed }
+					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Collapsed }
+					if ($connectLayer) { $connectLayer.Visibility = [System.Windows.Visibility]::Visible }
+					# Using Connect layer => Login may offer Back later
+					try { $B.CanGoBackToConnect = $true } catch {}
+					& $setBackVisible $false
+					$isConn = $false
+					try { $isConn = [bool]$B.ConnectMode } catch {}
+					& $setLoginTitleLabel $(if ($isConn) { 'Connect' } else { 'Connection' })
+					try {
+						if ($isConn) {
+							& $setLoginRobotFace 'default'
+							& $applyLoginWindowIcon 'default'
+						} else {
+							& $setLoginRobotFace 'dead'
+							& $applyLoginWindowIcon 'dead'
+						}
+					} catch {}
+					if ($epHeading) {
+						$epHeading.Text = $(if ($isConn) { 'Enter your model endpoint' } else { 'Cannot reach model endpoint' })
+					}
+					if ($epSub) {
+						if ($isConn) {
+							$epSub.Text = 'Connect MiniBot to an OpenAI-compatible API base. Example: http://127.0.0.1:8080/v1  (vLLM, Unsloth, llama.cpp, etc.)'
+						} else {
+							$em = ''
+							try { $em = [string]$B.ConnectError } catch {}
+							if ($em) { $epSub.Text = $em }
+							else { $epSub.Text = 'The configured BaseUrl is not responding. Check the URL and auth, then try again (prefer .../v1 for vLLM/Unsloth).' }
+						}
+					}
+					try {
+						$u0 = ''
+						try { $u0 = [string]$B.ConnectUrl } catch {}
+						if ([string]::IsNullOrWhiteSpace($u0)) { $u0 = [string]$Hint }
+						if ([string]::IsNullOrWhiteSpace($u0)) { $u0 = 'http://127.0.0.1:8080/v1' }
+						if ($epUrl) { $epUrl.Text = $u0 }
+					} catch {}
+					if ($epError) { $epError.Text = '' }
+					if ($ok) { try { $ok.IsDefault = $false } catch {} }
+					if ($cYes) { try { $cYes.IsDefault = $false } catch {} }
+					if ($epConnect) { try { $epConnect.IsDefault = $true } catch {} }
+					& $setEpBusy $false
+					& $syncEpKey
+					$epWantCancel.Value = $false
+					try { if ($epUrl) { [void]$epUrl.Focus(); $epUrl.SelectAll() } } catch {}
+				} catch {}
+			}.GetNewClosure()
+
+			$doConnectCancel = {
+				try {
+					if ($epBusy.Value) {
+						$epWantCancel.Value = $true
+						try {
+							if ($epError) {
+								$bcX = New-Object System.Windows.Media.BrushConverter
+								$epError.Foreground = $bcX.ConvertFromString('#8A8A96')
+								$epError.Text = 'Cancelling...'
+							}
+						} catch {}
+						return
+					}
+					$B.EndpointResult = @{
+						Cancelled = $true
+						Url = ''
+						AuthMode = 'none'
+						ApiKey = ''
+					}
+					try { [void]$B.EndpointWait.Set() } catch {}
+					try { [void]$B.CredWait.Set() } catch {}
+					try { [void]$B.ConfirmWait.Set() } catch {}
+					try { $win.Close() } catch {}
+				} catch {}
+			}.GetNewClosure()
+
+			$tryEpConnect = {
+				if ($epBusy.Value) { return }
+				try {
+					$bcX = New-Object System.Windows.Media.BrushConverter
+					$u = ''
+					try { $u = ([string]$epUrl.Text).Trim() } catch {}
+					if ([string]::IsNullOrWhiteSpace($u)) {
+						if ($epError) {
+							$epError.Foreground = $bcX.ConvertFromString('#F05C5C')
+							$epError.Text = 'Enter a base URL (e.g. http://127.0.0.1:8080 or .../v1).'
+						}
+						return
+					}
+					if ($u -notmatch '^(?i)https?://') {
+						if ($epError) {
+							$epError.Foreground = $bcX.ConvertFromString('#F05C5C')
+							$epError.Text = 'URL must start with http:// or https://'
+						}
+						return
+					}
+					$mode = 'none'
+					try { if ([bool]$epAuthKey.IsChecked) { $mode = 'apikey' } elseif ([bool]$epAuthNpm.IsChecked) { $mode = 'npm' } } catch {}
+					$k = ''
+					if ($mode -eq 'apikey') {
+						try { $k = [string]$epKey.Password } catch { $k = '' }
+						if ([string]::IsNullOrWhiteSpace($k) -or $k -eq 'none') {
+							if ($epError) {
+								$epError.Foreground = $bcX.ConvertFromString('#F05C5C')
+								$epError.Text = 'API mode requires a Bearer token.'
+							}
+							return
+						}
+					}
+					$epWantCancel.Value = $false
+					& $setEpBusy $true
+					if ($epError) {
+						$epError.Foreground = $bcX.ConvertFromString('#8A8A96')
+						$epError.Text = 'Connecting...'
+					}
+					[void]$win.Dispatcher.BeginInvoke([Action]{
+						try {
+							$probe = & $probeEndpoint $u $mode $k 8
+							if ($epWantCancel.Value -or [bool]$B.Closed) {
+								if (-not $B.EndpointResult) {
+									$B.EndpointResult = @{ Cancelled = $true; Url = ''; AuthMode = 'none'; ApiKey = '' }
+								}
+								try { [void]$B.EndpointWait.Set() } catch {}
+								try { if ($win.IsVisible) { $win.Close() } } catch {}
+								return
+							}
+							if ($probe -and $probe.Ok) {
+								# Keep window open for possible auth step — only signal result
+								try { $B.ConnectUrl = $u } catch {}
+								$B.EndpointResult = @{
+									Cancelled = $false
+									Url       = $u
+									AuthMode  = $mode
+									ApiKey    = $(if ($mode -eq 'apikey') { $k } else { '' })
+									StatusCode = [int]$probe.StatusCode
+									NeedsAuth = [bool]$probe.NeedsAuth
+								}
+								try { [void]$B.EndpointWait.Set() } catch {}
+								# Soft status while host retests / may switch to Login
+								try {
+									if ($epError) {
+										$bc2 = New-Object System.Windows.Media.BrushConverter
+										$epError.Foreground = $bc2.ConvertFromString('#8A8A96')
+										$epError.Text = $(if ($probe.NeedsAuth) { 'Endpoint reachable - signing in...' } else { 'Connected - continuing...' })
+									}
+								} catch {}
+								& $setEpBusy $false
+								return
+							}
+							$detail = if ($probe -and $probe.Message) { [string]$probe.Message } else { 'No response from server.' }
+							$detail = ($detail -replace '[\r\n]+', ' ').Trim()
+							if ($detail.Length -gt 120) { $detail = $detail.Substring(0, 117) + '...' }
+							if ($epError) {
+								$bc2 = New-Object System.Windows.Media.BrushConverter
+								$epError.Foreground = $bc2.ConvertFromString('#F05C5C')
+								$epError.Text = "Connection was not successful. $detail"
+							}
+							& $setEpBusy $false
+							try { if ($epUrl) { [void]$epUrl.Focus() } } catch {}
+						} catch {
+							try {
+								if ($epError) {
+									$bc2 = New-Object System.Windows.Media.BrushConverter
+									$epError.Foreground = $bc2.ConvertFromString('#F05C5C')
+									$epError.Text = "Connection was not successful. $($_.Exception.Message)"
+								}
+							} catch {}
+							& $setEpBusy $false
+						}
+					}.GetNewClosure(), [System.Windows.Threading.DispatcherPriority]::Background)
+				} catch {
+					& $setEpBusy $false
+				}
+			}.GetNewClosure()
+
+			try {
+				if ($epConnect) { $null = $epConnect.Add_Click({ & $tryEpConnect }.GetNewClosure()) }
+				if ($epCancel) { $null = $epCancel.Add_Click({ & $doConnectCancel }.GetNewClosure()) }
+			} catch {}
 
 			$submit = {
 				$u = ''
@@ -5309,7 +5805,34 @@ public const int ICON_BIG = 1;
 			if ($loginTitleClose) {
 				$loginTitleClose.add_Click({
 					param($s,$e)
-					try { & $doLoginCancel } catch {}
+					try {
+						$onConnect = $false
+						try { $onConnect = ($connectLayer -and $connectLayer.Visibility -eq [System.Windows.Visibility]::Visible) } catch {}
+						if ($onConnect) { & $doConnectCancel } else { & $doLoginCancel }
+					} catch {}
+				}.GetNewClosure())
+			}
+			# Back: leave Login (waiting for creds) and re-open Connect for another endpoint
+			$doGoBackToConnect = {
+				try {
+					if (-not [bool]$B.CanGoBackToConnect) { return }
+					$B.CredResult = @{
+						User = $null; Pass = $null
+						Cancelled = $false
+						Back = $true
+						SoftExit = $false
+						HardClose = $false
+					}
+					try { [void]$B.CredWait.Set() } catch {}
+					try { [void]$B.EndpointWait.Reset() } catch {}
+					$B.EndpointResult = $null
+					& $showConnect
+				} catch {}
+			}.GetNewClosure()
+			if ($loginTitleBack) {
+				$loginTitleBack.add_Click({
+					param($s, $e)
+					try { & $doGoBackToConnect } catch {}
 				}.GetNewClosure())
 			}
 			$pass.add_KeyDown({
@@ -5338,6 +5861,9 @@ public const int ICON_BIG = 1;
 						'show_login' {
 							try { & $setLoginRobotFace 'default' } catch {}
 							& $showLogin
+						}
+						'show_connect' {
+							& $showConnect
 						}
 						'show_confirm' {
 							& $showConfirm ([string]$B.ConfirmPrompt) ([string]$B.ConfirmTitle)
@@ -5410,6 +5936,7 @@ public const int ICON_BIG = 1;
 				param($s, $ev)
 				try {
 					$B.Closed = $true
+					try { $epWantCancel.Value = $true } catch {}
 					if ($null -eq $B.ConfirmResult) { $B.ConfirmResult = $false }
 					if (-not [bool]$B.AuthOk) {
 						$B.CredResult = @{
@@ -5417,8 +5944,12 @@ public const int ICON_BIG = 1;
 							SoftExit = $true; HardClose = $false
 						}
 					}
+					if ($null -eq $B.EndpointResult) {
+						$B.EndpointResult = @{ Cancelled = $true; Url = ''; AuthMode = 'none'; ApiKey = '' }
+					}
 					try { [void]$B.CredWait.Set() } catch {}
 					try { [void]$B.ConfirmWait.Set() } catch {}
+					try { [void]$B.EndpointWait.Set() } catch {}
 				} catch {}
 			}.GetNewClosure())
 			$win.add_Closed({
@@ -5427,6 +5958,7 @@ public const int ICON_BIG = 1;
 					$B.Closed = $true
 					try { [void]$B.CredWait.Set() } catch {}
 					try { [void]$B.ConfirmWait.Set() } catch {}
+					try { [void]$B.EndpointWait.Set() } catch {}
 					try {
 						$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
 						if ($disp -and -not $disp.HasShutdownStarted) {
@@ -5472,6 +6004,18 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				} catch {}
 			} catch {}
 
+			# Initial layer: connect-first avoids login flash for empty BaseUrl
+			try {
+				$il = 'login'
+				try { $il = [string]$B.InitialLayer } catch {}
+				if ($il -eq 'connect') {
+					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Collapsed }
+					& $showConnect
+				} else {
+					if ($connectLayer) { $connectLayer.Visibility = [System.Windows.Visibility]::Collapsed }
+				}
+			} catch {}
+
 			$B.Ready = $true
 			try { [void]$B.ReadyWait.Set() } catch {}
 			# Keep login window topmost
@@ -5489,10 +6033,12 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 			try { [void]$B.ReadyWait.Set() } catch {}
 			try { [void]$B.CredWait.Set() } catch {}
 			try { [void]$B.ConfirmWait.Set() } catch {}
+			try { [void]$B.EndpointWait.Set() } catch {}
 		} finally {
 			$B.Closed = $true
 			try { [void]$B.CredWait.Set() } catch {}
 			try { [void]$B.ConfirmWait.Set() } catch {}
+			try { [void]$B.EndpointWait.Set() } catch {}
 			try { [void]$B.Done.Set() } catch {}
 		}
 	}).AddArgument($bag).AddArgument($hint).AddArgument($ver)
@@ -5523,6 +6069,7 @@ function Close-MBLoginSession {
 	try {
 		try { [void]$Session.CredWait.Set() } catch {}
 		try { [void]$Session.ConfirmWait.Set() } catch {}
+		try { [void]$Session.EndpointWait.Set() } catch {}
 		if (-not [bool]$Session.Closed) {
 			# Show happy robot briefly before close
 			if ($Success) {
@@ -5556,12 +6103,26 @@ function Close-MBLoginSession {
 }
 
 function Wait-MBLoginSessionCred {
-	param($Session)
+	param(
+		$Session,
+		[string]$ServerHint = ''
+	)
 	if ($null -eq $Session -or [bool]$Session.Closed) {
 		return @{ User = $null; Pass = $null; Cancelled = $true; SoftExit = $true }
 	}
 	try { [void]$Session.CredWait.Reset() } catch {}
 	$Session.CredResult = $null
+	# Always refresh the host line for the Login layer (fixed endpoint after connect retry)
+	try {
+		$h = ([string]$ServerHint).Trim()
+		if ([string]::IsNullOrWhiteSpace($h)) {
+			try { $h = [string](Get-Variable -Name BaseUrl -ValueOnly -ErrorAction SilentlyContinue) } catch { $h = '' }
+		}
+		if ([string]::IsNullOrWhiteSpace($h)) {
+			try { $h = [string]$script:MB.PrimaryApiBase } catch { $h = '' }
+		}
+		if (-not [string]::IsNullOrWhiteSpace($h)) { $Session.ConnectUrl = $h }
+	} catch {}
 	$Session.Cmd = 'show_login'
 	while ($true) {
 		if ([bool]$Session.Closed) {
@@ -5638,10 +6199,22 @@ function Read-MBCredentialPrompt {
 		throw 'MiniBot requires WPF for login UI (PresentationFramework not available).'
 	}
 	$sess = Start-MBLoginSession -ServerHint ([string]$BaseUrl)
-	$dlg = Wait-MBLoginSessionCred -Session $sess
+	$dlg = Wait-MBLoginSessionCred -Session $sess -ServerHint ([string]$BaseUrl)
 	if ($null -eq $dlg) {
 		throw 'MiniBot login UI returned no result.'
 	}
+	# User pressed titlebar Back -> return to Connect (keep session open)
+	try {
+		if ([bool]$dlg.Back) {
+			return @{
+				User           = $null
+				Pass           = $null
+				SecurePassword = $null
+				Cancelled      = $false
+				Back           = $true
+			}
+		}
+	} catch {}
 	if ($dlg.Cancelled -or -not $dlg.User -or -not $dlg.Pass) {
 		Close-MBLoginSession -Session $sess
 		return @{
@@ -5812,18 +6385,182 @@ function Test-MBUserYesNo {
 	}
 }
 
+function Set-MBRuntimePrimaryBase {
+	# Update runtime primary endpoint (param + script bag) after user picks a working URL.
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$Url,
+		[ValidateSet('apikey', 'npm', 'none')]
+		[string]$AuthMode = 'none',
+		[string]$ApiKeyValue = ''
+	)
+	$n = Normalize-MBApiBase -Url $Url
+	if ([string]::IsNullOrWhiteSpace($n)) { throw 'Invalid base URL.' }
+	try { Set-Variable -Name BaseUrl -Scope Script -Value $n -Force } catch {}
+	try { $script:BaseUrl = $n } catch {}
+	try {
+		# Keep param-bound value in sync when present in this scope
+		if (Get-Variable -Name BaseUrl -ErrorAction SilentlyContinue) {
+			Set-Variable -Name BaseUrl -Value $n -Force -ErrorAction SilentlyContinue
+		}
+	} catch {}
+	$script:MB.PrimaryApiBase = $n
+	try { $script:MB.ResolvedApiBase = $n } catch {}
+	try { Set-MBApiAuthModeForBase -BaseUrl $n -Mode $AuthMode } catch {}
+	if ($AuthMode -eq 'apikey' -and (Test-MBApiKeyUsable -Key $ApiKeyValue)) {
+		try { Set-MBApiKeyForBase -BaseUrl $n -ApiKeyValue $ApiKeyValue } catch {}
+		try { Set-Variable -Name ApiKey -Scope Script -Value $ApiKeyValue -Force } catch {}
+		try { Set-Variable -Name ApiKey -Value $ApiKeyValue -Force -ErrorAction SilentlyContinue } catch {}
+	} elseif ($AuthMode -eq 'none') {
+		try { Set-Variable -Name ApiKey -Scope Script -Value 'none' -Force } catch {}
+		try { Set-Variable -Name ApiKey -Value 'none' -Force -ErrorAction SilentlyContinue } catch {}
+	}
+	return $n
+}
+
+function Show-MBEndpointConnectDialog {
+	# Endpoint picker on the shared Auth/Connect window (layer swap — not a second window).
+	# Stays open on success so 401 can flip to Login without another popup.
+	param(
+		[string]$CurrentUrl = '',
+		[string]$ErrorMessage = '',
+		[string]$Title = '',
+		[switch]$ConnectMode
+	)
+	if (-not (Test-MBWpfAvailable)) {
+		throw 'MiniBot requires WPF for the connection UI (PresentationFramework not available).'
+	}
+
+	$cur = ([string]$CurrentUrl).Trim()
+	if ([string]::IsNullOrWhiteSpace($cur)) {
+		try { $cur = [string](Get-Variable -Name BaseUrl -ValueOnly -ErrorAction SilentlyContinue) } catch { $cur = '' }
+	}
+	if ([string]::IsNullOrWhiteSpace($cur)) { $cur = 'http://127.0.0.1:8080/v1' }
+	$errMsg = ([string]$ErrorMessage).Trim()
+	$isConnect = [bool]$ConnectMode
+
+	$hadSession = $false
+	try {
+		if ($script:MB.LoginSession -and -not [bool]$script:MB.LoginSession.Closed) { $hadSession = $true }
+	} catch {}
+
+	$sess = $null
+	try {
+		# Always open on Connect layer when this is a new boot window (avoids Login flash)
+		if (-not $hadSession) {
+			$sess = Start-MBLoginSession -ServerHint $cur -InitialLayer 'connect'
+		} else {
+			$sess = Start-MBLoginSession -ServerHint $cur
+		}
+	} catch {
+		return @{
+			Cancelled = $true
+			Url       = $cur
+			AuthMode  = 'none'
+			ApiKey    = ''
+			Error     = $_.Exception.Message
+		}
+	}
+
+	try {
+		$sess.ConnectUrl = $cur
+		$sess.ConnectError = $errMsg
+		$sess.ConnectMode = $isConnect
+		$sess.EndpointResult = $null
+		try { [void]$sess.EndpointWait.Reset() } catch {}
+		# If we already started on connect layer, still push show_connect to refresh fields
+		$sess.Cmd = 'show_connect'
+	} catch {}
+
+	while ($true) {
+		if ([bool]$sess.Closed) {
+			$r = $sess.EndpointResult
+			if ($null -eq $r) {
+				return @{ Cancelled = $true; Url = $cur; AuthMode = 'none'; ApiKey = '' }
+			}
+			break
+		}
+		if ($sess.EndpointWait.WaitOne(50)) { break }
+	}
+
+	$r = $sess.EndpointResult
+	if ($null -eq $r) {
+		return @{ Cancelled = $true; Url = $cur; AuthMode = 'none'; ApiKey = '' }
+	}
+	if ($r.Cancelled) {
+		return @{
+			Cancelled = $true
+			Url       = $cur
+			AuthMode  = 'none'
+			ApiKey    = ''
+		}
+	}
+	return @{
+		Cancelled = $false
+		Url       = [string]$r.Url
+		AuthMode  = $(if ($r.AuthMode) { [string]$r.AuthMode } else { 'none' })
+		ApiKey    = [string]$r.ApiKey
+		NeedsAuth = [bool]$r.NeedsAuth
+		StatusCode = $(if ($null -ne $r.StatusCode) { [int]$r.StatusCode } else { 0 })
+	}
+}
+
 function Connect-MBModelEndpoint {
 	param(
 		[int]$TimeoutSeconds = 8
 	)
 
+	$resolveBase = {
+		$b = ''
+		try { $b = [string](Get-Variable -Name BaseUrl -ValueOnly -ErrorAction SilentlyContinue) } catch { $b = '' }
+		if ([string]::IsNullOrWhiteSpace($b)) {
+			try { $b = [string]$script:MB.PrimaryApiBase } catch { $b = '' }
+		}
+		return $b
+	}
+
 	$testParams = @{
-		BaseUrl        = $BaseUrl
+		BaseUrl        = (& $resolveBase)
 		TimeoutSeconds = $TimeoutSeconds
+	}
+
+	# Empty / blank primary → ask for endpoint before any network call
+	if ([string]::IsNullOrWhiteSpace([string]$testParams.BaseUrl)) {
+		$picked = $null
+		try {
+			$picked = Show-MBEndpointConnectDialog -CurrentUrl 'http://127.0.0.1:8080/v1' -ConnectMode
+		} catch {
+			return @{
+				Success  = $false
+				ConnTest = $null
+				Exit     = $true
+				HardClose = $true
+				Message  = $_.Exception.Message
+			}
+		}
+		if (-not $picked -or $picked.Cancelled -or [string]::IsNullOrWhiteSpace([string]$picked.Url)) {
+			return @{
+				Success  = $false
+				ConnTest = $null
+				Exit     = $true
+				SoftExit = $true
+				Message  = 'Endpoint setup cancelled.'
+			}
+		}
+		try {
+			$null = Set-MBRuntimePrimaryBase -Url $picked.Url -AuthMode $picked.AuthMode -ApiKeyValue $picked.ApiKey
+		} catch {
+			return @{ Success = $false; ConnTest = $null; Exit = $true; Message = $_.Exception.Message }
+		}
+		$testParams.BaseUrl = (& $resolveBase)
+		if ($picked.AuthMode -eq 'apikey' -and $picked.ApiKey) {
+			$testParams['BearerToken'] = $picked.ApiKey
+		}
 	}
 
 	$connTest = Test-ModelConnection @testParams
 	if ($connTest.Success) {
+		try { Close-MBLoginSession -Success } catch {}
 		return @{
 			Success  = $true
 			ConnTest = $connTest
@@ -5831,11 +6568,77 @@ function Connect-MBModelEndpoint {
 		}
 	}
 
+	# Unreachable / invalid / wrong URL (not HTTP auth) → endpoint recovery dialog (do not just quit)
 	if ($connTest.StatusCode -notin 401, 403) {
-		return @{
-			Success  = $false
-			ConnTest = $connTest
-			Exit     = $false
+		$maxEndpointRounds = 6
+		$epRound = 0
+		while ($epRound -lt $maxEndpointRounds) {
+			$epRound++
+			$failMsg = if ($connTest -and $connTest.Message) { [string]$connTest.Message } else { 'Unable to reach the model server.' }
+			$cur = [string]$testParams.BaseUrl
+			$picked = $null
+			try {
+				$picked = Show-MBEndpointConnectDialog -CurrentUrl $cur -ErrorMessage $failMsg
+			} catch {
+				return @{
+					Success   = $false
+					ConnTest  = $connTest
+					Exit      = $true
+					HardClose = $true
+					Message   = $_.Exception.Message
+				}
+			}
+			if (-not $picked -or $picked.Cancelled -or [string]::IsNullOrWhiteSpace([string]$picked.Url)) {
+				return @{
+					Success  = $false
+					ConnTest = $connTest
+					Exit     = $true
+					SoftExit = $true
+					Message  = 'Endpoint setup cancelled.'
+				}
+			}
+			try {
+				$n = Set-MBRuntimePrimaryBase -Url $picked.Url -AuthMode $picked.AuthMode -ApiKeyValue $picked.ApiKey
+			} catch {
+				$connTest = [pscustomobject]@{
+					Success = $false; StatusCode = 0
+					Message = $_.Exception.Message
+					AuthType = 'Basic'; ElapsedMs = 0; BaseUrl = $picked.Url
+				}
+				continue
+			}
+			$testParams = @{
+				BaseUrl        = $n
+				TimeoutSeconds = $TimeoutSeconds
+			}
+			if ($picked.AuthMode -eq 'apikey' -and (Test-MBApiKeyUsable -Key $picked.ApiKey)) {
+				$testParams['BearerToken'] = $picked.ApiKey
+			}
+			# Clear NPM session unless user chose NPM (they'll login next if 401)
+			if ($picked.AuthMode -ne 'npm') {
+				try {
+					if ($testParams.ContainsKey('Username')) { $testParams.Remove('Username') }
+					if ($testParams.ContainsKey('Password')) { $testParams.Remove('Password') }
+				} catch {}
+			}
+			$connTest = Test-ModelConnection @testParams
+			if ($connTest.Success) {
+				try { Close-MBLoginSession -Success } catch {}
+				return @{ Success = $true; ConnTest = $connTest; Exit = $false }
+			}
+			if ($connTest.StatusCode -in 401, 403) {
+				# Reachable but needs credentials — same window flips to Login layer
+				break
+			}
+		}
+		if ($connTest.StatusCode -notin 401, 403) {
+			return @{
+				Success  = $false
+				ConnTest = $connTest
+				Exit     = $true
+				SoftExit = $true
+				Message  = $(if ($connTest.Message) { [string]$connTest.Message } else { 'Unable to connect to endpoint.' })
+			}
 		}
 	}
 
@@ -5860,6 +6663,7 @@ function Connect-MBModelEndpoint {
 					$script:MB_StoreCredsFromEnv = $false
 					$wantStore = $false
 				}
+				try { Close-MBLoginSession -Success } catch {}
 				return @{ Success = $true; ConnTest = $connTest; Exit = $false }
 			}
 
@@ -5909,6 +6713,78 @@ function Connect-MBModelEndpoint {
 				Message  = $_.Exception.Message
 			}
 		}
+		# Back to Connect: re-pick endpoint (only when CanGoBackToConnect path was used)
+		try {
+			if ([bool]$entered.Back) {
+				$picked = $null
+				try {
+					$curEp = ''
+					try { $curEp = [string]$testParams.BaseUrl } catch {}
+					if ([string]::IsNullOrWhiteSpace($curEp)) { $curEp = 'http://127.0.0.1:8080/v1' }
+					$useConnectMode = $true
+					try {
+						if ($script:MB.LoginSession -and $null -ne $script:MB.LoginSession.ConnectMode) {
+							$useConnectMode = [bool]$script:MB.LoginSession.ConnectMode
+						}
+					} catch { $useConnectMode = $true }
+					if ($useConnectMode) {
+						$picked = Show-MBEndpointConnectDialog -CurrentUrl $curEp -ConnectMode
+					} else {
+						$failHint = if ($connTest -and $connTest.Message) { [string]$connTest.Message } else { '' }
+						$picked = Show-MBEndpointConnectDialog -CurrentUrl $curEp -ErrorMessage $failHint
+					}
+				} catch {
+					try { Close-MBLoginSession } catch {}
+					return @{
+						Success = $false; ConnTest = $connTest; Exit = $true
+						HardClose = $true; Message = $_.Exception.Message
+					}
+				}
+				if (-not $picked -or $picked.Cancelled -or [string]::IsNullOrWhiteSpace([string]$picked.Url)) {
+					try { Close-MBLoginSession } catch {}
+					return @{
+						Success = $false; ConnTest = $connTest; Exit = $true
+						SoftExit = $true; Message = 'Endpoint setup cancelled.'
+					}
+				}
+				try {
+					$n = Set-MBRuntimePrimaryBase -Url $picked.Url -AuthMode $picked.AuthMode -ApiKeyValue $picked.ApiKey
+				} catch {
+					$connTest = [pscustomobject]@{
+						Success = $false; StatusCode = 0
+						Message = $_.Exception.Message
+						AuthType = 'None'; ElapsedMs = 0; BaseUrl = $picked.Url
+					}
+					continue
+				}
+				$testParams = @{
+					BaseUrl        = $n
+					TimeoutSeconds = $TimeoutSeconds
+				}
+				if ($picked.AuthMode -eq 'apikey' -and (Test-MBApiKeyUsable -Key $picked.ApiKey)) {
+					$testParams['BearerToken'] = $picked.ApiKey
+				}
+				if ($picked.AuthMode -ne 'npm') {
+					try {
+						if ($testParams.ContainsKey('Username')) { $testParams.Remove('Username') }
+						if ($testParams.ContainsKey('Password')) { $testParams.Remove('Password') }
+					} catch {}
+					$script:MB.NpmUser = $null
+					$script:MB.NpmPass = $null
+				}
+				$connTest = Test-ModelConnection @testParams
+				if ($connTest.Success) {
+					try { Close-MBLoginSession -Success } catch {}
+					return @{ Success = $true; ConnTest = $connTest; Exit = $false }
+				}
+				if ($connTest.StatusCode -in 401, 403) {
+					# Still needs auth for the new endpoint - loop to login again
+					continue
+				}
+				# Unreachable after re-pick: keep dialog open via connect layer already; retry loop
+				continue
+			}
+		} catch {}
 		if ($entered.Cancelled -or -not $entered.User -or -not $entered.Pass) {
 			try { Close-MBLoginSession } catch {}
 			return @{
@@ -7202,7 +8078,7 @@ FindFiles: multi-ext one call; truncated=normal (use rows); specific ask→narro
 
 $script:MBGroupPrompt = [ordered]@{
 	core = @"
-CORE: text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; HexView/HexEdit; RunCommand; CWD/env; EnableToolGroup. Prefer specialized tools. MEDIA: always ![label](absolute-path) inline in chat for play/show — shell-open/default app last resort only.
+CORE: text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; HexView/HexEdit (path2=diff, next_diff, annotate magic/PE/controls/ASCII+UTF16 strings); RunCommand; CWD/env; EnableToolGroup. Prefer specialized tools. MEDIA: always ![label](absolute-path) inline in chat for play/show — shell-open/default app last resort only.
 "@
 	senses = @"
 SENSES: ReadImage (vision, auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true → show with ![label](path) inline, not external open); SpeakText. No ReadFile on images/PDF.
@@ -7300,8 +8176,8 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents under path."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" } }; required = @("path","pattern") } } },
 	@{ type = "function"; function = @{ name = "DiffText"; description = "Line diff of two strings or files."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" } }; required = @("left","right") } } },
-	@{ type = "function"; function = @{ name = "HexView"; description = "Hex dump binary file (offset/length/width)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; length = @{ type = "integer" }; width = @{ type = "integer" }; show_ascii = @{ type = "boolean" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes at offset (hex= or bytes[]). ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; extend = @{ type = "boolean" }; backup = @{ type = "boolean" } }; required = @("path","offset") } } },
+	@{ type = "function"; function = @{ name = "HexView"; description = "Hex dump for software/binary testing. offset/length/width; annotate=true (default) labels file magic, PE map (sections/dirs/entry file offset/imports/exports), control chars (NUL/TAB/LF/CR/...), ASCII + UTF-16LE strings, byte-class counts. DIFF: path2= side-by-side (* / XX!). next_diff=true seeks next differing byte. Prefer over dual ReadFile for binary compare."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default true)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes at offset (hex= or bytes[]). ALWAYS prompts. Prefer HexView first (use path2 to verify)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; extend = @{ type = "boolean" }; backup = @{ type = "boolean" } }; required = @("path","offset") } } },
 	@{ type = "function"; function = @{ name = "GetWorkingDirectory"; description = "Agent CWD."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "SetWorkingDirectory"; description = "Set agent CWD."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "GetEnvironment"; description = "Env vars / PATH summary."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" } } } } },
@@ -15915,12 +16791,61 @@ function Convert-MBHexStringToBytes {
 	return ,$out.ToArray()
 }
 
+function Get-MBHexAsciiGlyph {
+	# Single-width glyph for dump gutter (printable ASCII, else '.')
+	param([byte]$B)
+	if ($B -ge 32 -and $B -le 126) { return [string][char]$B }
+	return '.'
+}
+
+function Get-MBControlCharName {
+	param([byte]$B)
+	switch ([int]$B) {
+		0x00 { return 'NUL' }
+		0x01 { return 'SOH' }
+		0x02 { return 'STX' }
+		0x03 { return 'ETX' }
+		0x04 { return 'EOT' }
+		0x05 { return 'ENQ' }
+		0x06 { return 'ACK' }
+		0x07 { return 'BEL' }
+		0x08 { return 'BS' }
+		0x09 { return 'TAB' }
+		0x0A { return 'LF' }
+		0x0B { return 'VT' }
+		0x0C { return 'FF' }
+		0x0D { return 'CR' }
+		0x0E { return 'SO' }
+		0x0F { return 'SI' }
+		0x10 { return 'DLE' }
+		0x11 { return 'DC1' }
+		0x12 { return 'DC2' }
+		0x13 { return 'DC3' }
+		0x14 { return 'DC4' }
+		0x15 { return 'NAK' }
+		0x16 { return 'SYN' }
+		0x17 { return 'ETB' }
+		0x18 { return 'CAN' }
+		0x19 { return 'EM' }
+		0x1A { return 'SUB' }
+		0x1B { return 'ESC' }
+		0x1C { return 'FS' }
+		0x1D { return 'GS' }
+		0x1E { return 'RS' }
+		0x1F { return 'US' }
+		0x7F { return 'DEL' }
+		default { return $null }
+	}
+}
+
 function Format-MBHexDump {
 	param(
 		[byte[]]$Bytes,
 		[long]$BaseOffset = 0,
 		[int]$Width = 16,
-		[bool]$ShowAscii = $true
+		[bool]$ShowAscii = $true,
+		# optional per-byte mask: true = highlight as changed (prefix line with * and mark byte with !)
+		[bool[]]$DiffMask = $null
 	)
 	if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return '(empty)' }
 	if ($Width -lt 1) { $Width = 16 }
@@ -15929,15 +16854,30 @@ function Format-MBHexDump {
 	$i = 0
 	while ($i -lt $Bytes.Length) {
 		$lineOff = $BaseOffset + $i
+		$lineHasDiff = $false
+		if ($DiffMask) {
+			for ($c = 0; $c -lt $Width; $c++) {
+				if (($i + $c) -lt $Bytes.Length -and ($i + $c) -lt $DiffMask.Length -and $DiffMask[$i + $c]) {
+					$lineHasDiff = $true
+					break
+				}
+			}
+		}
+		if ($lineHasDiff) { [void]$sb.Append('* ') } else { [void]$sb.Append('  ') }
 		[void]$sb.Append(('{0:X8}  ' -f $lineOff))
 		$ascii = New-Object System.Text.StringBuilder
 		for ($c = 0; $c -lt $Width; $c++) {
 			if (($i + $c) -lt $Bytes.Length) {
 				$b = $Bytes[$i + $c]
-				[void]$sb.Append(('{0:X2} ' -f $b))
+				$changed = $false
+				if ($DiffMask -and ($i + $c) -lt $DiffMask.Length -and $DiffMask[$i + $c]) { $changed = $true }
+				if ($changed) {
+					[void]$sb.Append(('{0:X2}!' -f $b))
+				} else {
+					[void]$sb.Append(('{0:X2} ' -f $b))
+				}
 				if ($ShowAscii) {
-					if ($b -ge 32 -and $b -le 126) { [void]$ascii.Append([char]$b) }
-					else { [void]$ascii.Append('.') }
+					[void]$ascii.Append((Get-MBHexAsciiGlyph -B $b))
 				}
 			} else {
 				[void]$sb.Append('   ')
@@ -15956,66 +16896,972 @@ function Format-MBHexDump {
 	return $sb.ToString().TrimEnd()
 }
 
-function Invoke-HexView {
+function Format-MBHexDumpSideBySide {
+	# A/B dual dump for comparison (same offsets). Diff lines marked with * on the marker column.
 	param(
-		[string]$path,
-		$offset = 0,
-		[int]$length = 256,
-		[int]$width = 16,
-		[bool]$show_ascii = $true
+		[byte[]]$BytesA,
+		[byte[]]$BytesB,
+		[long]$BaseOffset = 0,
+		[int]$Width = 16,
+		[bool]$ShowAscii = $true
 	)
-	$path = Resolve-MBPath -Path $path -MustExist
-	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
-	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
-
-	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
-	if ($length -le 0) { $length = 256 }
-	if ($length -gt 8192) { $length = 8192 }
-	if ($width -le 0) { $width = 16 }
-	if ($width -gt 32) { $width = 32 }
-
-	$fs = $null
-	try {
-		$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-		$fileLen = $fs.Length
-		if ($off -ge $fileLen) {
-			return ConvertTo-MBJson @{
-				path          = $path
-				file_size     = $fileLen
-				offset        = $off
-				offset_hex    = ('0x{0:X}' -f $off)
-				length        = 0
-				truncated    = $false
-				note          = 'offset at or past EOF'
-				dump          = ''
+	if ($Width -lt 1) { $Width = 16 }
+	if ($Width -gt 16) { $Width = 16 } # side-by-side stays readable
+	$lenA = if ($BytesA) { $BytesA.Length } else { 0 }
+	$lenB = if ($BytesB) { $BytesB.Length } else { 0 }
+	$maxLen = [Math]::Max($lenA, $lenB)
+	if ($maxLen -eq 0) { return '(empty)' }
+	$sb = New-Object System.Text.StringBuilder
+	[void]$sb.AppendLine(('  {0,-44}  {1}' -f 'A (path)', 'B (path2)'))
+	$i = 0
+	while ($i -lt $maxLen) {
+		$lineOff = $BaseOffset + $i
+		$lineDiff = $false
+		for ($c = 0; $c -lt $Width; $c++) {
+			$ia = $i + $c
+			$ba = if ($ia -lt $lenA) { $BytesA[$ia] } else { $null }
+			$bb = if ($ia -lt $lenB) { $BytesB[$ia] } else { $null }
+			if ($ba -ne $bb) { $lineDiff = $true; break }
+		}
+		$mark = if ($lineDiff) { '* ' } else { '  ' }
+		$hexA = New-Object System.Text.StringBuilder
+		$hexB = New-Object System.Text.StringBuilder
+		$ascA = New-Object System.Text.StringBuilder
+		$ascB = New-Object System.Text.StringBuilder
+		for ($c = 0; $c -lt $Width; $c++) {
+			$ia = $i + $c
+			if ($ia -lt $lenA) {
+				$b = $BytesA[$ia]
+				$ch = ($ia -lt $lenB -and $b -ne $BytesB[$ia])
+				if ($ch) { [void]$hexA.Append(('{0:X2}!' -f $b)) } else { [void]$hexA.Append(('{0:X2} ' -f $b)) }
+				if ($ShowAscii) { [void]$ascA.Append((Get-MBHexAsciiGlyph -B $b)) }
+			} else {
+				[void]$hexA.Append('   ')
+				if ($ShowAscii) { [void]$ascA.Append(' ') }
+			}
+			if ($ia -lt $lenB) {
+				$b2 = $BytesB[$ia]
+				$ch2 = ($ia -lt $lenA -and $b2 -ne $BytesA[$ia])
+				if ($ch2) { [void]$hexB.Append(('{0:X2}!' -f $b2)) } else { [void]$hexB.Append(('{0:X2} ' -f $b2)) }
+				if ($ShowAscii) { [void]$ascB.Append((Get-MBHexAsciiGlyph -B $b2)) }
+			} else {
+				[void]$hexB.Append('   ')
+				if ($ShowAscii) { [void]$ascB.Append(' ') }
 			}
 		}
-		$take = [int][Math]::Min([long]$length, $fileLen - $off)
+		$left = ('{0:X8}  {1}' -f $lineOff, $hexA.ToString().TrimEnd())
+		if ($ShowAscii) { $left += (' |{0}|' -f $ascA.ToString()) }
+		$right = $hexB.ToString().TrimEnd()
+		if ($ShowAscii) { $right += (' |{0}|' -f $ascB.ToString()) }
+		[void]$sb.AppendLine(('{0}{1,-48}  {2}' -f $mark, $left, $right))
+		$i += $Width
+	}
+	return $sb.ToString().TrimEnd()
+}
+
+function Read-MBFileBytes {
+	param(
+		[string]$Path,
+		[long]$Offset = 0,
+		[int]$Length = 256
+	)
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$fileLen = $fs.Length
+		if ($Offset -lt 0) { $Offset = 0 }
+		if ($Offset -ge $fileLen) {
+			return @{ Ok = $true; FileSize = $fileLen; Offset = $Offset; Bytes = [byte[]]@(); Eof = $true }
+		}
+		$take = [int][Math]::Min([long]$Length, $fileLen - $Offset)
 		$buf = New-Object byte[] $take
-		[void]$fs.Seek($off, [System.IO.SeekOrigin]::Begin)
+		[void]$fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
 		$read = $fs.Read($buf, 0, $take)
 		if ($read -lt $take) {
 			$tmp = New-Object byte[] $read
 			[Array]::Copy($buf, $tmp, $read)
 			$buf = $tmp
 		}
-		$dump = Format-MBHexDump -Bytes $buf -BaseOffset $off -Width $width -ShowAscii $show_ascii
-		return ConvertTo-MBJson @{
-			path          = $path
-			file_size     = $fileLen
-			offset        = $off
-			offset_hex    = ('0x{0:X}' -f $off)
-			length        = $buf.Length
-			width         = $width
-			truncated    = (($off + $buf.Length) -lt $fileLen)
-			show_ascii    = $show_ascii
-			dump          = $dump
+		return @{
+			Ok       = $true
+			FileSize = $fileLen
+			Offset   = $Offset
+			Bytes    = $buf
+			Eof      = (($Offset + $buf.Length) -ge $fileLen)
 		}
 	} catch {
-		return "ERROR: $($_.Exception.Message)"
+		return @{ Ok = $false; Error = $_.Exception.Message }
 	} finally {
 		if ($null -ne $fs) { try { $fs.Dispose() } catch {} }
 	}
+}
+
+function Find-MBNextByteDiff {
+	# Scan two files from StartOffset; return first differing absolute offset, or -1 if identical to end of shorter.
+	param(
+		[string]$PathA,
+		[string]$PathB,
+		[long]$StartOffset = 0,
+		[int]$ChunkSize = 65536,
+		[long]$MaxScan = 0  # 0 = no limit beyond files
+	)
+	$fa = $null; $fb = $null
+	try {
+		$fa = [System.IO.File]::Open($PathA, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$fb = [System.IO.File]::Open($PathB, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$lenA = $fa.Length
+		$lenB = $fb.Length
+		$pos = [Math]::Max(0L, $StartOffset)
+		$endLimit = [Math]::Min($lenA, $lenB)
+		if ($MaxScan -gt 0) {
+			$cap = $pos + $MaxScan
+			if ($cap -lt $endLimit) { $endLimit = $cap }
+		}
+		if ($pos -ge $endLimit) {
+			if ($lenA -ne $lenB -and $pos -ge [Math]::Min($lenA, $lenB)) {
+				return @{ Found = $true; Offset = [Math]::Min($lenA, $lenB); Reason = 'length_mismatch_after' }
+			}
+			return @{ Found = $false; Offset = -1L; Reason = 'no_diff' }
+		}
+		[void]$fa.Seek($pos, [System.IO.SeekOrigin]::Begin)
+		[void]$fb.Seek($pos, [System.IO.SeekOrigin]::Begin)
+		$bufA = New-Object byte[] $ChunkSize
+		$bufB = New-Object byte[] $ChunkSize
+		while ($pos -lt $endLimit) {
+			$want = [int][Math]::Min([long]$ChunkSize, $endLimit - $pos)
+			$ra = $fa.Read($bufA, 0, $want)
+			$rb = $fb.Read($bufB, 0, $want)
+			$n = [Math]::Min($ra, $rb)
+			for ($i = 0; $i -lt $n; $i++) {
+				if ($bufA[$i] -ne $bufB[$i]) {
+					return @{ Found = $true; Offset = ($pos + $i); Reason = 'byte_diff'; ByteA = [int]$bufA[$i]; ByteB = [int]$bufB[$i] }
+				}
+			}
+			if ($ra -ne $rb) {
+				return @{ Found = $true; Offset = ($pos + $n); Reason = 'chunk_length' }
+			}
+			$pos += $n
+			if ($n -le 0) { break }
+		}
+		if ($lenA -ne $lenB) {
+			return @{ Found = $true; Offset = [Math]::Min($lenA, $lenB); Reason = 'file_length'; SizeA = $lenA; SizeB = $lenB }
+		}
+		return @{ Found = $false; Offset = -1L; Reason = 'identical' }
+	} catch {
+		return @{ Found = $false; Offset = -1L; Reason = 'error'; Error = $_.Exception.Message }
+	} finally {
+		if ($fa) { try { $fa.Dispose() } catch {} }
+		if ($fb) { try { $fb.Dispose() } catch {} }
+	}
+}
+
+function Convert-MBPeRvaToOffset {
+	param(
+		[System.Collections.IEnumerable]$Sections,
+		[uint32]$Rva
+	)
+	if ($null -eq $Sections) { return $null }
+	foreach ($s in @($Sections)) {
+		try {
+			$vrva = [uint32]$s.virt_rva
+			$vsz = [uint32]$s.virt_size
+			$rsz = [uint32]$s.raw_size
+			$rptr = [uint32]$s.raw_ptr
+			$span = $vsz
+			if ($rsz -gt $span) { $span = $rsz }
+			if ($span -eq 0) { $span = $rsz }
+			if ($Rva -ge $vrva -and $Rva -lt ($vrva + $span)) {
+				return [long]($rptr + ($Rva - $vrva))
+			}
+		} catch {}
+	}
+	return $null
+}
+
+function Get-MBFileMagicAnnotations {
+	# Common container/image/archive magic at file start (testing builds/artifacts).
+	param(
+		[string]$Path,
+		[byte[]]$HeadBytes = $null
+	)
+	$notes = New-Object System.Collections.ArrayList
+	$b = $HeadBytes
+	if ($null -eq $b -or $b.Length -lt 4) {
+		try {
+			$r = Read-MBFileBytes -Path $Path -Offset 0 -Length 32
+			if ($r.Ok) { $b = $r.Bytes }
+		} catch { $b = $null }
+	}
+	if ($null -eq $b -or $b.Length -lt 2) { return @() }
+	$add = {
+		param([long]$Off, [string]$Text, [string]$Kind = 'magic')
+		[void]$notes.Add([ordered]@{ offset = $Off; kind = $Kind; text = $Text })
+	}.GetNewClosure()
+	# PE/DOS
+	if ($b.Length -ge 2 -and $b[0] -eq 0x4D -and $b[1] -eq 0x5A) {
+		& $add 0 'Magic: MZ (DOS/PE executable or image)'
+	}
+	# ELF
+	elseif ($b.Length -ge 4 -and $b[0] -eq 0x7F -and $b[1] -eq 0x45 -and $b[2] -eq 0x4C -and $b[3] -eq 0x46) {
+		& $add 0 'Magic: ELF executable/object'
+	}
+	# ZIP / JAR / DOCX / APK (PK..)
+	elseif ($b.Length -ge 4 -and $b[0] -eq 0x50 -and $b[1] -eq 0x4B -and ($b[2] -eq 0x03 -or $b[2] -eq 0x05 -or $b[2] -eq 0x07)) {
+		& $add 0 'Magic: ZIP/PK archive (zip/jar/apk/office container)'
+	}
+	# PNG
+	elseif ($b.Length -ge 8 -and $b[0] -eq 0x89 -and $b[1] -eq 0x50 -and $b[2] -eq 0x4E -and $b[3] -eq 0x47) {
+		& $add 0 'Magic: PNG image'
+	}
+	# JPEG
+	elseif ($b.Length -ge 3 -and $b[0] -eq 0xFF -and $b[1] -eq 0xD8 -and $b[2] -eq 0xFF) {
+		& $add 0 'Magic: JPEG image'
+	}
+	# GIF
+	elseif ($b.Length -ge 6 -and $b[0] -eq 0x47 -and $b[1] -eq 0x49 -and $b[2] -eq 0x46) {
+		& $add 0 'Magic: GIF image'
+	}
+	# BMP
+	elseif ($b.Length -ge 2 -and $b[0] -eq 0x42 -and $b[1] -eq 0x4D) {
+		& $add 0 'Magic: BMP image'
+	}
+	# PDF
+	elseif ($b.Length -ge 5 -and $b[0] -eq 0x25 -and $b[1] -eq 0x50 -and $b[2] -eq 0x44 -and $b[3] -eq 0x46) {
+		& $add 0 'Magic: PDF document'
+	}
+	# 7z
+	elseif ($b.Length -ge 6 -and $b[0] -eq 0x37 -and $b[1] -eq 0x7A -and $b[2] -eq 0xBC -and $b[3] -eq 0xAF) {
+		& $add 0 'Magic: 7z archive'
+	}
+	# RAR
+	elseif ($b.Length -ge 4 -and $b[0] -eq 0x52 -and $b[1] -eq 0x61 -and $b[2] -eq 0x72 -and $b[3] -eq 0x21) {
+		& $add 0 'Magic: RAR archive'
+	}
+	# GZIP
+	elseif ($b.Length -ge 2 -and $b[0] -eq 0x1F -and $b[1] -eq 0x8B) {
+		& $add 0 'Magic: GZIP compressed'
+	}
+	# CAB
+	elseif ($b.Length -ge 4 -and $b[0] -eq 0x4D -and $b[1] -eq 0x53 -and $b[2] -eq 0x43 -and $b[3] -eq 0x46) {
+		& $add 0 'Magic: Microsoft CAB archive'
+	}
+	# MSI/OLE compound (D0 CF 11 E0)
+	elseif ($b.Length -ge 4 -and $b[0] -eq 0xD0 -and $b[1] -eq 0xCF -and $b[2] -eq 0x11 -and $b[3] -eq 0xE0) {
+		& $add 0 'Magic: OLE/CFB compound (doc/xls/msi/etc.)'
+	}
+	# WAV / RIFF
+	elseif ($b.Length -ge 12 -and $b[0] -eq 0x52 -and $b[1] -eq 0x49 -and $b[2] -eq 0x46 -and $b[3] -eq 0x46) {
+		$four = ''
+		try { $four = [System.Text.Encoding]::ASCII.GetString($b, 8, 4) } catch {}
+		& $add 0 ("Magic: RIFF container{0}" -f $(if ($four) { " ($four)" } else { '' }))
+	}
+	# ISO 9660 (CD001 at 0x8001 etc) - check if length allows
+	try {
+		$iso = Read-MBFileBytes -Path $Path -Offset 0x8001 -Length 5
+		if ($iso.Ok -and $iso.Bytes.Length -ge 5) {
+			$sig = [System.Text.Encoding]::ASCII.GetString($iso.Bytes)
+			if ($sig -eq 'CD001') { & $add 0x8001 'Magic: ISO 9660 primary volume (CD001)' }
+		}
+	} catch {}
+	return @($notes)
+}
+
+function Get-MBControlCharAnnotations {
+	# Label control / DEL bytes in the viewed window (for test binary inspection).
+	param(
+		[byte[]]$Bytes,
+		[long]$BaseOffset = 0,
+		[int]$MaxHits = 48
+	)
+	$out = New-Object System.Collections.ArrayList
+	if ($null -eq $Bytes) { return @() }
+	# Aggregate runs of same control for readability
+	$i = 0
+	while ($i -lt $Bytes.Length -and $out.Count -lt $MaxHits) {
+		$b = $Bytes[$i]
+		$nm = Get-MBControlCharName -B $b
+		if ($nm) {
+			$start = $i
+			while ($i -lt $Bytes.Length -and $Bytes[$i] -eq $b) { $i++ }
+			$len = $i - $start
+			$txt = if ($len -gt 1) { ("{0} x{1}" -f $nm, $len) } else { $nm }
+			[void]$out.Add([ordered]@{
+				offset = ($BaseOffset + $start)
+				length = $len
+				kind   = 'control'
+				byte   = ('0x{0:X2}' -f $b)
+				text   = $txt
+			})
+		} else {
+			$i++
+		}
+	}
+	return @($out)
+}
+
+function Get-MBPeAnnotations {
+	# PE/COFF map for test binaries: headers, sections, dirs, imports (no disassembler).
+	param([string]$Path)
+	$notes = New-Object System.Collections.ArrayList
+	$sections = New-Object System.Collections.ArrayList
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		if ($fs.Length -lt 64) { return @() }
+		$hdr = New-Object byte[] 64
+		[void]$fs.Read($hdr, 0, 64)
+		if ($hdr[0] -ne 0x4D -or $hdr[1] -ne 0x5A) { return @() } # MZ
+		$e_lfanew = [BitConverter]::ToInt32($hdr, 0x3C)
+		if ($e_lfanew -le 0 -or ($e_lfanew + 24) -gt $fs.Length) {
+			[void]$notes.Add([ordered]@{ offset = 0; kind = 'pe'; text = 'MZ header (invalid e_lfanew)' })
+			return @($notes)
+		}
+		[void]$notes.Add([ordered]@{ offset = 0; kind = 'pe'; text = 'DOS MZ header' })
+		[void]$notes.Add([ordered]@{ offset = 0x3C; kind = 'pe'; text = ('e_lfanew -> 0x{0:X}' -f $e_lfanew) })
+		# DOS stub region
+		if ($e_lfanew -gt 0x40) {
+			[void]$notes.Add([ordered]@{ offset = 0x40; kind = 'pe'; text = ('DOS stub region (to PE at 0x{0:X})' -f $e_lfanew) })
+		}
+		[void]$fs.Seek([long]$e_lfanew, [System.IO.SeekOrigin]::Begin)
+		$peSig = New-Object byte[] 4
+		[void]$fs.Read($peSig, 0, 4)
+		if ($peSig[0] -ne 0x50 -or $peSig[1] -ne 0x45 -or $peSig[2] -ne 0 -or $peSig[3] -ne 0) {
+			[void]$notes.Add([ordered]@{ offset = $e_lfanew; kind = 'pe'; text = 'PE signature missing' })
+			return @($notes)
+		}
+		[void]$notes.Add([ordered]@{ offset = $e_lfanew; kind = 'pe'; text = 'PE signature (PE\0\0)' })
+		$coff = New-Object byte[] 20
+		[void]$fs.Read($coff, 0, 20)
+		$machine = [BitConverter]::ToUInt16($coff, 0)
+		$numSec = [BitConverter]::ToUInt16($coff, 2)
+		$timedate = [BitConverter]::ToUInt32($coff, 4)
+		$chars = [BitConverter]::ToUInt16($coff, 18)
+		$optSize = [BitConverter]::ToUInt16($coff, 16)
+		$machName = switch ($machine) {
+			0x14c { 'i386' }
+			0x8664 { 'AMD64' }
+			0xAA64 { 'ARM64' }
+			0x1c0 { 'ARM' }
+			0x1c4 { 'ARMv7' }
+			0x200 { 'IA64' }
+			default { ('0x{0:X}' -f $machine) }
+		}
+		$charBits = New-Object System.Collections.ArrayList
+		if ($chars -band 0x0002) { [void]$charBits.Add('EXECUTABLE') }
+		if ($chars -band 0x2000) { [void]$charBits.Add('DLL') }
+		if ($chars -band 0x0020) { [void]$charBits.Add('LARGE_ADDRESS_AWARE') }
+		if ($chars -band 0x0100) { [void]$charBits.Add('32BIT_MACHINE') }
+		if ($chars -band 0x0001) { [void]$charBits.Add('RELOCS_STRIPPED') }
+		$charTxt = if ($charBits.Count -gt 0) { ($charBits -join '|') } else { ('0x{0:X}' -f $chars) }
+		[void]$notes.Add([ordered]@{
+			offset = ($e_lfanew + 4)
+			kind   = 'pe'
+			text   = ("COFF Machine={0} Sections={1} Characteristics={2}" -f $machName, $numSec, $charTxt)
+		})
+		if ($timedate -gt 0) {
+			try {
+				$epoch = [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).AddSeconds([double]$timedate)
+				[void]$notes.Add([ordered]@{
+					offset = ($e_lfanew + 8)
+					kind   = 'pe'
+					text   = ('TimeDateStamp {0:yyyy-MM-dd HH:mm:ss}Z (0x{1:X})' -f $epoch, $timedate)
+				})
+			} catch {
+				[void]$notes.Add([ordered]@{ offset = ($e_lfanew + 8); kind = 'pe'; text = ('TimeDateStamp 0x{0:X}' -f $timedate) })
+			}
+		}
+		$optOff = $e_lfanew + 24
+		$isPE32Plus = $false
+		$isPE32 = $false
+		$epRva = [uint32]0
+		$imgBase = [uint64]0
+		$sectionAlign = [uint32]0
+		$fileAlign = [uint32]0
+		$subsystem = [uint16]0
+		$numRvaSizes = 0
+		$dataDirOff = 0
+		if ($optSize -ge 2 -and ($optOff + $optSize) -le $fs.Length) {
+			[void]$fs.Seek([long]$optOff, [System.IO.SeekOrigin]::Begin)
+			$opt = New-Object byte[] ([Math]::Min([int]$optSize, 384))
+			[void]$fs.Read($opt, 0, $opt.Length)
+			$magic = [BitConverter]::ToUInt16($opt, 0)
+			$isPE32Plus = ($magic -eq 0x20B)
+			$isPE32 = ($magic -eq 0x10B)
+			if ($isPE32 -or $isPE32Plus) {
+				$epRva = [BitConverter]::ToUInt32($opt, 16)
+				$codeBase = [BitConverter]::ToUInt32($opt, 20)
+				if ($isPE32Plus -and $opt.Length -ge 32) {
+					$imgBase = [BitConverter]::ToUInt64($opt, 24)
+					if ($opt.Length -ge 40) {
+						$sectionAlign = [BitConverter]::ToUInt32($opt, 32)
+						$fileAlign = [BitConverter]::ToUInt32($opt, 36)
+					}
+					if ($opt.Length -ge 72) { $subsystem = [BitConverter]::ToUInt16($opt, 68) }
+					# DataDirectory starts at optional+112 for PE32+
+					$dataDirOff = $optOff + 112
+					if ($opt.Length -ge 110) { $numRvaSizes = [BitConverter]::ToInt32($opt, 108) }
+				} elseif ($opt.Length -ge 32) {
+					$imgBase = [uint64][BitConverter]::ToUInt32($opt, 28)
+					if ($opt.Length -ge 40) {
+						$sectionAlign = [BitConverter]::ToUInt32($opt, 32)
+						$fileAlign = [BitConverter]::ToUInt32($opt, 36)
+					}
+					if ($opt.Length -ge 72) { $subsystem = [BitConverter]::ToUInt16($opt, 68) }
+					$dataDirOff = $optOff + 96
+					if ($opt.Length -ge 96) { $numRvaSizes = [BitConverter]::ToInt32($opt, 92) }
+				}
+				$subName = switch ([int]$subsystem) {
+					1 { 'Native' }
+					2 { 'Windows GUI' }
+					3 { 'Windows CUI' }
+					5 { 'OS/2 CUI' }
+					7 { 'POSIX CUI' }
+					9 { 'Windows CE' }
+					10 { 'EFI app' }
+					11 { 'EFI boot driver' }
+					12 { 'EFI runtime driver' }
+					13 { 'EFI ROM' }
+					14 { 'Xbox' }
+					16 { 'Windows boot app' }
+					default { ('0x{0:X}' -f $subsystem) }
+				}
+				[void]$notes.Add([ordered]@{
+					offset = $optOff
+					kind   = 'pe'
+					text   = ('OptionalHeader {0} EntryPointRVA=0x{1:X} ImageBase=0x{2:X} Subsystem={3}' -f $(if ($isPE32Plus) { 'PE32+' } else { 'PE32' }), $epRva, $imgBase, $subName)
+				})
+				[void]$notes.Add([ordered]@{
+					offset = ($optOff + 16)
+					kind   = 'pe'
+					text   = ('AddressOfEntryPoint RVA 0x{0:X}' -f $epRva)
+				})
+				if ($codeBase -gt 0) {
+					[void]$notes.Add([ordered]@{ offset = ($optOff + 20); kind = 'pe'; text = ('BaseOfCode RVA 0x{0:X}' -f $codeBase) })
+				}
+				if ($sectionAlign -gt 0) {
+					[void]$notes.Add([ordered]@{
+						offset = $optOff
+						kind   = 'pe'
+						text   = ('SectionAlign=0x{0:X} FileAlign=0x{1:X}' -f $sectionAlign, $fileAlign)
+					})
+				}
+			}
+		}
+		$secOff = $e_lfanew + 24 + $optSize
+		$maxSec = [Math]::Min([int]$numSec, 48)
+		for ($s = 0; $s -lt $maxSec; $s++) {
+			$so = $secOff + ($s * 40)
+			if (($so + 40) -gt $fs.Length) { break }
+			[void]$fs.Seek([long]$so, [System.IO.SeekOrigin]::Begin)
+			$sec = New-Object byte[] 40
+			[void]$fs.Read($sec, 0, 40)
+			$nameBytes = New-Object byte[] 8
+			[Array]::Copy($sec, 0, $nameBytes, 0, 8)
+			$name = [System.Text.Encoding]::ASCII.GetString($nameBytes).TrimEnd([char]0)
+			$vsize = [BitConverter]::ToUInt32($sec, 8)
+			$vrva = [BitConverter]::ToUInt32($sec, 12)
+			$rsize = [BitConverter]::ToUInt32($sec, 16)
+			$rptr = [BitConverter]::ToUInt32($sec, 20)
+			$schars = [BitConverter]::ToUInt32($sec, 36)
+			$sflags = New-Object System.Collections.ArrayList
+			if ($schars -band 0x20) { [void]$sflags.Add('CODE') }
+			if ($schars -band 0x40) { [void]$sflags.Add('IDATA') }
+			if ($schars -band 0x80) { [void]$sflags.Add('UDATA') }
+			if ($schars -band 0x20000000) { [void]$sflags.Add('EXEC') }
+			if ($schars -band 0x40000000) { [void]$sflags.Add('READ') }
+			if ($schars -band 0x80000000) { [void]$sflags.Add('WRITE') }
+			$sflagTxt = if ($sflags.Count -gt 0) { ($sflags -join '|') } else { ('0x{0:X}' -f $schars) }
+			$secObj = [ordered]@{
+				name      = $name
+				virt_rva  = $vrva
+				virt_size = $vsize
+				raw_ptr   = $rptr
+				raw_size  = $rsize
+				chars     = $schars
+			}
+			[void]$sections.Add($secObj)
+			[void]$notes.Add([ordered]@{
+				offset    = $so
+				kind      = 'pe_section'
+				text      = ('Section "{0}" VA=0x{1:X} VSize=0x{2:X} RawPtr=0x{3:X} RawSize=0x{4:X} [{5}]' -f $name, $vrva, $vsize, $rptr, $rsize, $sflagTxt)
+				section   = $name
+				raw_ptr   = $rptr
+				raw_size  = $rsize
+				virt_rva  = $vrva
+				virt_size = $vsize
+			})
+			if ($rptr -gt 0) {
+				[void]$notes.Add([ordered]@{
+					offset  = [long]$rptr
+					kind    = 'pe_section_data'
+					text    = ('Start of section "{0}" raw data' -f $name)
+					section = $name
+				})
+				if ($rsize -gt 0) {
+					$endRaw = [long]$rptr + [long]$rsize - 1
+					if ($endRaw -gt 0 -and $endRaw -lt $fs.Length) {
+						[void]$notes.Add([ordered]@{
+							offset  = $endRaw
+							kind    = 'pe_section_data'
+							text    = ('End of section "{0}" raw data' -f $name)
+							section = $name
+						})
+					}
+				}
+			}
+		}
+		# Entry point file offset
+		if ($epRva -gt 0 -and $sections.Count -gt 0) {
+			$epFile = Convert-MBPeRvaToOffset -Sections $sections -Rva $epRva
+			if ($null -ne $epFile) {
+				[void]$notes.Add([ordered]@{
+					offset = [long]$epFile
+					kind   = 'pe_entry'
+					text   = ('Entry point file offset 0x{0:X} (RVA 0x{1:X}, ImageBase+RVA VA 0x{2:X})' -f $epFile, $epRva, ($imgBase + $epRva))
+					rva    = $epRva
+				})
+			} else {
+				[void]$notes.Add([ordered]@{
+					offset = $optOff + 16
+					kind   = 'pe_entry'
+					text   = ('Entry point RVA 0x{0:X} (no section mapping for file offset)' -f $epRva)
+					rva    = $epRva
+				})
+			}
+		}
+		# Data directories
+		$dirNames = @(
+			'Export','Import','Resource','Exception','Security','BaseReloc','Debug','Architecture',
+			'GlobalPtr','TLS','LoadConfig','BoundImport','IAT','DelayImport','CLR','Reserved'
+		)
+		if ($numRvaSizes -le 0) { $numRvaSizes = 16 }
+		if ($numRvaSizes -gt 16) { $numRvaSizes = 16 }
+		if ($dataDirOff -gt 0) {
+			for ($d = 0; $d -lt $numRvaSizes; $d++) {
+				$do = $dataDirOff + ($d * 8)
+				if (($do + 8) -gt $fs.Length) { break }
+				[void]$fs.Seek([long]$do, [System.IO.SeekOrigin]::Begin)
+				$db = New-Object byte[] 8
+				[void]$fs.Read($db, 0, 8)
+				$drva = [BitConverter]::ToUInt32($db, 0)
+				$dsz = [BitConverter]::ToUInt32($db, 4)
+				if ($drva -eq 0 -and $dsz -eq 0) { continue }
+				$dname = if ($d -lt $dirNames.Count) { $dirNames[$d] } else { ("Dir{0}" -f $d) }
+				$fo = Convert-MBPeRvaToOffset -Sections $sections -Rva $drva
+				$foTxt = if ($null -ne $fo) { (' file=0x{0:X}' -f $fo) } else { '' }
+				[void]$notes.Add([ordered]@{
+					offset = $(if ($null -ne $fo) { [long]$fo } else { [long]$do })
+					kind   = 'pe_dir'
+					text   = ('DataDir[{0}] {1} RVA=0x{2:X} Size=0x{3:X}{4}' -f $d, $dname, $drva, $dsz, $foTxt)
+					rva    = $drva
+					size   = $dsz
+					dir    = $dname
+				})
+			}
+			# Import DLL names (first N)
+			try {
+				$impNote = $notes | Where-Object { $_.dir -eq 'Import' } | Select-Object -First 1
+				if ($impNote -and $impNote.rva) {
+					$impFile = Convert-MBPeRvaToOffset -Sections $sections -Rva ([uint32]$impNote.rva)
+					if ($null -ne $impFile) {
+						$maxDll = 24
+						$dllCount = 0
+						$descOff = [long]$impFile
+						while ($dllCount -lt $maxDll) {
+							if (($descOff + 20) -gt $fs.Length) { break }
+							[void]$fs.Seek($descOff, [System.IO.SeekOrigin]::Begin)
+							$desc = New-Object byte[] 20
+							[void]$fs.Read($desc, 0, 20)
+							$oft = [BitConverter]::ToUInt32($desc, 0)
+							$nameRva = [BitConverter]::ToUInt32($desc, 12)
+							$ft = [BitConverter]::ToUInt32($desc, 16)
+							if ($oft -eq 0 -and $nameRva -eq 0 -and $ft -eq 0) { break }
+							$nameOff = Convert-MBPeRvaToOffset -Sections $sections -Rva $nameRva
+							$dllName = ''
+							if ($null -ne $nameOff) {
+								[void]$fs.Seek([long]$nameOff, [System.IO.SeekOrigin]::Begin)
+								$nb = New-Object byte[] 128
+								$nr = $fs.Read($nb, 0, 128)
+								$end = 0
+								while ($end -lt $nr -and $nb[$end] -ne 0) { $end++ }
+								if ($end -gt 0) {
+									$dllName = [System.Text.Encoding]::ASCII.GetString($nb, 0, $end)
+								}
+							}
+							if ($dllName) {
+								[void]$notes.Add([ordered]@{
+									offset = [long]$nameOff
+									kind   = 'pe_import'
+									text   = ('Import DLL: {0}' -f $dllName)
+									dll    = $dllName
+								})
+							}
+							$dllCount++
+							$descOff += 20
+						}
+						if ($dllCount -gt 0) {
+							[void]$notes.Add([ordered]@{
+								offset = [long]$impFile
+								kind   = 'pe_import'
+								text   = ('Import table: {0} DLL descriptor(s) listed' -f $dllCount)
+							})
+						}
+					}
+				}
+			} catch {}
+			# Export DLL name + a few export names
+			try {
+				$expNote = $notes | Where-Object { $_.dir -eq 'Export' } | Select-Object -First 1
+				if ($expNote -and $expNote.rva -and [uint32]$expNote.size -ge 40) {
+					$expFile = Convert-MBPeRvaToOffset -Sections $sections -Rva ([uint32]$expNote.rva)
+					if ($null -ne $expFile) {
+						[void]$fs.Seek([long]$expFile, [System.IO.SeekOrigin]::Begin)
+						$ed = New-Object byte[] 40
+						[void]$fs.Read($ed, 0, 40)
+						$nameRvaE = [BitConverter]::ToUInt32($ed, 12)
+						$numFuncs = [BitConverter]::ToUInt32($ed, 20)
+						$numNames = [BitConverter]::ToUInt32($ed, 24)
+						$namesRva = [BitConverter]::ToUInt32($ed, 32)
+						$modOff = Convert-MBPeRvaToOffset -Sections $sections -Rva $nameRvaE
+						if ($null -ne $modOff) {
+							[void]$fs.Seek([long]$modOff, [System.IO.SeekOrigin]::Begin)
+							$mb = New-Object byte[] 128
+							$mr = $fs.Read($mb, 0, 128)
+							$me = 0
+							while ($me -lt $mr -and $mb[$me] -ne 0) { $me++ }
+							$modName = if ($me -gt 0) { [System.Text.Encoding]::ASCII.GetString($mb, 0, $me) } else { '' }
+							if ($modName) {
+								[void]$notes.Add([ordered]@{
+									offset = [long]$modOff
+									kind   = 'pe_export'
+									text   = ('Export module: {0} (funcs={1} names={2})' -f $modName, $numFuncs, $numNames)
+								})
+							}
+						}
+						# first few export names
+						if ($numNames -gt 0 -and $namesRva -gt 0) {
+							$namesOff = Convert-MBPeRvaToOffset -Sections $sections -Rva $namesRva
+							if ($null -ne $namesOff) {
+								$takeN = [Math]::Min([int]$numNames, 16)
+								for ($ni = 0; $ni -lt $takeN; $ni++) {
+									[void]$fs.Seek([long]($namesOff + ($ni * 4)), [System.IO.SeekOrigin]::Begin)
+									$nrvaB = New-Object byte[] 4
+									[void]$fs.Read($nrvaB, 0, 4)
+									$nrva = [BitConverter]::ToUInt32($nrvaB, 0)
+									$nOff = Convert-MBPeRvaToOffset -Sections $sections -Rva $nrva
+									if ($null -eq $nOff) { continue }
+									[void]$fs.Seek([long]$nOff, [System.IO.SeekOrigin]::Begin)
+									$nb2 = New-Object byte[] 96
+									$nr2 = $fs.Read($nb2, 0, 96)
+									$ne = 0
+									while ($ne -lt $nr2 -and $nb2[$ne] -ne 0) { $ne++ }
+									if ($ne -le 0) { continue }
+									$en = [System.Text.Encoding]::ASCII.GetString($nb2, 0, $ne)
+									[void]$notes.Add([ordered]@{
+										offset = [long]$nOff
+										kind   = 'pe_export'
+										text   = ('Export name: {0}' -f $en)
+									})
+								}
+							}
+						}
+					}
+				}
+			} catch {}
+		}
+	} catch {
+		return @()
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	return @($notes)
+}
+
+function Get-MBStringAnnotations {
+	# Printable ASCII + UTF-16LE runs inside a byte window.
+	param(
+		[byte[]]$Bytes,
+		[long]$BaseOffset = 0,
+		[int]$MinLen = 4,
+		[int]$MaxHits = 48
+	)
+	$out = New-Object System.Collections.ArrayList
+	if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return @() }
+	# ASCII runs
+	$i = 0
+	while ($i -lt $Bytes.Length -and $out.Count -lt $MaxHits) {
+		if ($Bytes[$i] -ge 32 -and $Bytes[$i] -le 126) {
+			$start = $i
+			while ($i -lt $Bytes.Length -and $Bytes[$i] -ge 32 -and $Bytes[$i] -le 126) { $i++ }
+			$len = $i - $start
+			if ($len -ge $MinLen) {
+				$slice = New-Object byte[] $len
+				[Array]::Copy($Bytes, $start, $slice, 0, $len)
+				$s = [System.Text.Encoding]::ASCII.GetString($slice)
+				if ($s.Length -gt 80) { $s = $s.Substring(0, 77) + '...' }
+				[void]$out.Add([ordered]@{
+					offset = ($BaseOffset + $start)
+					length = $len
+					kind   = 'string_ascii'
+					text   = $s
+				})
+			}
+		} else {
+			$i++
+		}
+	}
+	# UTF-16LE runs (Windows test binaries)
+	$i = 0
+	while ($i -lt ($Bytes.Length - 1) -and $out.Count -lt $MaxHits) {
+		# aligned-ish: prefer even indices relative to base, but accept any if printable LE pattern
+		$b0 = $Bytes[$i]; $b1 = $Bytes[$i + 1]
+		$isPrint = ($b1 -eq 0 -and $b0 -ge 32 -and $b0 -le 126)
+		if ($isPrint) {
+			$start = $i
+			$chars = New-Object System.Text.StringBuilder
+			while (($i + 1) -lt $Bytes.Length -and $Bytes[$i + 1] -eq 0 -and $Bytes[$i] -ge 32 -and $Bytes[$i] -le 126) {
+				[void]$chars.Append([char]$Bytes[$i])
+				$i += 2
+			}
+			$s = $chars.ToString()
+			if ($s.Length -ge $MinLen) {
+				if ($s.Length -gt 80) { $s = $s.Substring(0, 77) + '...' }
+				$byteLen = ($i - $start)
+				[void]$out.Add([ordered]@{
+					offset = ($BaseOffset + $start)
+					length = $byteLen
+					kind   = 'string_utf16le'
+					text   = $s
+				})
+			}
+		} else {
+			$i++
+		}
+	}
+	return @($out)
+}
+
+function Get-MBByteClassSummary {
+	# Compact class counts for the viewed window (testing orientation).
+	param([byte[]]$Bytes)
+	if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+		return [ordered]@{ total = 0 }
+	}
+	$nul = 0; $ctrl = 0; $print = 0; $high = 0; $del = 0
+	foreach ($b in $Bytes) {
+		if ($b -eq 0) { $nul++ }
+		elseif ($b -eq 0x7F) { $del++ }
+		elseif ($b -lt 32) { $ctrl++ }
+		elseif ($b -le 126) { $print++ }
+		else { $high++ }
+	}
+	return [ordered]@{
+		total     = $Bytes.Length
+		nul       = $nul
+		control   = $ctrl
+		printable = $print
+		del       = $del
+		high_bit  = $high
+	}
+}
+
+function Invoke-HexView {
+	param(
+		[string]$path,
+		$path2 = $null,          # compare file (diff mode)
+		$compare = $null,        # alias for path2
+		$offset = 0,
+		[int]$length = 256,
+		[int]$width = 16,
+		[bool]$show_ascii = $true,
+		[bool]$annotate = $true, # PE/magic/strings/control labels
+		[bool]$next_diff = $false, # with path2: jump to next differing offset from `offset`
+		[bool]$side_by_side = $true, # dual dump layout when comparing
+		[int]$max_scan = 0       # optional cap for next_diff scan (bytes; 0 = full)
+	)
+	$path = Resolve-MBPath -Path $path -MustExist
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+
+	$cmpPath = $null
+	if (-not [string]::IsNullOrWhiteSpace([string]$path2)) { $cmpPath = Resolve-MBPath -Path ([string]$path2) }
+	elseif (-not [string]::IsNullOrWhiteSpace([string]$compare)) { $cmpPath = Resolve-MBPath -Path ([string]$compare) }
+	if ($cmpPath) {
+		if (-not (Test-Path -LiteralPath $cmpPath -PathType Leaf)) {
+			return "ERROR: Compare file not found: $cmpPath"
+		}
+	}
+
+	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
+	if ($length -le 0) { $length = 256 }
+	if ($length -gt 16384) { $length = 16384 }
+	if ($width -le 0) { $width = 16 }
+	if ($width -gt 32) { $width = 32 }
+
+	$diffInfo = $null
+	if ($cmpPath -and $next_diff) {
+		$diffInfo = Find-MBNextByteDiff -PathA $path -PathB $cmpPath -StartOffset $off -MaxScan $max_scan
+		if ($diffInfo.Found -and [long]$diffInfo.Offset -ge 0) {
+			$off = [long]$diffInfo.Offset
+			$align = [Math]::Max(0L, $off - ($off % [Math]::Max(1, $width)))
+			$off = $align
+		}
+	}
+
+	$ra = Read-MBFileBytes -Path $path -Offset $off -Length $length
+	if (-not $ra.Ok) { return "ERROR: $($ra.Error)" }
+
+	$rb = $null
+	$diffMask = $null
+	$diffCount = 0
+	$firstDiffInWindow = -1L
+	$nextDiffAfterWindow = $null
+
+	if ($cmpPath) {
+		$rb = Read-MBFileBytes -Path $cmpPath -Offset $off -Length $length
+		if (-not $rb.Ok) { return "ERROR: compare file: $($rb.Error)" }
+		$maxL = [Math]::Max($ra.Bytes.Length, $rb.Bytes.Length)
+		$diffMask = New-Object 'bool[]' $maxL
+		for ($i = 0; $i -lt $maxL; $i++) {
+			$ba = if ($i -lt $ra.Bytes.Length) { $ra.Bytes[$i] } else { $null }
+			$bb = if ($i -lt $rb.Bytes.Length) { $rb.Bytes[$i] } else { $null }
+			$d = ($ba -ne $bb)
+			$diffMask[$i] = $d
+			if ($d) {
+				$diffCount++
+				if ($firstDiffInWindow -lt 0) { $firstDiffInWindow = $off + $i }
+			}
+		}
+		$after = $off + $maxL
+		$nd = Find-MBNextByteDiff -PathA $path -PathB $cmpPath -StartOffset $after -MaxScan $max_scan
+		if ($nd.Found) {
+			$nextDiffAfterWindow = [ordered]@{
+				offset     = [long]$nd.Offset
+				offset_hex = ('0x{0:X}' -f [long]$nd.Offset)
+				reason     = [string]$nd.Reason
+			}
+		} else {
+			$nextDiffAfterWindow = [ordered]@{ offset = $null; reason = [string]$nd.Reason }
+		}
+	}
+
+	$dump = ''
+	if ($cmpPath -and $side_by_side) {
+		$dump = Format-MBHexDumpSideBySide -BytesA $ra.Bytes -BytesB $rb.Bytes -BaseOffset $off -Width ([Math]::Min($width, 16)) -ShowAscii $show_ascii
+	} elseif ($cmpPath) {
+		$dumpA = Format-MBHexDump -Bytes $ra.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii -DiffMask $diffMask
+		$dumpB = Format-MBHexDump -Bytes $rb.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii -DiffMask $diffMask
+		$dump = ("--- A: {0}`n{1}`n--- B: {2}`n{3}" -f $path, $dumpA, $cmpPath, $dumpB)
+	} else {
+		$dump = Format-MBHexDump -Bytes $ra.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii
+	}
+
+	$annotations = New-Object System.Collections.ArrayList
+	if ($annotate) {
+		$winEnd = $off + $ra.Bytes.Length
+		$peAll = @()
+		try { $peAll = @(Get-MBPeAnnotations -Path $path) } catch { $peAll = @() }
+		# Priority order so testing labels near the dump are not crowded out
+		try {
+			foreach ($m in @(Get-MBFileMagicAnnotations -Path $path)) { [void]$annotations.Add($m) }
+		} catch {}
+		# PE headers / entry / dirs / import-export first (high value map)
+		foreach ($a in $peAll) {
+			if ($a.kind -in @('pe', 'pe_entry', 'pe_dir', 'pe_import', 'pe_export')) {
+				[void]$annotations.Add($a)
+			}
+		}
+		# Section table + raw starts
+		foreach ($a in $peAll) {
+			if ($a.kind -in @('pe_section', 'pe_section_data')) {
+				[void]$annotations.Add($a)
+			}
+		}
+		# Window-local: controls + strings (known chars)
+		try {
+			foreach ($c in @(Get-MBControlCharAnnotations -Bytes $ra.Bytes -BaseOffset $off -MaxHits 48)) {
+				[void]$annotations.Add($c)
+			}
+		} catch {}
+		try {
+			foreach ($s in @(Get-MBStringAnnotations -Bytes $ra.Bytes -BaseOffset $off -MinLen 4 -MaxHits 40)) {
+				[void]$annotations.Add($s)
+			}
+		} catch {}
+		# Any remaining PE notes that fall inside the viewed window
+		foreach ($a in $peAll) {
+			try {
+				$ao = [long]$a.offset
+				if ($ao -ge $off -and $ao -lt $winEnd) {
+					# avoid exact dupes by text+offset
+					$dup = $false
+					foreach ($ex in $annotations) {
+						if ([long]$ex.offset -eq $ao -and [string]$ex.text -eq [string]$a.text) { $dup = $true; break }
+					}
+					if (-not $dup) { [void]$annotations.Add($a) }
+				}
+			} catch {}
+		}
+		if ($annotations.Count -gt 140) {
+			$tmp = New-Object System.Collections.ArrayList
+			for ($ai = 0; $ai -lt 140; $ai++) { [void]$tmp.Add($annotations[$ai]) }
+			$annotations = $tmp
+		}
+	}
+
+	$payload = [ordered]@{
+		path       = $path
+		file_size  = [long]$ra.FileSize
+		offset     = $off
+		offset_hex = ('0x{0:X}' -f $off)
+		length     = $ra.Bytes.Length
+		width      = $width
+		truncated = (-not $ra.Eof)
+		show_ascii = $show_ascii
+		annotate   = $annotate
+		dump       = $dump
+		legend     = 'ASCII gutter: printable 0x20-0x7E as chars, else ''.''. Diff: lines with * have differences; bytes XX! differ. annotations[]: magic, PE map, control names (NUL/TAB/LF/CR/...), ASCII + UTF-16LE strings.'
+		ascii_gutter_note = 'Non-printables shown as ''.''; named controls listed under annotations kind=control.'
+	}
+
+	try {
+		$payload['byte_classes'] = Get-MBByteClassSummary -Bytes $ra.Bytes
+	} catch {}
+
+	if ($annotations -and $annotations.Count -gt 0) {
+		$payload['annotations'] = @($annotations)
+	}
+
+	if ($cmpPath) {
+		$payload['compare_path'] = $cmpPath
+		$payload['compare_file_size'] = [long]$rb.FileSize
+		$payload['diff_mode'] = $true
+		$payload['side_by_side'] = [bool]$side_by_side
+		$payload['diff_bytes_in_window'] = $diffCount
+		$payload['first_diff_in_window'] = $(if ($firstDiffInWindow -ge 0) { $firstDiffInWindow } else { $null })
+		$payload['first_diff_in_window_hex'] = $(if ($firstDiffInWindow -ge 0) { ('0x{0:X}' -f $firstDiffInWindow) } else { $null })
+		$payload['next_diff_after_window'] = $nextDiffAfterWindow
+		$payload['hint'] = 'Use next_diff=true to jump from offset to the next differing byte. path2= dual-file compare. annotate=true adds magic/PE/control/string labels for test binaries.'
+	}
+
+	if ($diffInfo) {
+		$payload['next_diff_seek'] = [ordered]@{
+			requested_from = Convert-MBOffsetToInt64 -Value $offset -Default 0
+			landed_offset  = $off
+			found          = [bool]$diffInfo.Found
+			reason         = [string]$diffInfo.Reason
+			raw_diff_offset = $(if ($diffInfo.Found) { [long]$diffInfo.Offset } else { $null })
+		}
+		if (-not $diffInfo.Found) {
+			$payload['note'] = 'No further differences found from the requested offset (files identical from there, or scan ended).'
+		}
+	}
+
+	if ($ra.Bytes.Length -eq 0) {
+		$payload['note'] = 'offset at or past EOF'
+	}
+
+	return ConvertTo-MBJson $payload -Depth 10
 }
 
 function Invoke-HexEdit {
@@ -16064,6 +17910,18 @@ function Invoke-HexEdit {
 		try { $curSize = (Get-Item -LiteralPath $path).Length } catch { $curSize = 0 }
 	}
 	$previewDump = Format-MBHexDump -Bytes $patch -BaseOffset $off -Width 16 -ShowAscii $true
+	$beforeDump = ''
+	if ($exists -and $curSize -gt $off) {
+		try {
+			$beforeLen = [int][Math]::Min([long]$patch.Length, $curSize - $off)
+			if ($beforeLen -gt 0) {
+				$br = Read-MBFileBytes -Path $path -Offset $off -Length $beforeLen
+				if ($br.Ok -and $br.Bytes.Length -gt 0) {
+					$beforeDump = Format-MBHexDump -Bytes $br.Bytes -BaseOffset $off -Width 16 -ShowAscii $true
+				}
+			}
+		} catch { $beforeDump = '' }
+	}
 	$details = @"
 Path: $path
 Offset: $off (0x$('{0:X}' -f $off))
@@ -16073,10 +17931,11 @@ Backup (.bak): $backup
 Exists: $exists (current size $curSize)
 End after write: $end
 
-Patch:
+$(if ($beforeDump) { "Before (existing bytes):`n$beforeDump`n`n" } else { '' })After (patch to write):
 $previewDump
 "@
-	if (-not (Request-Confirmation -Title 'HexEdit requires approval' -Details $details -Code $previewDump -CodeLang 'text')) {
+	$codeShow = if ($beforeDump) { "BEFORE:`n$beforeDump`n`nAFTER:`n$previewDump" } else { $previewDump }
+	if (-not (Request-Confirmation -Title 'HexEdit requires approval' -Details $details -Code $codeShow -CodeLang 'text')) {
 		return 'BLOCKED BY USER: HexEdit denied by operator.'
 	}
 
@@ -16685,10 +18544,10 @@ function Test-ModelConnection {
 	}
 
 	$headers = @{}
-	# Display labels: NPM | API | Basic  (never "None" — open endpoints show as Basic)
-	$authType = 'Basic'
+	# Display labels: None | API | Basic (NPM)
+	$authType = 'None'
 	# Bearer / per-base key first; explicit Username/Password only if no key
-	# (NPM Basic only when Get-MBAuthHeaderValue decides the target is primary)
+	# (Basic (NPM) when session NPM credentials are used)
 	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $BearerToken
 	if ($auth) {
 		$headers['Authorization'] = $auth
@@ -16696,16 +18555,16 @@ function Test-ModelConnection {
 	} elseif ($Username -and $Password) {
 		$credBytes = [System.Text.Encoding]::UTF8.GetBytes("${Username}:${Password}")
 		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
-		# Explicit user/pass without ExtraApiAuth mode → still show NPM if session NPM, else Basic
+		# Explicit user/pass — Basic (NPM) when matching session NPM login
 		try {
 			if ($script:MB.NpmUser -and $script:MB.NpmPass -and
 				[string]::Equals([string]$Username, [string]$script:MB.NpmUser, [StringComparison]::Ordinal) -and
 				[string]::Equals([string]$Password, [string]$script:MB.NpmPass, [StringComparison]::Ordinal)) {
-				$authType = 'NPM'
+				$authType = 'Basic (NPM)'
 			} else {
-				$authType = 'Basic'
+				$authType = 'Basic (NPM)'
 			}
-		} catch { $authType = 'Basic' }
+		} catch { $authType = 'Basic (NPM)' }
 	} else {
 		$authType = Format-MBAuthDisplayLabel -Mode 'none' -BaseUrl $raw -Short
 	}
@@ -17463,7 +19322,7 @@ function Get-MBToolFingerprint {
 			[void]$parts.Add($cmd)
 		}
 		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^FindFiles$|^HexView$|^HexEdit$|^SandBox$|^SandBoxWrite$' {
-			foreach ($k in @('path','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description')) {
+			foreach ($k in @('path','path2','compare','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','annotate','next_diff','side_by_side','max_scan','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description')) {
 				if (Test-MBHasProp $ArgsObj $k) {
 					$v = Get-MBProp $ArgsObj $k
 					if ($null -ne $v) {
@@ -21795,10 +23654,16 @@ function Invoke-MBTool {
 			}
 			"HexView" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'path2') { $p['path2'] = (Get-MBProp $ArgsObj 'path2') }
+				elseif (Test-MBHasProp $ArgsObj 'compare') { $p['compare'] = (Get-MBProp $ArgsObj 'compare') }
 				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
 				if (Test-MBHasProp $ArgsObj 'length') { $p['length'] = [int](Get-MBProp $ArgsObj 'length') }
 				if (Test-MBHasProp $ArgsObj 'width') { $p['width'] = [int](Get-MBProp $ArgsObj 'width') }
 				if (Test-MBHasProp $ArgsObj 'show_ascii') { $p['show_ascii'] = [bool](Get-MBProp $ArgsObj 'show_ascii') }
+				if (Test-MBHasProp $ArgsObj 'annotate') { $p['annotate'] = [bool](Get-MBProp $ArgsObj 'annotate') }
+				if (Test-MBHasProp $ArgsObj 'next_diff') { $p['next_diff'] = [bool](Get-MBProp $ArgsObj 'next_diff') }
+				if (Test-MBHasProp $ArgsObj 'side_by_side') { $p['side_by_side'] = [bool](Get-MBProp $ArgsObj 'side_by_side') }
+				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = [int](Get-MBProp $ArgsObj 'max_scan') }
 				Invoke-HexView @p
 			}
 			"HexEdit" {
@@ -30567,7 +32432,7 @@ function Start-MBWpfHost {
                           Content="Sign in" Width="96" Height="30" Margin="0,0,8,0"
                           IsDefault="False" TabIndex="3"/>
                   <Button x:Name="AuthCancel" Style="{StaticResource MbAuthSecondaryBtn}"
-                          Content="Cancel" Width="88" Height="30" TabIndex="4"/>
+                          Content="Quit" Width="88" Height="30" TabIndex="4"/>
                 </StackPanel>
               </Grid>
             </Border>
@@ -31667,7 +33532,7 @@ function Start-MBWpfHost {
 					$box.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
 					[System.Windows.Controls.Grid]::SetRow($box, 2)
 					[void]$body.Children.Add($box)
-					# Auth mode: API key | NPM | None
+					# Auth mode: None | API | Basic (NPM)
 					$authLbl = New-Object System.Windows.Controls.TextBlock
 					$authLbl.Text = 'Auth mode (HTTP header for this endpoint only)'
 					$authLbl.FontSize = 11
@@ -31678,8 +33543,16 @@ function Start-MBWpfHost {
 					$authRow = New-Object System.Windows.Controls.StackPanel
 					$authRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
 					$authRow.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+					$rbNone = New-Object System.Windows.Controls.RadioButton
+					$rbNone.Content = 'None'
+					$rbNone.GroupName = 'MbEndpointAuth'
+					$rbNone.IsChecked = $false
+					$rbNone.Foreground = $bc.ConvertFromString('#C8C8D0')
+					$rbNone.FontSize = 12
+					$rbNone.Margin = New-Object System.Windows.Thickness(0, 0, 16, 0)
+					$rbNone.Cursor = [System.Windows.Input.Cursors]::Hand
 					$rbKey = New-Object System.Windows.Controls.RadioButton
-					$rbKey.Content = 'API key'
+					$rbKey.Content = 'API'
 					$rbKey.GroupName = 'MbEndpointAuth'
 					$rbKey.IsChecked = $true
 					$rbKey.Foreground = $bc.ConvertFromString('#C8C8D0')
@@ -31687,28 +33560,50 @@ function Start-MBWpfHost {
 					$rbKey.Margin = New-Object System.Windows.Thickness(0, 0, 16, 0)
 					$rbKey.Cursor = [System.Windows.Input.Cursors]::Hand
 					$rbNpm = New-Object System.Windows.Controls.RadioButton
-					$rbNpm.Content = 'NPM'
+					$rbNpm.Content = 'Basic (NPM)'
 					$rbNpm.GroupName = 'MbEndpointAuth'
 					$rbNpm.IsChecked = $false
 					$rbNpm.Foreground = $bc.ConvertFromString('#C8C8D0')
 					$rbNpm.FontSize = 12
-					$rbNpm.Margin = New-Object System.Windows.Thickness(0, 0, 16, 0)
 					$rbNpm.Cursor = [System.Windows.Input.Cursors]::Hand
-					$rbNone = New-Object System.Windows.Controls.RadioButton
-					$rbNone.Content = 'None'
-					$rbNone.GroupName = 'MbEndpointAuth'
-					$rbNone.IsChecked = $false
-					$rbNone.Foreground = $bc.ConvertFromString('#C8C8D0')
-					$rbNone.FontSize = 12
-					$rbNone.Cursor = [System.Windows.Input.Cursors]::Hand
-					try { $rbNone.ToolTip = 'No Authorization header (open LAN servers).' } catch {}
+					[void]$authRow.Children.Add($rbNone)
 					[void]$authRow.Children.Add($rbKey)
 					[void]$authRow.Children.Add($rbNpm)
-					[void]$authRow.Children.Add($rbNone)
+					# Themed auth-mode tooltips (None / API / Basic (NPM))
+					try {
+						$mkEpTip = {
+							param([string]$Text, [double]$MaxWidth = 300)
+							$bcT = New-Object System.Windows.Media.BrushConverter
+							$tip = New-Object System.Windows.Controls.ToolTip
+							$tip.Background = $bcT.ConvertFromString('#1A1A1E')
+							$tip.Foreground = $bcT.ConvertFromString('#C8C8D0')
+							$tip.BorderBrush = $bcT.ConvertFromString('#3A3A42')
+							$tip.BorderThickness = New-Object System.Windows.Thickness(1)
+							$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
+							$tip.HasDropShadow = $true
+							$ttb = New-Object System.Windows.Controls.TextBlock
+							$ttb.Text = $Text
+							$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+							$ttb.MaxWidth = $MaxWidth
+							$ttb.Foreground = $bcT.ConvertFromString('#C8C8D0')
+							$ttb.FontSize = 12
+							$tip.Content = $ttb
+							return $tip
+						}
+						$rbNone.ToolTip = & $mkEpTip 'No Authorization header (open LAN servers)'
+						$rbKey.ToolTip = & $mkEpTip 'Bearer token (Unsloth, vLLM --api-key, OpenAI-compat keys)'
+						$rbNpm.ToolTip = & $mkEpTip 'HTTP Basic - use for NPM reverse-proxy / session login credentials'
+						foreach ($rb in @($rbNone, $rbKey, $rbNpm)) {
+							try {
+								[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($rb, 350)
+								[System.Windows.Controls.ToolTipService]::SetShowDuration($rb, 20000)
+							} catch {}
+						}
+					} catch {}
 					[System.Windows.Controls.Grid]::SetRow($authRow, 4)
 					[void]$body.Children.Add($authRow)
 					$keyLbl = New-Object System.Windows.Controls.TextBlock
-					$keyLbl.Text = 'API key (Unsloth sk-unsloth-..., vLLM --api-key; unused for NPM / None)'
+					$keyLbl.Text = 'API token (Unsloth sk-unsloth-..., vLLM --api-key; unused for Basic (NPM) / None)'
 					$keyLbl.FontSize = 11
 					$keyLbl.Foreground = $bc.ConvertFromString('#8A8A96')
 					$keyLbl.Margin = New-Object System.Windows.Thickness(0, 0, 0, 3)
@@ -31903,7 +33798,7 @@ function Start-MBWpfHost {
 								}
 								if ($foundBase -and $foundIds.Count -gt 0) {
 									$ok = $true
-									$modeLabel = switch ($authMode) { 'npm' { 'NPM' } 'none' { 'None' } default { 'API key' } }
+									$modeLabel = switch ($authMode) { 'npm' { 'Basic (NPM)' } 'none' { 'None' } default { 'API' } }
 									$msg = ("OK - {0} model(s) at {1} ({2})" -f $foundIds.Count, $foundBase, $modeLabel)
 									try {
 										$lst = New-Object System.Collections.ArrayList
@@ -32028,7 +33923,7 @@ function Start-MBWpfHost {
 								} else {
 									$ok = $false
 									if ($lastErr -match '(?i)401|Not authenticated|Invalid token|Unauthorized') {
-										$msg = 'Auth failed - pick API key and enter Bearer token, or pick NPM if this host is behind the same proxy login.'
+										$msg = 'Auth failed - pick API and enter a Bearer token, or pick Basic (NPM) if this host uses reverse-proxy login.'
 									} elseif ($lastErr) {
 										$msg = $lastErr
 									} else {
@@ -32121,7 +34016,9 @@ function Start-MBWpfHost {
 							$W.TitleBtnMaxPath.Data = [System.Windows.Media.Geometry]::Parse([string]$g)
 						}
 						if ($W.TitleBtnMax) {
-							$W.TitleBtnMax.ToolTip = if ($isMax) { 'Restore' } else { 'Maximize' }
+							$tip = if ($isMax) { 'Restore' } else { 'Maximize' }
+							if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $W.TitleBtnMax $tip 180 }
+							else { $W.TitleBtnMax.ToolTip = $tip }
 						}
 					} catch {}
 				}.GetNewClosure()
@@ -32160,6 +34057,17 @@ function Start-MBWpfHost {
 					} catch {}
 				}.GetNewClosure()
 				$W.ToggleWorkAreaMax = $toggleWorkAreaMax
+				# Themed tooltips (title chrome)
+				try {
+					if ($W.SetThemedToolTip) {
+						if ($W.TitleBtnMin) { & $W.SetThemedToolTip $W.TitleBtnMin 'Minimize' 160 }
+						if ($W.TitleBtnMax) {
+							$mx = if ([bool]$W.IsWorkAreaMaximized) { 'Restore' } else { 'Maximize' }
+							& $W.SetThemedToolTip $W.TitleBtnMax $mx 160
+						}
+						if ($W.TitleBtnClose) { & $W.SetThemedToolTip $W.TitleBtnClose 'Close' 140 }
+					}
+				} catch {}
 				# Hover: exit red, min/max lighter grey (NoMouseOver - Background only)
 				$bcTitle = New-Object System.Windows.Media.BrushConverter
 				$hoverGrey = $bcTitle.ConvertFromString('#3A3A42')
@@ -32431,6 +34339,13 @@ function Start-MBWpfHost {
 			$W.LogWordWrap = $true
 			try {
 				if ($W.WordWrapToggle) { $W.WordWrapToggle.IsChecked = $true }
+			} catch {}
+			try {
+				if ($W.WordWrapToggle -and $W.SetThemedToolTip) {
+					& $W.SetThemedToolTip $W.WordWrapToggle 'Wrap long log lines' 220
+					$wwLbl = $window.FindName('WordWrapLabel')
+					if ($wwLbl) { & $W.SetThemedToolTip $wwLbl 'Wrap long log lines' 220 }
+				}
 			} catch {}
 			$W.CtxBarFill = $window.FindName('CtxBarFill')
 			$W.CtxPctText = $window.FindName('CtxPctText')
@@ -36786,7 +38701,12 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 													}
 												}
 												$tip = if ($isOn) { $tipOn } else { $tipOff }
-												if ($hitBtn) { try { $hitBtn.ToolTip = $tip } catch {} }
+												if ($hitBtn) {
+													try {
+														if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $hitBtn $tip 280 }
+														else { $hitBtn.ToolTip = $tip }
+													} catch {}
+												}
 											} catch {}
 										}.GetNewClosure()
 										$mkToggle = {
@@ -36806,7 +38726,11 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											$outer.Margin = New-Object System.Windows.Thickness(2, 0, 2, 0)
 											$outer.Cursor = [System.Windows.Input.Cursors]::Hand
 											$outer.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-											$outer.ToolTip = $(if ($isOn) { $tipOn } else { $tipOff })
+											try {
+												$tip0 = if ($isOn) { $tipOn } else { $tipOff }
+												if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $outer $tip0 280 }
+												else { $outer.ToolTip = $tip0 }
+											} catch { $outer.ToolTip = $(if ($isOn) { $tipOn } else { $tipOff }) }
 											$seg = New-Object System.Windows.Controls.StackPanel
 											$seg.Orientation = [System.Windows.Controls.Orientation]::Horizontal
 											$offSeg = & $mkSeg 'OFF' (-not $isOn) $offFg $offBg
@@ -36831,7 +38755,11 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 													'<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="Transparent"/></ControlTemplate>'
 												)
 											} catch {}
-											$hitBtn.ToolTip = $(if ($isOn) { $tipOn } else { $tipOff })
+											try {
+												$tip1 = if ($isOn) { $tipOn } else { $tipOff }
+												if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $hitBtn $tip1 280 }
+												else { $hitBtn.ToolTip = $tip1 }
+											} catch { $hitBtn.ToolTip = $(if ($isOn) { $tipOn } else { $tipOff }) }
 											[void]$layer.Children.Add($hitBtn)
 											$outer.Child = $layer
 											# Chip hover colors
@@ -36878,7 +38806,13 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$acLabel.FontSize = 12
 										$acLabel.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
 										$acLabel.Cursor = [System.Windows.Input.Cursors]::Hand
-										$acLabel.ToolTip = 'Click for Compact Now'
+										try {
+											if ($W.SetThemedToolTip) {
+												& $W.SetThemedToolTip $acLabel 'Click for Compact Now - open menu to run compaction immediately' 300
+											} else {
+												$acLabel.ToolTip = 'Click for Compact Now'
+											}
+										} catch { $acLabel.ToolTip = 'Click for Compact Now' }
 										if ($mono) { try { $acLabel.FontFamily = $mono } catch {} }
 										$W.AcLabel = $acLabel
 										$W.AcLabelGrayHex = $grayHex
@@ -36921,6 +38855,13 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$btnCompact.BorderBrush = $W.BrushCache[$acMenuBgHex]
 										$btnCompact.Foreground = $W.BrushCache[$acMenuFgHex]
 										$btnCompact.Focusable = $false
+										try {
+											if ($W.SetThemedToolTip) {
+												& $W.SetThemedToolTip $btnCompact 'Compact Now - summarize older context to free room for the next replies' 320
+											} else {
+												$btnCompact.ToolTip = 'Compact Now - free context by summarizing older history'
+											}
+										} catch {}
 										try {
 											$btnCompact.Template = [System.Windows.Markup.XamlReader]::Parse(@'
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
@@ -37999,7 +39940,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					if (-not $btn) { return }
 					if ($armed) {
 						$W.SendMode = 'send'
-						$btn.ToolTip = 'Send'
+						if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $btn 'Send' 140 }
+						else { $btn.ToolTip = 'Send' }
 						$btn.IsEnabled = $true
 						$W.SendBtnBaseBg = '#2A2A30'
 						$W.SendBtnBaseFg = '#C8C8D0'
@@ -38011,7 +39953,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 						} catch {}
 					} else {
 						$W.SendMode = 'stop'
-						$btn.ToolTip = 'Stop'
+						if ($W.SetThemedToolTip) { & $W.SetThemedToolTip $btn 'Stop' 140 }
+						else { $btn.ToolTip = 'Stop' }
 						$btn.IsEnabled = $true
 						$W.SendBtnBaseBg = '#2A1A1A'
 						$W.SendBtnBaseFg = '#8B4040'
@@ -38395,7 +40338,11 @@ function Start-LocalAgent {
 			elseif ($msg -match '(?i)cancel') { $isCancel = $true }
 		} catch {}
 		if ($isCancel) {
-			Complete-MBSessionExit -Message 'login cancelled, session ended.'
+			$bye = 'session ended.'
+			if ($msg -match '(?i)endpoint setup cancelled|login cancelled') {
+				$bye = if ($msg -match '(?i)endpoint') { 'endpoint setup cancelled, session ended.' } else { 'login cancelled, session ended.' }
+			}
+			Complete-MBSessionExit -Message $bye
 			return
 		}
 		try {
