@@ -28,6 +28,18 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Login.png" alt="Basic Auth Support">
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Video.png" alt="Inline Video Playback">
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Audio.png" alt="Inline Audio Playback">
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Image.png" alt="Inline Image Display">
+</p>
+
 ---
 
 ## Requirements
@@ -165,7 +177,6 @@ When media should be seen or heard, the agent embeds it in chat:
 ```text
 ![clip title](C:\Users\You\Videos\clip.mp4)
 ```
-
 Supported inline types include common images, video (`mp4` / `m4v` / `mov` / `wmv`), and audio. External apps are reserved for incompatible formats or an explicit request.
 
 ---
