@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.35.2 - Mini Repair-Bot
+	MiniBot v2.35.3 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -15,9 +15,9 @@
 
 param(
 	# --- Primary OpenAI-compatible API (llama.cpp / main host) ---
-	# Prefer …/v1 when the server is OpenAI-compat (vLLM, Unsloth Studio). llama.cpp often uses bare :8080.
+	# Prefer .../v1 when the server is OpenAI-compat (vLLM, Unsloth Studio). llama.cpp often uses bare :8080.
 	# Port stays in the URL (not a separate param) so multi-endpoint bases, HTTPS, and /v1 paths stay simple.
-	# Localhost placeholder: nothing listening → Connect recovery popup to enter real endpoint (xAI, LAN, etc.).
+	# Localhost placeholder: nothing listening -> Connect recovery popup to enter real endpoint (xAI, LAN, etc.).
 	# Leave empty ("") to open Connect immediately without a probe timeout.
 	[string]$BaseUrl = "http://127.0.0.1:8080/v1",
 	# Optional preferred model id. Leave empty to auto-pick from /models (single model)
@@ -31,8 +31,8 @@ param(
 	# Optional display override. Leave empty to use the live server model id.
 	[string]$ModelAlias = "",
 	# Primary HTTP auth Bearer key (NOT chat prompt text). Use "none" to skip.
-	# Examples: -ApiKey 'sk-…'   |   Unsloth: sk-unsloth-…   |   vLLM: value from --api-key
-	# xAI Grok: -BaseUrl 'https://api.x.ai/v1' -ApiKey 'xai-…' -Model 'grok-4.5'
+	# Examples: -ApiKey 'sk-...'   |   Unsloth: sk-unsloth-...   |   vLLM: value from --api-key
+	# xAI Grok: -BaseUrl 'https://api.x.ai/v1' -ApiKey 'xai-...' -Model 'grok-4.5'
 	# If you log in with NPM Basic for the primary llama.cpp host, leave this "none" unless the app itself needs Bearer.
 	[string]$ApiKey = "none",
 	[double]$Temperature = 0.15,
@@ -40,7 +40,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.35.2",
+	[string]$Version = "2.35.3",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -67,14 +67,14 @@ param(
 )
 
 # =============================================================================
-# Multi-model / multi-endpoint (optional hardcode; UI: PoweredBy → + Add endpoint)
+# Multi-model / multi-endpoint (optional hardcode; UI: PoweredBy -> + Add endpoint)
 # =============================================================================
 # Extra endpoints: each base can use apikey | npm | none independently.
-#   apikey → Bearer from MBExtraApiKeys
-#   npm    → same session NPM Basic as the primary host
-#   none   → no Authorization header
-# Prefer …/v1 for vLLM / Unsloth Studio. Bare host:port is fine for many llama.cpp builds.
-# Runtime UI: PoweredBy → + Add endpoint → Auth mode. Do not commit real secrets.
+#   apikey -> Bearer from MBExtraApiKeys
+#   npm    -> same session NPM Basic as the primary host
+#   none   -> no Authorization header
+# Prefer .../v1 for vLLM / Unsloth Studio. Bare host:port is fine for many llama.cpp builds.
+# Runtime UI: PoweredBy -> + Add endpoint -> Auth mode. Do not commit real secrets.
 #
 # --- llama.cpp + NPM (same reverse proxy / NPM Basic as primary) ---
 #   $script:MBExtraApiBases = @('https://llama.example.com')
@@ -487,9 +487,9 @@ $script:MB = @{
 	ToolCalls          = 0
 	# Tool names invoked this session (for sticky tool-list glow)
 	UsedToolNames      = @{}
-	# Local share users created/reset this session (username → password) for CreateShare soft re-auth
+	# Local share users created/reset this session (username -> password) for CreateShare soft re-auth
 	ShareSessionUsers  = @{}
-	# Drive letter → UNC mapped this session (elevated agent may not see letter as S:\)
+	# Drive letter -> UNC mapped this session (elevated agent may not see letter as S:\)
 	SessionDriveMaps   = @{}
 	ApprovalsGranted   = 0
 	ApprovalsDenied    = 0
@@ -572,7 +572,7 @@ $script:MB = @{
 	HostUi             = 'wpf'
 	Wpf                = $null
 	ResolvedApiBase    = $null
-	# Launch primary API (llama.cpp / NPM). Extra endpoints (vLLM, Unsloth, …) never inherit this auth.
+	# Launch primary API (llama.cpp / NPM). Extra endpoints (vLLM, Unsloth, ...) never inherit this auth.
 	PrimaryApiBase     = $(try { Normalize-MBApiBase -Url ([string]$BaseUrl) } catch { [string]$BaseUrl })
 	ActiveModel        = $(try { [string]$Model } catch { '' })
 	ActiveModelBase    = $null
@@ -580,7 +580,7 @@ $script:MB = @{
 	RemoteModels       = @()
 	RemoteModelEntries = @()
 	ExtraApiBases      = @()
-	# Per-endpoint Bearer keys (normalized base URL -> api key string). vLLM --api-key, Unsloth sk-unsloth-…, etc.
+	# Per-endpoint Bearer keys (normalized base URL -> api key string). vLLM --api-key, Unsloth sk-unsloth-..., etc.
 	ExtraApiKeys       = @{}
 	# Per-endpoint auth mode: 'npm' | 'apikey' | 'none' (HTTP Authorization only — never prompt text)
 	ExtraApiAuth       = @{}
@@ -987,7 +987,7 @@ function Normalize-MBApiBase {
 	if ([string]::IsNullOrWhiteSpace($u)) { return '' }
 	$u = $u.Trim()
 	if ($u -notmatch '^(?i)https?://') {
-		# host:port or host → assume http
+		# host:port or host -> assume http
 		if ($u -match '^\d+$') { $u = "http://127.0.0.1:$u" }
 		else { $u = "http://$u" }
 	}
@@ -1420,7 +1420,7 @@ namespace MiniBot.Core {
 				error = "MMDeviceEnumerator unavailable: " + ex.Message;
 				return null;
 			}
-			// multimedia → console → communications (dock/HDMI/Bluetooth default-device oddities)
+			// multimedia -> console -> communications (dock/HDMI/Bluetooth default-device oddities)
 			int[] roles = new int[] { 1, 0, 2 };
 			Guid iid = typeof(IAudioEndpointVolume).GUID;
 			foreach (int role in roles) {
@@ -2400,14 +2400,12 @@ function Format-MBParamCount {
 }
 
 function Format-MBByteSize {
-	param([object]$N)
-	try {
-		$v = [double]$N
-		if ($v -le 0) { return '' }
-		if ($v -ge 1GB) { return ('{0:N1} GB' -f ($v / 1GB)) }
-		if ($v -ge 1MB) { return ('{0:N0} MB' -f ($v / 1MB)) }
-		return ('{0:N0} B' -f $v)
-	} catch { return '' }
+	param([int64]$Bytes)
+	if ($Bytes -lt 0) { return '?' }
+	if ($Bytes -lt 1024) { return ("{0} B" -f $Bytes) }
+	if ($Bytes -lt 1MB) { return ("{0:N1} KB" -f ($Bytes / 1KB)) }
+	if ($Bytes -lt 1GB) { return ("{0:N1} MB" -f ($Bytes / 1MB)) }
+	return ("{0:N2} GB" -f ($Bytes / 1GB))
 }
 
 function Test-MBLooksLikeModelPath {
@@ -2945,7 +2943,7 @@ function Sync-MBActiveModelFromWpf {
 			try { $pickBase = [string]$script:MB.Wpf.ActiveModelBase } catch {}
 			try { $pickKey = [string]$script:MB.Wpf.ActiveModelKey } catch {}
 			if (-not [string]::IsNullOrWhiteSpace($pick) -and $pick -ne 'Select Model') {
-				# PoweredBy menu pick → "model switched" divider (add path sets BannerKind=added itself)
+				# PoweredBy menu pick -> "model switched" divider (add path sets BannerKind=added itself)
 				Set-MBActiveModel -Id $pick -Base $pickBase -Key $pickKey -FromUi -BannerKind 'switched'
 			}
 			$script:MB.Wpf.ModelDirty = $false
@@ -2958,8 +2956,8 @@ function Sync-MBActiveModelFromWpf {
 }
 
 function Get-MBRemoteModelsFromBase {
-	# Probe one OpenAI-compat base (llama.cpp / Unsloth / vLLM / …)
-	# → @{ Ok; Base; Models=@(id strings); Entries=@(rich); Props }
+	# Probe one OpenAI-compat base (llama.cpp / Unsloth / vLLM / ...)
+	# -> @{ Ok; Base; Models=@(id strings); Entries=@(rich); Props }
 	param(
 		[string]$BaseUrl = '',
 		[string]$Username = '',
@@ -3059,7 +3057,7 @@ function Get-MBRemoteModelsFromBase {
 					# Unsloth Studio / OpenAI-compat fields (top-level, not under meta)
 					try { if ($nCtx -le 0 -and $row.context_length) { $nCtx = [int]$row.context_length } } catch {}
 					try { if ($nCtx -le 0 -and $row.max_context_length) { $nCtx = [int]$row.max_context_length } } catch {}
-					# Do not map native_context_length → NCtxTrain (would show a misleading "train" banner field)
+					# Do not map native_context_length -> NCtxTrain (would show a misleading "train" banner field)
 					# vLLM OpenAI server: max_model_len on model card
 					try { if ($nCtx -le 0 -and $row.max_model_len) { $nCtx = [int]$row.max_model_len } } catch {}
 					try {
@@ -3213,10 +3211,10 @@ function Add-MBApiBaseEndpoint {
 				if (Test-MBApiKeyUsable -Key $BearerToken) {
 					"Connected to $n but no usable model ids (check GET /v1/models — load a model on Unsloth/vLLM)."
 				} else {
-					"Connected but no models — for API key mode enter a Bearer key (Unsloth sk-unsloth-…, vLLM --api-key), or use open server with auth=Basic (None)."
+					"Connected but no models — for API key mode enter a Bearer key (Unsloth sk-unsloth-..., vLLM --api-key), or use open server with auth=Basic (None)."
 				}
 			}
-			default { "Connected but no models at $n/models. Try …/v1, or pick NPM / API key auth if the host is protected." }
+			default { "Connected but no models at $n/models. Try .../v1, or pick NPM / API key auth if the host is protected." }
 		}
 		return @{ Ok = $false; Message = $hint }
 	}
@@ -4088,7 +4086,7 @@ function Test-MBApiBasesMatch {
 }
 
 function Test-MBIsPrimaryApiBase {
-	# Primary launch -BaseUrl (llama.cpp / NPM) vs extra OpenAI-compat endpoints (vLLM, Unsloth, …)
+	# Primary launch -BaseUrl (llama.cpp / NPM) vs extra OpenAI-compat endpoints (vLLM, Unsloth, ...)
 	param([string]$Candidate = '')
 	$n = ''
 	try { $n = Normalize-MBApiBase -Url $Candidate } catch { $n = ([string]$Candidate).Trim() }
@@ -4264,9 +4262,9 @@ function Get-MBApiAuthModeForBase {
 	}
 
 	# Defaults when no explicit mode:
-	#  - primary llama.cpp → npm if logged in, else apikey if -ApiKey set, else none
-	#  - extra with stored key → apikey
-	#  - extra open → none
+	#  - primary llama.cpp -> npm if logged in, else apikey if -ApiKey set, else none
+	#  - extra with stored key -> apikey
+	#  - extra open -> none
 	$isPrimary = Test-MBIsPrimaryApiBase -Candidate $n
 	if ($isPrimary -or [string]::IsNullOrWhiteSpace($n)) {
 		if ($script:MB.NpmUser -and $script:MB.NpmPass) { return 'npm' }
@@ -4306,7 +4304,7 @@ function Format-MBAuthDisplayLabel {
 		elseif ($AuthHeader -match '^(?i)Bearer\s+') { $m = 'apikey' }
 		else { $m = 'none' }
 	}
-	# If Basic header came from NPM creds → NPM; plain open = none
+	# If Basic header came from NPM creds -> NPM; plain open = none
 	if ($m -eq 'npm' -or ($AuthHeader -match '^(?i)Basic\s+' -and $script:MB.NpmUser -and $script:MB.NpmPass -and (Get-MBApiAuthModeForBase -BaseUrl $BaseUrl) -eq 'npm')) {
 		return 'Basic (NPM)'
 	}
@@ -4336,9 +4334,9 @@ function Get-MBAuthHeaderValue {
 		[string]$BearerToken = ''
 	)
 	# Per-endpoint HTTP auth only (never chat prompt):
-	#  mode 'npm'    → Basic from session NPM credentials
-	#  mode 'apikey' → Bearer from ExtraApiKeys / -ApiKey / BearerToken
-	#  mode 'none'   → no Authorization (open vLLM, etc.)
+	#  mode 'npm'    -> Basic from session NPM credentials
+	#  mode 'apikey' -> Bearer from ExtraApiKeys / -ApiKey / BearerToken
+	#  mode 'none'   -> no Authorization (open vLLM, etc.)
 	$target = ([string]$BaseUrl).Trim()
 	if ([string]::IsNullOrWhiteSpace($target)) {
 		try { $target = [string]$script:MB.ActiveModelBase } catch { $target = '' }
@@ -5781,7 +5779,7 @@ public const int ICON_BIG = 1;
 								$body = ''
 								try { $body = [string]$response.Content } catch { $body = '' }
 								if ($body -match '"object"\s*:\s*"list"' -or $body -match '"data"\s*:\s*\[' -or $body.Trim().StartsWith('{') -or $body.Trim().StartsWith('[')) {
-									return @{ Ok = $true; StatusCode = 200; Message = "OK → $base"; BaseUrl = $base }
+									return @{ Ok = $true; StatusCode = 200; Message = "OK -> $base"; BaseUrl = $base }
 								}
 								$lastMsg = "HTTP 200 from $testUrl but body is not a models API"
 								$lastCode = 200
@@ -6886,7 +6884,7 @@ function Connect-MBModelEndpoint {
 		}
 	} catch {}
 
-	# Empty / blank primary → ask for endpoint before any network call
+	# Empty / blank primary -> ask for endpoint before any network call
 	if ([string]::IsNullOrWhiteSpace([string]$testParams.BaseUrl)) {
 		$picked = $null
 		try {
@@ -6945,7 +6943,7 @@ function Connect-MBModelEndpoint {
 		return $false
 	}.GetNewClosure()
 
-	# Unreachable / invalid URL, OR API-key 401 → Connect dialog (not NPM Login)
+	# Unreachable / invalid URL, OR API-key 401 -> Connect dialog (not NPM Login)
 	if ($connTest.StatusCode -notin 401, 403 -or (& $isApiKeyHost ([string]$testParams.BaseUrl))) {
 		$maxEndpointRounds = 6
 		$epRound = 0
@@ -7505,7 +7503,7 @@ function Resolve-MBPath {
 			try {
 				if (Test-Path -LiteralPath $c) { return $c }
 			} catch {}
-			# Session-mapped letter → UNC when Test-Path on letter fails (elevated session isolation)
+			# Session-mapped letter -> UNC when Test-Path on letter fails (elevated session isolation)
 			try {
 				$uncAlt = Resolve-MBSessionMappedUnc -Path $c
 				if ($uncAlt -and (Test-Path -LiteralPath $uncAlt)) { return $uncAlt }
@@ -7539,7 +7537,7 @@ function Resolve-MBPath {
 			return [System.IO.Path]::GetFullPath((Join-Path $home $rest))
 		}
 	}
-	# Session map: S:\foo → \\server\share\foo when letter mapped this session but not visible to agent
+	# Session map: S:\foo -> \\server\share\foo when letter mapped this session but not visible to agent
 	try {
 		$uncMap = Resolve-MBSessionMappedUnc -Path $p
 		if ($uncMap) {
@@ -7550,11 +7548,11 @@ function Resolve-MBPath {
 			if (-not $letterOk) { return $uncMap }
 		}
 	} catch {}
-	# Users\Public\... without drive → C:\Users\Public\... (not under System32 CWD)
+	# Users\Public\... without drive -> C:\Users\Public\... (not under System32 CWD)
 	if ($p -match '^(?i)Users\\') {
 		return [System.IO.Path]::GetFullPath(('C:\' + $p))
 	}
-	# Already glued: C:\Windows\System32\Users\... → C:\Users\...
+	# Already glued: C:\Windows\System32\Users\... -> C:\Users\...
 	if ($p -match '(?i)^[A-Za-z]:\\Windows\\System32\\(Users\\.+)$') {
 		return [System.IO.Path]::GetFullPath(('C:\' + $Matches[1]))
 	}
@@ -7607,7 +7605,7 @@ function Get-MBPathCandidates {
 	}
 
 	# Unglue accidental System32 CWD joins (elevated launch):
-	# C:\Windows\System32\Users\Public\... → C:\Users\Public\...
+	# C:\Windows\System32\Users\Public\... -> C:\Users\Public\...
 	# Also handle relative "Windows\System32\Users\..." leftovers.
 	if ($p -match '(?i)(?:^[A-Za-z]:\\)?Windows\\System32\\(Users\\.+)$') {
 		& $add ('C:\' + $Matches[1])
@@ -7640,7 +7638,7 @@ function Get-MBPathCandidates {
 	try { $rooted = [System.IO.Path]::IsPathRooted($p) } catch { $rooted = $false }
 	if ($rooted) {
 		& $add $p
-		# \Users\... → C:\Users\... (GetFullPath uses current drive; also try C:)
+		# \Users\... -> C:\Users\... (GetFullPath uses current drive; also try C:)
 		if ($p.StartsWith('\') -and -not $p.StartsWith('\\')) {
 			& $add ('C:' + $p)
 			$drive = $null
@@ -7655,7 +7653,7 @@ function Get-MBPathCandidates {
 			& $add ('C:\' + $rest)
 		}
 	} else {
-		# Users\Public\... or Documents\... without drive → treat as under C:\ or profile
+		# Users\Public\... or Documents\... without drive -> treat as under C:\ or profile
 		if ($p -match '^(?i)Users\\') {
 			& $add ('C:\' + $p)
 		}
@@ -8593,21 +8591,21 @@ $script:MBSystemPromptBase = @"
 You are $AgentName v$Version - local Windows tool-first agent (PS 5.1). Evidence only; concise; CWD-relative paths unless absolute; never dump multi-MB/binary/.dmp.
 No delete/destroy unless operator asked for that specific target. Mutate after read when possible; deny = stop + replan (never retry the same blocked approach). Prefer specialized tools; RunCommand is LAST resort.
 Never ReadFile images/video/PDF/binary (crashes servers) — vision: senses ReadImage/ReadPdf; operator display: markdown below.
-INLINE MEDIA (chat UI) — REQUIRED for play/show/hear: always embed on its own line as ![label](absolute-path). Prefer absolute Windows paths. Images png/jpg/gif/webp/bmp/tif; video mp4/m4v/mov/wmv; audio mp3/wav/flac/m4a/aac/ogg/wma. After DownloadFile / ViewScreen save / FindFiles pick / any "play or show" ask: emit ![…](…) so it plays in-chat. NEVER Start-Process/Invoke-Item/explorer/VLC/default-app first. External player ONLY if format not inline-compatible or operator explicitly asked external. Do not reply with a bare path alone when they should see/hear it.
+INLINE MEDIA (chat UI) — REQUIRED for play/show/hear: always embed on its own line as ![label](absolute-path). Prefer absolute Windows paths. Images png/jpg/gif/webp/bmp/tif; video mp4/m4v/mov/wmv; audio mp3/wav/flac/m4a/aac/ogg/wma. After DownloadFile / ViewScreen save / FindFiles pick / any "play or show" ask: emit ![...](...) so it plays in-chat. NEVER Start-Process/Invoke-Item/explorer/VLC/default-app first. External player ONLY if format not inline-compatible or operator explicitly asked external. Do not reply with a bare path alone when they should see/hear it.
 Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration). If a tool is missing: ERROR may say missing_tool=X group=Y — EnableToolGroup group=Y then call X same turn; do NOT invent COM/shell.
-ROUTER (intent→tool; enable group first if off; do not shell these):
- volume|mute|unmute|speaker → EnableToolGroup group=system then AudioVolume (action=get|set|mute|unmute; level=0-100)
- brightness|dim display → EnableToolGroup group=system then DisplayBrightness (action=get|set; level=0-100)
- service start/stop/restart → EnableToolGroup group=system then ControlService
- kill process → EnableToolGroup group=diag then StopProcess
- find shares/LAN → EnableToolGroup group=network then ProbeShares/ScanNetwork
- sfc|dism|chkdsk → EnableToolGroup group=repair then RunRepairTool
- reboot/shutdown → EnableToolGroup group=setup then Reboot
- group policy / gpedit / Policies registry → EnableToolGroup group=setup then GroupPolicy (list_catalog|get|set|remove|gpupdate)
+ROUTER (intent->tool; enable group first if off; do not shell these):
+ volume|mute|unmute|speaker -> EnableToolGroup group=system then AudioVolume (action=get|set|mute|unmute; level=0-100)
+ brightness|dim display -> EnableToolGroup group=system then DisplayBrightness (action=get|set; level=0-100)
+ service start/stop/restart -> EnableToolGroup group=system then ControlService
+ kill process -> EnableToolGroup group=diag then StopProcess
+ find shares/LAN -> EnableToolGroup group=network then ProbeShares/ScanNetwork
+ sfc|dism|chkdsk -> EnableToolGroup group=repair then RunRepairTool
+ reboot/shutdown -> EnableToolGroup group=setup then Reboot
+ group policy / gpedit / Policies registry -> EnableToolGroup group=setup then GroupPolicy (list_catalog|get|set|remove|gpupdate)
  NEVER RunCommand for volume/mute/brightness/endpoint COM/AudioEndpointVolume/IAudioEndpointVolume/nircmd volume — use AudioVolume/DisplayBrightness (system group).
  NEVER raw reg.exe for policy keys if GroupPolicy tool available (setup group).
 MAP: senses=vision/TTS | system=inventory+services+AudioVolume+DisplayBrightness | network=LAN+ProbeShares+lists | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=options+GroupPolicy+restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso | packages=PSGallery | registry | clipboard | web=HTTP/GitHub
-FindFiles: multi-ext one call; truncated=normal (use rows); specific ask→narrow; vague play/show→pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice→tell operator. User text = results only.
+FindFiles: multi-ext one call; truncated=normal (use rows); specific ask->narrow; vague play/show->pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice->tell operator. User text = results only.
 "@
 
 $script:MBGroupPrompt = [ordered]@{
@@ -8615,13 +8613,13 @@ $script:MBGroupPrompt = [ordered]@{
 CORE: text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; HexView/HexEdit; RunCommand (last resort); CWD/env; EnableToolGroup. Prefer specialized tools. MEDIA: ![label](absolute-path) inline for play/show. Volume/mute/brightness are system group (AudioVolume/DisplayBrightness) — not RunCommand.
 "@
 	senses = @"
-SENSES: ReadImage (vision, auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true → show with ![label](path) inline, not external open); SpeakText. No ReadFile on images/PDF.
+SENSES: ReadImage (vision, auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true -> show with ![label](path) inline, not external open); SpeakText. No ReadFile on images/PDF.
 "@
 	system = @"
 SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime; AudioVolume (volume/mute); DisplayBrightness. Prefer over Get-ComputerInfo / shell COM. Services: ControlService not shell.
 "@
 	network = @"
-NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; ProbeShares (REQUIRED to find shares - never net view loops); GetLocalShares/MappedDrives/Printers. Known host→ProbeShares computer=; search→omit hosts. Then shares group to map/create.
+NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; ProbeShares (REQUIRED to find shares - never net view loops); GetLocalShares/MappedDrives/Printers. Known host->ProbeShares computer=; search->omit hosts. Then shares group to map/create.
 "@
 	diag = @"
 DIAG: BSOD/events/disk/startup/tasks/drivers/StopProcess/RunQuickDiagnostics. Never dump .dmp bytes. Kill only if asked.
@@ -8642,7 +8640,7 @@ SHARES mutate: Map/Unmap; CreateShare (path,name,user,pass,everyone_full require
 INSTALLERS: ListInstallers / InstallPackage (prompt; silent).
 "@
 	sandbox = @"
-SANDBOX: SandBoxWrite→SandBox piece/pieces+assert; compose to ship. Claim pass only if ok=true.
+SANDBOX: SandBoxWrite->SandBox piece/pieces+assert; compose to ship. Claim pass only if ok=true.
 "@
 	files = @"
 FILES: DownloadFile; zip Expand/Compress; MakeCab/ExpandCab; MakeIso/MountIso/UnmountIso (prompt on mutate). After download/save of media, show with ![label](path) inline.
@@ -8657,7 +8655,7 @@ REGISTRY: ReadRegistry; SetRegistry (prompt).
 CLIPBOARD: read|write (prompt).
 "@
 	web = @"
-WEB: MakeHttpRequest/BrowsePage/GitHub raw+list. File downloads→files DownloadFile.
+WEB: MakeHttpRequest/BrowsePage/GitHub raw+list. File downloads->files DownloadFile.
 "@
 }
 
@@ -8721,7 +8719,7 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "StopProcess"; description = "Stop one or more processes. ALWAYS approval. Prefer pid= from GetProcessList; or name= ProcessName (without .exe). force=true (default) uses Force. Never kills MiniBot itself or protected system processes (csrss, lsass, services, smss, wininit, winlogon, System, svchost, dwm, ...). Prefer over taskkill in RunCommand."; parameters = @{ type = "object"; properties = @{ pid = @{ type = "integer"; description = "Process id (preferred)" }; process_id = @{ type = "integer"; description = "Alias for pid" }; name = @{ type = "string"; description = "ProcessName without .exe (may match multiple)" }; force = @{ type = "boolean"; description = "Force kill (default true)" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetProcessTree"; description = "Process parent/child tree (pid, ppid, name, depth). Optional root_pid to start from one process."; parameters = @{ type = "object"; properties = @{ root_pid = @{ type = "integer"; description = "Start from this PID (0 = all roots)" }; max_depth = @{ type = "integer"; description = "Max tree depth (default 6)" }; max_nodes = @{ type = "integer"; description = "Cap nodes returned (default 200)" } } } } },
 	@{ type = "function"; function = @{ name = "GetNetConnections"; description = "TCP connections/listeners (local/remote address:port, state, pid, process). Like netstat."; parameters = @{ type = "object"; properties = @{ state = @{ type = "string"; description = "Filter e.g. Listen, Established" }; port = @{ type = "integer"; description = "Filter by local or remote port" }; max = @{ type = "integer"; description = "Max rows (default 100)" } } } } },
-	@{ type = "function"; function = @{ name = "FindFiles"; description = "Find by name/ext/size/days. Multi-ext one call (extensions=[mp4,mkv] or glob='*.mp4;*.mkv'). Cap max=100 (hard 500), newest first; truncated=use rows (specific→narrow; vague play→pick one then INLINE ![label](path)). Content→SearchFiles."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; glob = @{ type = "string" }; globs = @{ type = "array"; items = @{ type = "string" } }; extensions = @{ type = "array"; items = @{ type = "string" } }; modified_within_days = @{ type = "integer" }; min_bytes = @{ type = "integer" }; max_bytes = @{ type = "integer" }; recursive = @{ type = "boolean" }; max = @{ type = "integer" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "FindFiles"; description = "Find by name/ext/size/days. Multi-ext one call (extensions=[mp4,mkv] or glob='*.mp4;*.mkv'). Cap max=100 (hard 500), newest first; truncated=use rows (specific->narrow; vague play->pick one then INLINE ![label](path)). Content->SearchFiles."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; glob = @{ type = "string" }; globs = @{ type = "array"; items = @{ type = "string" } }; extensions = @{ type = "array"; items = @{ type = "string" } }; modified_within_days = @{ type = "integer" }; min_bytes = @{ type = "integer" }; max_bytes = @{ type = "integer" }; recursive = @{ type = "boolean" }; max = @{ type = "integer" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "ReadImage"; description = "Load an image for vision (next model reply can see it). png/jpg/gif/bmp/tif/webp. ALWAYS heavily downscales for the model (default max side ~896px, hard max 1024, max ~0.72MP, JPEG) so large TIFFs/photos cannot OOM llama.cpp. Optional maxWidth is clamped. Prefer small/cropped images. To show the operator the full file without vision cost PREFER inline markdown ![label](absolute-path) in your reply. No approval."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxWidth = @{ type = "integer"; description = "Vision max side px (default ~896, hard-capped at 1024)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "ReadPdf"; description = "Read a PDF (cheap path first). Default page=1 only - multipage vision is expensive; only set page>1 or call again for other pages if the user needs them or page 1 is insufficient. Extracts text when clean; if empty/garbled, auto-renders that one page into vision. render=true forces vision; maxWidth downscales vision."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxChars = @{ type = "integer"; description = "Max text chars (default 50000)" }; page = @{ type = "integer"; description = "1-based page for vision render (default 1). Prefer 1 unless user needs another page." }; render = @{ type = "boolean"; description = "Force page render to vision even if text looks fine" }; autoVision = @{ type = "boolean"; description = "Auto-render when text empty/garbled (default true)" }; maxWidth = @{ type = "integer"; description = "Vision max width px (default 1280)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "Clipboard"; description = "Read or write clipboard text. Always requires approval."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; enum = @("read","write") }; text = @{ type = "string" } }; required = @("action") } } },
@@ -9821,7 +9819,7 @@ function Test-MBBinaryMediaSniff {
 			if ($n -ge 4 -and $buf[0] -eq 0x25 -and $buf[1] -eq 0x50 -and $buf[2] -eq 0x44 -and $buf[3] -eq 0x46) { return 'pdf' }
 			# MP4 / ISO-BMFF (....ftyp)
 			if ($n -ge 8 -and $buf[4] -eq 0x66 -and $buf[5] -eq 0x74 -and $buf[6] -eq 0x79 -and $buf[7] -eq 0x70) { return 'video' }
-			# null-heavy head → binary (not text)
+			# null-heavy head -> binary (not text)
 			$nulls = 0
 			for ($i = 0; $i -lt $n; $i++) { if ($buf[$i] -eq 0) { $nulls++ } }
 			if ($n -ge 8 -and $nulls -ge [Math]::Max(2, [int]($n * 0.25))) { return 'binary' }
@@ -11871,7 +11869,7 @@ $test_script
 		if ($expect_stderr_empty) { $checksDesc += 'expect_stderr_empty=true' }
 		foreach ($a in $assertList) { $checksDesc += "assert: $a" }
 		if ($test_script) { $checksDesc += 'test_script=yes' }
-		if ($compose) { $checksDesc += 'compose=true → work\composed.ps1' }
+		if ($compose) { $checksDesc += 'compose=true -> work\composed.ps1' }
 		if ($doResolveDeps) { $checksDesc += 'resolve_deps=true' }
 		if ($doMergeResults) { $checksDesc += 'merge_results=true' }
 		if ($trackedPieces.Count -gt 0) { $checksDesc += 'pieces=' + ($trackedPieces -join ',') }
@@ -12259,15 +12257,15 @@ function Invoke-RunCommand {
 				"REDIRECTED: Do not dump large recursive file lists with Get-ChildItem (wastes time/context; still truncates).`n" +
 				"Use FindFiles path=... recursive=true extensions=[mp4,mkv,...] or glob='*.mp4;*.mkv' max=50-100.`n" +
 				"If FindFiles already returned truncated=true: do not re-fetch everything. " +
-				"Specific ask (named file/subject/folder) → narrow filters to match. " +
-				"Deliberately vague ask (play something / random …) → pick one from files[] and act.`n" +
+				"Specific ask (named file/subject/folder) -> narrow filters to match. " +
+				"Deliberately vague ask (play something / random ...) -> pick one from files[] and act.`n" +
 				"Play/show: ![label](absolute-path) INLINE. Default app only as last resort (incompatible format or explicit external player)."
 			)
 		}
 	}
 
 	# Never interpolate $command into expandable strings (eats $_, $$, `" , etc. in the parent).
-	# In-memory only: build script bytes → Base64 → -EncodedCommand (no temp files).
+	# In-memory only: build script bytes -> Base64 -> -EncodedCommand (no temp files).
 	try {
 		if ($shell -eq "cmd") {
 			$rr = Invoke-MBProcessCapture -FileName "cmd.exe" -Arguments ('/c chcp 65001>nul & ' + $command) -WorkingDir $wd -TimeoutMs $timeoutMs
@@ -16109,15 +16107,6 @@ function Invoke-ControlService {
 	}
 }
 
-function Format-MBByteSize {
-	param([int64]$Bytes)
-	if ($Bytes -lt 0) { return '?' }
-	if ($Bytes -lt 1024) { return ("{0} B" -f $Bytes) }
-	if ($Bytes -lt 1MB) { return ("{0:N1} KB" -f ($Bytes / 1KB)) }
-	if ($Bytes -lt 1GB) { return ("{0:N1} MB" -f ($Bytes / 1MB)) }
-	return ("{0:N2} GB" -f ($Bytes / 1GB))
-}
-
 function Write-MBDownloadProgress {
 	param(
 		[string]$Label = 'Downloading',
@@ -16934,7 +16923,7 @@ function Invoke-MakeCab {
 							$rel = $rel -replace '/', '\'
 						} catch { $rel = $fi.Name }
 					}
-					# CAB entry names: use flat name unless recursive (then path with backslash → underscore for safety in simple mode)
+					# CAB entry names: use flat name unless recursive (then path with backslash -> underscore for safety in simple mode)
 					$cabName = if ($recursive -and $rel -match '[\\/]') {
 						($rel -replace '[\\/]', '_')
 					} else {
@@ -17943,7 +17932,7 @@ function Convert-MBFindFilePatterns {
 			}
 		}
 	}
-	# If any real filter exists, drop bare '*' (model sometimes sends glob='*' with extensions=…)
+	# If any real filter exists, drop bare '*' (model sometimes sends glob='*' with extensions=...)
 	$real = New-Object System.Collections.ArrayList
 	foreach ($p in @($patterns)) {
 		if ([string]$p -ne '*') { [void]$real.Add($p) }
@@ -17979,7 +17968,7 @@ function Invoke-FindFiles {
 		}
 		if ($recursive) { $gci['Recurse'] = $true }
 
-		# Single simple name filter → native Filter (fast). Multi-pattern → one walk + -like any.
+		# Single simple name filter -> native Filter (fast). Multi-pattern -> one walk + -like any.
 		$useNativeFilter = ($patterns.Count -eq 1 -and $patterns[0] -ne '*' -and $patterns[0] -notmatch '[\\/]')
 		if ($useNativeFilter) {
 			$gci['Filter'] = $patterns[0]
@@ -17994,7 +17983,7 @@ function Invoke-FindFiles {
 				try { $ext = [string]$f.Extension } catch { $ext = '' }
 				foreach ($p in $patterns) {
 					if ($p -eq '*') { return $true }
-					# Extension-style patterns: *.mp4 or .mp4 → match Extension (more reliable than name -like)
+					# Extension-style patterns: *.mp4 or .mp4 -> match Extension (more reliable than name -like)
 					if ($p -match '^\*\.([A-Za-z0-9]+)$') {
 						$want = '.' + $Matches[1]
 						if ($ext -and [string]::Equals($ext, $want, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
@@ -18053,7 +18042,7 @@ function Invoke-FindFiles {
 			$payload['hint'] = (
 				"TRUNCATED: showing {0} of {1} matches (newest first). Do NOT re-run FindFiles with the same args or Get-ChildItem -Recurse to dump the rest. " +
 				"If the operator was SPECIFIC (named file/subject/folder/criteria): narrow path/name/days/size (or raise max once, hard max 500) until you match — do not pick a random unrelated file. " +
-				"If they were deliberately VAGUE (e.g. play something / show a random … / any clip with no criteria): pick one suitable path from files[] now and act — no extra search loops. " +
+				"If they were deliberately VAGUE (e.g. play something / show a random ... / any clip with no criteria): pick one suitable path from files[] now and act — no extra search loops. " +
 				"Play/show: embed INLINE as ![label](absolute-path). Default app only if format is not inline-compatible or they asked external."
 			) -f $rows.Count, $total
 		}
@@ -21067,7 +21056,7 @@ function Test-ModelConnection {
 				return [pscustomobject]@{
 					Success    = $true
 					StatusCode = 200
-					Message    = "Connection successful ($($stopwatch.ElapsedMilliseconds) ms) → $base"
+					Message    = "Connection successful ($($stopwatch.ElapsedMilliseconds) ms) -> $base"
 					AuthType   = $authType
 					ElapsedMs  = $stopwatch.ElapsedMilliseconds
 					BaseUrl    = $base
@@ -21636,7 +21625,7 @@ function Invoke-ModelStreaming {
 				$shortErr = $lastError
 				if ($shortErr.Length -gt 180) { $shortErr = $shortErr.Substring(0, 177) + '...' }
 				Write-MBWarn ("Request failed (attempt {0}/{1}): {2}" -f $attempt, ($RetryCount + 1), $shortErr)
-				Write-Host ("  retrying in {0}ms  →  {1}" -f $waitMs, $completionsUrl) -ForegroundColor DarkGray
+				Write-Host ("  retrying in {0}ms  ->  {1}" -f $waitMs, $completionsUrl) -ForegroundColor DarkGray
 				Start-Sleep -Milliseconds $waitMs
 				Start-MBThinkingAnimation -Name $AgentName
 				continue
@@ -23555,7 +23544,7 @@ function Get-MBMaskedSecret {
 }
 
 function Test-MBLocalUserExists {
-	# LocalAccounts → ADSI → short net user query.
+	# LocalAccounts -> ADSI -> short net user query.
 	param([string]$Username)
 	$user = ([string]$Username).Trim()
 	if ([string]::IsNullOrWhiteSpace($user)) {
@@ -24311,7 +24300,7 @@ function Normalize-MBUncPath {
 	param([string]$Path)
 	$p = ([string]$Path).Trim().Trim('"').Trim("'")
 	if ([string]::IsNullOrWhiteSpace($p)) { return $p }
-	# JSON often produces \\\\server\\share → normalize to \\server\share
+	# JSON often produces \\\\server\\share -> normalize to \\server\share
 	while ($p -match '\\\\\\') { $p = $p -replace '\\\\', '\' } # too aggressive?
 	# Safer: replace runs of 2+ backslashes with single, then ensure leading \\
 	$p = [regex]::Replace($p, '\\{2,}', '\')
@@ -24328,7 +24317,7 @@ function Normalize-MBUncPath {
 	}
 	# Final: must start with \\ for UNC
 	if ($p -match '^\\[^\\]') { $p = '\' + $p }
-	# Local hostnames → 127.0.0.1 for reliable loopback
+	# Local hostnames -> 127.0.0.1 for reliable loopback
 	try {
 		if ($p -match '^\\\\(?<host>[^\\]+)\\(?<rest>.+)$') {
 			$h = [string]$Matches['host']
@@ -27125,7 +27114,7 @@ function Invoke-MBTool {
 			$hint = Get-MBToolEnableHint -ToolName $match
 			return "ERROR: Tool '$match' is not in the active tool list. $hint"
 		}
-		return "ERROR: Unknown tool '$Name'. Prefer ROUTER in system prompt (volume→AudioVolume, brightness→DisplayBrightness). For gated tools: EnableToolGroup using MAP then real tool name. Do not invent tools or shell COM for OS UX knobs."
+		return "ERROR: Unknown tool '$Name'. Prefer ROUTER in system prompt (volume->AudioVolume, brightness->DisplayBrightness). For gated tools: EnableToolGroup using MAP then real tool name. Do not invent tools or shell COM for OS UX knobs."
 	}
 
 	$guard = Test-MBToolLoopGuard -Name $Name -ArgsObj $ArgsObj
@@ -27182,7 +27171,7 @@ function Invoke-MBTool {
 					$codeLang = if ([string]$shell -match '^(?i)cmd') { 'bat' } else { 'ps' }
 					if (-not (Request-Confirmation -Title "RunCommand requires approval" -Details $cmdDetails -Code ([string]$cmd) -CodeLang $codeLang)) {
 						Write-Host "    denied" -ForegroundColor Red
-						"BLOCKED BY USER: Operator denied this RunCommand. Do NOT retry the same shell approach. Re-read ROUTER/MAP: volume/mute→EnableToolGroup system + AudioVolume; brightness→system + DisplayBrightness; services→system + ControlService. EnableToolGroup then call specialized tool same turn."
+						"BLOCKED BY USER: Operator denied this RunCommand. Do NOT retry the same shell approach. Re-read ROUTER/MAP: volume/mute->EnableToolGroup system + AudioVolume; brightness->system + DisplayBrightness; services->system + ControlService. EnableToolGroup then call specialized tool same turn."
 					} else {
 						if ($script:MB.AutoApprove) {
 							if ($script:MB.ModeSwitch) { $script:MB.ModeSwitch = $false }
@@ -28522,7 +28511,7 @@ function Ensure-MBPromptBudget {
 
 	$final = Get-MBContextEstimate -Messages $Messages
 	if ($final.PromptTokens -lt $beforeTok) {
-		$script:MB.LastCompactReason = ("silent trim ~{0:N0}→{1:N0} tok" -f $beforeTok, $final.PromptTokens)
+		$script:MB.LastCompactReason = ("silent trim ~{0:N0}->{1:N0} tok" -f $beforeTok, $final.PromptTokens)
 	}
 	if ($final.PromptTokens -gt $budget) {
 		Write-MBWarn ("Context still ~{0:N0} tok over usable n_ctx room {1:N0} - consider /clear or /compact" -f $final.PromptTokens, $budget)
@@ -28765,7 +28754,7 @@ function Invoke-MBSpeak {
 		try { $script:MB.SpeechSynth.SpeakAsyncCancelAll() } catch {}
 		try { Stop-MBSpeechWavePlayback } catch {}
 
-		# WPF: synthesize TTS to WAV → play + high-FPS wave scrub.
+		# WPF: synthesize TTS to WAV -> play + high-FPS wave scrub.
 		# Always wait for playback to finish so the agent turn cannot race ahead of speech.
 		$useWave = $false
 		try { $useWave = [bool](Test-MBWpfActive) } catch { $useWave = $false }
@@ -29419,7 +29408,7 @@ function Update-MBSpeechWaveFrame {
 			try { $idleN = [int]$W.SpeechWaveIdleTicks } catch { $idleN = 0 }
 			$idleN++
 			$W.SpeechWaveIdleTicks = $idleN
-			# CompositionTarget is ~60fps → ~0.5s tail
+			# CompositionTarget is ~60fps -> ~0.5s tail
 			if ($idleN -gt 30) {
 				try { Stop-MBSpeechWaveRenderLoop } catch {}
 				$W.SpeechWaveBox.Visibility = [System.Windows.Visibility]::Collapsed
@@ -33560,7 +33549,7 @@ function global:Register-MBVideoApi {
 		}
 	}
 
-	# Fill any remaining holes via Get-Command → unbound
+	# Fill any remaining holes via Get-Command -> unbound
 	$map = @{
 		StartInline = 'Start-MBInlineVideoInHost'
 		StopInline  = 'Stop-MBInlineVideoState'
@@ -33638,7 +33627,7 @@ function Convert-MBMdMediaTarget {
 
 function Convert-MBMdMediaLabel {
 	# Display title for image/video/audio cards. PRESERVES spaces in labels and filenames
-	# e.g. ![My Song Title](...), or bare path ...\My Song.mp3 → "My Song".
+	# e.g. ![My Song Title](...), or bare path ...\My Song.mp3 -> "My Song".
 	param(
 		[string]$Alt = '',
 		[string]$PathOrDisplay = '',
@@ -35940,8 +35929,8 @@ function Start-MBWpfHost {
         </Border>
 
  <!-- Lower status: status+timer (dynamic width by mode) | ctx | meta
-             ready → compact (ctx far left); thinking/working → same reserved band + timer;
-             auto-compacting → label may grow and shift ctx once. -->
+             ready -> compact (ctx far left); thinking/working -> same reserved band + timer;
+             auto-compacting -> label may grow and shift ctx once. -->
         <Border Grid.Row="4" Background="#1E1E24" BorderBrush="#2A2A30" BorderThickness="0,1,0,0" Padding="12,4">
           <Grid>
             <Grid.ColumnDefinitions>
@@ -37429,7 +37418,7 @@ function Start-MBWpfHost {
 											throw 'NPM auth selected but session has no NPM credentials (log in first).'
 										}
 									}
-									# authMode 'none' → no Authorization header
+									# authMode 'none' -> no Authorization header
 								} catch {
 									$lastErr = $_.Exception.Message
 									throw
@@ -39093,7 +39082,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				& $emit $para $mode $sb $brush $monoFont $emojiFont
 			}.GetNewClosure()
 
-			# Code-block syntax highlighting (regex lexer → WPF Runs)
+			# Code-block syntax highlighting (regex lexer -> WPF Runs)
 			$synNormLang = {
 				param([string]$L)
 				$x = ([string]$L).Trim().ToLowerInvariant() -replace '^\.+', ''
