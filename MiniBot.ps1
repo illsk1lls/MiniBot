@@ -1,15 +1,15 @@
-﻿<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
+<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
 @START /MIN "" POWERSHELL -nop -w hidden -c "iex ([io.file]::ReadAllText('%~f0'))">nul&EXIT
 #>
 
 <#
 .SYNOPSIS
-	MiniBot v2.30.2 - Mini Repair-Bot
+	MiniBot v2.35.1 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
 .NOTES
-	Requires Windows PowerShell 5.1+. Optional: PSWindowsUpdate for GetWindowsUpdateStatus.
+	Requires Windows PowerShell 5.1+. GetWindowsUpdateStatus uses native WU COM (optional PSWindowsUpdate fallback).
 	Optional: System.Speech for /speech (Right-Ctrl PTT + TTS).
 #>
 
@@ -17,27 +17,30 @@ param(
 	# --- Primary OpenAI-compatible API (llama.cpp / main host) ---
 	# Prefer …/v1 when the server is OpenAI-compat (vLLM, Unsloth Studio). llama.cpp often uses bare :8080.
 	# Port stays in the URL (not a separate param) so multi-endpoint bases, HTTPS, and /v1 paths stay simple.
-	[string]$BaseUrl = "http://127.0.0.1:8080",
-	# Primary HTTP auth Bearer key (NOT chat prompt text). Use "none" to skip.
-	# Examples: -ApiKey 'sk-…'   |   Unsloth: sk-unsloth-…   |   vLLM: value from --api-key
-	# If you log in with NPM Basic for the primary llama.cpp host, leave this "none" unless the app itself needs Bearer.
-	[string]$ApiKey = "none",
+	# Localhost placeholder: nothing listening → Connect recovery popup to enter real endpoint (xAI, LAN, etc.).
+	# Leave empty ("") to open Connect immediately without a probe timeout.
+	[string]$BaseUrl = "http://127.0.0.1:8080/v1",
 	# Optional preferred model id. Leave empty to auto-pick from /models (single model)
 	# or the PoweredBy picker (multiple). Only used when set / -Model is passed.
 	# HF/Unsloth-style ids with a slash are OK: unsloth/Qwen3.5-4B-MTP-GGUF
 	[string]$Model = "",
-	# Optional display override. Leave empty to use the live server model id.
-	[string]$ModelAlias = "",
-	# Optional n_ctx fallback. 0 = use server /props + /models only. Set / -ContextWindowTokens if needed.
-	[int]$ContextWindowTokens = 0,
 	# Max completion tokens. 0 = auto (n_ctx/8 from server). Set a value or pass -MaxTokens to lock.
 	[int]$MaxTokens = 0,
+	# Optional n_ctx fallback. 0 = use server /props + /models only. Set / -ContextWindowTokens if needed.
+	[int]$ContextWindowTokens = 0,
+	# Optional display override. Leave empty to use the live server model id.
+	[string]$ModelAlias = "",
+	# Primary HTTP auth Bearer key (NOT chat prompt text). Use "none" to skip.
+	# Examples: -ApiKey 'sk-…'   |   Unsloth: sk-unsloth-…   |   vLLM: value from --api-key
+	# xAI Grok: -BaseUrl 'https://api.x.ai/v1' -ApiKey 'xai-…' -Model 'grok-4.5'
+	# If you log in with NPM Basic for the primary llama.cpp host, leave this "none" unless the app itself needs Bearer.
+	[string]$ApiKey = "none",
 	[double]$Temperature = 0.15,
 	[int]$MaxTurns = 30,
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.30.2",
+	[string]$Version = "2.35.1",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -87,18 +90,18 @@ param(
 #   $script:MBExtraApiKeys  = @{ 'http://127.0.0.1:8081' = 'sk-your-key' }
 #
 # --- Unsloth Studio + apikey ---
-#   $script:MBExtraApiBases = @('http://192.168.1.106:8888/v1')
-#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.106:8888/v1' = 'apikey' }
-#   $script:MBExtraApiKeys  = @{ 'http://192.168.1.106:8888/v1' = 'sk-unsloth-xxxxxxxx' }
+#   $script:MBExtraApiBases = @('http://192.168.1.10:8888/v1')
+#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.10:8888/v1' = 'apikey' }
+#   $script:MBExtraApiKeys  = @{ 'http://192.168.1.10:8888/v1' = 'sk-unsloth-xxxxxxxx' }
 #
 # --- vLLM + none (open LAN) ---
-#   $script:MBExtraApiBases = @('http://192.168.1.50:8000/v1')
-#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.50:8000/v1' = 'none' }
+#   $script:MBExtraApiBases = @('http://192.168.1.20:8000/v1')
+#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.20:8000/v1' = 'none' }
 #
 # --- vLLM + apikey (--api-key / OpenAI-compat Bearer) ---
-#   $script:MBExtraApiBases = @('http://192.168.1.50:8000/v1')
-#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.50:8000/v1' = 'apikey' }
-#   $script:MBExtraApiKeys  = @{ 'http://192.168.1.50:8000/v1' = 'token-abc123' }
+#   $script:MBExtraApiBases = @('http://192.168.1.20:8000/v1')
+#   $script:MBExtraApiAuth  = @{ 'http://192.168.1.20:8000/v1' = 'apikey' }
+#   $script:MBExtraApiKeys  = @{ 'http://192.168.1.20:8000/v1' = 'token-abc123' }
 # =============================================================================
 
 # Extra OpenAI-compatible API bases (in addition to -BaseUrl). Uncomment / edit to hardcode.
@@ -179,7 +182,7 @@ public static class Win32 {
 	} catch {}
 }
 
-# Installer catalog (release): personal software only. kind: exe | msi | zip_msi | open_url
+# Installer catalog (default consumer apps). kind: exe | msi | zip_msi | open_url
 # install: raw flags after payload. interactive: show UI (ADWCleaner).
 # NewMachineSetup installs every package in this catalog (profile is settings flavor only).
 $script:MBInstallerCatalog = [ordered]@{
@@ -195,7 +198,8 @@ $script:MBInstallerCatalog = [ordered]@{
 	'chrome' = [ordered]@{
 		id        = 'chrome'
 		name      = 'Google Chrome'
-		url       = 'https://dl.google.com/tag/s/appguid%3D%7B8A69D345-D564-463C-AFF1-A69D9E530F96%7D%26iid%3D%7B01BE02E1-8E3F-B3BD-885C-6A7E4415E17F%7D%26lang%3Den%26browser%3D5%26usagestats%3D0%26appname%3DGoogle%2520Chrome%26needsadmin%3Dtrue%26ap%3Dx64-stable-statsdef_0%26brand%3DGCEB/dl/chrome/install/GoogleChromeEnterpriseBundle64.zip'
+		# Enterprise offline bundle (no machine-specific iid tracking params)
+		url       = 'https://dl.google.com/dl/chrome/install/GoogleChromeEnterpriseBundle64.zip'
 		file      = 'GoogleChromeEnterpriseBundle64.zip'
 		kind      = 'zip_msi'
 		zip_entry = 'GoogleChromeStandaloneEnterprise64.msi'
@@ -455,7 +459,7 @@ namespace MB.Launch {
 } catch {}
 
 # Prefer a sane CWD: elevated "Run as admin" often starts in C:\Windows\System32,
-# which wrongly turns relative paths like Users\Owner\... into System32\Users\...
+# which wrongly turns relative paths like Users\Public\... into System32\Users\...
 $__mbWd = $null
 try { $__mbWd = (Get-Location).Path } catch { $__mbWd = $null }
 if ([string]::IsNullOrWhiteSpace($__mbWd)) { $__mbWd = $env:SystemRoot }
@@ -483,6 +487,10 @@ $script:MB = @{
 	ToolCalls          = 0
 	# Tool names invoked this session (for sticky tool-list glow)
 	UsedToolNames      = @{}
+	# Local share users created/reset this session (username → password) for CreateShare soft re-auth
+	ShareSessionUsers  = @{}
+	# Drive letter → UNC mapped this session (elevated agent may not see letter as S:\)
+	SessionDriveMaps   = @{}
 	ApprovalsGranted   = 0
 	ApprovalsDenied    = 0
 	LastToolMs         = 0
@@ -1079,6 +1087,21 @@ function Initialize-MBExtraApiBases {
 				}
 			}
 		} catch {}
+
+		# Primary -ApiKey (xAI xai-... / OpenAI sk-...) => apikey mode on primary base
+		try {
+			$pk = ''
+			try { $pk = [string]$ApiKey } catch { $pk = '' }
+			$pb = ''
+			try { $pb = [string]$script:MB.PrimaryApiBase } catch { $pb = '' }
+			if ([string]::IsNullOrWhiteSpace($pb)) {
+				try { $pb = Normalize-MBApiBase -Url ([string](Get-Variable -Name BaseUrl -ValueOnly -ErrorAction SilentlyContinue)) } catch {}
+			}
+			if ((Test-MBApiKeyUsable -Key $pk) -and -not [string]::IsNullOrWhiteSpace($pb)) {
+				Set-MBApiAuthModeForBase -BaseUrl $pb -Mode 'apikey'
+				Set-MBApiKeyForBase -BaseUrl $pb -ApiKeyValue $pk
+			}
+		} catch {}
 	} catch {
 		try { if ($null -eq $script:MB.ExtraApiBases) { $script:MB.ExtraApiBases = @() } } catch {}
 	}
@@ -1097,10 +1120,13 @@ function Get-MBConfiguredApiBases {
 		[void]$out.Add($n)
 	}
 	try { & $add ([string]$BaseUrl) } catch {}
+	try { & $add ([string]$script:MB.PrimaryApiBase) } catch {}
+	try { & $add ([string]$script:MB.ResolvedApiBase) } catch {}
+	try { & $add ([string]$script:MB.ActiveModelBase) } catch {}
 	try {
 		foreach ($x in @($script:MB.ExtraApiBases)) { & $add ([string]$x) }
 	} catch {}
-	if ($out.Count -eq 0) { [void]$out.Add('http://127.0.0.1:8080') }
+	if ($out.Count -eq 0) { [void]$out.Add('http://127.0.0.1:8080/v1') }
 	return @($out)
 }
 
@@ -1348,6 +1374,152 @@ namespace MiniBot.Core {
 		}
 	}
 
+	// Default playback volume/mute via Core Audio EndpointVolume (IAudioEndpointVolume).
+	[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+	class MMDeviceEnumeratorComObject { }
+
+	[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+	interface IMMDeviceEnumerator {
+		[PreserveSig] int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IntPtr ppDevices);
+		[PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+	}
+
+	[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+	interface IMMDevice {
+		[PreserveSig] int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+	}
+
+	[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+	interface IAudioEndpointVolume {
+		[PreserveSig] int RegisterControlChangeNotify(IntPtr pNotify);
+		[PreserveSig] int UnregisterControlChangeNotify(IntPtr pNotify);
+		[PreserveSig] int GetChannelCount(out uint pnChannelCount);
+		[PreserveSig] int SetMasterVolumeLevel(float fLevelDB, Guid pguidEventContext);
+		[PreserveSig] int SetMasterVolumeLevelScalar(float fLevel, Guid pguidEventContext);
+		[PreserveSig] int GetMasterVolumeLevel(out float pfLevelDB);
+		[PreserveSig] int GetMasterVolumeLevelScalar(out float pfLevel);
+		[PreserveSig] int SetChannelVolumeLevel(uint nChannel, float fLevelDB, Guid pguidEventContext);
+		[PreserveSig] int SetChannelVolumeLevelScalar(uint nChannel, float fLevel, Guid pguidEventContext);
+		[PreserveSig] int GetChannelVolumeLevel(uint nChannel, out float pfLevelDB);
+		[PreserveSig] int GetChannelVolumeLevelScalar(uint nChannel, out float pfLevel);
+		[PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, Guid pguidEventContext);
+		[PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool pbMute);
+	}
+
+	public static class AudioEndpoint {
+		const int eRender = 0;
+		const int CLSCTX_ALL = 23;
+
+		static IAudioEndpointVolume TryGetVol(out string error, out int roleUsed) {
+			error = null;
+			roleUsed = -1;
+			IMMDeviceEnumerator enu = null;
+			try {
+				enu = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+			} catch (Exception ex) {
+				error = "MMDeviceEnumerator unavailable: " + ex.Message;
+				return null;
+			}
+			// multimedia → console → communications (dock/HDMI/Bluetooth default-device oddities)
+			int[] roles = new int[] { 1, 0, 2 };
+			Guid iid = typeof(IAudioEndpointVolume).GUID;
+			foreach (int role in roles) {
+				IMMDevice dev = null;
+				try {
+					int hr = enu.GetDefaultAudioEndpoint(eRender, role, out dev);
+					if (hr < 0 || dev == null) continue;
+					object o = null;
+					hr = dev.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out o);
+					if (hr < 0 || o == null) continue;
+					IAudioEndpointVolume vol = o as IAudioEndpointVolume;
+					if (vol == null) continue;
+					roleUsed = role;
+					return vol;
+				} catch { }
+			}
+			error = "No default playback endpoint (render). Check Sound settings / external audio.";
+			return null;
+		}
+
+		public static bool TryGet(out float level, out bool mute, out string error, out int role) {
+			level = 0f;
+			mute = false;
+			error = null;
+			role = -1;
+			try {
+				IAudioEndpointVolume vol = TryGetVol(out error, out role);
+				if (vol == null) return false;
+				float v;
+				int hr = vol.GetMasterVolumeLevelScalar(out v);
+				if (hr < 0) {
+					error = "GetMasterVolumeLevelScalar failed HR=0x" + hr.ToString("X8");
+					return false;
+				}
+				bool m = false;
+				hr = vol.GetMute(out m);
+				if (hr < 0) {
+					level = v;
+					mute = false;
+					error = null;
+					return true;
+				}
+				level = v;
+				mute = m;
+				return true;
+			} catch (NullReferenceException) {
+				error = "Audio endpoint COM object was null (no default device or driver oddity).";
+				return false;
+			} catch (Exception ex) {
+				error = ex.Message;
+				return false;
+			}
+		}
+
+		public static bool TrySetLevel(float v, out string error) {
+			error = null;
+			try {
+				if (v < 0f) v = 0f;
+				if (v > 1f) v = 1f;
+				int role;
+				IAudioEndpointVolume vol = TryGetVol(out error, out role);
+				if (vol == null) return false;
+				int hr = vol.SetMasterVolumeLevelScalar(v, Guid.Empty);
+				if (hr < 0) {
+					error = "SetMasterVolumeLevelScalar failed HR=0x" + hr.ToString("X8");
+					return false;
+				}
+				return true;
+			} catch (NullReferenceException) {
+				error = "Audio endpoint COM object was null while setting level.";
+				return false;
+			} catch (Exception ex) {
+				error = ex.Message;
+				return false;
+			}
+		}
+
+		public static bool TrySetMute(bool m, out string error) {
+			error = null;
+			try {
+				int role;
+				IAudioEndpointVolume vol = TryGetVol(out error, out role);
+				if (vol == null) return false;
+				int hr = vol.SetMute(m, Guid.Empty);
+				if (hr < 0) {
+					error = "SetMute failed HR=0x" + hr.ToString("X8");
+					return false;
+				}
+				return true;
+			} catch (NullReferenceException) {
+				error = "Audio endpoint COM object was null while setting mute.";
+				return false;
+			} catch (Exception ex) {
+				error = ex.Message;
+				return false;
+			}
+		}
+	}
+
 }
 '@
 
@@ -1361,6 +1533,7 @@ namespace MiniBot.Core {
 }
 
 $script:HasNative = [bool]("MiniBot.Core.Native" -as [type])
+$script:HasAudioEndpoint = [bool]("MiniBot.Core.AudioEndpoint" -as [type])
 
 # Credential Manager helper (-StoreCredentials).
 if (-not ("MiniBot.Core.CredMan" -as [type])) {
@@ -2313,9 +2486,13 @@ function Get-MBServerPropsFromBase {
 	}
 	$user = [string]$Username
 	$pass = [string]$Password
+	$bt = [string]$BearerToken
+	if (-not (Test-MBApiKeyUsable -Key $bt)) {
+		try { $bt = Get-MBApiKeyForBase -BaseUrl $raw } catch { $bt = '' }
+	}
 	# Per-endpoint auth only (NPM on primary; Bearer on extras; never bleed primary NPM onto vLLM)
 	$headers = @{}
-	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $BearerToken
+	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $bt
 	if ($auth) {
 		$headers['Authorization'] = $auth
 	} elseif ($user -and $pass) {
@@ -2808,7 +2985,12 @@ function Get-MBRemoteModelsFromBase {
 	$pass = [string]$Password
 	# Per-endpoint auth only — extras do not inherit primary llama.cpp NPM
 	$headers = @{}
-	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $BearerToken
+	# Prefer explicit BearerToken; else resolved key for this base (xAI / cloud)
+	$bt = [string]$BearerToken
+	if (-not (Test-MBApiKeyUsable -Key $bt)) {
+		try { $bt = Get-MBApiKeyForBase -BaseUrl $raw } catch { $bt = '' }
+	}
+	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $bt
 	if ($auth) {
 		$headers['Authorization'] = $auth
 	} elseif ($user -and $pass) {
@@ -2816,9 +2998,15 @@ function Get-MBRemoteModelsFromBase {
 		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
 	}
 
-	$props = Get-MBServerPropsFromBase -BaseUrl $raw -Username $Username -Password $Password -BearerToken $BearerToken -TimeoutSeconds $TimeoutSeconds
+	$props = Get-MBServerPropsFromBase -BaseUrl $raw -Username $Username -Password $Password -BearerToken $bt -TimeoutSeconds $TimeoutSeconds
 
-	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+	try {
+		$proto = [System.Net.SecurityProtocolType]::Tls12
+		try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
+		[System.Net.ServicePointManager]::SecurityProtocol = $proto
+	} catch {
+		try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+	}
 	$OriginalProgressPreference = $Global:ProgressPreference
 	$Global:ProgressPreference = 'SilentlyContinue'
 	try {
@@ -2850,8 +3038,17 @@ function Get-MBRemoteModelsFromBase {
 						if (-not (Test-MBLooksLikeModelPath -S $row)) { $id = $row.Trim() }
 					} else {
 						$id = Get-MBPreferredModelAlias -Row $row -PropsAlias $propsAlias
+						# Cloud OpenAI-compat (xAI etc.): id is authoritative
+						if ([string]::IsNullOrWhiteSpace($id)) {
+							try {
+								if ($row.id) { $id = ([string]$row.id).Trim() }
+								elseif ($row.model) { $id = ([string]$row.model).Trim() }
+								elseif ($row.name) { $id = ([string]$row.name).Trim() }
+							} catch {}
+						}
 					}
 					if ([string]::IsNullOrWhiteSpace($id)) { continue }
+					if (Test-MBLooksLikeModelPath -S $id) { continue }
 					if ($ids -contains $id) { continue }
 					[void]$ids.Add($id)
 					$nCtx = 0; $nCtxTrain = 0; $nParams = 0; $sizeB = 0
@@ -3079,7 +3276,18 @@ function Refresh-MBRemoteModels {
 		$bestProps = $null
 		$bestNCtx = 0
 		foreach ($b in $apiBases) {
-			$r = Get-MBRemoteModelsFromBase -BaseUrl $b
+			$bt = ''
+			try { $bt = Get-MBApiKeyForBase -BaseUrl $b } catch { $bt = '' }
+			$r = Get-MBRemoteModelsFromBase -BaseUrl $b -BearerToken $bt
+			if (-not $r.Ok) {
+				# Retry once with launch -ApiKey if base is primary
+				try {
+					$lk = [string]$ApiKey
+					if ((Test-MBApiKeyUsable -Key $lk) -and -not (Test-MBApiKeyUsable -Key $bt)) {
+						$r = Get-MBRemoteModelsFromBase -BaseUrl $b -BearerToken $lk
+					}
+				} catch {}
+			}
 			if (-not $r.Ok) { continue }
 			$resolved = [string]$r.Base
 			$hostLab = Get-MBShortHostLabel -Base $resolved
@@ -3185,17 +3393,44 @@ function Refresh-MBRemoteModels {
 				if ($p -and $p.Ok) { $script:MB.ServerInfo = $p }
 			} catch {}
 		} elseif ($entries.Count -gt 1) {
-			$script:MB.ActiveModel = ''
-			$script:MB.ActiveModelKey = ''
-			if ($script:MB.Wpf) {
-				try {
-					$script:MB.Wpf.ActiveModel = ''
-					$script:MB.Wpf.ActiveModelKey = ''
-					$script:MB.Wpf.ModelDirty = $false
-				} catch {}
+			# Prefer -Model match already handled; otherwise auto-pick first so chat works (user can change in PoweredBy)
+			$pick = $entries[0]
+			try {
+				$launch = [string]$Model
+				if ($launch -and -not (Test-MBLooksLikeModelPath -S $launch)) {
+					$m2 = @($entries | Where-Object { $_.Id -eq $launch } | Select-Object -First 1)
+					if ($m2) { $pick = $m2 }
+					else {
+						# partial match e.g. Model=grok-4.5 against id grok-4.5-...
+						$m3 = @($entries | Where-Object { $_.Id -like ("*{0}*" -f $launch) } | Select-Object -First 1)
+						if ($m3) { $pick = $m3 }
+					}
+				}
+			} catch {}
+			Set-MBActiveModel -Id $pick.Id -Base $pick.Base -Key $pick.Key -Quiet
+			if ($pick.NCtx -gt 0) {
+				[void](Apply-MBServerContextWindow -NCtx ([int]$pick.NCtx) -Source 'server')
 			}
+			try {
+				$p = Get-MBServerPropsFromBase -BaseUrl ([string]$pick.Base)
+				if ($p -and $p.Ok) { $script:MB.ServerInfo = $p }
+			} catch {}
 		} elseif ($entries.Count -eq 0) {
 			# leave launch -Model as fallback only if not a path
+			try {
+				$launch = [string]$Model
+				if ($launch -and -not (Test-MBLooksLikeModelPath -S $launch) -and (Test-MBApiKeyUsable -Key ([string]$ApiKey) -or $true)) {
+					# Keep -Model as active even if /models list was empty (some gateways omit listing)
+					$pb = ''
+					try { $pb = [string]$script:MB.PrimaryApiBase } catch {}
+					if (-not $pb) { try { $pb = [string]$BaseUrl } catch {} }
+					if ($pb) {
+						Set-MBActiveModel -Id $launch -Base $pb -Key ("{0}|{1}" -f $launch, $pb) -Quiet
+					} else {
+						$script:MB.ActiveModel = $launch
+					}
+				}
+			} catch {}
 		}
 
 		if ($script:MB.Wpf) {
@@ -5517,7 +5752,13 @@ public const int ICON_BIG = 1;
 				}
 				$headers = @{}
 				if ($Mode -eq 'apikey' -and $Key) { $headers['Authorization'] = "Bearer $Key" }
-				try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+				try {
+					$proto = [System.Net.SecurityProtocolType]::Tls12
+					try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
+					[System.Net.ServicePointManager]::SecurityProtocol = $proto
+				} catch {
+					try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+				}
 				try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
 				$lastMsg = 'No response'
 				$lastCode = 0
@@ -5546,7 +5787,11 @@ public const int ICON_BIG = 1;
 							try { $code = [int]$_.Exception.Response.StatusCode } catch {}
 							if ($code -in 401, 403) {
 								if ($Mode -eq 'apikey') {
-									return @{ Ok = $false; StatusCode = $code; Message = "Authentication failed ($code) — check API key"; BaseUrl = $base }
+									return @{ Ok = $false; StatusCode = $code; Message = "Authentication failed ($code) - check Bearer API key (xAI: xai-... from console.x.ai). Auth mode must be API, not None/NPM."; BaseUrl = $base }
+								}
+								$bLow = ([string]$base).ToLowerInvariant()
+								if ($bLow -match 'api\.x\.ai|openai\.com|openrouter\.ai|together\.xyz|groq\.com') {
+									return @{ Ok = $false; StatusCode = $code; Message = "HTTP $code - select Auth mode API and paste your API key (not username/password)."; BaseUrl = $base }
 								}
 								return @{ Ok = $true; StatusCode = $code; Message = 'Reachable (auth required)'; BaseUrl = $base; NeedsAuth = $true }
 							}
@@ -5569,7 +5814,8 @@ public const int ICON_BIG = 1;
 				try {
 					if ($epConnect) {
 						$epConnect.IsEnabled = -not $On
-						$epConnect.Content = $(if ($On) { '…' } else { 'Connect' })
+						# ASCII-only (Unicode ellipsis mojibakes under PS 5.1 WPF)
+						$epConnect.Content = $(if ($On) { '...' } else { 'Connect' })
 					}
 					if ($epUrl) { $epUrl.IsEnabled = -not $On }
 					if ($epAuthNone) { $epAuthNone.IsEnabled = -not $On }
@@ -5619,6 +5865,15 @@ public const int ICON_BIG = 1;
 						if ([string]::IsNullOrWhiteSpace($u0)) { $u0 = [string]$Hint }
 						if ([string]::IsNullOrWhiteSpace($u0)) { $u0 = 'http://127.0.0.1:8080/v1' }
 						if ($epUrl) { $epUrl.Text = $u0 }
+						# Cloud OpenAI-compat (xAI etc.): default Auth = API, not None/NPM
+						$uLow = $u0.ToLowerInvariant()
+						if ($uLow -match 'api\.x\.ai|openai\.com|openrouter\.ai|together\.xyz|groq\.com|anthropic') {
+							try {
+								if ($epAuthKey) { $epAuthKey.IsChecked = $true }
+								if ($epAuthNone) { $epAuthNone.IsChecked = $false }
+								if ($epAuthNpm) { $epAuthNpm.IsChecked = $false }
+							} catch {}
+						}
 					} catch {}
 					if ($epError) { $epError.Text = '' }
 					if ($ok) { try { $ok.IsDefault = $false } catch {} }
@@ -6523,6 +6778,21 @@ function Connect-MBModelEndpoint {
 		BaseUrl        = (& $resolveBase)
 		TimeoutSeconds = $TimeoutSeconds
 	}
+	# Always attach launch -ApiKey when usable (xAI / OpenAI-compat Bearer)
+	try {
+		$launchKey = ''
+		try { $launchKey = [string]$ApiKey } catch {}
+		if (Test-MBApiKeyUsable -Key $launchKey) {
+			$testParams['BearerToken'] = $launchKey
+			try {
+				$pb = [string]$testParams.BaseUrl
+				if (-not [string]::IsNullOrWhiteSpace($pb)) {
+					Set-MBApiAuthModeForBase -BaseUrl $pb -Mode 'apikey'
+					Set-MBApiKeyForBase -BaseUrl $pb -ApiKeyValue $launchKey
+				}
+			} catch {}
+		}
+	} catch {}
 
 	# Empty / blank primary → ask for endpoint before any network call
 	if ([string]::IsNullOrWhiteSpace([string]$testParams.BaseUrl)) {
@@ -6568,8 +6838,23 @@ function Connect-MBModelEndpoint {
 		}
 	}
 
-	# Unreachable / invalid / wrong URL (not HTTP auth) → endpoint recovery dialog (do not just quit)
-	if ($connTest.StatusCode -notin 401, 403) {
+	# Helper: API-key cloud hosts must not fall into NPM username/password Login
+	$isApiKeyHost = {
+		param($Base)
+		try {
+			$m = Get-MBApiAuthModeForBase -BaseUrl $Base
+			if ($m -eq 'apikey') { return $true }
+		} catch {}
+		try {
+			if ($testParams.ContainsKey('BearerToken') -and (Test-MBApiKeyUsable -Key ([string]$testParams['BearerToken']))) { return $true }
+		} catch {}
+		$u = ([string]$Base).ToLowerInvariant()
+		if ($u -match 'api\.x\.ai|openai\.com|api\.openai|openrouter\.ai|together\.xyz|groq\.com') { return $true }
+		return $false
+	}.GetNewClosure()
+
+	# Unreachable / invalid URL, OR API-key 401 → Connect dialog (not NPM Login)
+	if ($connTest.StatusCode -notin 401, 403 -or (& $isApiKeyHost ([string]$testParams.BaseUrl))) {
 		$maxEndpointRounds = 6
 		$epRound = 0
 		while ($epRound -lt $maxEndpointRounds) {
@@ -6627,7 +6912,11 @@ function Connect-MBModelEndpoint {
 				return @{ Success = $true; ConnTest = $connTest; Exit = $false }
 			}
 			if ($connTest.StatusCode -in 401, 403) {
-				# Reachable but needs credentials — same window flips to Login layer
+				if (& $isApiKeyHost ([string]$testParams.BaseUrl)) {
+					# Wrong/missing API key — stay in Connect recovery (API auth), not NPM Login
+					continue
+				}
+				# Reachable but needs NPM Basic credentials — flip to Login layer
 				break
 			}
 		}
@@ -6638,6 +6927,17 @@ function Connect-MBModelEndpoint {
 				Exit     = $true
 				SoftExit = $true
 				Message  = $(if ($connTest.Message) { [string]$connTest.Message } else { 'Unable to connect to endpoint.' })
+			}
+		}
+		# Exhausted Connect rounds still on API-key 401
+		if ((& $isApiKeyHost ([string]$testParams.BaseUrl)) -and $connTest.StatusCode -in 401, 403) {
+			try { Close-MBLoginSession } catch {}
+			return @{
+				Success  = $false
+				ConnTest = $connTest
+				Exit     = $true
+				SoftExit = $true
+				Message  = $(if ($connTest.Message) { [string]$connTest.Message } else { 'API key rejected (HTTP 401/403). Use BaseUrl https://api.x.ai/v1 and Auth mode API with your xai-... key.' })
 			}
 		}
 	}
@@ -7065,6 +7365,40 @@ function Request-Confirmation {
 	return (Request-MBWpfConfirmation -Title $Title -Details $Details -Code $Code -CodeLang $CodeLang)
 }
 
+function Resolve-MBSessionMappedUnc {
+	# MapNetworkDrive may live in a session the agent can't see as S:\ — rewrite to UNC we recorded.
+	param([string]$Path)
+	$p = ([string]$Path).Trim().Trim('"').Trim("'")
+	if ($p -notmatch '^(?i)([A-Z]):(\\.*)?$') { return $null }
+	$let = $Matches[1].ToUpperInvariant()
+	$rest = ''
+	if ($Matches.Count -gt 2 -and $Matches[2]) { $rest = [string]$Matches[2] }
+	try {
+		if ($null -eq $script:MB.SessionDriveMaps -or -not ($script:MB.SessionDriveMaps -is [hashtable])) {
+			return $null
+		}
+		if (-not $script:MB.SessionDriveMaps.ContainsKey($let)) { return $null }
+		$uncRoot = [string]$script:MB.SessionDriveMaps[$let]
+		if ([string]::IsNullOrWhiteSpace($uncRoot)) { return $null }
+		if ([string]::IsNullOrWhiteSpace($rest) -or $rest -eq '\') { return $uncRoot.TrimEnd('\') }
+		return ($uncRoot.TrimEnd('\') + '\' + $rest.TrimStart('\'))
+	} catch { return $null }
+}
+
+function Register-MBSessionDriveMap {
+	param([string]$Letter, [string]$Unc)
+	try {
+		if ($null -eq $script:MB.SessionDriveMaps -or -not ($script:MB.SessionDriveMaps -is [hashtable])) {
+			$script:MB.SessionDriveMaps = @{}
+		}
+		$let = ([string]$Letter).Trim().TrimEnd(':').ToUpperInvariant()
+		$u = ([string]$Unc).Trim()
+		if ($let -match '^[A-Z]$' -and $u) {
+			$script:MB.SessionDriveMaps[$let] = $u
+		}
+	} catch {}
+}
+
 function Resolve-MBPath {
 	param(
 		[string]$Path,
@@ -7079,7 +7413,18 @@ function Resolve-MBPath {
 			try {
 				if (Test-Path -LiteralPath $c) { return $c }
 			} catch {}
+			# Session-mapped letter → UNC when Test-Path on letter fails (elevated session isolation)
+			try {
+				$uncAlt = Resolve-MBSessionMappedUnc -Path $c
+				if ($uncAlt -and (Test-Path -LiteralPath $uncAlt)) { return $uncAlt }
+			} catch {}
 		}
+		# Direct letter path not in candidates expansion
+		try {
+			$uncDirect = Resolve-MBSessionMappedUnc -Path $Path
+			if ($uncDirect -and (Test-Path -LiteralPath $uncDirect)) { return $uncDirect }
+			if ($uncDirect) { return $uncDirect }
+		} catch {}
 		if ($cands.Count -gt 0) { return $cands[0] }
 		return $Path.Trim().Trim('"').Trim("'")
 	}
@@ -7102,7 +7447,18 @@ function Resolve-MBPath {
 			return [System.IO.Path]::GetFullPath((Join-Path $home $rest))
 		}
 	}
-	# Users\Owner\... without drive → C:\Users\Owner\... (not under System32 CWD)
+	# Session map: S:\foo → \\server\share\foo when letter mapped this session but not visible to agent
+	try {
+		$uncMap = Resolve-MBSessionMappedUnc -Path $p
+		if ($uncMap) {
+			# Prefer UNC if letter root is not visible
+			$letterRoot = $p.Substring(0, 2)
+			$letterOk = $false
+			try { $letterOk = Test-Path -LiteralPath ($letterRoot + '\') } catch { $letterOk = $false }
+			if (-not $letterOk) { return $uncMap }
+		}
+	} catch {}
+	# Users\Public\... without drive → C:\Users\Public\... (not under System32 CWD)
 	if ($p -match '^(?i)Users\\') {
 		return [System.IO.Path]::GetFullPath(('C:\' + $p))
 	}
@@ -7128,7 +7484,7 @@ function Resolve-MBPath {
 
 function Get-MBPathCandidates {
 	# Ordered list of absolute paths to try for a user/model-supplied path.
-	# Fixes common case: CWD is C:\Windows\System32 (elevated) + relative "Users\Owner\..."
+	# Fixes common case: CWD is C:\Windows\System32 (elevated) + relative "Users\Public\..."
 	param([string]$Path)
 	$list = New-Object System.Collections.ArrayList
 	$seen = @{}
@@ -7159,7 +7515,7 @@ function Get-MBPathCandidates {
 	}
 
 	# Unglue accidental System32 CWD joins (elevated launch):
-	# C:\Windows\System32\Users\Owner\... → C:\Users\Owner\...
+	# C:\Windows\System32\Users\Public\... → C:\Users\Public\...
 	# Also handle relative "Windows\System32\Users\..." leftovers.
 	if ($p -match '(?i)(?:^[A-Za-z]:\\)?Windows\\System32\\(Users\\.+)$') {
 		& $add ('C:\' + $Matches[1])
@@ -7207,7 +7563,7 @@ function Get-MBPathCandidates {
 			& $add ('C:\' + $rest)
 		}
 	} else {
-		# Users\Owner\... or Documents\... without drive → treat as under C:\ or profile
+		# Users\Public\... or Documents\... without drive → treat as under C:\ or profile
 		if ($p -match '^(?i)Users\\') {
 			& $add ('C:\' + $p)
 		}
@@ -7301,6 +7657,78 @@ function Sanitize-MBText {
 		$s = [regex]::Replace([string]$Text, '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', ' ')
 		return $s
 	}
+}
+
+function Sanitize-MBProcessOutput {
+	# Strip PowerShell CLIXML / progress noise from child stdout/stderr (context killers for local models).
+	param([AllowNull()][string]$Text)
+	if ($null -eq $Text -or $Text.Length -eq 0) { return '' }
+	$s = [string]$Text
+	try {
+		# Full CLIXML dump: "#< CLIXML\n<Objs ...>...</Objs>"
+		if ($s -match '(?is)#<\s*CLIXML\s*<Objs[\s\S]*?</Objs>') {
+			$msgs = New-Object System.Collections.ArrayList
+			foreach ($m in [regex]::Matches($s, '(?is)<S\s+N="Message"[^>]*>(.*?)</S>')) {
+				$t = [System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value).Trim()
+				if ($t) { [void]$msgs.Add($t) }
+			}
+			if ($msgs.Count -eq 0) {
+				foreach ($m in [regex]::Matches($s, '(?is)<S\s+N="FullyQualifiedErrorId"[^>]*>(.*?)</S>')) {
+					$t = [System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value).Trim()
+					if ($t) { [void]$msgs.Add($t) }
+				}
+			}
+			if ($msgs.Count -gt 0) {
+				$s = ($msgs | Select-Object -First 6) -join "`n"
+			} else {
+				$s = ($s -replace '(?is)#<\s*CLIXML\s*<Objs[\s\S]*?</Objs>', '[CLIXML error stream scrubbed]').Trim()
+			}
+		} else {
+			# Partial / nested CLIXML fragments
+			$s = [regex]::Replace($s, '(?is)#<\s*CLIXML\s*', '')
+			$s = [regex]::Replace($s, '(?is)<Objs\b[^>]*>[\s\S]*?</Objs>', '')
+			$s = [regex]::Replace($s, '(?is)<Obj\b[^>]*>[\s\S]*?</Obj>', '')
+		}
+		# Progress / Information stream boilerplate sometimes leaks as bare tags
+		$s = [regex]::Replace($s, '(?im)^\s*Preparing modules for first use\.?\s*$', '')
+		$s = [regex]::Replace($s, '(?im)^\s*Loading personal and system profiles\.?\s*$', '')
+	} catch {}
+	return (Sanitize-MBText -Text $s)
+}
+
+function ConvertFrom-MBToolJson {
+	# Parse tool JSON string results into objects for nested bundles (QuickDiag etc.).
+	param($Value)
+	if ($null -eq $Value) { return $null }
+	if ($Value -is [string]) {
+		$t = $Value.Trim()
+		if ([string]::IsNullOrWhiteSpace($t)) { return $null }
+		if ($t.StartsWith('{') -or $t.StartsWith('[')) {
+			try { return ($t | ConvertFrom-Json -ErrorAction Stop) } catch {}
+		}
+		if ($t -match '^(?i)ERROR:') {
+			return [pscustomobject]@{ ok = $false; error = $t }
+		}
+		return [pscustomobject]@{ value = $t }
+	}
+	return $Value
+}
+
+function Format-MBShortToolError {
+	# Packages / soft tools: always {success:false,error} — never echo child runner dumps.
+	param(
+		[string]$ErrorText = '',
+		[string]$Fallback = 'operation failed'
+	)
+	$msg = Sanitize-MBProcessOutput -Text $ErrorText
+	if ([string]::IsNullOrWhiteSpace($msg)) { $msg = $Fallback }
+	$msg = $msg.Trim()
+	# Drop "ERROR:" / "BLOCKED:" prefixes for cleaner JSON
+	if ($msg -match '^(?i)(ERROR|BLOCKED BY USER|BLOCKED|CANCELLED)\s*:\s*(.+)$') {
+		$msg = $Matches[2].Trim()
+	}
+	if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 397) + '...' }
+	return ConvertTo-MBJson ([ordered]@{ success = $false; error = $msg })
 }
 
 function ConvertTo-MBWireJson {
@@ -8059,8 +8487,11 @@ function New-MBChatRequestBody {
 # Cold-start group map. Model enables groups by these names.
 # Short labels for errors / ListToolGroups only (not expanded into every system prompt OFF line)
 $script:MBGroupQuickMap = [ordered]@{
-	senses = 'vision/TTS'; system = 'inventory'; network = 'LAN/shares-find'
-	diag = 'BSOD/disk/events'; repair = 'sfc/dism/chkdsk'; setup = 'tune/setup'
+	senses = 'vision/TTS'
+	system = 'inventory+services+volume+brightness'
+	network = 'LAN/shares-find'
+	diag = 'BSOD/disk/events'; repair = 'sfc/dism/chkdsk'
+	setup = 'options/GroupPolicy/restore/uninstall/reboot/NewMachine'
 	identity = 'users/domain'; shares = 'map/share/print'; installers = 'apps'
 	sandbox = 'PS lab'; files = 'dl/zip/cab/iso'; packages = 'PSGallery'
 	registry = 'reg'; clipboard = 'clip'; web = 'HTTP/GitHub'
@@ -8068,23 +8499,34 @@ $script:MBGroupQuickMap = [ordered]@{
 
 $script:MBSystemPromptBase = @"
 You are $AgentName v$Version - local Windows tool-first agent (PS 5.1). Evidence only; concise; CWD-relative paths unless absolute; never dump multi-MB/binary/.dmp.
-No delete/destroy unless operator asked for that specific target. Mutate after read when possible; deny = stop. Prefer tools over RunCommand.
+No delete/destroy unless operator asked for that specific target. Mutate after read when possible; deny = stop + replan (never retry the same blocked approach). Prefer specialized tools; RunCommand is LAST resort.
 Never ReadFile images/video/PDF/binary (crashes servers) — vision: senses ReadImage/ReadPdf; operator display: markdown below.
 INLINE MEDIA (chat UI) — REQUIRED for play/show/hear: always embed on its own line as ![label](absolute-path). Prefer absolute Windows paths. Images png/jpg/gif/webp/bmp/tif; video mp4/m4v/mov/wmv; audio mp3/wav/flac/m4a/aac/ogg/wma. After DownloadFile / ViewScreen save / FindFiles pick / any "play or show" ask: emit ![…](…) so it plays in-chat. NEVER Start-Process/Invoke-Item/explorer/VLC/default-app first. External player ONLY if format not inline-compatible or operator explicitly asked external. Do not reply with a bare path alone when they should see/hear it.
-Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration).
-MAP: senses=vision/TTS | system=inventory | network=LAN+ProbeShares+lists | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=tune/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso | packages=PSGallery | registry | clipboard | web=HTTP/GitHub
+Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration). If a tool is missing: ERROR may say missing_tool=X group=Y — EnableToolGroup group=Y then call X same turn; do NOT invent COM/shell.
+ROUTER (intent→tool; enable group first if off; do not shell these):
+ volume|mute|unmute|speaker → EnableToolGroup group=system then AudioVolume (action=get|set|mute|unmute; level=0-100)
+ brightness|dim display → EnableToolGroup group=system then DisplayBrightness (action=get|set; level=0-100)
+ service start/stop/restart → EnableToolGroup group=system then ControlService
+ kill process → EnableToolGroup group=diag then StopProcess
+ find shares/LAN → EnableToolGroup group=network then ProbeShares/ScanNetwork
+ sfc|dism|chkdsk → EnableToolGroup group=repair then RunRepairTool
+ reboot/shutdown → EnableToolGroup group=setup then Reboot
+ group policy / gpedit / Policies registry → EnableToolGroup group=setup then GroupPolicy (list_catalog|get|set|remove|gpupdate)
+ NEVER RunCommand for volume/mute/brightness/endpoint COM/AudioEndpointVolume/IAudioEndpointVolume/nircmd volume — use AudioVolume/DisplayBrightness (system group).
+ NEVER raw reg.exe for policy keys if GroupPolicy tool available (setup group).
+MAP: senses=vision/TTS | system=inventory+services+AudioVolume+DisplayBrightness | network=LAN+ProbeShares+lists | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=options+GroupPolicy+restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso | packages=PSGallery | registry | clipboard | web=HTTP/GitHub
 FindFiles: multi-ext one call; truncated=normal (use rows); specific ask→narrow; vague play/show→pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice→tell operator. User text = results only.
 "@
 
 $script:MBGroupPrompt = [ordered]@{
 	core = @"
-CORE: text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; HexView/HexEdit (path2=diff, next_diff, annotate magic/PE/controls/ASCII+UTF16 strings); RunCommand; CWD/env; EnableToolGroup. Prefer specialized tools. MEDIA: always ![label](absolute-path) inline in chat for play/show — shell-open/default app last resort only.
+CORE: text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; HexView/HexEdit; RunCommand (last resort); CWD/env; EnableToolGroup. Prefer specialized tools. MEDIA: ![label](absolute-path) inline for play/show. Volume/mute/brightness are system group (AudioVolume/DisplayBrightness) — not RunCommand.
 "@
 	senses = @"
 SENSES: ReadImage (vision, auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true → show with ![label](path) inline, not external open); SpeakText. No ReadFile on images/PDF.
 "@
 	system = @"
-SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime. Prefer over Get-ComputerInfo.
+SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime; AudioVolume (volume/mute); DisplayBrightness. Prefer over Get-ComputerInfo / shell COM. Services: ControlService not shell.
 "@
 	network = @"
 NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; ProbeShares (REQUIRED to find shares - never net view loops); GetLocalShares/MappedDrives/Printers. Known host→ProbeShares computer=; search→omit hosts. Then shares group to map/create.
@@ -8096,7 +8538,7 @@ DIAG: BSOD/events/disk/startup/tasks/drivers/StopProcess/RunQuickDiagnostics. Ne
 REPAIR: RunRepairTool sfc|dism|chkdsk (prompt). Prefer diag first.
 "@
 	setup = @"
-SETUP: volume/brightness/options/restore/uninstall/reboot/NewMachineSetup (prompt on mutate).
+SETUP: List/SetWindowsOption; GroupPolicy (local Policies registry editor: list_catalog/get/set/remove/gpupdate — prompt on mutate); SystemRestore; UninstallSoftware; Reboot; NewMachineSetup. Volume/brightness = system group.
 "@
 	identity = @"
 IDENTITY: Add/RemoveLocalUser; Join/LeaveDomain. Leave needs local admin creds in chat (NEED_INPUT if missing).
@@ -8176,8 +8618,8 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents under path."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" } }; required = @("path","pattern") } } },
 	@{ type = "function"; function = @{ name = "DiffText"; description = "Line diff of two strings or files."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" } }; required = @("left","right") } } },
-	@{ type = "function"; function = @{ name = "HexView"; description = "Hex dump for software/binary testing. offset/length/width; annotate=true (default) labels file magic, PE map (sections/dirs/entry file offset/imports/exports), control chars (NUL/TAB/LF/CR/...), ASCII + UTF-16LE strings, byte-class counts. DIFF: path2= side-by-side (* / XX!). next_diff=true seeks next differing byte. Prefer over dual ReadFile for binary compare."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default true)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes at offset (hex= or bytes[]). ALWAYS prompts. Prefer HexView first (use path2 to verify)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; extend = @{ type = "boolean" }; backup = @{ type = "boolean" } }; required = @("path","offset") } } },
+	@{ type = "function"; function = @{ name = "HexView"; description = "Binary inspect for PE/abandonware: hex dump + labels; disasm=true for x86/x64 listing (jmp/je/jne/jnz/jcc/call/ret with FILE offsets); trace=true walks control flow; at_entry=true starts at PE entry. Follow targets via offset=0x... disasm=true. Prefer HexView over [IO.File]::ReadAllBytes. DIFF: path2/next_diff. Patch jumps with HexEdit (JNE 75->EB force, or 90 90 nop)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default true)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" }; disasm = @{ type = "boolean"; description = "x86/x64 disassembly listing; resolves jmp/jcc/call relative targets to file offsets" }; trace = @{ type = "boolean"; description = "Walk control flow from offset (follow JMP; list JE/JNE both paths)" }; at_entry = @{ type = "boolean"; description = "Start at PE entry point file offset" }; max_insns = @{ type = "integer"; description = "Disasm instruction count (default 48, max 200)" }; max_steps = @{ type = "integer"; description = "Trace steps (default 32, max 80)" }; follow_calls = @{ type = "boolean"; description = "trace: step into CALL targets" }; prefer_branch = @{ type = "string"; description = "trace: fallthrough (default) or taken at Jcc" }; arch = @{ type = "string"; description = "auto|x86|x64 (default auto from PE)" }; dump_hex = @{ type = "boolean"; description = "Include hex dump (default true)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes at offset (hex= or bytes[]). ALWAYS prompts. For jumps: HexView disasm first; common patches JE/JNE short 74/75 -> EB (always) or 90 90 (nop). Prefer HexView path2 to verify."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; extend = @{ type = "boolean" }; backup = @{ type = "boolean" } }; required = @("path","offset") } } },
 	@{ type = "function"; function = @{ name = "GetWorkingDirectory"; description = "Agent CWD."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "SetWorkingDirectory"; description = "Set agent CWD."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "GetEnvironment"; description = "Env vars / PATH summary."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" } } } } },
@@ -8193,30 +8635,30 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "Clipboard"; description = "Read or write clipboard text. Always requires approval."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; enum = @("read","write") }; text = @{ type = "string" } }; required = @("action") } } },
 	@{ type = "function"; function = @{ name = "ViewScreen"; description = "Look at the desktop for vision (MemoryStream base64; NO file by default). NO approval. DEFAULT: omit save and path - capture stays in memory for the next model turn only. ONLY set save=true or path= when the user explicitly wants a PNG on disk. After a disk save, reply with the exact path. monitor: primary|all|0|1|... Do not save screenshots unprompted."; parameters = @{ type = "object"; properties = @{ save = @{ type = "boolean"; description = "Write PNG to disk. Default false = memory only. true without path = Desktop. Only when user asked to save." }; path = @{ type = "string"; description = "Disk save path (file or folder). Implies save. Only when user asked for a file. Omit for look-only." }; monitor = @{ type = "string"; description = "primary | all | 0-based monitor index" }; x = @{ type = "integer" }; y = @{ type = "integer" }; width = @{ type = "integer" }; height = @{ type = "integer" }; maxWidth = @{ type = "integer"; description = "Vision downscale max width (default 1280); disk save (if any) is full-res" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetBSODInfo"; description = "Recent BSOD/minidump info + related events."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "GetEventLogs"; description = "Recent errors/warnings + disk I/O events."; parameters = @{ type = "object"; properties = @{ hours = @{ type = "integer" } } } } },
+	@{ type = "function"; function = @{ name = "GetEventLogs"; description = "Recent errors/warnings + disk I/O events. Collapses duplicate Id+Provider (e.g. DCOM 10016 spam) into Count. Default hours=72 max=40."; parameters = @{ type = "object"; properties = @{ hours = @{ type = "integer"; description = "Lookback hours (default 72, max 168)" }; max = @{ type = "integer"; description = "Max unique event rows (default 40)" } } } } },
 	@{ type = "function"; function = @{ name = "GetDiskHealth"; description = "Physical disk health + SMART counters."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetDiskSpace"; description = "Drive free/used + top folders under path. Recursive sizes use a fast Win32 FindFirstFileEx walk, not PowerShell Get-ChildItem -Recurse."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Folder whose top-level children are sized (default C:\\)" }; deep = @{ type = "boolean"; description = "true (default) = full recursive under each top-level child; false = immediate files only" }; top = @{ type = "integer"; description = "How many largest folders to return (default 10)" }; timeout_sec = @{ type = "integer"; description = "Scan budget seconds (default 45)" } } } } },
 	@{ type = "function"; function = @{ name = "GetInstalledSoftware"; description = "Installed programs (Uninstall registry). Optional name filter; caps results for context."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Filter by display name or publisher (substring)" }; max = @{ type = "integer"; description = "Max rows (default 200, max 1000)" } } } } },
 	@{ type = "function"; function = @{ name = "GetDriverInfo"; description = "Query PnP drivers with filters."; parameters = @{ type = "object"; properties = @{ filter = @{ type = "string"; description = "unsigned, microsoft, realtek, nvidia, network, audio, storage, or free text" }; limit = @{ type = "integer" }; showAll = @{ type = "boolean" } } } } },
-	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services (capped; default max_services=25, system noise deprioritized)."; parameters = @{ type = "object"; properties = @{ max_services = @{ type = "integer"; description = "Max auto services to return (default 25)" }; include_all_services = @{ type = "boolean"; description = "true = dump all auto services up to max (default false prioritizes non-system)" } } } } },
 	@{ type = "function"; function = @{ name = "GetMemoryInfo"; description = "RAM usage + top consumers."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetNetworkInfo"; description = "Adapters + connectivity test."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "GetLocalShares"; description = "List SMB shares published on THIS PC (not remote discovery). Read-only. Returns share name, path, and who has access: share_access / access_summary (share ACL via Get-SmbShareAccess) plus optional ntfs_access on the folder. Special shares (C$, ADMIN$, IPC$) omitted unless include_special=true. include_ntfs=false for share ACL only. For remote shares use ProbeShares; to create use CreateShare; to unpublish use RemoveShare."; parameters = @{ type = "object"; properties = @{ include_special = @{ type = "boolean"; description = "Include admin/special shares ending in $ (default false)" }; include_ntfs = @{ type = "boolean"; description = "Include NTFS ACL on share path (default true)" }; max = @{ type = "integer"; description = "Max shares (default 80)" } } } } },
+	@{ type = "function"; function = @{ name = "GetLocalShares"; description = "List SMB shares published on THIS PC (not remote discovery). Read-only. Returns share name, path, and who has access: share_access / access_summary (share ACL via Get-SmbShareAccess) plus optional ntfs_access on the folder. Special shares (C$, ADMIN$, IPC$) omitted unless include_special=true. include_ntfs=false for share ACL only. Clipboard copy is opt-in: copy_clipboard=true. For remote shares use ProbeShares; to create use CreateShare; to unpublish use RemoveShare."; parameters = @{ type = "object"; properties = @{ include_special = @{ type = "boolean"; description = "Include admin/special shares ending in $ (default false)" }; include_ntfs = @{ type = "boolean"; description = "Include NTFS ACL on share path (default true)" }; copy_clipboard = @{ type = "boolean"; description = "Copy first UNC to clipboard (default false, opt-in)" }; max = @{ type = "integer"; description = "Max shares (default 80)" } } } } },
 	@{ type = "function"; function = @{ name = "GetMappedDrives"; description = "List network drive mappings on THIS PC (letter -> UNC, status). Read-only. Combines Get-SmbMapping, PSDrive, net use. include_disconnected=false to hide Unavailable. Not for finding remote shares (ProbeShares) or mapping (MapNetworkDrive). To disconnect use RemoveMappedDrive (setup group)."; parameters = @{ type = "object"; properties = @{ include_disconnected = @{ type = "boolean"; description = "Include Unavailable/Disconnected maps (default true)" } } } } },
 	@{ type = "function"; function = @{ name = "GetPrinters"; description = "List printers on THIS PC (local + network connections). Read-only. Returns name, port, driver, default, shared. Use RemoveNetworkPrinter to remove; AddNetworkPrinter to add a UNC printer."; parameters = @{ type = "object"; properties = @{ include_remote = @{ type = "boolean"; description = "Include network/UNC printers (default true)" }; max = @{ type = "integer"; description = "Max rows (default 80)" } } } } },
 	@{ type = "function"; function = @{ name = "ScanNetwork"; description = "Scan the local LAN for machines and identify them (IP, MAC, hostname, MAC vendor). Harness-native LAN discovery (no GUI). Discovery: active=true (default) uses fast flood-ping - Test-Connection -Count 1 -AsJob for the whole subnet at once then Wait-Job. Then ARP/neighbors + SendARP MAC discovery (required for vendor OUI), reverse DNS, macvendorlookup. active=false = ARP only (quieter). Default auto primary private /24. Returns sorted hosts. To find which hosts export a share, call ProbeShares next (not RunCommand)."; parameters = @{ type = "object"; properties = @{ subnet = @{ type = "string"; description = "Optional CIDR or prefix e.g. 192.168.1.0/24 or 192.168.1. (default auto)" }; active = @{ type = "boolean"; description = "Flood-ping subnet then ARP/MAC resolve (default true). false = neighbors only" }; resolve_mac = @{ type = "boolean"; description = "SendARP MAC discovery for IPs missing MAC (default true; required for vendors)" }; resolve_hostnames = @{ type = "boolean"; description = "Reverse DNS (default true)" }; resolve_vendors = @{ type = "boolean"; description = "MAC OUI vendor lookup (default true; needs internet + MAC)" }; timeout_ms = @{ type = "integer"; description = "Wait-Job timeout budget ms for flood (default 4000 effective floor)" }; max_hosts = @{ type = "integer"; description = "Max addresses to flood-ping (default 254, max 1022)" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "ProbeShares"; description = "REQUIRED tool when the user asks to find/locate/discover a network share (or which PC has a named share). Do not use RunCommand. TARGETED: computer=IP or hosts=['IP'] only those machines. SEARCH: omit hosts = auto LAN flood then probe. Then TCP 445/139 + timed net use guess (share_name=temp or common names). Optional username/password; access-denied still means share exists. Returns found_uncs/hosts_with_match - next call MapNetworkDrive (setup group). Not for creating shares (use CreateShare)."; parameters = @{ type = "object"; properties = @{ hosts = @{ type = "array"; items = @{ type = "string" }; description = "Known host IPs (targeted). Omit for auto LAN search." }; computer = @{ type = "string"; description = "Single known host (targeted)" }; share_name = @{ type = "string"; description = "Share name to try first e.g. temp" }; share_names = @{ type = "array"; items = @{ type = "string" }; description = "Extra share names to try" }; username = @{ type = "string"; description = "Optional HOST\\share for probe" }; password = @{ type = "string"; description = "Optional password for probe" }; port_timeout_ms = @{ type = "integer"; description = "TCP timeout ms (default 300)" }; probe_timeout_sec = @{ type = "integer"; description = "net use timeout sec per guess (default 3)" }; stop_on_first_match = @{ type = "boolean"; description = "Stop after first hit (default false)" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "GetWindowsUpdateStatus"; description = "Pending Windows updates (needs PSWindowsUpdate)."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetWindowsUpdateStatus"; description = "Pending Windows updates via native Microsoft.Update.Session COM (no PSGallery). Optional PSWindowsUpdate module fallback only if COM fails."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetSystemUptime"; description = "Uptime and last boot."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle: BSOD, events, disk health/space, memory."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle: BSOD, events (24h collapsed), disk health, one-level disk space, memory. Embeds objects not nested JSON strings."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "RunRepairTool"; description = "sfc, dism, or chkdsk. ALWAYS prompts for approval."; parameters = @{ type = "object"; properties = @{ tool = @{ type = "string"; enum = @("sfc","dism","chkdsk") }; driveLetter = @{ type = "string" }; arguments = @{ type = "string" } }; required = @("tool") } } },
 	@{ type = "function"; function = @{ name = "GetServiceStatus"; description = "Service status. Omit name to list services (optional status filter, max cap). With name = one service."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Service name; omit to list many" }; status = @{ type = "string"; description = "When listing: Running|Stopped|..." }; max = @{ type = "integer"; description = "Max when listing (default 250)" } } } } },
 	@{ type = "function"; function = @{ name = "ReadRegistry"; description = "Read registry key values."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "SetRegistry"; description = "Create/set a registry value (creates key if missing). ALWAYS prompts. type: String|ExpandString|MultiString|DWord|QWord|Binary."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "e.g. HKCU:\\Software\\MyApp" }; name = @{ type = "string"; description = "Value name; (default) for default value" }; value = @{ type = "string"; description = "Value (hex for Binary; MultiString newline/semicolon separated)" }; type = @{ type = "string"; description = "String (default) | ExpandString | MultiString | DWord | QWord | Binary" } }; required = @("path","name","value") } } },
-	@{ type = "function"; function = @{ name = "GetPowerInfo"; description = "Battery/power health summary."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "GetScheduledTasks"; description = "Scheduled tasks for diagnostics/persistence hunting."; parameters = @{ type = "object"; properties = @{ days = @{ type = "integer" }; filter = @{ type = "string" }; includeDisabled = @{ type = "boolean" }; exportPath = @{ type = "string" } } } } },
-	@{ type = "function"; function = @{ name = "MakeHttpRequest"; description = "HTTP client GET/POST/PUT/PATCH/DELETE/HEAD with auth, headers, JSON/form body."; parameters = @{ type = "object"; properties = @{ method = @{ type = "string"; enum = @("GET","POST","PUT","PATCH","DELETE","HEAD") }; url = @{ type = "string" }; headers = @{ type = "object" }; params = @{ type = "object" }; json_body = @{ type = "object" }; form_data = @{ type = "object" }; raw_data = @{ type = "string" }; bearer_token = @{ type = "string" }; basic_auth_username = @{ type = "string" }; basic_auth_password = @{ type = "string" }; cookies = @{ type = "object" }; content_type = @{ type = "string" }; verify_ssl = @{ type = "boolean" }; user_agent = @{ type = "string" }; timeout = @{ type = "integer" } }; required = @("method","url") } } },
-	@{ type = "function"; function = @{ name = "BrowsePage"; description = "Fetch webpage as clean readable text."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string" }; max_length = @{ type = "integer" }; verify_ssl = @{ type = "boolean" }; user_agent = @{ type = "string" }; extract_links = @{ type = "boolean" } }; required = @("url") } } },
+	@{ type = "function"; function = @{ name = "GetPowerInfo"; description = "Battery/power health summary as single clean JSON (ok/has_battery/fields). Soft errors as ok=false."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GetScheduledTasks"; description = "Scheduled tasks for diagnostics/persistence hunting. Default max=30, includeSystem=false (excludes Microsoft\\Windows + SYSTEM). filter=system|enabled|recent|user or name substring."; parameters = @{ type = "object"; properties = @{ days = @{ type = "integer" }; filter = @{ type = "string" }; includeDisabled = @{ type = "boolean" }; includeSystem = @{ type = "boolean"; description = "Include Microsoft\\Windows / SYSTEM tasks (default false)" }; max = @{ type = "integer"; description = "Max tasks returned (default 30)" }; exportPath = @{ type = "string" } } } } },
+	@{ type = "function"; function = @{ name = "MakeHttpRequest"; description = "HTTP client GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS with auth, headers, JSON/form/raw body. Default verify_ssl=false (bad/self-signed HTTPS via system curl -k). verify_ssl=true uses strict Invoke-WebRequest. Returns status_code, headers, body, final_url."; parameters = @{ type = "object"; properties = @{ method = @{ type = "string"; enum = @("GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS") }; url = @{ type = "string" }; headers = @{ type = "object" }; params = @{ type = "object" }; json_body = @{ type = "object" }; form_data = @{ type = "object" }; raw_data = @{ type = "string" }; bearer_token = @{ type = "string" }; basic_auth_username = @{ type = "string" }; basic_auth_password = @{ type = "string" }; cookies = @{ type = "object" }; content_type = @{ type = "string" }; verify_ssl = @{ type = "boolean"; description = "default false = curl -k for HTTPS; true = strict cert check" }; user_agent = @{ type = "string" }; timeout = @{ type = "integer"; description = "seconds (default 30, max 600)" } }; required = @("method","url") } } },
+	@{ type = "function"; function = @{ name = "BrowsePage"; description = "Fetch webpage as clean readable text. Default verify_ssl=false (bad HTTPS via system curl -k)."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string" }; max_length = @{ type = "integer" }; verify_ssl = @{ type = "boolean"; description = "default false = curl -k for HTTPS" }; user_agent = @{ type = "string" }; extract_links = @{ type = "boolean" } }; required = @("url") } } },
 	@{ type = "function"; function = @{ name = "ConvertGitHubUrl"; description = "Convert github.com URLs to raw.githubusercontent.com form."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string" } }; required = @("github_url") } } },
 	@{ type = "function"; function = @{ name = "GetGitHubRawFile"; description = "Fetch raw file content from a GitHub URL."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string" }; max_length = @{ type = "integer" } }; required = @("github_url") } } },
 	@{ type = "function"; function = @{ name = "ListGitHubDirectory"; description = "List files/folders in a GitHub repo (repo URL or tree/blob URL; optional ref)."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string"; description = "github.com owner/repo or tree/blob URL" }; ref = @{ type = "string"; description = "Branch/tag/commit if not in URL (default main)" } }; required = @("github_url") } } },
@@ -8234,21 +8676,22 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "UnmountIso"; description = "Dismount a mounted .iso (Dismount-DiskImage). ALWAYS prompts. Pass path= to the .iso and/or letter= drive (e.g. E). Prefer over shell Dismount-DiskImage."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Path to the .iso that is mounted" }; iso_path = @{ type = "string"; description = "Alias for path" }; letter = @{ type = "string"; description = "Drive letter e.g. E or E:" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "MakeCab"; description = "Build a .cab with makecab.exe (LZX by default) and live progress in the UI. ALWAYS prompts. source= folder (pack files inside) and/or files=[paths]. force=true overwrites. Prefer over raw makecab directive scripts."; parameters = @{ type = "object"; properties = @{ source = @{ type = "string"; description = "Folder whose files are packed (non-recursive by default)" }; path = @{ type = "string"; description = "Alias for source folder" }; files = @{ type = "array"; items = @{ type = "string" }; description = "Explicit file paths to pack" }; destination = @{ type = "string"; description = "Output .cab path" }; cab_path = @{ type = "string"; description = "Alias for destination" }; force = @{ type = "boolean"; description = "Overwrite existing .cab (default false)" }; recursive = @{ type = "boolean"; description = "When source is a folder, include subfolders (default false)" }; compression = @{ type = "string"; description = "LZX (default) | MSZIP | none" }; compression_level = @{ type = "integer"; description = "LZX level 1-7 (default 7)" }; compression_memory = @{ type = "integer"; description = "LZX memory 15-21 (default 21)" } }; required = @("destination") } } },
 	@{ type = "function"; function = @{ name = "ExpandCab"; description = "Extract a .cab with expand.exe. ALWAYS prompts. path= .cab, destination= output folder. force=true allows non-empty dest."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Source .cab path" }; cab_path = @{ type = "string"; description = "Alias for path" }; destination = @{ type = "string"; description = "Output folder" }; force = @{ type = "boolean"; description = "Allow extract into existing non-empty folder (default false)" } }; required = @("path","destination") } } },
-	@{ type = "function"; function = @{ name = "FindPSModule"; description = "Search PowerShell Gallery modules (read-only)."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Module name or wildcard" }; max_results = @{ type = "integer"; description = "Max results (default 15)" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "FindPSModule"; description = "Search PowerShell Gallery modules (read-only). Isolated process with timeout (default 60s); Esc/Stop aborts."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Module name or wildcard" }; max_results = @{ type = "integer"; description = "Max results (default 15)" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default 60)" } }; required = @("name") } } },
 	@{ type = "function"; function = @{ name = "GetInstalledPSModule"; description = "List installed PowerShell modules (optional name filter)."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Optional module name filter" } } } } },
-	@{ type = "function"; function = @{ name = "InstallPSModule"; description = "Install a PowerShell module (default CurrentUser scope). ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; version = @{ type = "string"; description = "Optional exact version" }; scope = @{ type = "string"; description = "CurrentUser (default) or AllUsers" }; allow_prerelease = @{ type = "boolean" } }; required = @("name") } } },
-	@{ type = "function"; function = @{ name = "UpdatePSModule"; description = "Update an installed PowerShell module. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; scope = @{ type = "string"; description = "CurrentUser or AllUsers (optional)" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "InstallPSModule"; description = "Install a PowerShell module (default CurrentUser scope). ALWAYS prompts. Isolated process with timeout (default 180s); Esc/Stop aborts — will not freeze MiniBot."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; version = @{ type = "string"; description = "Optional exact version" }; scope = @{ type = "string"; description = "CurrentUser (default) or AllUsers" }; allow_prerelease = @{ type = "boolean" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default 180)" } }; required = @("name") } } },
+	@{ type = "function"; function = @{ name = "UpdatePSModule"; description = "Update an installed PowerShell module. ALWAYS prompts. Isolated process with timeout (default 180s); Esc/Stop aborts — Gallery hangs will not freeze MiniBot."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; scope = @{ type = "string"; description = "CurrentUser or AllUsers (optional)" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default 180)" } }; required = @("name") } } },
 	@{ type = "function"; function = @{ name = "SpeakText"; description = "Speak text aloud via Windows built-in speech (System.Speech SAPI). Prefer short plain sentences. No approval."; parameters = @{ type = "object"; properties = @{ text = @{ type = "string"; description = "Text to speak" }; rate = @{ type = "integer"; description = "Speech rate -10..10 (default 1)" }; wait = @{ type = "boolean"; description = "true = block until finished (default false async)" } }; required = @("text") } } },
 	@{ type = "function"; function = @{ name = "AudioVolume"; description = "Get or set default playback volume/mute (Windows Core Audio). action=get|set|mute|unmute. level=0-100 for set. set/mute ALWAYS prompt."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "get (default) | set | mute | unmute" }; level = @{ type = "integer"; description = "0-100 percent when action=set" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "DisplayBrightness"; description = "Get or set internal display brightness when supported (usually laptops via WMI). action=get|set; level=0-100. Desktops often unsupported - tool reports that cleanly. set ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "get (default) | set" }; level = @{ type = "integer"; description = "0-100 percent when action=set" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "SetWindowsOption"; description = "Apply a named Windows setup/tune option (explorer, UAC, power, boot F8, network sharing, timezone, bitlocker-off, etc). option= catalog key; value= on|off|show|hide|... ALWAYS prompts. Call ListWindowsOptions for keys."; parameters = @{ type = "object"; properties = @{ option = @{ type = "string"; description = "e.g. explorer.hidden_files, power.max_performance, boot.f8_legacy" }; value = @{ type = "string"; description = "Target value (on/off/show/hide/timezone id/etc)" }; drive = @{ type = "string"; description = "Drive letter for bitlocker/restore options (default C:)" } }; required = @("option","value") } } },
 	@{ type = "function"; function = @{ name = "ListWindowsOptions"; description = "List SetWindowsOption catalog keys, allowed values, and short descriptions (read-only)."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "GroupPolicy"; description = "Local Group Policy editor via Policies registry (Administrative Template-style). NOT domain RSAT GPO. actions: status|list_catalog|get|set|remove|list_key|search|gpupdate|export_security. Prefer key= catalog shortcut; or path= + name=. set/remove/gpupdate ALWAYS prompt. Writes only under SOFTWARE\\Policies and CurrentVersion\\Policies. Optional gpupdate=true after set/remove."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "status|list_catalog|get|set|remove|list_key|search|gpupdate|export_security" }; key = @{ type = "string"; description = "Catalog key e.g. windows.update.no_auto_update (preferred for known settings)" }; path = @{ type = "string"; description = "Registry path e.g. HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU" }; name = @{ type = "string"; description = "Value name under path" }; value = @{ type = "string"; description = "Value for set (DWord/string)" }; type = @{ type = "string"; description = "DWord|String|ExpandString|MultiString|QWord (default DWord)" }; pattern = @{ type = "string"; description = "Filter for list_catalog/search" }; max = @{ type = "integer"; description = "Max rows (default 80)" }; gpupdate = @{ type = "boolean"; description = "After set/remove, run gpupdate /force (default false)" } }; required = @("action") } } },
 	@{ type = "function"; function = @{ name = "SystemRestore"; description = "System Restore: action=status|enable|disable|create|list. enable/create/disable ALWAYS prompt. create optional description=."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "status|enable|disable|create|list" }; description = @{ type = "string"; description = "Restore point description when action=create" }; drive = @{ type = "string"; description = "Drive letter (default C:)" } }; required = @("action") } } },
 	@{ type = "function"; function = @{ name = "UninstallSoftware"; description = "Uninstall an installed program by display name match (Uninstall registry). Prefer exact-ish name from GetInstalledSoftware first. ALWAYS prompts. No silent force beyond QuietUninstall/msiexec when available."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Display name substring to match" }; product_code = @{ type = "string"; description = "Optional MSI product code {GUID}" } }; required = @("name") } } },
-	@{ type = "function"; function = @{ name = "AddLocalUser"; description = "Create a local Windows user. ALWAYS prompts. Optional full_name, description, admin=true (Administrators group). Password is operator-visible (pass what they said; show it back in the result). To delete use RemoveLocalUser."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; password = @{ type = "string" }; full_name = @{ type = "string" }; description = @{ type = "string" }; admin = @{ type = "boolean"; description = "Add to local Administrators (default false)" } }; required = @("username","password") } } },
+	@{ type = "function"; function = @{ name = "AddLocalUser"; description = "Create a local Windows user. ALWAYS prompts. Optional full_name, description, admin=true (Administrators group). Password is operator-visible (pass what they said; show it back in the result). If the account already exists returns ok=false exists=true. To delete use RemoveLocalUser."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; password = @{ type = "string" }; full_name = @{ type = "string" }; description = @{ type = "string" }; admin = @{ type = "boolean"; description = "Add to local Administrators (default false)" } }; required = @("username","password") } } },
 	@{ type = "function"; function = @{ name = "JoinDomain"; description = "Join this PC to an Active Directory domain. ALWAYS prompts. Requires domain + domain join credentials. Optional ou= distinguished name, new_name= rename before join, reboot=true to restart after success."; parameters = @{ type = "object"; properties = @{ domain = @{ type = "string"; description = "Domain FQDN e.g. corp.example.com" }; username = @{ type = "string"; description = "Domain account authorized to join (DOMAIN\\user or user@domain)" }; password = @{ type = "string" }; ou = @{ type = "string"; description = "Optional target OU DN" }; new_name = @{ type = "string"; description = "Optional new computer name before join" }; reboot = @{ type = "boolean"; description = "Restart after successful join (default false)" } }; required = @("domain","username","password") } } },
 	@{ type = "function"; function = @{ name = "LeaveDomain"; description = "Leave the Active Directory domain (join workgroup). ALWAYS prompts. REQUIRED: local_username + local_password of a local admin that can sign in after disjoin. No UI password popup - if missing or auth fails, returns NEED_INPUT so you ASK the operator in chat. If no local admin exists, call AddLocalUser admin=true with a password the operator chooses, then LeaveDomain with those creds. workgroup= default WORKGROUP; reboot=true optional. Show the local admin password back to the operator when they provide it."; parameters = @{ type = "object"; properties = @{ workgroup = @{ type = "string"; description = "Target workgroup name (default WORKGROUP)" }; reboot = @{ type = "boolean"; description = "Restart after successful leave (default false)" }; local_username = @{ type = "string"; description = "REQUIRED local admin username" }; local_password = @{ type = "string"; description = "REQUIRED local admin password (operator-visible; no popup)" } }; required = @("local_username","local_password") } } },
-			@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional - if omitted or busy, auto-picks free letter D-Z (RescueMaker-style: skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. If username is set, password is required (no popup - NEED_INPUT if missing; ask operator in chat). Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M - omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string"; description = "Required when username set; ask operator if missing" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
+			@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional - if omitted or busy, auto-picks free letter D-Z (skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. If username is set, password is required (no popup - NEED_INPUT if missing; ask operator in chat). Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M - omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string"; description = "Required when username set; ask operator if missing" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "RemoveMappedDrive"; description = "Disconnect a mapped network drive letter on THIS PC. ALWAYS approval. REQUIRED: letter= (e.g. Z). Call GetMappedDrives first if unknown. Does not delete remote share data. Prefer over net use /delete in RunCommand."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Drive letter e.g. Z or Z:" }; path = @{ type = "string"; description = "Optional expected UNC (for display/verify)" }; force = @{ type = "boolean"; description = "Force remove (default true)" } }; required = @("letter") } } },
 @{ type = "function"; function = @{ name = "AddNetworkPrinter"; description = "Connect a network/shared printer (\\\\server\\printer). ALWAYS prompts. Optional name= friendly name, set_default=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Printer share UNC \\\\server\\printer" }; name = @{ type = "string"; description = "Optional local display name" }; set_default = @{ type = "boolean"; description = "Set as default printer (default false)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "RemoveNetworkPrinter"; description = "Remove a printer from THIS PC. ALWAYS approval. REQUIRED: name= exact printer name from GetPrinters (or path= UNC). Prefer over printui in RunCommand."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Printer name from GetPrinters" }; path = @{ type = "string"; description = "Alias - UNC or name" } }; required = @("name") } } },
@@ -8256,8 +8699,8 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "Reboot"; description = "Schedule reboot or shutdown, or abort a pending timer. ALWAYS approval. action=reboot (default) | shutdown | abort. delay_sec=60 default (0=immediate). force=true closes apps. reason= optional message. Abort pending with action=abort. Prefer over shutdown.exe in RunCommand."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "reboot | shutdown | abort" }; delay_sec = @{ type = "integer"; description = "Seconds before reboot/shutdown (default 60, max 86400)" }; reason = @{ type = "string"; description = "Optional comment shown in shutdown UI" }; force = @{ type = "boolean"; description = "Force-close apps (default true)" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "CreateShare"; description = "Share a local folder over SMB. ALWAYS approval once. REQUIRED: path, name, access_username, access_password (or share_password), everyone_full (true|false - ALWAYS ask: Everyone access or only a specific user?). If access_username exists: verifies password via local logon (does not overwrite). If missing: creates user. force_password_update=true (alias reset_password=true) only when operator wants to RESET password on existing user. Grants share+NTFS rights to that user; optionally Everyone. Optional access_right/permission = Full|Change|Read (DEFAULT Full if omitted - do not force Full when Read/Change requested). No UI popups. Show password back. SMBv1 check if off. Copies UNC."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; name = @{ type = "string" }; access_username = @{ type = "string"; description = "Local account for grant (created if missing). Not Everyone." }; access_password = @{ type = "string"; description = "Password for access_username" }; share_password = @{ type = "string"; description = "Alias for access_password" }; everyone_full = @{ type = "boolean"; description = "REQUIRED. true=also grant Everyone same access_right; false=only access_username" }; access_right = @{ type = "string"; description = "Full (default) | Change | Read - share+NTFS level" }; permission = @{ type = "string"; description = "Alias for access_right" }; force_password_update = @{ type = "boolean"; description = "true = reset existing user password to access_password (destructive; only when operator asks)" }; reset_password = @{ type = "boolean"; description = "Alias for force_password_update" }; description = @{ type = "string" }; ensure_network = @{ type = "boolean" }; ensure_discovery = @{ type = "boolean" }; ensure_folder = @{ type = "boolean" }; force = @{ type = "boolean" } }; required = @("path","name","access_username","access_password","everyone_full") } } },
 	@{ type = "function"; function = @{ name = "RemoveShare"; description = "Unpublish a local SMB share on THIS PC. ALWAYS approval. REQUIRED: name (share name from GetLocalShares). Removes the share only - does not delete the folder or local users. force=true (default) closes open files then removes. Refuses special/admin shares (C$, ADMIN$, IPC$, PRINT$). Prefer over RunCommand net share /delete."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Share name to remove (e.g. temp). UNC \\PC\\name also accepted." }; share = @{ type = "string"; description = "Alias for name" }; force = @{ type = "boolean"; description = "Force close sessions and remove (default true)" } }; required = @("name") } } },
-	@{ type = "function"; function = @{ name = "NewMachineSetup"; description = "Full new-machine setup. profile=residential|business (settings flavor only). ALWAYS prompts once listing SETTINGS + SOFTWARE. Settings: restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off. If portable, re-enable encryption after setup is recommended. Software (full personal catalog every time): 7zip, Chrome, Adobe Reader, ADWCleaner (runs a scan), VLC. skip_software=true for settings only. dry_run=true previews."; parameters = @{ type = "object"; properties = @{ profile = @{ type = "string"; description = "residential | business (settings notes only; software catalog is always the full personal set)" }; dry_run = @{ type = "boolean" }; timezone = @{ type = "string" }; skip_restore_point = @{ type = "boolean" }; skip_software = @{ type = "boolean" } }; required = @("profile") } } },
-	@{ type = "function"; function = @{ name = "ListInstallers"; description = "List silent installer catalog (id, name, notes). Read-only. Personal catalog: 7zip, chrome, adobe_reader, adwcleaner, vlc."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "NewMachineSetup"; description = "Full new-machine setup. profile=residential|business (settings flavor only). ALWAYS prompts once listing SETTINGS + SOFTWARE. Settings: restore, F8, max power, explorer UX, network discovery/sharing, time sync, Device Encryption off. If portable, re-enable encryption after setup is recommended. Software (full catalog every time): 7zip, Chrome, Adobe Reader, ADWCleaner (runs a scan), VLC. skip_software=true for settings only. dry_run=true previews."; parameters = @{ type = "object"; properties = @{ profile = @{ type = "string"; description = "residential | business (settings notes only; software catalog is always the full default set)" }; dry_run = @{ type = "boolean" }; timezone = @{ type = "string" }; skip_restore_point = @{ type = "boolean" }; skip_software = @{ type = "boolean" } }; required = @("profile") } } },
+	@{ type = "function"; function = @{ name = "ListInstallers"; description = "List silent installer catalog (id, name, notes). Read-only. Catalog: 7zip, chrome, adobe_reader, adwcleaner, vlc."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "InstallPackage"; description = "Silent download+install from the installers catalog. package=id or packages=[ids]. Follows redirects (dynamic URLs). ALWAYS prompts. Temp downloads cleaned after each package. Ids: 7zip, chrome, adobe_reader, adwcleaner (will run a scan), vlc."; parameters = @{ type = "object"; properties = @{ package = @{ type = "string"; description = "Single package id" }; packages = @{ type = "array"; items = @{ type = "string" }; description = "Multiple package ids" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently enable group(s): group=network,shares or groups=[diag,repair]. See MAP. Then call tools same turn; never narrate."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string" }; groups = @{ type = "array"; items = @{ type = "string" } } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "ListToolGroups"; description = "List groups/tools. Prefer EnableToolGroup + MAP."; parameters = @{ type = "object"; properties = @{} } } }
@@ -8276,7 +8719,9 @@ $script:MBToolCatalog = [ordered]@{
 	)
 	system = @(
 		'GetSystemInfo','GetProcessList','GetProcessTree','GetMemoryInfo','GetPowerInfo',
-		'GetServiceStatus','ControlService','GetInstalledSoftware','GetWindowsUpdateStatus','GetSystemUptime'
+		'GetServiceStatus','ControlService','GetInstalledSoftware','GetWindowsUpdateStatus','GetSystemUptime',
+		# Endpoint UX: not setup (reboot/NewMachine) and not core — enable system when needed
+		'AudioVolume','DisplayBrightness'
 	)
 	network = @(
 		'GetNetworkInfo','GetNetConnections','ScanNetwork','ProbeShares','GetLocalShares','GetMappedDrives','GetPrinters'
@@ -8287,7 +8732,7 @@ $script:MBToolCatalog = [ordered]@{
 	)
 	repair    = @('RunRepairTool')
 	setup     = @(
-		'AudioVolume','DisplayBrightness','SetWindowsOption','ListWindowsOptions',
+		'SetWindowsOption','ListWindowsOptions','GroupPolicy',
 		'SystemRestore','UninstallSoftware','Reboot','NewMachineSetup'
 	)
 	identity  = @(
@@ -8319,7 +8764,7 @@ $script:MBToolGroupMeta = [ordered]@{
 	}
 	system = @{
 		Label       = 'System'
-		Description = 'Inspect this PC: hardware, processes, memory, services, installed software, and uptime.'
+		Description = 'This PC: hardware, processes, memory, services, software, uptime, plus volume/mute (AudioVolume) and display brightness.'
 	}
 	network = @{
 		Label       = 'Network'
@@ -8335,7 +8780,7 @@ $script:MBToolGroupMeta = [ordered]@{
 	}
 	setup = @{
 		Label       = 'Setup / Tune'
-		Description = 'Tune Windows: volume, brightness, options, restore points, uninstall, reboot, new-machine setup.'
+		Description = 'Windows options, local Group Policy (Policies registry), restore points, uninstall, reboot, new-machine setup. Volume/brightness under System.'
 	}
 	identity = @{
 		Label       = 'Identity'
@@ -8490,6 +8935,19 @@ function Get-MBToolUiTips {
 		}
 	}
 
+	# GroupPolicy: orange when Windows edition has no Local GPO (Home/Core, no gpedit)
+	$hasGpo = $true
+	try { $hasGpo = [bool](Test-MBWindowsHasLocalGroupPolicy) } catch { $hasGpo = $true }
+	if (-not $hasGpo) {
+		$why = Get-MBGroupPolicyUnavailableReason
+		foreach ($gt in @(Get-MBGroupPolicyToolNames)) {
+			$base = ''
+			if ($toolTips.ContainsKey($gt)) { $base = [string]$toolTips[$gt] }
+			if ([string]::IsNullOrWhiteSpace($base)) { $base = $gt }
+			$toolTips[$gt] = ("{0}`n`nUnavailable: {1}" -f $base.TrimEnd(), $why)
+		}
+	}
+
 	return @{
 		groups = $groupTips
 		labels = $groupLabels
@@ -8528,7 +8986,9 @@ function Update-MBWpfToolGroupBar {
 	$usedList = @($usedList | Sort-Object)
 	$hasVision = $false
 	try { $hasVision = [bool](Test-MBModelHasVision) } catch { $hasVision = $false }
-	$fp = ((@($activeList) -join ',') + '|u:' + ($usedList -join ',') + '|v:' + $(if ($hasVision) { '1' } else { '0' }))
+	$hasGpo = $true
+	try { $hasGpo = [bool](Test-MBWindowsHasLocalGroupPolicy) } catch { $hasGpo = $true }
+	$fp = ((@($activeList) -join ',') + '|u:' + ($usedList -join ',') + '|v:' + $(if ($hasVision) { '1' } else { '0' }) + '|gpo:' + $(if ($hasGpo) { '1' } else { '0' }))
 	if (-not $Force) {
 		try {
 			if ($W.ToolGroupsFp -eq $fp -and $W.ToolGroupsBuilt -and -not $W.ToolGroupsDirty) { return }
@@ -8548,6 +9008,13 @@ function Update-MBWpfToolGroupBar {
 	$visionBlocked = @{}
 	if (-not $hasVision) {
 		foreach ($vt in @(Get-MBVisionToolNames)) { $visionBlocked[$vt] = $true }
+	}
+	# Tools shown orange in setup menu when edition lacks Local Group Policy (Home/Core)
+	$gpoBlocked = @{}
+	$gpoBlockReason = ''
+	if (-not $hasGpo) {
+		$gpoBlockReason = Get-MBGroupPolicyUnavailableReason
+		foreach ($gt in @(Get-MBGroupPolicyToolNames)) { $gpoBlocked[$gt] = $true }
 	}
 
 	# Active chips first so they stay visible on the first wrap line
@@ -8594,6 +9061,9 @@ function Update-MBWpfToolGroupBar {
 			usedTools          = @($usedList)
 			modelHasVision     = $hasVision
 			visionBlocked      = $visionBlocked
+			hasLocalGroupPolicy = $hasGpo
+			gpoBlocked         = $gpoBlocked
+			gpoBlockReason     = $gpoBlockReason
 			fp                 = $fp
 		}
 		$W.ToolGroupsDirty = $true
@@ -8713,7 +9183,11 @@ function Resolve-MBToolName {
 		'list_maps' = 'GetMappedDrives'; 'get_mapped_drives' = 'GetMappedDrives'
 		'enable_tools' = 'EnableToolGroup'; 'enable_group' = 'EnableToolGroup'
 		'tools' = 'ListToolGroups'; 'list_tools' = 'ListToolGroups'
-		'volume' = 'AudioVolume'; 'mute' = 'AudioVolume'; 'brightness' = 'DisplayBrightness'
+		'volume' = 'AudioVolume'; 'mute' = 'AudioVolume'; 'unmute' = 'AudioVolume'
+		'set_volume' = 'AudioVolume'; 'setvolume' = 'AudioVolume'; 'audio_volume' = 'AudioVolume'
+		'speaker' = 'AudioVolume'; 'speakers' = 'AudioVolume'; 'sound_level' = 'AudioVolume'
+		'brightness' = 'DisplayBrightness'; 'set_brightness' = 'DisplayBrightness'; 'display_brightness' = 'DisplayBrightness'
+		'dim' = 'DisplayBrightness'; 'screen_brightness' = 'DisplayBrightness'
 		'uninstall' = 'UninstallSoftware'; 'setup_machine' = 'NewMachineSetup'; 'new_machine' = 'NewMachineSetup'
 		'add_user' = 'AddLocalUser'; 'local_user' = 'AddLocalUser'; 'create_user' = 'AddLocalUser'
 		'join_domain' = 'JoinDomain'; 'domain_join' = 'JoinDomain'
@@ -8733,6 +9207,8 @@ function Resolve-MBToolName {
 		'drop_share' = 'RemoveShare'; 'stop_share' = 'RemoveShare'
 		'system_restore' = 'SystemRestore'; 'restore_point' = 'SystemRestore'
 		'list_installers' = 'ListInstallers'; 'install_package' = 'InstallPackage'; 'install_app' = 'InstallPackage'
+		'group_policy' = 'GroupPolicy'; 'gpedit' = 'GroupPolicy'; 'gpo' = 'GroupPolicy'
+		'local_policy' = 'GroupPolicy'; 'secpol' = 'GroupPolicy'; 'policies' = 'GroupPolicy'
 	}
 	$key = ($lower -replace '[\s-]+', '_')
 	if ($nick.ContainsKey($key)) { return [string]$nick[$key] }
@@ -8762,14 +9238,19 @@ function Get-MBToolEnableHint {
 	if ((Test-MBToolNeedsVision -Name $resolved) -and -not (Test-MBModelHasVision)) {
 		return "Current model has no vision ability (Abilities must include 'vision'). $resolved is unavailable - do not call it."
 	}
+	if ((Test-MBToolNeedsGroupPolicyEdition -Name $resolved) -and -not (Test-MBWindowsHasLocalGroupPolicy)) {
+		$why = Get-MBGroupPolicyUnavailableReason
+		return "unavailable_tool=$resolved reason=windows_edition. $why Do not use RunCommand/reg to fake gpedit on Home."
+	}
 	$grp = Get-MBToolGroupForName -Name $resolved
 	if ($grp -and $grp -ne 'core') {
-		return "Call EnableToolGroup with group=$grp then call $resolved (same turn; do not narrate)."
+		# Machine-parseable recovery: models often spiral into RunCommand without this
+		return "missing_tool=$resolved group=$grp. Call EnableToolGroup group=$grp then call $resolved (same turn; do not narrate; do not use RunCommand for this intent)."
 	}
 	if ($grp -eq 'core') {
-		return "Tool $resolved is in core and should already be available."
+		return "missing_tool=$resolved group=core (should already be available). Call $resolved directly - do not use RunCommand."
 	}
-	return "Call ListToolGroups or EnableToolGroup using the MAP (senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web)."
+	return "Call EnableToolGroup using MAP (senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web) then the real tool name."
 }
 
 function Get-MBAbilityParts {
@@ -8836,6 +9317,118 @@ function Test-MBToolNeedsVision {
 	return $false
 }
 
+function Get-MBGroupPolicyToolNames {
+	@('GroupPolicy')
+}
+
+function Test-MBToolNeedsGroupPolicyEdition {
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+	$t = $Name.Trim()
+	foreach ($n in @(Get-MBGroupPolicyToolNames)) {
+		if ([string]::Equals($n, $t, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+	}
+	return $false
+}
+
+function Get-MBWindowsEditionSnapshot {
+	# Caption / ProductName / EditionID for GPO availability (cached).
+	if ($script:MB.WindowsEditionSnap -and $script:MB.WindowsEditionSnap.At) {
+		try {
+			$age = ((Get-Date) - [datetime]$script:MB.WindowsEditionSnap.At).TotalMinutes
+			if ($age -ge 0 -and $age -lt 30) { return $script:MB.WindowsEditionSnap }
+		} catch {}
+	}
+	$caption = ''
+	$productName = ''
+	$editionId = ''
+	$displayVersion = ''
+	try {
+		$os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+		if ($os) { $caption = [string]$os.Caption }
+	} catch {}
+	try {
+		$nt = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+		if ($nt) {
+			try { $productName = [string]$nt.ProductName } catch {}
+			try { $editionId = [string]$nt.EditionID } catch {}
+			try { $displayVersion = [string]$nt.DisplayVersion } catch {}
+			if (-not $displayVersion) { try { $displayVersion = [string]$nt.ReleaseId } catch {} }
+		}
+	} catch {}
+	$gpeditPath = Join-Path $env:SystemRoot 'System32\gpedit.msc'
+	$gpedit = $false
+	try { $gpedit = Test-Path -LiteralPath $gpeditPath } catch { $gpedit = $false }
+	$snap = [pscustomobject]@{
+		Caption         = $caption
+		ProductName     = $productName
+		EditionID       = $editionId
+		DisplayVersion  = $displayVersion
+		GpeditMsc       = [bool]$gpedit
+		GpeditPath      = $gpeditPath
+		At              = Get-Date
+	}
+	$script:MB.WindowsEditionSnap = $snap
+	return $snap
+}
+
+function Test-MBWindowsHasLocalGroupPolicy {
+	# Pro and above (and Server) ship Local Group Policy / gpedit; Home/Core do not.
+	# UI paints GroupPolicy orange when this is false (same pattern as vision-blocked senses tools).
+	if ($null -ne $script:MB.HasLocalGroupPolicy) {
+		return [bool]$script:MB.HasLocalGroupPolicy
+	}
+	$ok = $false
+	$reason = ''
+	try {
+		$snap = Get-MBWindowsEditionSnapshot
+		$blob = ('{0} {1} {2}' -f $snap.Caption, $snap.ProductName, $snap.EditionID).Trim()
+		$ed = [string]$snap.EditionID
+		# Explicit Home / Core SKUs (no Local Group Policy Object Editor)
+		if ($ed -match '(?i)^(Core|CoreN|CoreSingleLanguage|CoreCountrySpecific|HomeBasic|HomePremium|CoreConnected|CoreConnectedN|CoreConnectedSingleLanguage|CoreConnectedCountrySpecific)$' -or
+			$blob -match '(?i)\bHome\b' -or
+			$blob -match '(?i)Single Language' -or
+			$blob -match '(?i)\bStarter\b') {
+			$ok = $false
+			$reason = "Windows edition does not include Local Group Policy (gpedit): $blob"
+		}
+		elseif ($ed -match '(?i)^(Professional|ProfessionalN|ProfessionalEducation|ProfessionalWorkstation|Enterprise|EnterpriseN|EnterpriseS|Education|EducationN|Business|Server|ServerRdsh|IoTEnterprise|IoTEnterpriseS|Ultimate)' -or
+			$blob -match '(?i)\b(Pro|Professional|Enterprise|Education|Workstation|Server|Ultimate|Business)\b') {
+			# Pro+ : still require gpedit.msc when present on full SKU; Server Core may lack MSC but allow policy tooling
+			if ($snap.GpeditMsc) {
+				$ok = $true
+				$reason = "Local Group Policy available ($blob)"
+			} elseif ($blob -match '(?i)Server') {
+				$ok = $true
+				$reason = "Server edition without gpedit.msc UI; policy registry tooling still allowed"
+			} else {
+				$ok = $false
+				$reason = "Pro-class edition but gpedit.msc missing: $blob"
+			}
+		}
+		else {
+			# Unknown SKU: gpedit.msc is the practical signal
+			$ok = [bool]$snap.GpeditMsc
+			$reason = if ($ok) { "gpedit.msc present ($blob)" } else { "gpedit.msc missing; edition not recognized as Pro+: $blob" }
+		}
+	} catch {
+		$ok = $false
+		$reason = $_.Exception.Message
+	}
+	$script:MB.HasLocalGroupPolicy = [bool]$ok
+	$script:MB.HasLocalGroupPolicyReason = [string]$reason
+	return [bool]$ok
+}
+
+function Get-MBGroupPolicyUnavailableReason {
+	if (Test-MBWindowsHasLocalGroupPolicy) { return '' }
+	$r = [string]$script:MB.HasLocalGroupPolicyReason
+	if ([string]::IsNullOrWhiteSpace($r)) {
+		$r = 'This Windows edition does not include Local Group Policy (typically Home/Core). Upgrade to Pro or higher for gpedit / full GPO editor support.'
+	}
+	return $r
+}
+
 function Get-MBActiveToolNames {
 	# Case-insensitive set (hashtable; PS 5.1)
 	$map = @{}
@@ -8856,12 +9449,14 @@ function Get-MBActiveToolNames {
 	}
 	[void]$toAdd.Add('EnableToolGroup')
 	[void]$toAdd.Add('ListToolGroups')
-	# Vision tools only when Abilities includes lowercase "vision" (even if senses group is on)
+	# When senses is enabled, always push vision tools into the LIVE API schema so the model
+	# can call them same-turn. Runtime still soft-fails if the model lacks vision ability.
+	$sensesOn = ($groups -contains 'senses' -or $groups -contains 'full' -or $groups -contains 'all')
 	$hasVision = $false
 	try { $hasVision = [bool](Test-MBModelHasVision) } catch { $hasVision = $false }
 	foreach ($n in @($toAdd)) {
 		if ([string]::IsNullOrWhiteSpace($n)) { continue }
-		if (-not $hasVision -and (Test-MBToolNeedsVision -Name $n)) { continue }
+		if (-not $hasVision -and -not $sensesOn -and (Test-MBToolNeedsVision -Name $n)) { continue }
 		$map[$n.ToLowerInvariant()] = $n
 	}
 	return @($map.Values)
@@ -9041,7 +9636,8 @@ function Enable-MBToolGroup {
 	}
 
 	Sync-MBPromptAfterToolGroups
-	$nNow = @((Get-MBActiveToolNames)).Count
+	$activeNames = @(Get-MBActiveToolNames)
+	$nNow = $activeNames.Count
 	$bits = New-Object System.Collections.ArrayList
 	if ($enabled.Count -gt 0) {
 		$detail = foreach ($g in @($enabled)) {
@@ -9058,6 +9654,22 @@ function Enable-MBToolGroup {
 	}
 	if ($coreToolHints.Count -gt 0) {
 		[void]$bits.Add(("core_tools={0}" -f ($coreToolHints -join ',')))
+	}
+	# List newly unlocked tools so local models know they are in the live schema now
+	$newTools = New-Object System.Collections.ArrayList
+	foreach ($g in @($enabled)) {
+		if ($script:MBToolCatalog.Contains($g)) {
+			foreach ($tn in @($script:MBToolCatalog[$g])) {
+				if ($tn -and ($activeNames -contains $tn) -and -not ($newTools -contains $tn)) {
+					[void]$newTools.Add($tn)
+				}
+			}
+		}
+	}
+	if ($newTools.Count -gt 0) {
+		$show = @($newTools | Select-Object -First 12)
+		$extra = if ($newTools.Count -gt 12) { "+$($newTools.Count - 12)" } else { '' }
+		[void]$bits.Add(("live_tools={0}{1}" -f ($show -join ','), $extra))
 	}
 	return "OK $($bits -join '. '). totalSchemas=$nNow. Call the tool(s) you need NOW in this turn - do not narrate to the user."
 }
@@ -11273,13 +11885,13 @@ exit `$___mbExit
 	$argLine = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$runnerPath`""
 	$rr = Invoke-MBProcessCapture -FileName ([string]$psExe) -Arguments ([string]$argLine) -WorkingDir ([string]$work) -TimeoutMs ([int]$timeoutMs)
 
-	$stdout = [string]$rr.StdOut
-	$stderr = [string]$rr.StdErr
+	$stdout = Sanitize-MBProcessOutput -Text ([string]$rr.StdOut)
+	$stderr = Sanitize-MBProcessOutput -Text ([string]$rr.StdErr)
 	$exitCode = [int]$rr.ExitCode
 	if ($rr.TimedOut) { $exitCode = -1 }
 	if ($rr.Cancelled) { $exitCode = -1 }
 
-	$maxStream = 8000
+	$maxStream = 6000
 	$stdoutFull = $stdout
 	$stderrFull = $stderr
 	if ($stdout.Length -gt $maxStream) { $stdout = $stdout.Substring(0, $maxStream) + "`n...[stdout truncated]..." }
@@ -11383,13 +11995,61 @@ exit `$___mbExit
 		}
 	}
 
-	# Plain hashtable + PSCustomObject checks (PS 5.1 safe)
+	# Always expose the same $Result shape for code= and piece=: by_piece + merged + order
 	$checksArr = @($checks | ForEach-Object { $_ })
 	$piecesArr = @($trackedPieces | ForEach-Object { [string]$_ })
-	$resultShape = ''
-	if ($doMergeResults -and $piecesArr.Count -gt 0) {
-		$resultShape = 'by_piece + merged (+ top-level keys from merged). Assert: $Result.merged.X or $Result.by_piece.name.X or $Result.X'
+	$parsedResult = $null
+	try { $parsedResult = Get-MBSandboxJsonResult -Stdout $stdoutFull -SandboxRoot $root } catch { $parsedResult = $null }
+
+	$normalizedResult = $null
+	try {
+		$alreadyMerged = $false
+		if ($null -ne $parsedResult) {
+			try {
+				if ($parsedResult.PSObject.Properties['by_piece'] -and $parsedResult.PSObject.Properties['merged']) {
+					$alreadyMerged = $true
+				}
+			} catch { $alreadyMerged = $false }
+		}
+		if ($alreadyMerged) {
+			$normalizedResult = $parsedResult
+		} elseif ($piecesArr.Count -gt 0 -and $null -ne $parsedResult) {
+			# Single-piece path sometimes emits raw $Result without merge wrapper
+			$bp = [ordered]@{}
+			$nm = [string]$piecesArr[0]
+			if ($piecesArr.Count -eq 1) { $bp[$nm] = $parsedResult }
+			else {
+				foreach ($pn in $piecesArr) { $bp[[string]$pn] = $null }
+				$bp['_raw'] = $parsedResult
+			}
+			$normalizedResult = [pscustomobject]@{
+				by_piece = [pscustomobject]$bp
+				merged   = $parsedResult
+				order    = @($piecesArr)
+			}
+		} elseif ($null -ne $parsedResult) {
+			# code= / path= : wrap so asserts can use $Result.merged.X or $Result.by_piece.code.X
+			$normalizedResult = [pscustomobject]@{
+				by_piece = [pscustomobject]@{ code = $parsedResult }
+				merged   = $parsedResult
+				order    = @('code')
+			}
+		} else {
+			$normalizedResult = [pscustomobject]@{
+				by_piece = [pscustomobject]@{}
+				merged   = [pscustomobject]@{}
+				order    = @($piecesArr)
+			}
+		}
+	} catch {
+		$normalizedResult = [pscustomobject]@{
+			by_piece = [pscustomobject]@{}
+			merged   = $(if ($null -ne $parsedResult) { $parsedResult } else { [pscustomobject]@{} })
+			order    = @($piecesArr)
+		}
 	}
+
+	$resultShape = 'by_piece + merged + order (same for code= and piece=). Assert: $Result.merged.X or $Result.by_piece.name.X or $Result.X after promote.'
 	$payload = [pscustomobject]@{
 		ok             = [bool]$ok
 		phase          = [string]$phase
@@ -11409,6 +12069,7 @@ exit `$___mbExit
 		composed_path  = [string]$composedPathOut
 		stdout         = [string]$stdout
 		stderr         = [string]$stderr
+		result         = $normalizedResult
 		checks         = $checksArr
 		hint           = [string]$hintText
 		result_shape   = [string]$resultShape
@@ -11465,6 +12126,23 @@ function Invoke-RunCommand {
 	$timeoutMs = if ($timeout_sec -gt 0) { $timeout_sec * 1000 } else { $CommandTimeoutSec * 1000 }
 	$wd = $script:MB.WorkingDir
 
+	# OS UX knobs: never shell/COM — specialized tools are always preferred (volume is CORE).
+	$cmdStr = [string]$command
+	if ($cmdStr -match '(?i)(AudioEndpointVolume|IAudioEndpointVolume|MMDeviceEnumerator|EndpointVolume|nircmd.*(mute|volume)|Set-AudioDevice|AudioDeviceCmdlets|\(New-Object\s+-[Mm]om\s+WScript\.Shell\).*(SendKeys|\{VOLUME)|keybd_event.*VOLUME)') {
+		return (
+			"REDIRECTED: Do not use RunCommand for volume/mute (COM/WASAPI/nircmd/SendKeys).`n" +
+			"missing_tool=AudioVolume group=system. Call EnableToolGroup group=system then AudioVolume (same turn).`n" +
+			"AudioVolume action=get|set|mute|unmute; level=0-100 for set. Example: action=set level=40"
+		)
+	}
+	if ($cmdStr -match '(?i)(WmiMonitorBrightness|WmiSetBrightness|brightness)' -and $cmdStr -match '(?i)(Wmi|CIM|Set-Cim|Invoke-Cim|Get-Cim)') {
+		return (
+			"REDIRECTED: Do not use RunCommand for display brightness.`n" +
+			"missing_tool=DisplayBrightness group=system. Call EnableToolGroup group=system then DisplayBrightness (same turn).`n" +
+			"DisplayBrightness action=get|set; level=0-100."
+		)
+	}
+
 	# Get-ComputerInfo is slow + enormous; model often treats truncated output as complete.
 	# Redirect to the fast inventory tool instead of spawning a multi-minute dump.
 	if ($shell -ne 'cmd' -and [string]$command -match '(?i)\bGet-ComputerInfo\b') {
@@ -11511,6 +12189,8 @@ function Invoke-RunCommand {
 				'try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}'
 				'try { [Console]::InputEncoding  = [System.Text.Encoding]::UTF8 } catch {}'
 				'$OutputEncoding = [System.Text.Encoding]::UTF8'
+				'$ProgressPreference = ''SilentlyContinue'''
+				'$WarningPreference = ''Continue'''
 				'try { chcp 65001 | Out-Null } catch {}'
 			) -join "`r`n"
 			$body = $preamble + "`r`n" + [string]$command + "`r`n"
@@ -11523,7 +12203,7 @@ function Invoke-RunCommand {
 			} finally {
 				try { $ms.Dispose() } catch {}
 			}
-			$rr = Invoke-MBProcessCapture -FileName $psExe -Arguments ("-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + $enc) -WorkingDir $wd -TimeoutMs $timeoutMs
+			$rr = Invoke-MBProcessCapture -FileName $psExe -Arguments ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $enc) -WorkingDir $wd -TimeoutMs $timeoutMs
 		}
 		if ($rr.Cancelled) {
 			$script:MB.Interrupt = $true
@@ -11531,8 +12211,10 @@ function Invoke-RunCommand {
 		$parts = @()
 		if ($rr.TimedOut) { $parts += "ERROR: Command timed out after $([math]::Round($timeoutMs/1000))s" }
 		if ($rr.Cancelled) { $parts += "CANCELLED: Interrupted by user (ESC)" }
-		if ($rr.StdOut) { $parts += (Sanitize-MBText -Text $rr.StdOut.TrimEnd()) }
-		if ($rr.StdErr) { $parts += "STDERR:`n$(Sanitize-MBText -Text $rr.StdErr.TrimEnd())" }
+		$stdoutClean = Sanitize-MBProcessOutput -Text $rr.StdOut
+		$stderrClean = Sanitize-MBProcessOutput -Text $rr.StdErr
+		if ($stdoutClean) { $parts += $stdoutClean.TrimEnd() }
+		if ($stderrClean) { $parts += "STDERR:`n$($stderrClean.TrimEnd())" }
 		if (-not $rr.TimedOut -and -not $rr.Cancelled) {
 			$parts += "EXIT_CODE: $($rr.ExitCode) ($($rr.ElapsedMs) ms)"
 		}
@@ -11687,7 +12369,22 @@ function Invoke-DiffText {
 }
 
 function Invoke-GetWorkingDirectory {
-	ConvertTo-MBJson @{ cwd = $script:MB.WorkingDir; exists = (Test-Path -LiteralPath $script:MB.WorkingDir) }
+	# Keep process location and sticky/banner aligned with session WorkingDir
+	$cwd = [string]$script:MB.WorkingDir
+	try {
+		if ($cwd -and (Test-Path -LiteralPath $cwd)) {
+			$proc = (Get-Location).Path
+			if ($proc -and -not [string]::Equals($proc, $cwd, [StringComparison]::OrdinalIgnoreCase)) {
+				try { Set-Location -LiteralPath $cwd } catch {}
+			}
+		}
+	} catch {}
+	try { Update-MBWpfWindowTitle } catch {}
+	ConvertTo-MBJson @{
+		cwd    = $cwd
+		exists = (Test-Path -LiteralPath $cwd)
+		process_cwd = $(try { (Get-Location).Path } catch { $null })
+	}
 }
 
 function Invoke-SetWorkingDirectory {
@@ -11695,10 +12392,19 @@ function Invoke-SetWorkingDirectory {
 	$path = Resolve-MBPath $path
 	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Path not found: $path" }
 	if (-not (Get-Item -LiteralPath $path).PSIsContainer) { return "ERROR: Not a directory: $path" }
-	$script:MB.WorkingDir = $path
-	try { Set-Location -LiteralPath $path } catch {}
+	$full = $path
+	try { $full = [System.IO.Path]::GetFullPath($path) } catch { $full = $path }
+	$script:MB.WorkingDir = $full
+	try { Set-Location -LiteralPath $full } catch {}
+	try { if ($script:MB.Wpf) { $script:MB.Wpf.CurrentCwd = $full } } catch {}
+	try { Update-MBWpfWindowTitle } catch {}
 	try { Refresh-MBWpfStickyFromSession } catch {}
-	return "WORKING_DIR: $path"
+	try {
+		if ($script:Messages) {
+			$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+		}
+	} catch {}
+	return "WORKING_DIR: $full"
 }
 
 function Invoke-GetEnvironment {
@@ -13244,14 +13950,81 @@ function Invoke-GetBSODInfo {
 }
 
 function Invoke-GetEventLogs {
-	param([int]$hours = 72)
+	param(
+		[int]$hours = 72,
+		[int]$max = 40
+	)
 	if ($hours -le 0) { $hours = 72 }
+	if ($hours -gt 168) { $hours = 168 }
+	if ($max -le 0) { $max = 40 }
+	if ($max -gt 100) { $max = 100 }
+	$msgCap = 160
 	$start = (Get-Date).AddHours(-$hours)
-	$general = Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2,3; StartTime=$start} -MaxEvents 120 -ErrorAction SilentlyContinue |
-		Select-Object TimeCreated, LogName, LevelDisplayName, Id, ProviderName, @{N='Message';E={ if ($_.Message -and $_.Message.Length -gt 240) { $_.Message.Substring(0,240) + '...' } else { $_.Message } }}
-	$disk = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='*disk*','*ntfs*','*stor*'; Level=1,2,3; StartTime=$start} -MaxEvents 80 -ErrorAction SilentlyContinue |
-		Select-Object TimeCreated, Id, ProviderName, @{N='Message';E={ if ($_.Message -and $_.Message.Length -gt 240) { $_.Message.Substring(0,240) + '...' } else { $_.Message } }}
-	ConvertTo-MBJson @{ hours = $hours; GeneralEvents = @($general); DiskIO_Errors = @($disk) } -Depth 4
+
+	$trimMsg = {
+		param($m)
+		if (-not $m) { return '' }
+		$t = ([string]$m) -replace '\s+', ' '
+		if ($t.Length -gt $msgCap) { return $t.Substring(0, $msgCap - 3) + '...' }
+		return $t
+	}
+
+	# Collapse duplicate Id+Provider floods (e.g. repeated DCOM 10016) into one row + count
+	$collapse = {
+		param($events, [int]$limit)
+		$groups = @{}
+		$order = New-Object System.Collections.ArrayList
+		foreach ($e in @($events)) {
+			if ($null -eq $e) { continue }
+			$key = '{0}|{1}|{2}' -f [string]$e.Id, [string]$e.ProviderName, [string]$e.LogName
+			if (-not $groups.ContainsKey($key)) {
+				$groups[$key] = [pscustomobject]@{
+					TimeCreated      = $e.TimeCreated
+					LogName          = $e.LogName
+					LevelDisplayName = $e.LevelDisplayName
+					Id               = $e.Id
+					ProviderName     = $e.ProviderName
+					Message          = & $trimMsg $e.Message
+					Count            = 1
+					LastSeen         = $e.TimeCreated
+				}
+				[void]$order.Add($key)
+			} else {
+				$groups[$key].Count++
+				if ($e.TimeCreated -and ($null -eq $groups[$key].LastSeen -or $e.TimeCreated -gt $groups[$key].LastSeen)) {
+					$groups[$key].LastSeen = $e.TimeCreated
+				}
+			}
+		}
+		$rows = @($order | ForEach-Object { $groups[$_] } | Sort-Object Count -Descending)
+		$totalCollapsed = $rows.Count
+		$truncated = ($totalCollapsed -gt $limit)
+		return @{
+			rows      = @($rows | Select-Object -First $limit)
+			unique    = $totalCollapsed
+			truncated = $truncated
+		}
+	}
+
+	$rawGeneral = @(Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2,3; StartTime=$start} -MaxEvents 200 -ErrorAction SilentlyContinue |
+		Select-Object TimeCreated, LogName, LevelDisplayName, Id, ProviderName, Message)
+	$rawDisk = @(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='*disk*','*ntfs*','*stor*'; Level=1,2,3; StartTime=$start} -MaxEvents 100 -ErrorAction SilentlyContinue |
+		Select-Object TimeCreated, Id, ProviderName, @{N='LogName';E={'System'}}, @{N='LevelDisplayName';E={$null}}, Message)
+
+	$g = & $collapse $rawGeneral $max
+	$d = & $collapse $rawDisk ([math]::Min(20, $max))
+
+	ConvertTo-MBJson @{
+		hours              = $hours
+		message_cap_chars  = $msgCap
+		GeneralEvents      = @($g.rows)
+		GeneralUnique      = [int]$g.unique
+		GeneralTruncated   = [bool]$g.truncated
+		DiskIO_Errors      = @($d.rows)
+		DiskUnique         = [int]$d.unique
+		DiskTruncated      = [bool]$d.truncated
+		note               = 'Duplicate Id+Provider collapsed into Count. Pass hours= for window (default 72, max 168). DCOM 10016 repeats appear as one row with Count.'
+	} -Depth 5
 }
 
 function Invoke-GetDiskHealth {
@@ -13467,13 +14240,65 @@ function Invoke-GetDriverInfo {
 }
 
 function Invoke-GetStartupItems {
+	param(
+		[int]$max_services = 25,
+		[bool]$include_all_services = $false
+	)
 	try {
-		$auto = Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue |
-			Select-Object Name, Command, Location, User
-		$services = Get-Service -ErrorAction SilentlyContinue |
-			Where-Object { $_.StartType -eq 'Automatic' } |
-			Select-Object Name, Status, DisplayName
-		ConvertTo-MBJson @{ StartupPrograms = @($auto); AutoServices = @($services) } -Depth 3
+		if ($max_services -le 0) { $max_services = 25 }
+		if ($max_services -gt 80) { $max_services = 80 }
+
+		$auto = @(Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue |
+			Select-Object Name, Command, Location, User)
+
+		$allAuto = @(Get-Service -ErrorAction SilentlyContinue |
+			Where-Object { $_.StartType -eq 'Automatic' -or $_.StartType -eq 'AutomaticDelayedStart' } |
+			Select-Object Name, Status, DisplayName, StartType |
+			Sort-Object Name)
+
+		# Prefer non-Microsoft / non-running-stopped signal first for diagnostics
+		$interesting = @($allAuto | Where-Object {
+			$dn = [string]$_.DisplayName
+			$nm = [string]$_.Name
+			-not (
+				$dn -match '^(?i)(Windows|Microsoft|Background Tasks|Connected User|CoreMessaging|Cryptographic|DHCP|DNS Client|Event Log|Group Policy|Plug and Play|Power|Print Spooler|Remote Procedure|RPC|Security Accounts|Server|System Events|Task Scheduler|Themes|User Profile|Windows Update|WLAN|Workstation)' -or
+				$nm -match '^(?i)(AppX|BFE|BrokerInfrastructure|camsvc|CDPSvc|CoreMessagingRegistrar|CryptSvc|DcomLaunch|Dhcp|Dnscache|DPS|EventLog|EventSystem|FontCache|gpsvc|iphlpsvc|KeyIso|LSM|mpssvc|nsi|Power|ProfSvc|RpcEptMapper|RpcSs|SamSs|Schedule|seclogon|SENS|ShellHWDetection|Spooler|StateRepository|StorSvc|SystemEventsBroker|TextInputManagementService|Themes|TokenBroker|UserManager|VaultSvc|Wcmsvc|WinDefend|Winmgmt|WlanSvc|WpnService|wscsvc)$'
+			)
+		})
+		$svcTotal = $allAuto.Count
+		if ($include_all_services) {
+			$services = @($allAuto | Select-Object -First $max_services)
+		} else {
+			# Interesting first, then fill remaining slots from the rest
+			$picked = New-Object System.Collections.ArrayList
+			$seen = @{}
+			foreach ($s in $interesting) {
+				if ($picked.Count -ge $max_services) { break }
+				$key = [string]$s.Name
+				if ($seen.ContainsKey($key)) { continue }
+				$seen[$key] = $true
+				[void]$picked.Add($s)
+			}
+			if ($picked.Count -lt $max_services) {
+				foreach ($s in $allAuto) {
+					if ($picked.Count -ge $max_services) { break }
+					$key = [string]$s.Name
+					if ($seen.ContainsKey($key)) { continue }
+					$seen[$key] = $true
+					[void]$picked.Add($s)
+				}
+			}
+			$services = @($picked)
+		}
+
+		ConvertTo-MBJson @{
+			StartupPrograms     = @($auto)
+			AutoServices        = @($services)
+			AutoServiceTotal    = [int]$svcTotal
+			AutoServiceReturned = [int]$services.Count
+			truncated           = ($svcTotal -gt $services.Count)
+			note                = 'Auto services capped (default max_services=25, system noise deprioritized). Pass include_all_services=true + higher max for full dump.'
+		} -Depth 3
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -13602,6 +14427,7 @@ function Invoke-GetLocalShares {
 	param(
 		[object]$include_special = $false,
 		[object]$include_ntfs = $true,
+		[object]$copy_clipboard = $false,
 		[int]$max = 80
 	)
 	$incSpecial = $false
@@ -13610,6 +14436,9 @@ function Invoke-GetLocalShares {
 	$incNtfs = $true
 	if ($include_ntfs -is [bool]) { $incNtfs = $include_ntfs }
 	elseif ([string]$include_ntfs -match '^(?i)0|false|no|off$') { $incNtfs = $false }
+	$doClip = $false
+	if ($copy_clipboard -is [bool]) { $doClip = $copy_clipboard }
+	elseif ([string]$copy_clipboard -match '^(?i)1|true|yes|y|on$') { $doClip = $true }
 	if ($max -lt 1) { $max = 1 }
 	if ($max -gt 200) { $max = 200 }
 
@@ -13718,7 +14547,7 @@ function Invoke-GetLocalShares {
 
 	$clipOk = $false
 	$clipUnc = ''
-	if ($uncHints.Count -eq 1) {
+	if ($doClip -and $uncHints.Count -ge 1) {
 		$clipUnc = [string]$uncHints[0]
 		$clipOk = Set-MBClipboardTextQuiet -Text $clipUnc
 	}
@@ -13735,7 +14564,7 @@ function Invoke-GetLocalShares {
 	$card = Write-MBOperatorCard -Title 'LOCAL SHARES' -Fields ([ordered]@{
 		Host     = $hostName
 		Count    = $shares.Count
-		Clipboard = $(if ($clipOk) { "copied $clipUnc" } elseif ($uncHints.Count -gt 1) { 'not auto-copied (multiple UNC)' } else { 'n/a' })
+		Clipboard = $(if ($clipOk) { "copied $clipUnc" } elseif ($doClip -and $uncHints.Count -eq 0) { 'nothing to copy' } elseif (-not $doClip) { 'opt-in: copy_clipboard=true' } else { 'n/a' })
 	}) -Notes @($summaryLines)
 
 	return ConvertTo-MBJson ([ordered]@{
@@ -13744,13 +14573,14 @@ function Invoke-GetLocalShares {
 		method           = $method
 		include_special  = $incSpecial
 		include_ntfs     = $incNtfs
+		copy_clipboard   = [bool]$doClip
 		share_count      = $shares.Count
 		shares           = @($shares)
 		unc_hints        = @($uncHints)
 		clipboard_unc    = [bool]$clipOk
 		clipboard_value  = $clipUnc
 		operator_card    = $card
-		note             = 'Local SMB shares on THIS PC. share_access / access_summary = who can connect over the network (share ACL). ntfs_access = folder filesystem ACL (when include_ntfs=true). Special shares (C$, ADMIN$, IPC$) hidden unless include_special=true. Create with CreateShare; map remote with MapNetworkDrive; find remote with ProbeShares.'
+		note             = 'Local SMB shares on THIS PC. Clipboard copy is opt-in (copy_clipboard=true). share_access / access_summary = share ACL. ntfs_access when include_ntfs=true. Special shares hidden unless include_special=true.'
 	}) -Depth 8
 }
 
@@ -14883,19 +15713,79 @@ function Invoke-ProbeShares {
 }
 
 function Invoke-GetWindowsUpdateStatus {
+	# Prefer native Windows Update COM (Microsoft.Update.Session) — no PSGallery/PSWindowsUpdate required.
+	# Falls back to PSWindowsUpdate module only if COM path fails.
+	$lastBoot = $null
 	try {
-		if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
-			Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
-			$updates = Get-WUList -ErrorAction SilentlyContinue | Select-Object Title, KB, Size
-			ConvertTo-MBJson @{
-				PendingUpdates = @($updates)
-				LastBoot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-			} -Depth 3
-		} else {
-			return "PSWindowsUpdate module not installed. Run: Install-Module PSWindowsUpdate -Force"
+		$lastBoot = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime
+		if ($lastBoot) { $lastBoot = $lastBoot.ToString('s') }
+	} catch {}
+
+	try {
+		$session = New-Object -ComObject Microsoft.Update.Session
+		$searcher = $session.CreateUpdateSearcher()
+		# Pending software updates (not installed). Include optional for completeness; cap rows.
+		$searchResult = $searcher.Search("IsInstalled=0 and Type='Software'")
+		$rows = New-Object System.Collections.ArrayList
+		$i = 0
+		foreach ($u in @($searchResult.Updates)) {
+			if ($null -eq $u) { continue }
+			$i++
+			if ($i -gt 80) { break }
+			$kb = ''
+			try {
+				if ($u.KBArticleIDs -and @($u.KBArticleIDs).Count -gt 0) {
+					$kb = (@($u.KBArticleIDs) | ForEach-Object { "KB$_" }) -join ','
+				}
+			} catch {}
+			$sizeMb = $null
+			try {
+				if ($u.MaxDownloadSize -gt 0) {
+					$sizeMb = [math]::Round([double]$u.MaxDownloadSize / 1MB, 2)
+				}
+			} catch {}
+			[void]$rows.Add([ordered]@{
+				Title      = [string]$u.Title
+				KB         = $kb
+				SizeMB     = $sizeMb
+				IsDownloaded = $(try { [bool]$u.IsDownloaded } catch { $null })
+				IsMandatory  = $(try { [bool]$u.IsMandatory } catch { $null })
+				MsrcSeverity = $(try { [string]$u.MsrcSeverity } catch { '' })
+			})
 		}
+		return ConvertTo-MBJson ([ordered]@{
+			ok             = $true
+			method         = 'Microsoft.Update.Session'
+			count          = $rows.Count
+			truncated     = ($i -gt 80)
+			PendingUpdates = @($rows)
+			LastBoot       = $lastBoot
+			note           = 'Native WU COM search (IsInstalled=0 Software). No PSWindowsUpdate module required.'
+		}) -Depth 5
 	} catch {
-		return "ERROR: $($_.Exception.Message)"
+		$comErr = $_.Exception.Message
+		# Optional module fallback
+		try {
+			if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
+				Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+				$updates = @(Get-WUList -ErrorAction SilentlyContinue | Select-Object -First 80 Title, KB, Size)
+				return ConvertTo-MBJson ([ordered]@{
+					ok             = $true
+					method         = 'PSWindowsUpdate'
+					count          = $updates.Count
+					PendingUpdates = $updates
+					LastBoot       = $lastBoot
+					com_error      = $comErr
+					note           = 'COM path failed; used PSWindowsUpdate module fallback.'
+				}) -Depth 4
+			}
+		} catch {}
+		return ConvertTo-MBJson ([ordered]@{
+			ok      = $false
+			error   = $comErr
+			LastBoot = $lastBoot
+			note    = 'Windows Update COM unavailable (service disabled, offline, or policy). Install PSWindowsUpdate only if you want the module fallback.'
+		})
 	}
 }
 
@@ -14910,16 +15800,26 @@ function Invoke-GetSystemUptime {
 }
 
 function Invoke-RunQuickDiagnostics {
+	# Embed parsed objects (not nested JSON strings). Short event window; one-level disk scan.
+	$diskRaw = Invoke-GetDiskSpace -deep:$false -timeout_sec 20 -top 8
+	$diskObj = ConvertFrom-MBToolJson $diskRaw
+	try {
+		if ($diskObj -and $diskObj.PSObject.Properties['Note']) {
+			$diskObj | Add-Member -NotePropertyName ScanNote -NotePropertyValue 'one_level (deep=false). Pass GetDiskSpace deep=true for recursive folder sizes.' -Force
+		}
+	} catch {}
+
 	$bundle = [ordered]@{
-		GeneratedAt = (Get-Date).ToString("s")
-		Uptime      = Invoke-GetSystemUptime
-		BSOD        = Invoke-GetBSODInfo
-		Events      = Invoke-GetEventLogs -hours 48
-		DiskHealth  = Invoke-GetDiskHealth
-		DiskSpace   = Invoke-GetDiskSpace -deep:$false -timeout_sec 20 -top 8
-		Memory      = Invoke-GetMemoryInfo
+		GeneratedAt = (Get-Date).ToString('s')
+		Uptime      = ConvertFrom-MBToolJson (Invoke-GetSystemUptime)
+		BSOD        = ConvertFrom-MBToolJson (Invoke-GetBSODInfo)
+		Events      = ConvertFrom-MBToolJson (Invoke-GetEventLogs -hours 24 -max 25)
+		DiskHealth  = ConvertFrom-MBToolJson (Invoke-GetDiskHealth)
+		DiskSpace   = $diskObj
+		Memory      = ConvertFrom-MBToolJson (Invoke-GetMemoryInfo)
+		note        = 'QuickDiag: events last 24h collapsed; disk scan is one-level (not recursive). Use specialized tools for deep dive.'
 	}
-	Limit-MBResult (ConvertTo-MBJson $bundle -Depth 8) 40000
+	Limit-MBResult (ConvertTo-MBJson $bundle -Depth 8) 32000
 }
 
 function Invoke-RunRepairTool {
@@ -14954,6 +15854,22 @@ function Invoke-RunRepairTool {
 	return Invoke-RunCommand -command $command -shell "cmd" -timeout_sec 7200
 }
 
+function ConvertTo-MBServiceRow {
+	param($Svc)
+	if ($null -eq $Svc) { return $null }
+	$statusStr = 'Unknown'
+	$startStr = 'Unknown'
+	try { $statusStr = [string]$Svc.Status } catch {}
+	try { $startStr = [string]$Svc.StartType } catch {}
+	# Normalize to stable string enums (never numeric ServiceControllerStatus)
+	return [ordered]@{
+		Name        = [string]$Svc.Name
+		DisplayName = [string]$Svc.DisplayName
+		Status      = $statusStr
+		StartType   = $startStr
+	}
+}
+
 function Invoke-GetServiceStatus {
 	param(
 		[string]$name,
@@ -14964,25 +15880,32 @@ function Invoke-GetServiceStatus {
 	if ($max -gt 1000) { $max = 1000 }
 	try {
 		if ($name) {
-			return (Get-Service -Name $name -ErrorAction Stop |
-				Select-Object Name, Status, StartType, DisplayName |
-				ConvertTo-Json -Compress)
+			$svc = Get-Service -Name $name -ErrorAction Stop
+			return ConvertTo-MBJson ([ordered]@{
+				ok      = $true
+				count   = 1
+				service = (ConvertTo-MBServiceRow $svc)
+			}) -Depth 4
 		}
 		$svcs = @(Get-Service -ErrorAction Stop)
 		if ($status) {
-			$svcs = @($svcs | Where-Object { $_.Status -like $status })
+			$want = $status.Trim()
+			$svcs = @($svcs | Where-Object { [string]$_.Status -like $want -or [string]$_.Status -eq $want })
 		}
 		$total = $svcs.Count
 		$svcs = @($svcs | Sort-Object Name | Select-Object -First $max)
-		$rows = @($svcs | Select-Object Name, Status, StartType, DisplayName)
-		return ConvertTo-MBJson @{
+		$rows = @($svcs | ForEach-Object { ConvertTo-MBServiceRow $_ })
+		return ConvertTo-MBJson ([ordered]@{
+			ok        = $true
 			count     = $rows.Count
 			total     = $total
 			truncated = ($total -gt $rows.Count)
 			services  = $rows
-		}
+			status_enum = @('Running','Stopped','Paused','StartPending','StopPending','ContinuePending','PausePending')
+			starttype_enum = @('Automatic','Manual','Disabled','Boot','System')
+		}) -Depth 5
 	} catch {
-		return "ERROR: $($_.Exception.Message)"
+		return ConvertTo-MBJson ([ordered]@{ ok = $false; error = $_.Exception.Message })
 	}
 }
 
@@ -15041,13 +15964,13 @@ function Invoke-ControlService {
 		switch ($action) {
 			'start' {
 				if ($svc.Status -eq 'Running') {
-					return ConvertTo-MBJson @{ success = $true; note = "Already running"; service = ($svc | Select-Object Name, Status, StartType, DisplayName) }
+					return ConvertTo-MBJson @{ success = $true; note = "Already running"; service = (ConvertTo-MBServiceRow $svc) }
 				}
 				Start-Service -Name $svc.Name -ErrorAction Stop
 			}
 			'stop' {
 				if ($svc.Status -eq 'Stopped') {
-					return ConvertTo-MBJson @{ success = $true; note = "Already stopped"; service = ($svc | Select-Object Name, Status, StartType, DisplayName) }
+					return ConvertTo-MBJson @{ success = $true; note = "Already stopped"; service = (ConvertTo-MBServiceRow $svc) }
 				}
 				Stop-Service -Name $svc.Name -Force -ErrorAction Stop
 			}
@@ -15087,7 +16010,7 @@ function Invoke-ControlService {
 		return ConvertTo-MBJson @{
 			success = $true
 			message = "$prefix`: ControlService $action on $($after.Name)"
-			service = ($after | Select-Object Name, Status, StartType, DisplayName)
+			service = (ConvertTo-MBServiceRow $after)
 		}
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
@@ -15428,7 +16351,7 @@ function Invoke-CompressArchive {
 	}
 }
 
-# ISO helpers (IMAPI2 / Chris Wu New-IsoFile style — embedded, no download required)
+# ISO helpers (IMAPI2)
 function Initialize-MBIsoFileType {
 	if ('MB_ISOFileWriter' -as [type]) { return $true }
 	try {
@@ -15495,7 +16418,7 @@ function Get-MBIsoMountInfo {
 }
 
 function New-MBIsoFile {
-	# Create ISO from paths (contents). Based on Chris Wu New-IsoFile / IMAPI2.
+	# Create ISO from paths via IMAPI2.
 	param(
 		[Parameter(Mandatory = $true)]
 		[object[]]$Items,
@@ -15995,12 +16918,32 @@ $($sample -join "`n")
 
 	$workRoot = $null
 	try {
+		# Stage in temp: numeric sources 100/101/..., DDF directive file, makecab /F + /D CabinetNameTemplate
 		$workRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("MiniBotCab_" + [guid]::NewGuid().ToString('N').Substring(0, 10))
+		if (Test-Path -LiteralPath $workRoot) {
+			Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
+		}
 		New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
-		$stage = Join-Path $workRoot 'src'
-		New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
-		# Stage files as 100, 101, ... (like offline.config) with cabinet names in quotes
+		# Stage files as progressive ids starting at 100 (makecab SourceDir=. map)
+		$id = 100
+		$stagedEntries = New-Object System.Collections.ArrayList
+		foreach ($e in @($fileList)) {
+			$srcId = [string]$id
+			$staged = Join-Path $workRoot $srcId
+			Copy-Item -LiteralPath $e.FullName -Destination $staged -Force -ErrorAction Stop
+			$cabSafe = ([string]$e.CabName) -replace '["\r\n]', '_'
+			if ([string]::IsNullOrWhiteSpace($cabSafe)) { $cabSafe = "file$id" }
+			[void]$stagedEntries.Add([pscustomobject]@{
+				Id       = $id
+				SrcId    = $srcId
+				CabName  = $cabSafe
+				Source   = [string]$e.FullName
+			})
+			$id++
+		}
+
+		# DDF defaults: LZX level 7 / memory 21; Compress ON/OFF via /D on cmdline
 		$ddfLines = New-Object System.Collections.Generic.List[string]
 		[void]$ddfLines.Add('.new Cabinet')
 		[void]$ddfLines.Add('.Set Cabinet=ON')
@@ -16008,9 +16951,10 @@ $($sample -join "`n")
 		[void]$ddfLines.Add('.Set ChecksumWidth=1')
 		[void]$ddfLines.Add('.Set ClusterSize=CDROM')
 		[void]$ddfLines.Add('.Set LongSourceFileNames=ON')
-		if ($comp -eq 'NONE' -or $comp -eq 'OFF') {
-			[void]$ddfLines.Add('.Set CompressionType=MSZIP') # ignored when Compress=OFF via cmdline
-		} elseif ($comp -eq 'MSZIP') {
+		if ($comp -eq 'MSZIP') {
+			[void]$ddfLines.Add('.Set CompressionType=MSZIP')
+		} elseif ($comp -eq 'NONE' -or $comp -eq 'OFF') {
+			# Type still set; Compress=OFF on cmdline is what stores uncompressed
 			[void]$ddfLines.Add('.Set CompressionType=MSZIP')
 		} else {
 			[void]$ddfLines.Add('.Set CompressionType=LZX')
@@ -16020,44 +16964,44 @@ $($sample -join "`n")
 		[void]$ddfLines.Add('.Set DiskDirectoryTemplate=')
 		[void]$ddfLines.Add('.Set FolderFileCountThreshold=0')
 		[void]$ddfLines.Add('.Set FolderSizeThreshold=0')
-		[void]$ddfLines.Add('.Set GenerateInf=OFF')
+		[void]$ddfLines.Add('.Set GenerateInf=ON')
+		[void]$ddfLines.Add('.Set InfFileName=nul')
 		[void]$ddfLines.Add('.Set MaxCabinetSize=0')
 		[void]$ddfLines.Add('.Set MaxDiskFileCount=0')
 		[void]$ddfLines.Add('.Set MaxDiskSize=0')
 		[void]$ddfLines.Add('.Set MaxErrors=0')
+		[void]$ddfLines.Add('.Set ReservePerCabinetSize=0')
+		[void]$ddfLines.Add('.Set ReservePerDataBlockSize=0')
+		[void]$ddfLines.Add('.Set ReservePerFolderSize=0')
 		[void]$ddfLines.Add('.Set RptFileName=nul')
 		[void]$ddfLines.Add('.Set UniqueFiles=ON')
 		[void]$ddfLines.Add('.Set SourceDir=.')
-
-		$id = 100
-		foreach ($e in @($fileList)) {
-			$srcName = [string]$id
-			$staged = Join-Path $stage $srcName
-			Copy-Item -LiteralPath $e.FullName -Destination $staged -Force -ErrorAction Stop
-			# source id  "cabinet name"
-			$cabSafe = ([string]$e.CabName) -replace '"', ''
-			[void]$ddfLines.Add(('{0} "{1}"' -f $srcName, $cabSafe))
-			$id++
+		# File map: 100 "name.ext"  (source id unquoted; cabinet name quoted) — built after packing list is final
+		foreach ($se in @($stagedEntries)) {
+			[void]$ddfLines.Add(('{0} "{1}"' -f $se.SrcId, $se.CabName))
 		}
 
-		$ddfPath = Join-Path $workRoot 'cabinet.ddf'
-		$outCab = Join-Path $workRoot 'out.cab'
-		# CabinetNameTemplate can be absolute
-		$compressArg = if ($comp -eq 'NONE' -or $comp -eq 'OFF') { 'OFF' } else { 'ON' }
+		$ddfPath = Join-Path $workRoot 'offline.config'
+		# CRLF: makecab expects directive file with Windows line endings
 		$ddfText = ($ddfLines -join "`r`n") + "`r`n"
 		[System.IO.File]::WriteAllText($ddfPath, $ddfText, (New-Object System.Text.UTF8Encoding $false))
 
+		# Build into work dir first, then copy to destination (CabinetNameTemplate absolute path)
+		$outCab = Join-Path $workRoot 'out.cab'
 		if ((Test-Path -LiteralPath $dest) -and $force) {
 			Remove-Item -LiteralPath $dest -Force -ErrorAction Stop
 		}
 
-		try { Write-MBDownloadProgress -Label 'MakeCab' -Percent 0 -Phase start -Detail ("packing {0} file(s)" -f $fileList.Count) } catch {}
+		$compressArg = if ($comp -eq 'NONE' -or $comp -eq 'OFF') { 'OFF' } else { 'ON' }
+		# makecab /F config /D Compress=... /D CabinetNameTemplate=absPath  (cwd = stage)
+		$argLine = '/F "{0}" /D Compress={1} /D CabinetNameTemplate="{2}"' -f $ddfPath, $compressArg, $outCab
+
+		try { Write-MBDownloadProgress -Label 'MakeCab' -Percent 0 -Phase start -Detail ("packing {0} file(s)" -f $stagedEntries.Count) } catch {}
 
 		$psi = New-Object System.Diagnostics.ProcessStartInfo
 		$psi.FileName = $makecab
-		# /F ddf /D Compress=ON|OFF /D CabinetNameTemplate=out.cab
-		$psi.Arguments = "/F `"$ddfPath`" /D Compress=$compressArg /D CabinetNameTemplate=`"$outCab`""
-		$psi.WorkingDirectory = $stage
+		$psi.Arguments = $argLine
+		$psi.WorkingDirectory = $workRoot
 		$psi.UseShellExecute = $false
 		$psi.RedirectStandardOutput = $true
 		$psi.RedirectStandardError = $true
@@ -16073,11 +17017,11 @@ $($sample -join "`n")
 		$childPid = 0
 		$lastPct = -1
 		$sw = [System.Diagnostics.Stopwatch]::StartNew()
-		$stderrBag = New-Object System.Text.StringBuilder
-		$stdoutBag = New-Object System.Text.StringBuilder
+		$stderrBuf = New-Object System.Text.StringBuilder
+		$stdoutBuf = New-Object System.Text.StringBuilder
 
-		# Progress lines look like: "  12.34% - completing disk..."
-		$pctRx = [regex]'(?i)(\d{1,3})(?:\.\d+)?\s*%'
+		# Progress: integer percent from lines like "  12.34% - completing disk..."
+		$pctRx = [regex]'(?i)(\d{1,3})(?=\.\d{1,2}\s*%)'
 
 		[void]$proc.Start()
 		try {
@@ -16085,7 +17029,6 @@ $($sample -join "`n")
 			Register-MBChildProcess -ProcessId $childPid
 		} catch { $childPid = 0 }
 
-		# Async stderr drain
 		$errTask = $proc.StandardError.ReadToEndAsync()
 
 		$readLine = {
@@ -16101,8 +17044,11 @@ $($sample -join "`n")
 			}
 			$line = & $readLine $proc
 			if ($null -ne $line) {
-				[void]$stdoutBag.AppendLine($line)
+				[void]$stdoutBuf.AppendLine($line)
 				$m = $pctRx.Match([string]$line)
+				if (-not $m.Success) {
+					$m = [regex]::Match([string]$line, '(?i)(\d{1,3})\s*%')
+				}
 				if ($m.Success) {
 					$p = 0
 					[void][int]::TryParse($m.Groups[1].Value, [ref]$p)
@@ -16115,7 +17061,6 @@ $($sample -join "`n")
 			} else {
 				Start-Sleep -Milliseconds 40
 			}
-			# Soft timeout: 30 min for huge packs
 			if ($sw.ElapsedMilliseconds -gt 1800000) {
 				try { Stop-MBProcessTree -ProcessId $childPid } catch { try { $proc.Kill() } catch {} }
 				try { Write-MBDownloadProgress -Label 'MakeCab' -Percent -1 -Phase fail -Detail 'timeout' } catch {}
@@ -16123,13 +17068,13 @@ $($sample -join "`n")
 				return "ERROR: MakeCab timed out after 30 minutes."
 			}
 		}
-		# Drain remaining stdout after exit
 		try {
 			while ($true) {
 				$line = & $readLine $proc
 				if ($null -eq $line) { break }
-				[void]$stdoutBag.AppendLine($line)
+				[void]$stdoutBuf.AppendLine($line)
 				$m = $pctRx.Match([string]$line)
+				if (-not $m.Success) { $m = [regex]::Match([string]$line, '(?i)(\d{1,3})\s*%') }
 				if ($m.Success) {
 					$p = 0
 					[void][int]::TryParse($m.Groups[1].Value, [ref]$p)
@@ -16145,28 +17090,44 @@ $($sample -join "`n")
 		$exitCode = -1
 		try { $exitCode = [int]$proc.ExitCode } catch { $exitCode = -1 }
 		try {
-			if ($errTask.IsCompleted) { [void]$stderrBag.Append([string]$errTask.Result) }
+			if ($errTask.IsCompleted) { [void]$stderrBuf.Append([string]$errTask.Result) }
 			else {
 				try { [void]$errTask.Wait(1000) } catch {}
-				if ($errTask.IsCompleted) { [void]$stderrBag.Append([string]$errTask.Result) }
+				if ($errTask.IsCompleted) { [void]$stderrBuf.Append([string]$errTask.Result) }
 			}
 		} catch {}
 		if ($childPid -gt 0) { try { Unregister-MBChildProcess -ProcessId $childPid } catch {} }
 		try { $proc.Dispose() } catch {}
 
-		if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $outCab)) {
-			# Some makecab builds write CabinetNameTemplate relative to SourceDir
-			$alt = Join-Path $stage 'out.cab'
-			if ((Test-Path -LiteralPath $alt) -and -not (Test-Path -LiteralPath $outCab)) {
-				$outCab = $alt
+		if (-not (Test-Path -LiteralPath $outCab)) {
+			foreach ($alt in @(
+				(Join-Path $workRoot '1.cab'),
+				(Join-Path $workRoot 'disk1\1.cab'),
+				(Join-Path $workRoot 'disk1\out.cab')
+			)) {
+				if (Test-Path -LiteralPath $alt) { $outCab = $alt; break }
 			}
 		}
 		if (-not (Test-Path -LiteralPath $outCab)) {
-			$err = $stderrBag.ToString()
-			if ([string]::IsNullOrWhiteSpace($err)) { $err = $stdoutBag.ToString() }
-			if ($err.Length -gt 800) { $err = $err.Substring($err.Length - 800) }
+			$err = $stderrBuf.ToString()
+			if ([string]::IsNullOrWhiteSpace($err)) { $err = $stdoutBuf.ToString() }
+			$err = Sanitize-MBProcessOutput -Text $err
+			if ($err.Length -gt 600) { $err = $err.Substring($err.Length - 600) }
 			try { Write-MBDownloadProgress -Label 'MakeCab' -Percent -1 -Phase fail -Detail 'makecab failed' } catch {}
 			return ("ERROR: makecab failed (exit {0}). {1}" -f $exitCode, $err.Trim())
+		}
+		if ($exitCode -ne 0) {
+			$probe = Get-Item -LiteralPath $outCab -ErrorAction SilentlyContinue
+			if (-not $probe -or $probe.Length -lt 1) {
+				$err = Sanitize-MBProcessOutput -Text ($stderrBuf.ToString() + "`n" + $stdoutBuf.ToString())
+				if ($err.Length -gt 400) { $err = $err.Substring($err.Length - 400) }
+				return ("ERROR: makecab failed (exit {0}). {1}" -f $exitCode, $err.Trim())
+			}
+		}
+
+		$fiOut = Get-Item -LiteralPath $outCab -ErrorAction Stop
+		if ($fiOut.Length -lt 1) {
+			return "ERROR: makecab produced empty cab: $outCab"
 		}
 
 		Copy-Item -LiteralPath $outCab -Destination $dest -Force -ErrorAction Stop
@@ -16179,12 +17140,13 @@ $($sample -join "`n")
 			message            = ("{0}: CAB created {1}" -f $prefix, $dest)
 			destination        = $dest
 			bytes              = [int64]$fi.Length
-			file_count         = [int]$fileList.Count
+			file_count         = [int]$stagedEntries.Count
 			compression        = $comp
 			compression_level  = $(if ($comp -eq 'LZX') { $compression_level } else { $null })
 			duration_ms        = [int]$sw.ElapsedMilliseconds
-			files              = @($fileList | Select-Object -First 40 | ForEach-Object {
-				[ordered]@{ name = $_.CabName; source = $_.FullName }
+			ddf                = 'offline.config'
+			files              = @($stagedEntries | Select-Object -First 40 | ForEach-Object {
+				[ordered]@{ id = [int]$_.Id; name = $_.CabName; source = $_.Source }
 			})
 		}) -Depth 6
 	} catch {
@@ -16243,9 +17205,20 @@ function Invoke-ExpandCab {
 			New-Item -ItemType Directory -Path $dest -Force | Out-Null
 		}
 		try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent 0 -Phase start -Detail $cab } catch {}
-		# expand -F:* cab dest\
-		$destArg = $dest.TrimEnd('\') + '\'
-		$rr = Invoke-MBProcessCapture -FileName $expand -Arguments ("-F:* `"$cab`" `"$destArg`"") -WorkingDir $dest -TimeoutMs 600000
+		# expand.exe quoting: trailing '\' inside "..." escapes the close quote on Windows.
+		# Use dest without trailing slash, or "dest\." form. Prefer unquoted when no spaces.
+		$destArg = $dest.TrimEnd('\', '/')
+		$quotePath = {
+			param([string]$p)
+			if ($p -match '[\s"]') {
+				return '"' + ($p -replace '"', '""') + '"'
+			}
+			return $p
+		}
+		$cabQ = & $quotePath $cab
+		$destQ = & $quotePath $destArg
+		$argLine = "-F:* $cabQ $destQ"
+		$rr = Invoke-MBProcessCapture -FileName $expand -Arguments $argLine -WorkingDir $destArg -TimeoutMs 600000
 		if ($rr.TimedOut) {
 			try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent -1 -Phase fail -Detail 'timeout' } catch {}
 			return "ERROR: ExpandCab timed out."
@@ -16255,9 +17228,8 @@ function Invoke-ExpandCab {
 			return "ERROR: ExpandCab cancelled."
 		}
 		if ([int]$rr.ExitCode -ne 0) {
-			$err = [string]$rr.StdErr
-			if ([string]::IsNullOrWhiteSpace($err)) { $err = [string]$rr.StdOut }
-			if ($err.Length -gt 600) { $err = $err.Substring($err.Length - 600) }
+			$err = Sanitize-MBProcessOutput -Text $(if ($rr.StdErr) { $rr.StdErr } else { $rr.StdOut })
+			if ($err.Length -gt 400) { $err = $err.Substring($err.Length - 400) }
 			try { Write-MBDownloadProgress -Label 'ExpandCab' -Percent -1 -Phase fail -Detail 'expand failed' } catch {}
 			return ("ERROR: expand.exe failed (exit {0}). {1}" -f $rr.ExitCode, $err.Trim())
 		}
@@ -16287,40 +17259,324 @@ function Invoke-ExpandCab {
 	}
 }
 
+
+function Invoke-MBPSGalleryOp {
+	# Isolate Find/Install/Update-Module in a child powershell.exe with timeout + Esc kill.
+	param(
+		[ValidateSet('Find','Install','Update')]
+		[string]$Op,
+		[string]$Name,
+		[string]$Version = '',
+		[string]$Scope = 'CurrentUser',
+		[bool]$AllowPrerelease = $false,
+		[int]$MaxResults = 15,
+		[int]$TimeoutSec = 0
+	)
+	if ([string]::IsNullOrWhiteSpace($Name)) {
+		return @{ Ok = $false; Error = 'name is required'; TimedOut = $false; Cancelled = $false; ExitCode = -1; StdOut = ''; StdErr = '' }
+	}
+	if ($TimeoutSec -le 0) {
+		$TimeoutSec = switch ($Op) {
+			'Find' { 60 }
+			'Install' { 180 }
+			'Update' { 180 }
+			default { 120 }
+		}
+	}
+	if ($TimeoutSec -lt 15) { $TimeoutSec = 15 }
+	if ($TimeoutSec -gt 600) { $TimeoutSec = 600 }
+
+	$nameEsc = $Name.Replace("'", "''")
+	$verEsc = ([string]$Version).Replace("'", "''")
+	$scopeEsc = ([string]$Scope).Replace("'", "''")
+	$maxR = [int]$MaxResults
+	if ($maxR -le 0) { $maxR = 15 }
+	if ($maxR -gt 50) { $maxR = 50 }
+	$pre = if ($AllowPrerelease) { '$true' } else { '$false' }
+
+	# Child script on disk: NonInteractive Gallery ops (NuGet bootstrap, PSGallery trust, Force/Confirm:$false)
+	$child = @"
+`$ErrorActionPreference = 'Stop'
+`$ProgressPreference = 'SilentlyContinue'
+`$ConfirmPreference = 'None'
+`$WhatIfPreference = `$false
+try { `$PSDefaultParameterValues = @{
+	'*:Confirm' = `$false
+	'*:Force' = `$true
+	'Install-Module:Confirm' = `$false
+	'Install-Module:Force' = `$true
+	'Update-Module:Confirm' = `$false
+	'Update-Module:Force' = `$true
+	'Find-Module:Repository' = 'PSGallery'
+	'Install-Module:Repository' = 'PSGallery'
+	'Install-PackageProvider:Confirm' = `$false
+	'Install-PackageProvider:Force' = `$true
+	'Set-PSRepository:InstallationPolicy' = 'Trusted'
+} } catch {}
+try {
+	`$proto = [System.Net.SecurityProtocolType]::Tls12
+	try { `$proto = `$proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
+	[System.Net.ServicePointManager]::SecurityProtocol = `$proto
+} catch {}
+try { [Net.ServicePointManager]::Expect100Continue = `$false } catch {}
+
+function Initialize-MBGalleryNonInteractive {
+	try {
+		`$needNuGet = `$true
+		`$nug = @(Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue |
+			Sort-Object { [version]`$_.Version } -Descending)
+		if (`$nug.Count -gt 0) {
+			try {
+				if ([version]`$nug[0].Version -ge [version]'2.8.5.201') { `$needNuGet = `$false }
+			} catch { `$needNuGet = `$false }
+		}
+		if (`$needNuGet) {
+			try {
+				Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:`$false -Scope CurrentUser -ErrorAction Stop | Out-Null
+			} catch {
+				try { Install-PackageProvider -Name NuGet -Force -Confirm:`$false -ErrorAction Stop | Out-Null } catch {}
+			}
+		}
+	} catch {}
+	try { Import-Module PackageManagement -ErrorAction SilentlyContinue | Out-Null } catch {}
+	try { Import-Module PowerShellGet -ErrorAction SilentlyContinue | Out-Null } catch {}
+	try {
+		`$repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+		if (-not `$repo) {
+			try { Register-PSRepository -Default -ErrorAction SilentlyContinue } catch {}
+			try {
+				if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+					Register-PSRepository -Name PSGallery -SourceLocation 'https://www.powershellgallery.com/api/v2' -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+				}
+			} catch {}
+		}
+		Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+	} catch {}
+	try {
+		if (Get-Command Set-PackageSource -ErrorAction SilentlyContinue) {
+			Set-PackageSource -Name PSGallery -Trusted -Force -ErrorAction SilentlyContinue | Out-Null
+		}
+	} catch {}
+}
+Initialize-MBGalleryNonInteractive
+
+`$name = '$nameEsc'
+`$op = '$Op'
+try {
+	switch (`$op) {
+		'Find' {
+			if (-not (Get-Command Find-Module -ErrorAction SilentlyContinue)) { throw 'Find-Module not available (install PowerShellGet).' }
+			`$fp = @{
+				Name = `$name
+				Repository = 'PSGallery'
+				ErrorAction = 'Stop'
+			}
+			`$fm = Get-Command Find-Module -ErrorAction SilentlyContinue
+			if (`$fm -and `$fm.Parameters.ContainsKey('AllowPrerelease') -and $pre) { `$fp['AllowPrerelease'] = `$true }
+			if (`$fm -and `$fm.Parameters.ContainsKey('Force')) { `$fp['Force'] = `$true }
+			if (`$fm -and `$fm.Parameters.ContainsKey('Confirm')) { `$fp['Confirm'] = `$false }
+			`$mods = @(Find-Module @fp | Select-Object -First $maxR)
+			`$rows = @(`$mods | ForEach-Object {
+				[ordered]@{
+					Name = `$_.Name
+					Version = [string]`$_.Version
+					Author = [string]`$_.Author
+					Description = `$(if (`$_.Description) { ([string]`$_.Description).Substring(0, [math]::Min(200, ([string]`$_.Description).Length)) } else { '' })
+					Repository = [string]`$_.Repository
+				}
+			})
+			@{ success = `$true; count = `$rows.Count; query = `$name; modules = `$rows; gallery = 'PSGallery'; trusted = `$true } | ConvertTo-Json -Compress -Depth 6
+		}
+		'Install' {
+			if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue)) { throw 'Install-Module not available (install PowerShellGet).' }
+			`$ip = @{
+				Name = `$name
+				Scope = '$scopeEsc'
+				Force = `$true
+				AllowClobber = `$true
+				Confirm = `$false
+				ErrorAction = 'Stop'
+				Repository = 'PSGallery'
+			}
+			if ('$verEsc') { `$ip['RequiredVersion'] = '$verEsc' }
+			`$imCmd = Get-Command Install-Module -ErrorAction SilentlyContinue
+			if (`$imCmd -and `$imCmd.Parameters.ContainsKey('AcceptLicense')) { `$ip['AcceptLicense'] = `$true }
+			if ($pre -and `$imCmd -and `$imCmd.Parameters.ContainsKey('AllowPrerelease')) { `$ip['AllowPrerelease'] = `$true }
+			if (`$imCmd -and `$imCmd.Parameters.ContainsKey('SkipPublisherCheck')) { `$ip['SkipPublisherCheck'] = `$true }
+			Install-Module @ip
+			`$installed = @(Get-Module -ListAvailable -Name `$name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 3)
+			@{
+				success = `$true
+				name = `$name
+				scope = '$scopeEsc'
+				modules = @(`$installed | ForEach-Object { [ordered]@{ Name = `$_.Name; Version = [string]`$_.Version; ModuleBase = [string]`$_.ModuleBase } })
+			} | ConvertTo-Json -Compress -Depth 6
+		}
+		'Update' {
+			if (-not (Get-Command Update-Module -ErrorAction SilentlyContinue)) { throw 'Update-Module not available (install PowerShellGet).' }
+			`$before = @(Get-Module -ListAvailable -Name `$name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1)
+			if (`$before.Count -eq 0) { throw "Module '`$name' is not installed." }
+			`$up = @{
+				Name = `$name
+				Force = `$true
+				Confirm = `$false
+				ErrorAction = 'Stop'
+			}
+			`$umCmd = Get-Command Update-Module -ErrorAction SilentlyContinue
+			if (`$umCmd -and `$umCmd.Parameters.ContainsKey('AcceptLicense')) { `$up['AcceptLicense'] = `$true }
+			`$scopeVal = '$scopeEsc'
+			if (`$scopeVal -and `$umCmd -and `$umCmd.Parameters.ContainsKey('Scope')) {
+				try { Update-Module @up -Scope `$scopeVal }
+				catch { Update-Module @up }
+			} else {
+				Update-Module @up
+			}
+			`$after = @(Get-Module -ListAvailable -Name `$name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 3)
+			@{
+				success = `$true
+				name = `$name
+				before = `$(if (`$before[0]) { [string]`$before[0].Version } else { `$null })
+				modules = @(`$after | ForEach-Object { [ordered]@{ Name = `$_.Name; Version = [string]`$_.Version; ModuleBase = [string]`$_.ModuleBase } })
+			} | ConvertTo-Json -Compress -Depth 6
+		}
+	}
+} catch {
+	`$errMsg = `$_.Exception.Message
+	if ([string]::IsNullOrWhiteSpace(`$errMsg)) { `$errMsg = 'operation failed' }
+	if (`$errMsg -match '(?i)NuGet|package provider|untrusted|confirmation|interactive|prompt|PSGallery') {
+		`$errMsg = (`$errMsg.Trim() + ' [hint: NuGet bootstrap / PSGallery trust / -Force -Confirm:`$false]')
+	}
+	if (`$errMsg.Length -gt 300) { `$errMsg = `$errMsg.Substring(0, 297) + '...' }
+	@{ success = `$false; error = `$errMsg } | ConvertTo-Json -Compress
+	exit 2
+}
+"@
+
+	$scriptPath = $null
+	$out = @{
+		Ok = $false
+		TimedOut = $false
+		Cancelled = $false
+		ExitCode = -1
+		StdOut = ''
+		StdErr = ''
+		Error = ''
+		Payload = $null
+		Isolation = 'file'
+	}
+	try {
+		$scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("MiniBotGallery_" + [guid]::NewGuid().ToString('N').Substring(0, 12) + '.ps1')
+		# UTF-8 with BOM for PS 5.1 -File
+		$utf8Bom = New-Object System.Text.UTF8Encoding $true
+		[System.IO.File]::WriteAllText($scriptPath, $child, $utf8Bom)
+
+		$psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+		if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+		$timeoutMs = [int]($TimeoutSec * 1000)
+		$argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $scriptPath + '"'
+		$rr = Invoke-MBProcessCapture -FileName $psExe -Arguments $argLine -TimeoutMs $timeoutMs
+		$out.TimedOut = [bool]$rr.TimedOut
+		$out.Cancelled = [bool]$rr.Cancelled
+		$out.ExitCode = [int]$rr.ExitCode
+		$out.StdOut = [string]$rr.StdOut
+		$out.StdErr = [string]$rr.StdErr
+	} catch {
+		$out.Error = "Gallery child launch failed: $($_.Exception.Message)"
+		return $out
+	} finally {
+		if ($scriptPath -and (Test-Path -LiteralPath $scriptPath)) {
+			try { Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue } catch {}
+		}
+	}
+
+	if ($out.Cancelled) {
+		$out.Error = "$Op module operation cancelled by user (Esc/Stop)."
+		return $out
+	}
+	if ($out.TimedOut) {
+		$out.Error = "$Op-Module timed out after ${TimeoutSec}s (PowerShell Gallery / NuGet may be slow or stuck)."
+		return $out
+	}
+	$stderr = Sanitize-MBProcessOutput -Text $out.StdErr
+	$stdout = Sanitize-MBProcessOutput -Text $out.StdOut
+	$jsonText = ''
+	try {
+		$blob = if (-not [string]::IsNullOrWhiteSpace($stdout)) { $stdout } else { $stderr }
+		if ($blob -match '(\{[\s\S]*\})\s*$') { $jsonText = $Matches[1] }
+	} catch {}
+	if ($out.ExitCode -ne 0) {
+		if ($jsonText) {
+			try {
+				$j = $jsonText | ConvertFrom-Json -ErrorAction Stop
+				$em = ''
+				try { $em = [string]$j.error } catch {}
+				if (-not $em) { try { $em = [string]$j.message } catch {} }
+				if ($em) { $out.Error = $em; return $out }
+			} catch {}
+		}
+		$msg = $stderr
+		if ([string]::IsNullOrWhiteSpace($msg)) { $msg = $stdout }
+		if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "exit code $($out.ExitCode)" }
+		if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 397) + '...' }
+		$out.Error = $msg
+		return $out
+	}
+	if ([string]::IsNullOrWhiteSpace($stdout)) {
+		$out.Error = "$Op-Module produced no output."
+		return $out
+	}
+	try {
+		if (-not $jsonText -and $stdout -match '(\{[\s\S]*\})\s*$') { $jsonText = $Matches[1] }
+		if (-not $jsonText) { $jsonText = $stdout }
+		$out.Payload = $jsonText | ConvertFrom-Json -ErrorAction Stop
+		try {
+			if ($null -ne $out.Payload.success -and -not [bool]$out.Payload.success) {
+				$em = [string]$out.Payload.error
+				if (-not $em) { $em = "$Op failed" }
+				$out.Error = $em
+				$out.Ok = $false
+				return $out
+			}
+		} catch {}
+		$out.Ok = $true
+	} catch {
+		$out.Error = "could not parse $Op-Module result"
+	}
+	return $out
+}
+
 function Invoke-FindPSModule {
 	param(
 		[string]$name,
-		[int]$max_results = 15
+		[int]$max_results = 15,
+		[int]$timeout_sec = 60
 	)
-	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name is required." }
+	if ([string]::IsNullOrWhiteSpace($name)) { return (Format-MBShortToolError -ErrorText 'name is required') }
 	if ($max_results -le 0) { $max_results = 15 }
 	if ($max_results -gt 50) { $max_results = 50 }
+	if ($timeout_sec -le 0) { $timeout_sec = 60 }
 
+	$r = Invoke-MBPSGalleryOp -Op Find -Name $name -MaxResults $max_results -TimeoutSec $timeout_sec
+	if (-not $r.Ok) {
+		$err = if ($r.Error) { [string]$r.Error } else { "Find-Module failed (exit $($r.ExitCode))" }
+		# Prefer short message; never dump full child runner / CLIXML
+		$short = Sanitize-MBProcessOutput -Text $err
+		if ([string]::IsNullOrWhiteSpace($short) -and $r.StdErr) {
+			$short = Sanitize-MBProcessOutput -Text $r.StdErr
+		}
+		return (Format-MBShortToolError -ErrorText $short -Fallback 'Find-Module failed')
+	}
 	try {
-		if (-not (Get-Command Find-Module -ErrorAction SilentlyContinue)) {
-			return "ERROR: Find-Module not available. Install PowerShellGet: Install-Module PowerShellGet -Scope CurrentUser -Force"
-		}
-		$mods = @(Find-Module -Name $name -ErrorAction Stop | Select-Object -First $max_results)
-		if ($mods.Count -eq 0) {
-			return ConvertTo-MBJson @{ success = $true; count = 0; modules = @(); query = $name }
-		}
-		$rows = @($mods | ForEach-Object {
-			[ordered]@{
-				Name        = $_.Name
-				Version     = [string]$_.Version
-				Author      = [string]$_.Author
-				Description = $(if ($_.Description) { ([string]$_.Description).Substring(0, [math]::Min(200, ([string]$_.Description).Length)) } else { '' })
-				Repository  = [string]$_.Repository
-			}
-		})
+		$payload = $r.Payload
 		return ConvertTo-MBJson @{
 			success = $true
-			count   = $rows.Count
-			query   = $name
-			modules = $rows
-		} -Depth 5
+			count   = [int]$payload.count
+			query   = [string]$payload.query
+			modules = @($payload.modules)
+			note    = 'Find-Module in child process (timeout; Esc aborts).'
+		} -Depth 6
 	} catch {
-		return "ERROR: $($_.Exception.Message)"
+		return (Format-MBShortToolError -ErrorText $_.Exception.Message -Fallback 'Find-Module parse failed')
 	}
 }
 
@@ -16365,16 +17621,17 @@ function Invoke-InstallPSModule {
 		[string]$name,
 		[string]$version,
 		[string]$scope = 'CurrentUser',
-		[bool]$allow_prerelease = $false
+		[bool]$allow_prerelease = $false,
+		[int]$timeout_sec = 180
 	)
-	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name is required." }
+	if ([string]::IsNullOrWhiteSpace($name)) { return (Format-MBShortToolError -ErrorText 'name is required') }
 	if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue)) {
-		return "ERROR: Install-Module not available. Install PowerShellGet first."
+		return (Format-MBShortToolError -ErrorText 'Install-Module not available. Install PowerShellGet first.')
 	}
 
 	$scopeNorm = if ([string]::IsNullOrWhiteSpace($scope)) { 'CurrentUser' } else { $scope.Trim() }
 	if ($scopeNorm -notin @('CurrentUser','AllUsers')) {
-		return "ERROR: scope must be CurrentUser or AllUsers."
+		return (Format-MBShortToolError -ErrorText 'scope must be CurrentUser or AllUsers')
 	}
 	if ($scopeNorm -eq 'AllUsers') {
 		$isAdmin = $false
@@ -16384,114 +17641,82 @@ function Invoke-InstallPSModule {
 			$isAdmin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 		} catch {}
 		if (-not $isAdmin) {
-			return "ERROR: AllUsers scope requires an elevated (Administrator) PowerShell session."
+			return (Format-MBShortToolError -ErrorText 'AllUsers scope requires an elevated (Administrator) PowerShell session')
 		}
 	}
+	if ($timeout_sec -le 0) { $timeout_sec = 180 }
 
-	$details = "Install PowerShell module from PSGallery:`n`n  Name:    $name`n  Scope:   $scopeNorm"
+	$details = "Install PowerShell module from PSGallery:`n`n  Name:    $name`n  Scope:   $scopeNorm`n  Timeout: ${timeout_sec}s (Esc/Stop aborts)"
 	if ($version) { $details += "`n  Version: $version" }
 	if ($allow_prerelease) { $details += "`n  Prerelease: yes" }
-	$details += "`n`nUses Install-Module (may download from internet)."
+	$details += "`n`nRuns Install-Module in a child process so Gallery/NuGet hangs cannot freeze MiniBot."
 	if (-not (Request-Confirmation -Title "InstallPSModule requires approval" -Details $details)) {
-		return "BLOCKED BY USER: Module install denied by operator."
+		return (Format-MBShortToolError -ErrorText 'Module install denied by operator' -Fallback 'denied')
 	}
 
+	$r = Invoke-MBPSGalleryOp -Op Install -Name $name -Version $version -Scope $scopeNorm -AllowPrerelease $allow_prerelease -TimeoutSec $timeout_sec
+	if (-not $r.Ok) {
+		$err = if ($r.Error) { [string]$r.Error } elseif ($r.StdErr) { [string]$r.StdErr } else { "Install-Module failed (exit $($r.ExitCode))" }
+		return (Format-MBShortToolError -ErrorText $err -Fallback 'Install-Module failed')
+	}
 	try {
-		$ip = @{
-			Name         = $name
-			Scope        = $scopeNorm
-			Force        = $true
-			AllowClobber = $true
-			ErrorAction  = 'Stop'
-			Repository   = 'PSGallery'
-		}
-		if ($version) { $ip['RequiredVersion'] = $version }
-
-		$imCmd = Get-Command Install-Module -ErrorAction SilentlyContinue
-		$imParams = @()
-		if ($imCmd) { $imParams = @($imCmd.Parameters.Keys) }
-		if ($imParams -contains 'AcceptLicense') { $ip['AcceptLicense'] = $true }
-		if ($allow_prerelease -and ($imParams -contains 'AllowPrerelease')) {
-			$ip['AllowPrerelease'] = $true
-		}
-
-		Install-Module @ip
-
-		$installed = @(Get-Module -ListAvailable -Name $name -ErrorAction SilentlyContinue |
-			Sort-Object Version -Descending | Select-Object -First 3)
+		$payload = $r.Payload
 		$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
 		return ConvertTo-MBJson @{
 			success  = $true
 			message  = "$prefix`: Install-Module $name (scope=$scopeNorm)"
 			name     = $name
 			scope    = $scopeNorm
-			modules  = @($installed | ForEach-Object {
-				[ordered]@{ Name = $_.Name; Version = [string]$_.Version; ModuleBase = $_.ModuleBase }
-			})
+			modules  = @($payload.modules)
 		} -Depth 5
 	} catch {
-		return "ERROR: $($_.Exception.Message)"
+		return (Format-MBShortToolError -ErrorText $_.Exception.Message -Fallback 'Install-Module parse failed')
 	}
 }
 
 function Invoke-UpdatePSModule {
 	param(
 		[string]$name,
-		[string]$scope
+		[string]$scope,
+		[int]$timeout_sec = 180
 	)
-	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name is required." }
+	if ([string]::IsNullOrWhiteSpace($name)) { return (Format-MBShortToolError -ErrorText 'name is required') }
 	if (-not (Get-Command Update-Module -ErrorAction SilentlyContinue)) {
-		return "ERROR: Update-Module not available. Install PowerShellGet first."
+		return (Format-MBShortToolError -ErrorText 'Update-Module not available. Install PowerShellGet first.')
 	}
 
 	$before = @(Get-Module -ListAvailable -Name $name -ErrorAction SilentlyContinue |
 		Sort-Object Version -Descending | Select-Object -First 1)
 	if ($before.Count -eq 0) {
-		return "ERROR: Module '$name' is not installed. Use InstallPSModule first."
+		return (Format-MBShortToolError -ErrorText "Module '$name' is not installed. Use InstallPSModule first.")
 	}
+	if ($timeout_sec -le 0) { $timeout_sec = 180 }
 
-	$details = "Update installed PowerShell module:`n`n  Name: $name`n  Current: $([string]$before[0].Version)"
+	$details = "Update installed PowerShell module:`n`n  Name: $name`n  Current: $([string]$before[0].Version)`n  Timeout: ${timeout_sec}s (Esc/Stop aborts)"
 	if ($scope) { $details += "`n  Scope: $scope" }
-	$details += "`n`nUses Update-Module (may download from internet)."
+	$details += "`n`nRuns Update-Module in a child process so Gallery/NuGet hangs cannot freeze MiniBot."
 	if (-not (Request-Confirmation -Title "UpdatePSModule requires approval" -Details $details)) {
-		return "BLOCKED BY USER: Module update denied by operator."
+		return (Format-MBShortToolError -ErrorText 'Module update denied by operator' -Fallback 'denied')
 	}
 
+	$scopeArg = if ($scope) { $scope.Trim() } else { '' }
+	$r = Invoke-MBPSGalleryOp -Op Update -Name $name -Scope $scopeArg -TimeoutSec $timeout_sec
+	if (-not $r.Ok) {
+		$err = if ($r.Error) { [string]$r.Error } elseif ($r.StdErr) { [string]$r.StdErr } else { "Update-Module failed (exit $($r.ExitCode))" }
+		return (Format-MBShortToolError -ErrorText $err -Fallback 'Update-Module failed')
+	}
 	try {
-		$up = @{
-			Name        = $name
-			Force       = $true
-			ErrorAction = 'Stop'
-		}
-		if (-not [string]::IsNullOrWhiteSpace($scope)) {
-			# Pass -Scope to Update-Module only if the param exists (PS 5.1)
-			$up['Scope'] = $scope.Trim()
-		}
-		try {
-			Update-Module @up
-		} catch {
-			if ($up.ContainsKey('Scope')) {
-				$up.Remove('Scope')
-				Update-Module @up
-			} else {
-				throw
-			}
-		}
-
-		$after = @(Get-Module -ListAvailable -Name $name -ErrorAction SilentlyContinue |
-			Sort-Object Version -Descending | Select-Object -First 3)
+		$payload = $r.Payload
 		$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
 		return ConvertTo-MBJson @{
 			success = $true
 			message = "$prefix`: Update-Module $name"
 			name    = $name
 			before  = $(if ($before[0]) { [string]$before[0].Version } else { $null })
-			modules = @($after | ForEach-Object {
-				[ordered]@{ Name = $_.Name; Version = [string]$_.Version; ModuleBase = $_.ModuleBase }
-			})
+			modules = @($payload.modules)
 		} -Depth 5
 	} catch {
-		return "ERROR: $($_.Exception.Message)"
+		return (Format-MBShortToolError -ErrorText $_.Exception.Message -Fallback 'Update-Module parse failed')
 	}
 }
 
@@ -17665,19 +18890,634 @@ function Get-MBByteClassSummary {
 	}
 }
 
+
+function Get-MBPeDisasmContext {
+	# Compact PE map for disasm/trace: arch, entry file offset, sections.
+	param([string]$Path)
+	$ctx = [ordered]@{
+		Ok = $false
+		Is64 = $false
+		Machine = ''
+		EntryRva = 0
+		EntryFile = $null
+		ImageBase = [uint64]0
+		Sections = @()
+	}
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		if ($fs.Length -lt 64) { return $ctx }
+		$hdr = New-Object byte[] 64
+		[void]$fs.Read($hdr, 0, 64)
+		if ($hdr[0] -ne 0x4D -or $hdr[1] -ne 0x5A) { return $ctx }
+		$e_lfanew = [BitConverter]::ToInt32($hdr, 0x3C)
+		if ($e_lfanew -le 0 -or ($e_lfanew + 24) -gt $fs.Length) { return $ctx }
+		[void]$fs.Seek([long]$e_lfanew, [System.IO.SeekOrigin]::Begin)
+		$peSig = New-Object byte[] 4
+		[void]$fs.Read($peSig, 0, 4)
+		if ($peSig[0] -ne 0x50 -or $peSig[1] -ne 0x45) { return $ctx }
+		$coff = New-Object byte[] 20
+		[void]$fs.Read($coff, 0, 20)
+		$machine = [BitConverter]::ToUInt16($coff, 0)
+		$numSec = [BitConverter]::ToUInt16($coff, 2)
+		$optSize = [BitConverter]::ToUInt16($coff, 16)
+		$ctx.Machine = switch ($machine) {
+			0x14c { 'i386' }
+			0x8664 { 'AMD64' }
+			0xAA64 { 'ARM64' }
+			default { ('0x{0:X}' -f $machine) }
+		}
+		$optOff = $e_lfanew + 24
+		$epRva = [uint32]0
+		$imgBase = [uint64]0
+		$is64 = $false
+		if ($optSize -ge 2 -and ($optOff + $optSize) -le $fs.Length) {
+			[void]$fs.Seek([long]$optOff, [System.IO.SeekOrigin]::Begin)
+			$opt = New-Object byte[] ([Math]::Min([int]$optSize, 256))
+			[void]$fs.Read($opt, 0, $opt.Length)
+			$magic = [BitConverter]::ToUInt16($opt, 0)
+			$is64 = ($magic -eq 0x20B)
+			$ctx.Is64 = $is64
+			if ($magic -eq 0x10B -or $magic -eq 0x20B) {
+				$epRva = [BitConverter]::ToUInt32($opt, 16)
+				if ($is64 -and $opt.Length -ge 32) { $imgBase = [BitConverter]::ToUInt64($opt, 24) }
+				elseif ($opt.Length -ge 32) { $imgBase = [uint64][BitConverter]::ToUInt32($opt, 28) }
+			}
+		}
+		$ctx.EntryRva = $epRva
+		$ctx.ImageBase = $imgBase
+		$secOff = $e_lfanew + 24 + $optSize
+		$secs = New-Object System.Collections.ArrayList
+		$maxSec = [Math]::Min([int]$numSec, 48)
+		for ($s = 0; $s -lt $maxSec; $s++) {
+			$so = $secOff + ($s * 40)
+			if (($so + 40) -gt $fs.Length) { break }
+			[void]$fs.Seek([long]$so, [System.IO.SeekOrigin]::Begin)
+			$sec = New-Object byte[] 40
+			[void]$fs.Read($sec, 0, 40)
+			$nb = New-Object byte[] 8
+			[Array]::Copy($sec, 0, $nb, 0, 8)
+			$name = [System.Text.Encoding]::ASCII.GetString($nb).TrimEnd([char]0)
+			[void]$secs.Add([ordered]@{
+				name = $name
+				virt_rva = [BitConverter]::ToUInt32($sec, 12)
+				virt_size = [BitConverter]::ToUInt32($sec, 8)
+				raw_ptr = [BitConverter]::ToUInt32($sec, 20)
+				raw_size = [BitConverter]::ToUInt32($sec, 16)
+			})
+		}
+		$ctx.Sections = @($secs)
+		if ($epRva -gt 0) {
+			$ctx.EntryFile = Convert-MBPeRvaToOffset -Sections $ctx.Sections -Rva $epRva
+		}
+		$ctx.Ok = $true
+	} catch {
+		$ctx.Ok = $false
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	return $ctx
+}
+
+function Get-MBX86ModRMExtraLen {
+	# Bytes after the ModRM byte (SIB + displacement), not counting ModRM itself.
+	param(
+		[byte[]]$Bytes,
+		[int]$ModRmIndex,
+		[bool]$Addr16 = $false
+	)
+	if ($ModRmIndex -ge $Bytes.Length) { return -1 }
+	$modrm = [int]$Bytes[$ModRmIndex]
+	$mod = ($modrm -shr 6) -band 3
+	$rm = $modrm -band 7
+	$extra = 0
+	$i = $ModRmIndex + 1
+	if ($Addr16) {
+		if ($mod -eq 0 -and $rm -eq 6) { $extra = 2 }
+		elseif ($mod -eq 1) { $extra = 1 }
+		elseif ($mod -eq 2) { $extra = 2 }
+		return $extra
+	}
+	# 32/64-bit addressing
+	if ($mod -ne 3 -and $rm -eq 4) {
+		# SIB
+		if ($i -ge $Bytes.Length) { return -1 }
+		$sib = [int]$Bytes[$i]
+		$extra++
+		$i++
+		$base = $sib -band 7
+		if ($mod -eq 0 -and $base -eq 5) { $extra += 4 }
+		elseif ($mod -eq 1) { $extra += 1 }
+		elseif ($mod -eq 2) { $extra += 4 }
+		return $extra
+	}
+	if ($mod -eq 0 -and $rm -eq 5) { return 4 } # disp32
+	if ($mod -eq 1) { return 1 }
+	if ($mod -eq 2) { return 4 }
+	return 0
+}
+
+function Read-MBX86Instruction {
+	# Decode one x86/x64 instruction focusing on control-flow + common ops for abandonware PE.
+	param(
+		[byte[]]$Bytes,
+		[int]$Index = 0,
+		[long]$FileOffset = 0,
+		[bool]$Is64 = $false
+	)
+	$n = $Bytes.Length
+	if ($Index -lt 0 -or $Index -ge $n) {
+		return @{ Ok = $false; Error = 'eof' }
+	}
+	$start = $Index
+	$i = $Index
+	$opSize16 = $false
+	$addr16 = $false
+	$rep = ''
+	$lock = $false
+	$rexW = $false
+	# prefixes
+	while ($i -lt $n) {
+		$b = [int]$Bytes[$i]
+		if ($b -eq 0xF0) { $lock = $true; $i++; continue }
+		if ($b -eq 0xF2) { $rep = 'repne'; $i++; continue }
+		if ($b -eq 0xF3) { $rep = 'rep'; $i++; continue }
+		if ($b -eq 0x2E -or $b -eq 0x36 -or $b -eq 0x3E -or $b -eq 0x26 -or $b -eq 0x64 -or $b -eq 0x65) { $i++; continue } # seg
+		if ($b -eq 0x66) { $opSize16 = $true; $i++; continue }
+		if ($b -eq 0x67) { $addr16 = $true; $i++; continue }
+		if ($Is64 -and $b -ge 0x40 -and $b -le 0x4F) {
+			$rexW = (($b -band 8) -ne 0)
+			$i++
+			continue
+		}
+		break
+	}
+	if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated_only' } }
+	$op = [int]$Bytes[$i]
+	$i++
+	$mnem = 'db'
+	$opstr = ('0x{0:X2}' -f $op)
+	$isCF = $false
+	$isUncond = $false
+	$isCond = $false
+	$isCall = $false
+	$isRet = $false
+	$target = $null
+	$fallthrough = $null
+	$immHex = ''
+
+	$jcc8 = @{
+		'70'='jo'; '71'='jno'; '72'='jb/jc'; '73'='jae/jnc'; '74'='je/jz'; '75'='jne/jnz'
+		'76'='jbe'; '77'='ja'; '78'='js'; '79'='jns'; '7A'='jp'; '7B'='jnp'
+		'7C'='jl'; '7D'='jge'; '7E'='jle'; '7F'='jg'
+	}
+
+	$finish = {
+		param($endI)
+		$len = $endI - $start
+		$raw = New-Object byte[] $len
+		[Array]::Copy($Bytes, $start, $raw, 0, $len)
+		$hx = ($raw | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
+		$fo = $FileOffset + $start
+		$ft = $null
+		if ($null -ne $target) {
+			$fallthrough = $FileOffset + $endI
+		} else {
+			$fallthrough = $FileOffset + $endI
+		}
+		return @{
+			Ok = $true
+			offset = [long]$fo
+			offset_hex = ('0x{0:X}' -f $fo)
+			length = $len
+			bytes = $hx
+			mnemonic = $mnem
+			operands = $opstr
+			is_control_flow = $isCF
+			is_unconditional_jump = $isUncond
+			is_conditional_jump = $isCond
+			is_call = $isCall
+			is_ret = $isRet
+			target = $target
+			target_hex = $(if ($null -ne $target) { ('0x{0:X}' -f [long]$target) } else { $null })
+			fallthrough = [long]$fallthrough
+			fallthrough_hex = ('0x{0:X}' -f [long]$fallthrough)
+			next_index = $endI
+		}
+	}
+
+	# Single-byte opcodes
+	if ($op -eq 0x90) {
+		$mnem = 'nop'; $opstr = ''
+		return & $finish $i
+	}
+	if ($op -eq 0xCC) {
+		$mnem = 'int3'; $opstr = ''; $isCF = $true; $isRet = $true # treat as stop
+		return & $finish $i
+	}
+	if ($op -eq 0xC3) {
+		$mnem = 'ret'; $opstr = ''; $isCF = $true; $isRet = $true
+		return & $finish $i
+	}
+	if ($op -eq 0xC2) {
+		if ($i + 1 -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$imm = [BitConverter]::ToUInt16($Bytes, $i); $i += 2
+		$mnem = 'ret'; $opstr = ('0x{0:X}' -f $imm); $isCF = $true; $isRet = $true
+		return & $finish $i
+	}
+	if ($op -eq 0xCB -or $op -eq 0xCA) {
+		$mnem = 'retf'; $isCF = $true; $isRet = $true
+		if ($op -eq 0xCA) {
+			if ($i + 1 -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+			$imm = [BitConverter]::ToUInt16($Bytes, $i); $i += 2
+			$opstr = ('0x{0:X}' -f $imm)
+		} else { $opstr = '' }
+		return & $finish $i
+	}
+	# JMP rel8
+	if ($op -eq 0xEB) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$ub = [int]$Bytes[$i]; $rel = $(if ($ub -ge 128) { $ub - 256 } else { $ub }); $i++
+		$mnem = 'jmp'; $isCF = $true; $isUncond = $true
+		$target = [long]($FileOffset + $i + $rel)
+		$opstr = ('short 0x{0:X}' -f $target)
+		return & $finish $i
+	}
+	# JMP rel32 / CALL rel32
+	if ($op -eq 0xE9 -or $op -eq 0xE8) {
+		if ($i + 3 -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$rel = [BitConverter]::ToInt32($Bytes, $i); $i += 4
+		if ($op -eq 0xE9) {
+			$mnem = 'jmp'; $isCF = $true; $isUncond = $true
+		} else {
+			$mnem = 'call'; $isCF = $true; $isCall = $true
+		}
+		$target = [long]($FileOffset + $i + $rel)
+		$opstr = ('0x{0:X}' -f $target)
+		return & $finish $i
+	}
+	# Jcc rel8
+	$jccKey = '{0:X2}' -f $op
+	if ($jcc8.ContainsKey($jccKey)) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$ub = [int]$Bytes[$i]; $rel = $(if ($ub -ge 128) { $ub - 256 } else { $ub }); $i++
+		$mnem = [string]$jcc8[$jccKey]
+		$isCF = $true; $isCond = $true
+		$target = [long]($FileOffset + $i + $rel)
+		$opstr = ('short 0x{0:X}' -f $target)
+		return & $finish $i
+	}
+	# LOOP/JCXZ
+	if ($op -in 0xE0, 0xE1, 0xE2, 0xE3) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$ub = [int]$Bytes[$i]; $rel = $(if ($ub -ge 128) { $ub - 256 } else { $ub }); $i++
+		$mnem = switch ($op) { 0xE0 { 'loopne' } 0xE1 { 'loope' } 0xE2 { 'loop' } 0xE3 { 'jcxz/jecxz' } }
+		$isCF = $true; $isCond = $true
+		$target = [long]($FileOffset + $i + $rel)
+		$opstr = ('short 0x{0:X}' -f $target)
+		return & $finish $i
+	}
+	# Two-byte: 0F xx
+	if ($op -eq 0x0F) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$op2 = [int]$Bytes[$i]; $i++
+		# Jcc rel32
+		if ($op2 -ge 0x80 -and $op2 -le 0x8F) {
+			if ($i + 3 -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+			$rel = [BitConverter]::ToInt32($Bytes, $i); $i += 4
+			$map = @{
+				'80'='jo'; '81'='jno'; '82'='jb/jc'; '83'='jae/jnc'; '84'='je/jz'; '85'='jne/jnz'
+				'86'='jbe'; '87'='ja'; '88'='js'; '89'='jns'; '8A'='jp'; '8B'='jnp'
+				'8C'='jl'; '8D'='jge'; '8E'='jle'; '8F'='jg'
+			}
+			$mnem = [string]$map[('{0:X2}' -f $op2)]
+			$isCF = $true; $isCond = $true
+			$target = [long]($FileOffset + $i + $rel)
+			$opstr = ('0x{0:X}' -f $target)
+			return & $finish $i
+		}
+		# common 0F with modrm
+		if ($op2 -in 0x1F, 0xB6, 0xB7, 0xBE, 0xBF, 0xAF, 0xA3, 0xAB, 0xBA) {
+			if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+			$extra = Get-MBX86ModRMExtraLen -Bytes $Bytes -ModRmIndex $i -Addr16 $addr16
+			if ($extra -lt 0) { return @{ Ok = $false; Error = 'truncated' } }
+			$i = $i + 1 + $extra
+			$mnem = switch ($op2) {
+				0x1F { 'nop' }
+				0xB6 { 'movzx' }
+				0xB7 { 'movzx' }
+				0xBE { 'movsx' }
+				0xBF { 'movsx' }
+				0xAF { 'imul' }
+				default { ('0F {0:X2}' -f $op2) }
+			}
+			$opstr = 'r/m'
+			return & $finish $i
+		}
+		$mnem = ('0F {0:X2}' -f $op2)
+		$opstr = ''
+		return & $finish $i
+	}
+	# FF /2 CALL, /4 JMP r/m
+	if ($op -eq 0xFF) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$modrm = [int]$Bytes[$i]
+		$reg = ($modrm -shr 3) -band 7
+		$extra = Get-MBX86ModRMExtraLen -Bytes $Bytes -ModRmIndex $i -Addr16 $addr16
+		if ($extra -lt 0) { return @{ Ok = $false; Error = 'truncated' } }
+		$i = $i + 1 + $extra
+		if ($reg -eq 2) {
+			$mnem = 'call'; $opstr = 'r/m'; $isCF = $true; $isCall = $true
+		} elseif ($reg -eq 4) {
+			$mnem = 'jmp'; $opstr = 'r/m'; $isCF = $true; $isUncond = $true
+		} elseif ($reg -eq 6) {
+			$mnem = 'push'; $opstr = 'r/m'
+		} else {
+			$mnem = 'ff'; $opstr = ('/{0}' -f $reg)
+		}
+		return & $finish $i
+	}
+	# PUSH/POP r32
+	if ($op -ge 0x50 -and $op -le 0x57) {
+		$regs = @('eax','ecx','edx','ebx','esp','ebp','esi','edi')
+		if ($Is64) { $regs = @('rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi') }
+		$mnem = 'push'; $opstr = $regs[$op - 0x50]
+		return & $finish $i
+	}
+	if ($op -ge 0x58 -and $op -le 0x5F) {
+		$regs = @('eax','ecx','edx','ebx','esp','ebp','esi','edi')
+		if ($Is64) { $regs = @('rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi') }
+		$mnem = 'pop'; $opstr = $regs[$op - 0x58]
+		return & $finish $i
+	}
+	# MOV r/m, r | r, r/m | etc with modrm
+	if ($op -in 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x01, 0x03, 0x29, 0x2B, 0x31, 0x33, 0x39, 0x3B, 0x85, 0x20, 0x21, 0x09, 0x0A, 0x0B) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$extra = Get-MBX86ModRMExtraLen -Bytes $Bytes -ModRmIndex $i -Addr16 $addr16
+		if ($extra -lt 0) { return @{ Ok = $false; Error = 'truncated' } }
+		$i = $i + 1 + $extra
+		$mnem = switch ($op) {
+			0x8D { 'lea' }
+			0x85 { 'test' }
+			{ $_ -in 0x88, 0x89, 0x8A, 0x8B } { 'mov' }
+			{ $_ -in 0x01, 0x03 } { 'add' }
+			{ $_ -in 0x29, 0x2B } { 'sub' }
+			{ $_ -in 0x31, 0x33 } { 'xor' }
+			{ $_ -in 0x39, 0x3B } { 'cmp' }
+			{ $_ -in 0x20, 0x21 } { 'and' }
+			{ $_ -in 0x09, 0x0A, 0x0B } { 'or' }
+			default { ('op_{0:X2}' -f $op) }
+		}
+		$opstr = 'r/m'
+		return & $finish $i
+	}
+	# MOV r32, imm32
+	if ($op -ge 0xB8 -and $op -le 0xBF) {
+		$regs = @('eax','ecx','edx','ebx','esp','ebp','esi','edi')
+		if ($Is64 -and $rexW) { $regs = @('rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi') }
+		$immLen = if ($Is64 -and $rexW) { 8 } elseif ($opSize16) { 2 } else { 4 }
+		if (($i + $immLen - 1) -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		if ($immLen -eq 4) {
+			$imm = [BitConverter]::ToUInt32($Bytes, $i)
+			$opstr = ('{0}, 0x{1:X}' -f $regs[$op - 0xB8], $imm)
+		} elseif ($immLen -eq 2) {
+			$imm = [BitConverter]::ToUInt16($Bytes, $i)
+			$opstr = ('{0}, 0x{1:X}' -f $regs[$op - 0xB8], $imm)
+		} else {
+			$imm = [BitConverter]::ToUInt64($Bytes, $i)
+			$opstr = ('{0}, 0x{1:X}' -f $regs[$op - 0xB8], $imm)
+		}
+		$i += $immLen
+		$mnem = 'mov'
+		return & $finish $i
+	}
+	# group 0x80/81/83 imm
+	if ($op -in 0x80, 0x81, 0x83) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$modrm = [int]$Bytes[$i]
+		$reg = ($modrm -shr 3) -band 7
+		$extra = Get-MBX86ModRMExtraLen -Bytes $Bytes -ModRmIndex $i -Addr16 $addr16
+		if ($extra -lt 0) { return @{ Ok = $false; Error = 'truncated' } }
+		$i = $i + 1 + $extra
+		$immLen = if ($op -eq 0x81) { if ($opSize16) { 2 } else { 4 } } else { 1 }
+		if (($i + $immLen - 1) -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$i += $immLen
+		$ops = @('add','or','adc','sbb','and','sub','xor','cmp')
+		$mnem = $ops[$reg]
+		$opstr = 'r/m, imm'
+		return & $finish $i
+	}
+	# C6/C7 mov imm
+	if ($op -in 0xC6, 0xC7) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$extra = Get-MBX86ModRMExtraLen -Bytes $Bytes -ModRmIndex $i -Addr16 $addr16
+		if ($extra -lt 0) { return @{ Ok = $false; Error = 'truncated' } }
+		$i = $i + 1 + $extra
+		$immLen = if ($op -eq 0xC6) { 1 } elseif ($opSize16) { 2 } else { 4 }
+		if (($i + $immLen - 1) -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$i += $immLen
+		$mnem = 'mov'; $opstr = 'r/m, imm'
+		return & $finish $i
+	}
+	# TEST al/ax/eax, imm
+	if ($op -eq 0xA8) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$i++; $mnem = 'test'; $opstr = 'al, imm8'
+		return & $finish $i
+	}
+	if ($op -eq 0xA9) {
+		$immLen = if ($opSize16) { 2 } else { 4 }
+		if (($i + $immLen - 1) -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$i += $immLen
+		$mnem = 'test'; $opstr = 'eax, imm'
+		return & $finish $i
+	}
+	# CMP/TEST with modrm 0x84
+	if ($op -eq 0x84) {
+		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
+		$extra = Get-MBX86ModRMExtraLen -Bytes $Bytes -ModRmIndex $i -Addr16 $addr16
+		if ($extra -lt 0) { return @{ Ok = $false; Error = 'truncated' } }
+		$i = $i + 1 + $extra
+		$mnem = 'test'; $opstr = 'r/m'
+		return & $finish $i
+	}
+	# Fallback: consume 1 byte as db
+	$mnem = 'db'
+	$opstr = ('0x{0:X2}' -f $op)
+	return & $finish $i
+}
+
+function Get-MBX86Disasm {
+	# Linear disassembly listing from a file offset.
+	param(
+		[string]$Path,
+		[long]$Offset = 0,
+		[int]$MaxInsns = 48,
+		[bool]$Is64 = $false,
+		[int]$ReadBytes = 0
+	)
+	if ($MaxInsns -le 0) { $MaxInsns = 48 }
+	if ($MaxInsns -gt 200) { $MaxInsns = 200 }
+	if ($ReadBytes -le 0) { $ReadBytes = [Math]::Min(4096, $MaxInsns * 16) }
+	if ($ReadBytes -gt 8192) { $ReadBytes = 8192 }
+	$r = Read-MBFileBytes -Path $Path -Offset $Offset -Length $ReadBytes
+	if (-not $r.Ok) { return @{ Ok = $false; Error = $r.Error; instructions = @() } }
+	$ins = New-Object System.Collections.ArrayList
+	$idx = 0
+	$count = 0
+	while ($count -lt $MaxInsns -and $idx -lt $r.Bytes.Length) {
+		$dec = Read-MBX86Instruction -Bytes $r.Bytes -Index $idx -FileOffset $Offset -Is64 $Is64
+		if (-not $dec.Ok) { break }
+		[void]$ins.Add($dec)
+		$idx = [int]$dec.next_index
+		$count++
+		if ($dec.is_ret) { break }
+	}
+	return @{
+		Ok = $true
+		offset = $Offset
+		offset_hex = ('0x{0:X}' -f $Offset)
+		is64 = $Is64
+		count = $ins.Count
+		instructions = @($ins)
+	}
+}
+
+function Get-MBX86Trace {
+	# Walk control flow: follow unconditional JMP; at Jcc record both paths; CALL records target then falls through.
+	param(
+		[string]$Path,
+		[long]$Offset = 0,
+		[int]$MaxSteps = 32,
+		[bool]$Is64 = $false,
+		[bool]$FollowCalls = $false,
+		[string]$PreferBranch = 'fallthrough'  # fallthrough | taken
+	)
+	if ($MaxSteps -le 0) { $MaxSteps = 32 }
+	if ($MaxSteps -gt 80) { $MaxSteps = 80 }
+	$steps = New-Object System.Collections.ArrayList
+	$branches = New-Object System.Collections.ArrayList
+	$visited = @{}
+	$pos = [long]$Offset
+	$fileLen = 0L
+	try { $fileLen = (Get-Item -LiteralPath $Path).Length } catch {}
+	for ($s = 0; $s -lt $MaxSteps; $s++) {
+		if ($pos -lt 0 -or ($fileLen -gt 0 -and $pos -ge $fileLen)) { break }
+		$key = [string]$pos
+		if ($visited.ContainsKey($key)) {
+			[void]$steps.Add([ordered]@{
+				step = $s
+				note = 'loop_detected'
+				offset = $pos
+				offset_hex = ('0x{0:X}' -f $pos)
+			})
+			break
+		}
+		$visited[$key] = $true
+		$chunk = Read-MBFileBytes -Path $Path -Offset $pos -Length 32
+		if (-not $chunk.Ok -or $chunk.Bytes.Length -eq 0) { break }
+		$dec = Read-MBX86Instruction -Bytes $chunk.Bytes -Index 0 -FileOffset $pos -Is64 $Is64
+		if (-not $dec.Ok) {
+			[void]$steps.Add([ordered]@{ step = $s; note = 'decode_fail'; offset = $pos })
+			break
+		}
+		$rec = [ordered]@{
+			step = $s
+			offset = $dec.offset
+			offset_hex = $dec.offset_hex
+			bytes = $dec.bytes
+			mnemonic = $dec.mnemonic
+			operands = $dec.operands
+			is_control_flow = $dec.is_control_flow
+			target = $dec.target
+			target_hex = $dec.target_hex
+			fallthrough = $dec.fallthrough
+			fallthrough_hex = $dec.fallthrough_hex
+		}
+		[void]$steps.Add($rec)
+		if ($dec.is_ret) { break }
+		if ($dec.is_unconditional_jump -and $null -ne $dec.target) {
+			$pos = [long]$dec.target
+			continue
+		}
+		if ($dec.is_conditional_jump -and $null -ne $dec.target) {
+			[void]$branches.Add([ordered]@{
+				at = $dec.offset
+				at_hex = $dec.offset_hex
+				mnemonic = $dec.mnemonic
+				taken = $dec.target
+				taken_hex = $dec.target_hex
+				not_taken = $dec.fallthrough
+				not_taken_hex = $dec.fallthrough_hex
+				hint = 'HexView offset=taken_hex or not_taken_hex with disasm=true to explore either path. HexEdit can patch Jcc (e.g. 75->EB always, 75->90 90 nop).'
+			})
+			if ($PreferBranch -eq 'taken') { $pos = [long]$dec.target }
+			else { $pos = [long]$dec.fallthrough }
+			continue
+		}
+		if ($dec.is_call -and $null -ne $dec.target) {
+			[void]$branches.Add([ordered]@{
+				at = $dec.offset
+				at_hex = $dec.offset_hex
+				mnemonic = 'call'
+				taken = $dec.target
+				taken_hex = $dec.target_hex
+				not_taken = $dec.fallthrough
+				not_taken_hex = $dec.fallthrough_hex
+				hint = 'CALL target listed; default continues at return (fallthrough). Use follow_calls=true to step into.'
+			})
+			if ($FollowCalls) { $pos = [long]$dec.target }
+			else { $pos = [long]$dec.fallthrough }
+			continue
+		}
+		# call r/m or jmp r/m - cannot resolve statically
+		if ($dec.is_call -or $dec.is_unconditional_jump) {
+			[void]$branches.Add([ordered]@{
+				at = $dec.offset
+				at_hex = $dec.offset_hex
+				mnemonic = $dec.mnemonic
+				note = 'indirect - target not static; inspect surrounding mov/lea'
+			})
+			if ($dec.is_unconditional_jump) { break }
+			$pos = [long]$dec.fallthrough
+			continue
+		}
+		$pos = [long]$dec.fallthrough
+	}
+	return @{
+		Ok = $true
+		start = $Offset
+		start_hex = ('0x{0:X}' -f $Offset)
+		steps = @($steps)
+		branches = @($branches)
+		prefer_branch = $PreferBranch
+	}
+}
+
+
 function Invoke-HexView {
 	param(
 		[string]$path,
-		$path2 = $null,          # compare file (diff mode)
-		$compare = $null,        # alias for path2
+		$path2 = $null,
+		$compare = $null,
 		$offset = 0,
 		[int]$length = 256,
 		[int]$width = 16,
 		[bool]$show_ascii = $true,
-		[bool]$annotate = $true, # PE/magic/strings/control labels
-		[bool]$next_diff = $false, # with path2: jump to next differing offset from `offset`
-		[bool]$side_by_side = $true, # dual dump layout when comparing
-		[int]$max_scan = 0       # optional cap for next_diff scan (bytes; 0 = full)
+		[bool]$annotate = $true,
+		[bool]$next_diff = $false,
+		[bool]$side_by_side = $true,
+		[int]$max_scan = 0,
+		# Control-flow / disasm (prefer these over ReadAllBytes for PE navigation)
+		[bool]$disasm = $false,
+		[bool]$trace = $false,
+		[bool]$at_entry = $false,
+		[int]$max_insns = 48,
+		[int]$max_steps = 32,
+		[bool]$follow_calls = $false,
+		[string]$prefer_branch = 'fallthrough', # fallthrough | taken
+		[string]$arch = 'auto', # auto | x86 | x64
+		[bool]$dump_hex = $true
 	)
 	$path = Resolve-MBPath -Path $path -MustExist
 	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
@@ -17693,10 +19533,34 @@ function Invoke-HexView {
 	}
 
 	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
+	$peCtx = $null
+	try { $peCtx = Get-MBPeDisasmContext -Path $path } catch { $peCtx = $null }
+	$is64 = $false
+	if ($arch -eq 'x64') { $is64 = $true }
+	elseif ($arch -eq 'x86') { $is64 = $false }
+	elseif ($peCtx -and $peCtx.Ok) { $is64 = [bool]$peCtx.Is64 }
+
+	if ($at_entry) {
+		if ($peCtx -and $peCtx.Ok -and $null -ne $peCtx.EntryFile) {
+			$off = [long]$peCtx.EntryFile
+		} else {
+			return 'ERROR: at_entry=true but PE entry file offset not found (not a PE or unmapped EP)'
+		}
+	}
+
+	# Auto-enable disasm when trace requested
+	if ($trace) { $disasm = $true }
+
 	if ($length -le 0) { $length = 256 }
 	if ($length -gt 16384) { $length = 16384 }
 	if ($width -le 0) { $width = 16 }
 	if ($width -gt 32) { $width = 32 }
+	if ($max_insns -le 0) { $max_insns = 48 }
+	if ($max_insns -gt 200) { $max_insns = 200 }
+	if ($max_steps -le 0) { $max_steps = 32 }
+	if ($max_steps -gt 80) { $max_steps = 80 }
+	$pref = ([string]$prefer_branch).ToLowerInvariant()
+	if ($pref -ne 'taken') { $pref = 'fallthrough' }
 
 	$diffInfo = $null
 	if ($cmpPath -and $next_diff) {
@@ -17708,7 +19572,12 @@ function Invoke-HexView {
 		}
 	}
 
-	$ra = Read-MBFileBytes -Path $path -Offset $off -Length $length
+	# When pure disasm/trace, still read a hex window for context unless dump_hex=false
+	$hexLen = $length
+	if ($disasm -and -not $cmpPath) {
+		$hexLen = [Math]::Max($length, [Math]::Min(512, $max_insns * 8))
+	}
+	$ra = Read-MBFileBytes -Path $path -Offset $off -Length $hexLen
 	if (-not $ra.Ok) { return "ERROR: $($ra.Error)" }
 
 	$rb = $null
@@ -17736,100 +19605,173 @@ function Invoke-HexView {
 		$nd = Find-MBNextByteDiff -PathA $path -PathB $cmpPath -StartOffset $after -MaxScan $max_scan
 		if ($nd.Found) {
 			$nextDiffAfterWindow = [ordered]@{
-				offset     = [long]$nd.Offset
+				offset = [long]$nd.Offset
 				offset_hex = ('0x{0:X}' -f [long]$nd.Offset)
-				reason     = [string]$nd.Reason
+				reason = [string]$nd.Reason
 			}
 		} else {
 			$nextDiffAfterWindow = [ordered]@{ offset = $null; reason = [string]$nd.Reason }
 		}
 	}
 
-	$dump = ''
-	if ($cmpPath -and $side_by_side) {
-		$dump = Format-MBHexDumpSideBySide -BytesA $ra.Bytes -BytesB $rb.Bytes -BaseOffset $off -Width ([Math]::Min($width, 16)) -ShowAscii $show_ascii
-	} elseif ($cmpPath) {
-		$dumpA = Format-MBHexDump -Bytes $ra.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii -DiffMask $diffMask
-		$dumpB = Format-MBHexDump -Bytes $rb.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii -DiffMask $diffMask
-		$dump = ("--- A: {0}`n{1}`n--- B: {2}`n{3}" -f $path, $dumpA, $cmpPath, $dumpB)
-	} else {
-		$dump = Format-MBHexDump -Bytes $ra.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii
+	$dump = $null
+	if ($dump_hex -or $cmpPath -or -not $disasm) {
+		if ($cmpPath -and $side_by_side) {
+			$dump = Format-MBHexDumpSideBySide -BytesA $ra.Bytes -BytesB $rb.Bytes -BaseOffset $off -Width ([Math]::Min($width, 16)) -ShowAscii $show_ascii
+		} elseif ($cmpPath) {
+			$dumpA = Format-MBHexDump -Bytes $ra.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii -DiffMask $diffMask
+			$dumpB = Format-MBHexDump -Bytes $rb.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii -DiffMask $diffMask
+			$dump = ("--- A: {0}`n{1}`n--- B: {2}`n{3}" -f $path, $dumpA, $cmpPath, $dumpB)
+		} else {
+			$dump = Format-MBHexDump -Bytes $ra.Bytes -BaseOffset $off -Width $width -ShowAscii $show_ascii
+		}
 	}
 
 	$annotations = New-Object System.Collections.ArrayList
+	# Lighter annotate on large / system binaries (full PE import/export dumps kill local-model context)
+	$annotateMode = 'off'
 	if ($annotate) {
+		$annotateMode = 'full'
+		$sysPath = $false
+		try {
+			$win = [string]$env:WINDIR
+			if ($win -and $path.StartsWith($win, [StringComparison]::OrdinalIgnoreCase)) { $sysPath = $true }
+			if ($path -match '(?i)\\(System32|SysWOW64|WinSxS)\\') { $sysPath = $true }
+		} catch {}
+		$bigFile = ($ra.FileSize -gt 2MB)
+		if ($sysPath -or $bigFile) { $annotateMode = 'light' }
+		# Explicit disasm/trace still get PE entry/sections; skip string flood
+		if ($disasm -or $trace) {
+			if ($annotateMode -eq 'full') { $annotateMode = 'full' }
+		}
+
 		$winEnd = $off + $ra.Bytes.Length
 		$peAll = @()
 		try { $peAll = @(Get-MBPeAnnotations -Path $path) } catch { $peAll = @() }
-		# Priority order so testing labels near the dump are not crowded out
 		try {
 			foreach ($m in @(Get-MBFileMagicAnnotations -Path $path)) { [void]$annotations.Add($m) }
 		} catch {}
-		# PE headers / entry / dirs / import-export first (high value map)
+		# Always include PE structural labels (headers, entry, sections) — cheap and high value
 		foreach ($a in $peAll) {
-			if ($a.kind -in @('pe', 'pe_entry', 'pe_dir', 'pe_import', 'pe_export')) {
+			if ($a.kind -in @('pe', 'pe_entry', 'pe_section', 'pe_section_data')) {
 				[void]$annotations.Add($a)
 			}
 		}
-		# Section table + raw starts
-		foreach ($a in $peAll) {
-			if ($a.kind -in @('pe_section', 'pe_section_data')) {
-				[void]$annotations.Add($a)
+		if ($annotateMode -eq 'full') {
+			foreach ($a in $peAll) {
+				if ($a.kind -in @('pe_dir', 'pe_import', 'pe_export')) {
+					[void]$annotations.Add($a)
+				}
 			}
-		}
-		# Window-local: controls + strings (known chars)
-		try {
-			foreach ($c in @(Get-MBControlCharAnnotations -Bytes $ra.Bytes -BaseOffset $off -MaxHits 48)) {
-				[void]$annotations.Add($c)
-			}
-		} catch {}
-		try {
-			foreach ($s in @(Get-MBStringAnnotations -Bytes $ra.Bytes -BaseOffset $off -MinLen 4 -MaxHits 40)) {
-				[void]$annotations.Add($s)
-			}
-		} catch {}
-		# Any remaining PE notes that fall inside the viewed window
-		foreach ($a in $peAll) {
 			try {
-				$ao = [long]$a.offset
-				if ($ao -ge $off -and $ao -lt $winEnd) {
-					# avoid exact dupes by text+offset
-					$dup = $false
-					foreach ($ex in $annotations) {
-						if ([long]$ex.offset -eq $ao -and [string]$ex.text -eq [string]$a.text) { $dup = $true; break }
+				foreach ($c in @(Get-MBControlCharAnnotations -Bytes $ra.Bytes -BaseOffset $off -MaxHits 48)) {
+					[void]$annotations.Add($c)
+				}
+			} catch {}
+			try {
+				foreach ($s in @(Get-MBStringAnnotations -Bytes $ra.Bytes -BaseOffset $off -MinLen 4 -MaxHits 40)) {
+					[void]$annotations.Add($s)
+				}
+			} catch {}
+			foreach ($a in $peAll) {
+				try {
+					$ao = [long]$a.offset
+					if ($ao -ge $off -and $ao -lt $winEnd) {
+						$dup = $false
+						foreach ($ex in $annotations) {
+							if ([long]$ex.offset -eq $ao -and [string]$ex.text -eq [string]$a.text) { $dup = $true; break }
+						}
+						if (-not $dup) { [void]$annotations.Add($a) }
 					}
-					if (-not $dup) { [void]$annotations.Add($a) }
+				} catch {}
+			}
+		} else {
+			# light: only PE structure + a few in-window strings (no full import table)
+			try {
+				foreach ($s in @(Get-MBStringAnnotations -Bytes $ra.Bytes -BaseOffset $off -MinLen 6 -MaxHits 12)) {
+					[void]$annotations.Add($s)
 				}
 			} catch {}
 		}
-		if ($annotations.Count -gt 140) {
+		$annCap = if ($annotateMode -eq 'light') { 48 } else { 100 }
+		if ($annotations.Count -gt $annCap) {
 			$tmp = New-Object System.Collections.ArrayList
-			for ($ai = 0; $ai -lt 140; $ai++) { [void]$tmp.Add($annotations[$ai]) }
+			for ($ai = 0; $ai -lt $annCap; $ai++) { [void]$tmp.Add($annotations[$ai]) }
 			$annotations = $tmp
 		}
 	}
 
 	$payload = [ordered]@{
-		path       = $path
-		file_size  = [long]$ra.FileSize
-		offset     = $off
+		path = $path
+		file_size = [long]$ra.FileSize
+		offset = $off
 		offset_hex = ('0x{0:X}' -f $off)
-		length     = $ra.Bytes.Length
-		width      = $width
+		length = $ra.Bytes.Length
+		width = $width
 		truncated = (-not $ra.Eof)
 		show_ascii = $show_ascii
-		annotate   = $annotate
-		dump       = $dump
-		legend     = 'ASCII gutter: printable 0x20-0x7E as chars, else ''.''. Diff: lines with * have differences; bytes XX! differ. annotations[]: magic, PE map, control names (NUL/TAB/LF/CR/...), ASCII + UTF-16LE strings.'
-		ascii_gutter_note = 'Non-printables shown as ''.''; named controls listed under annotations kind=control.'
+		annotate = $annotate
+		annotate_mode = $annotateMode
+		disasm = $disasm
+		trace = $trace
+		arch = $(if ($is64) { 'x64' } else { 'x86' })
+		legend = 'Use disasm=true for x86/x64 listing with jmp/jcc/call targets as file offsets. trace=true walks control flow (follow JMP; list both sides of JE/JNE/...). at_entry=true starts at PE entry. Large/system binaries use annotate light mode (PE structure only). Prefer HexView over ReadAllBytes. Patch jumps with HexEdit (e.g. 75->EB force jump, 75->90 90 nop).'
 	}
-
-	try {
-		$payload['byte_classes'] = Get-MBByteClassSummary -Bytes $ra.Bytes
-	} catch {}
-
+	if ($dump) { $payload['dump'] = $dump }
+	try { $payload['byte_classes'] = Get-MBByteClassSummary -Bytes $ra.Bytes } catch {}
 	if ($annotations -and $annotations.Count -gt 0) {
 		$payload['annotations'] = @($annotations)
+	}
+	if ($peCtx -and $peCtx.Ok) {
+		$payload['pe'] = [ordered]@{
+			machine = $peCtx.Machine
+			is64 = [bool]$peCtx.Is64
+			entry_rva = $peCtx.EntryRva
+			entry_file = $peCtx.EntryFile
+			entry_file_hex = $(if ($null -ne $peCtx.EntryFile) { ('0x{0:X}' -f [long]$peCtx.EntryFile) } else { $null })
+			image_base = ('0x{0:X}' -f [uint64]$peCtx.ImageBase)
+		}
+	}
+
+	if ($disasm) {
+		try {
+			$d = Get-MBX86Disasm -Path $path -Offset $off -MaxInsns $max_insns -Is64 $is64
+			if ($d.Ok) {
+				# compact listing string for model readability
+				$lines = New-Object System.Collections.ArrayList
+				foreach ($ins in @($d.instructions)) {
+					$tline = ('{0}  {1,-20}  {2,-12} {3}' -f $ins.offset_hex, $ins.bytes, $ins.mnemonic, $ins.operands)
+					if ($ins.is_control_flow -and $ins.target_hex) {
+						$tline += ('  -> {0}' -f $ins.target_hex)
+						if ($ins.is_conditional_jump) { $tline += (' | else {0}' -f $ins.fallthrough_hex) }
+					}
+					[void]$lines.Add($tline)
+				}
+				$payload['disassembly'] = [ordered]@{
+					offset = $d.offset
+					offset_hex = $d.offset_hex
+					count = $d.count
+					is64 = $d.is64
+					listing = ($lines -join "`n")
+					instructions = @($d.instructions)
+					how_to_follow = 'Each JMP/Jcc/CALL with a resolved relative target shows -> file_offset. Call HexView again with offset=<target_hex> disasm=true. For path exploration use trace=true.'
+				}
+			} else {
+				$payload['disassembly_error'] = [string]$d.Error
+			}
+		} catch {
+			$payload['disassembly_error'] = $_.Exception.Message
+		}
+	}
+
+	if ($trace) {
+		try {
+			$tr = Get-MBX86Trace -Path $path -Offset $off -MaxSteps $max_steps -Is64 $is64 -FollowCalls $follow_calls -PreferBranch $pref
+			$payload['trace'] = $tr
+			$payload['hint'] = 'trace.branches lists JE/JNE/Jcc alternatives. Set offset to taken_hex or not_taken_hex and disasm/trace again. Prefer HexView over manual ReadAllBytes.'
+		} catch {
+			$payload['trace_error'] = $_.Exception.Message
+		}
 	}
 
 	if ($cmpPath) {
@@ -17841,19 +19783,15 @@ function Invoke-HexView {
 		$payload['first_diff_in_window'] = $(if ($firstDiffInWindow -ge 0) { $firstDiffInWindow } else { $null })
 		$payload['first_diff_in_window_hex'] = $(if ($firstDiffInWindow -ge 0) { ('0x{0:X}' -f $firstDiffInWindow) } else { $null })
 		$payload['next_diff_after_window'] = $nextDiffAfterWindow
-		$payload['hint'] = 'Use next_diff=true to jump from offset to the next differing byte. path2= dual-file compare. annotate=true adds magic/PE/control/string labels for test binaries.'
 	}
 
 	if ($diffInfo) {
 		$payload['next_diff_seek'] = [ordered]@{
 			requested_from = Convert-MBOffsetToInt64 -Value $offset -Default 0
-			landed_offset  = $off
-			found          = [bool]$diffInfo.Found
-			reason         = [string]$diffInfo.Reason
+			landed_offset = $off
+			found = [bool]$diffInfo.Found
+			reason = [string]$diffInfo.Reason
 			raw_diff_offset = $(if ($diffInfo.Found) { [long]$diffInfo.Offset } else { $null })
-		}
-		if (-not $diffInfo.Found) {
-			$payload['note'] = 'No further differences found from the requested offset (files identical from there, or scan ended).'
 		}
 	}
 
@@ -17861,7 +19799,7 @@ function Invoke-HexView {
 		$payload['note'] = 'offset at or past EOF'
 	}
 
-	return ConvertTo-MBJson $payload -Depth 10
+	return ConvertTo-MBJson $payload -Depth 12
 }
 
 function Invoke-HexEdit {
@@ -17985,30 +19923,51 @@ $previewDump
 function Invoke-GetPowerInfo {
 	$reportPath = New-MBTempFile -Prefix 'mb-battery' -Extension '.html'
 	try {
-		$p = Start-Process -FilePath "powercfg.exe" -ArgumentList "/batteryreport","/output",$reportPath -Wait -PassThru -WindowStyle Hidden
-		if (-not (Test-Path $reportPath)) {
-			$scheme = powercfg /getactivescheme 2>&1 | Out-String
-			return ConvertTo-MBJson @{
-				Note = "No battery report generated (desktop or unsupported)."
-				ActiveScheme = $scheme.Trim()
-			}
+		$scheme = ''
+		try {
+			$scheme = (powercfg /getactivescheme 2>&1 | Out-String).Trim()
+			if ($scheme.Length -gt 200) { $scheme = $scheme.Substring(0, 197) + '...' }
+		} catch { $scheme = '' }
+
+		$p = $null
+		try {
+			$p = Start-Process -FilePath "powercfg.exe" -ArgumentList "/batteryreport","/output",$reportPath -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+		} catch {}
+
+		if (-not (Test-Path -LiteralPath $reportPath)) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok           = $true
+				has_battery  = $false
+				note         = 'No battery report (desktop or unsupported hardware).'
+				active_scheme = $scheme
+			})
 		}
-		$html = Get-Content $reportPath -Raw -ErrorAction SilentlyContinue
-		$designCap = if ($html -match 'Design Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { 'N/A' }
-		$fullCap   = if ($html -match 'Full Charge Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { 'N/A' }
-		$cycleCount = if ($html -match 'Cycle Count</td>\s*<td[^>]*>(\d+)</td>') { $matches[1] } else { 'N/A' }
-		$healthPct = 'N/A'
-		if ($designCap -ne 'N/A' -and $fullCap -ne 'N/A' -and [double]$designCap -gt 0) {
-			$healthPct = [math]::Round(([double]$fullCap / [double]$designCap) * 100, 1)
+		$html = Get-Content -LiteralPath $reportPath -Raw -ErrorAction SilentlyContinue
+		$designCap = if ($html -match 'Design Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { $null }
+		$fullCap   = if ($html -match 'Full Charge Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { $null }
+		$cycleCount = if ($html -match 'Cycle Count</td>\s*<td[^>]*>(\d+)</td>') { $matches[1] } else { $null }
+		$healthPct = $null
+		if ($designCap -and $fullCap) {
+			try {
+				$d = [double]$designCap
+				$f = [double]$fullCap
+				if ($d -gt 0) { $healthPct = [math]::Round(($f / $d) * 100, 1) }
+			} catch {}
 		}
-		ConvertTo-MBJson @{
-			DesignCapacity_mWh     = $designCap
-			FullChargeCapacity_mWh = $fullCap
-			EstimatedHealthPercent = $healthPct
-			CycleCount             = $cycleCount
-		}
+		return ConvertTo-MBJson ([ordered]@{
+			ok                       = $true
+			has_battery              = $true
+			design_capacity_mWh      = $designCap
+			full_charge_capacity_mWh = $fullCap
+			estimated_health_percent = $healthPct
+			cycle_count              = $cycleCount
+			active_scheme            = $scheme
+		})
 	} catch {
-		return "ERROR: $($_.Exception.Message)"
+		return ConvertTo-MBJson ([ordered]@{
+			ok    = $false
+			error = $_.Exception.Message
+		})
 	} finally {
 		try { Remove-MBTempPath -Path $reportPath } catch {}
 	}
@@ -18019,18 +19978,23 @@ function Invoke-GetScheduledTasks {
 		[int]$days = 7,
 		[string]$filter,
 		[bool]$includeDisabled = $false,
+		[bool]$includeSystem = $false,
+		[int]$max = 30,
 		[string]$exportPath
 	)
 	try {
+		if ($max -le 0) { $max = 30 }
+		if ($max -gt 150) { $max = 150 }
 		$allTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
 		if ($allTasks.Count -eq 0) {
 			return ConvertTo-MBJson @{ Error = "No scheduled tasks found or insufficient permissions." }
 		}
 		$cutoff = (Get-Date).AddDays(-[math]::Abs($days))
 		$taskDetails = @()
-		$systemTasks = @()
-		$recentTasks = @()
+		$systemCount = 0
+		$recentCount = 0
 		$enabledCount = 0
+		$matchedCount = 0
 
 		foreach ($task in $allTasks) {
 			if ((Test-MBInterrupt)) { break }
@@ -18049,7 +20013,8 @@ function Invoke-GetScheduledTasks {
 			}
 
 			$principal = if ($task.Principal) { $task.Principal.UserId } else { $null }
-			$isSystem = $principal -and ($principal -match 'SYSTEM')
+			$taskPathStr = [string]$task.TaskPath
+			$isSystem = ($principal -and ($principal -match 'SYSTEM')) -or ($taskPathStr -match '(?i)\\Microsoft\\Windows\\')
 			$lastRun = if ($info -and $info.LastRunTime -and $info.LastRunTime.Year -gt 2000) { $info.LastRunTime } else { $null }
 			$isRecent = $lastRun -and ($lastRun -gt $cutoff)
 			$execute = $null
@@ -18064,9 +20029,38 @@ function Invoke-GetScheduledTasks {
 			$stateStr = if ($task.State) { $task.State.ToString() } else { "Unknown" }
 			$isEnabled = $stateStr -in @('Ready','Running','Queued')
 
+			if ($isSystem) { $systemCount++ }
+			if ($isRecent -and $isEnabled) { $recentCount++ }
+			if ($isEnabled) { $enabledCount++ }
+
+			$include = $true
+			if (-not $includeDisabled -and -not $isEnabled) { $include = $false }
+			if (-not $includeSystem -and $isSystem) { $include = $false }
+			if ($filter) {
+				$f = $filter.Trim().ToLower()
+				if ($f -eq 'system') {
+					# Explicit system filter overrides includeSystem=false
+					$include = $isSystem
+					if (-not $includeDisabled -and -not $isEnabled) { $include = $false }
+				}
+				elseif ($f -eq 'enabled' -and -not $isEnabled) { $include = $false }
+				elseif ($f -eq 'recent' -and -not $isRecent) { $include = $false }
+				elseif ($f -eq 'user' -or $f -eq 'nonsystem') {
+					if ($isSystem) { $include = $false }
+				}
+				elseif ($f -notin @('system','enabled','recent','user','nonsystem')) {
+					if (-not ($task.TaskName.ToLower().Contains($f) -or $taskPathStr.ToLower().Contains($f))) {
+						$include = $false
+					}
+				}
+			}
+
+			if (-not $include) { continue }
+			$matchedCount++
+
 			$detail = [pscustomobject]@{
 				TaskName       = $task.TaskName
-				TaskPath       = $task.TaskPath
+				TaskPath       = $taskPathStr
 				State          = $stateStr
 				Enabled        = $isEnabled
 				LastRunTime    = if ($lastRun) { $lastRun.ToString("yyyy-MM-dd HH:mm:ss") } else { "Never" }
@@ -18075,46 +20069,31 @@ function Invoke-GetScheduledTasks {
 				Principal      = $principal
 				IsSystem       = [bool]$isSystem
 				Execute        = $execute
-				Arguments      = $arguments
+				Arguments      = $(if ($arguments -and $arguments.Length -gt 120) { $arguments.Substring(0, 117) + '...' } else { $arguments })
 				TriggerTypes   = if ($triggerTypes.Count -gt 0) { ($triggerTypes -join '; ') } else { "None" }
 			}
-
-			$include = $true
-			if (-not $includeDisabled -and -not $isEnabled) { $include = $false }
-			if ($filter) {
-				$f = $filter.Trim().ToLower()
-				if ($f -eq 'system' -and -not $isSystem) { $include = $false }
-				elseif ($f -eq 'enabled' -and -not $isEnabled) { $include = $false }
-				elseif ($f -eq 'recent' -and -not $isRecent) { $include = $false }
-				elseif ($f -notin @('system','enabled','recent')) {
-					if (-not ($task.TaskName.ToLower().Contains($f) -or $task.TaskPath.ToLower().Contains($f))) {
-						$include = $false
-					}
-				}
-			}
-
-			if ($include) { $taskDetails += $detail }
-			if ($isSystem) { $systemTasks += $detail }
-			if ($isRecent -and $isEnabled) { $recentTasks += $detail }
-			if ($isEnabled) { $enabledCount++ }
+			$taskDetails += $detail
 		}
 
-		$taskDetails = @($taskDetails | Select-Object -First 150)
-		$systemTasks = @($systemTasks | Select-Object -First 80)
-		$recentTasks = @($recentTasks | Select-Object -First 80)
+		$taskDetails = @($taskDetails | Select-Object -First $max)
 
 		$result = @{
 			Summary = @{
 				TotalTasks          = $allTasks.Count
 				EnabledTasks        = $enabledCount
-				SystemLevelTasks    = $systemTasks.Count
-				RecentActivityTasks = $recentTasks.Count
+				SystemLevelTasks    = $systemCount
+				RecentActivityTasks = $recentCount
+				MatchedTasks        = $matchedCount
+				ReturnedTasks       = $taskDetails.Count
+				Truncated           = ($matchedCount -gt $taskDetails.Count)
 				DaysLookback        = $days
+				Max                 = $max
+				IncludeSystem       = [bool]$includeSystem
+				IncludeDisabled     = [bool]$includeDisabled
 				FilterApplied       = $(if ($filter) { $filter } else { "None" })
 			}
-			Tasks       = $taskDetails
-			SystemTasks = $systemTasks
-			RecentTasks = $recentTasks
+			Tasks = $taskDetails
+			note  = 'Default: max=30, includeSystem=false (excludes \\Microsoft\\Windows\\ + SYSTEM principal). filter=system|enabled|recent|user or name substring. includeSystem=true for Microsoft tasks.'
 		}
 
 		if ($exportPath) {
@@ -18139,15 +20118,284 @@ function Invoke-GetScheduledTasks {
 
 function Convert-IfJson {
 	param($val)
-	if ($val -is [string] -and $val.Trim().StartsWith('{')) {
-		try { return $val | ConvertFrom-Json -ErrorAction Stop } catch { return $val }
+	if ($val -is [string]) {
+		$t = $val.Trim()
+		if ($t.StartsWith('{') -or $t.StartsWith('[')) {
+			try { return $t | ConvertFrom-Json -ErrorAction Stop } catch { return $val }
+		}
 	}
 	return $val
 }
 
+function ConvertTo-MBHttpHeaderHash {
+	param($headers)
+	$h = @{}
+	if ($null -eq $headers) { return $h }
+	if ($headers -is [hashtable]) {
+		foreach ($k in @($headers.Keys)) { $h[[string]$k] = [string]$headers[$k] }
+		return $h
+	}
+	if ($headers -is [System.Collections.IDictionary]) {
+		foreach ($k in @($headers.Keys)) { $h[[string]$k] = [string]$headers[$k] }
+		return $h
+	}
+	try {
+		foreach ($p in $headers.PSObject.Properties) {
+			if ($p.Name -and $p.Name -notmatch '^PS') { $h[[string]$p.Name] = [string]$p.Value }
+		}
+	} catch {}
+	return $h
+}
+
+function Get-MBHttpHeaderInsensitive {
+	param([hashtable]$Headers, [string]$Name)
+	if ($null -eq $Headers -or [string]::IsNullOrWhiteSpace($Name)) { return $null }
+	foreach ($k in @($Headers.Keys)) {
+		if ([string]::Equals([string]$k, $Name, [StringComparison]::OrdinalIgnoreCase)) {
+			return [string]$Headers[$k]
+		}
+	}
+	return $null
+}
+
+function Remove-MBHttpHeaderInsensitive {
+	param([hashtable]$Headers, [string]$Name)
+	if ($null -eq $Headers -or [string]::IsNullOrWhiteSpace($Name)) { return }
+	$drop = @()
+	foreach ($k in @($Headers.Keys)) {
+		if ([string]::Equals([string]$k, $Name, [StringComparison]::OrdinalIgnoreCase)) { $drop += $k }
+	}
+	foreach ($k in $drop) { [void]$Headers.Remove($k) }
+}
+
+function Enable-MBHttpTls {
+	try {
+		$proto = [System.Net.SecurityProtocolType]::Tls12
+		try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
+		try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls11 } catch {}
+		[System.Net.ServicePointManager]::SecurityProtocol = $proto
+	} catch {
+		try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+	}
+	try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
+}
+
+function Resolve-MBCurlExe {
+	# System curl only (not aliases). Used for insecure HTTPS without process cert callbacks (AV-safe).
+	try {
+		$sys = Join-Path $env:SystemRoot 'System32\curl.exe'
+		if (Test-Path -LiteralPath $sys) { return $sys }
+	} catch {}
+	try {
+		$cmd = Get-Command curl.exe -ErrorAction SilentlyContinue
+		if ($cmd -and $cmd.Path -and (Test-Path -LiteralPath $cmd.Path)) {
+			if ($cmd.Path -notmatch '(?i)\\WindowsPowerShell\\|\\PowerShell\\') { return $cmd.Path }
+		}
+	} catch {}
+	return $null
+}
+
+function Invoke-MBCurlHttp {
+	# Out-of-process HTTPS via curl.exe. -k when VerifySsl is false (no ServicePointManager cert hooks).
+	param(
+		[string]$CurlPath,
+		[string]$Method = 'GET',
+		[string]$Url,
+		[hashtable]$Headers = $null,
+		[string]$Body = $null,
+		[string]$ContentType = $null,
+		[int]$TimeoutSec = 30,
+		[bool]$VerifySsl = $true
+	)
+	if ([string]::IsNullOrWhiteSpace($CurlPath) -or -not (Test-Path -LiteralPath $CurlPath)) {
+		return @{ ok = $false; error = 'curl.exe not found' }
+	}
+	if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
+	if ($TimeoutSec -gt 600) { $TimeoutSec = 600 }
+
+	$tmp = $null
+	$hdrFile = $null
+	$bodyFile = $null
+	$dataFile = $null
+	try {
+		$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('mb-http-' + [guid]::NewGuid().ToString('n'))
+		[void][System.IO.Directory]::CreateDirectory($tmp)
+		$hdrFile = Join-Path $tmp 'resp.hdr'
+		$bodyFile = Join-Path $tmp 'resp.body'
+
+		$argList = New-Object System.Collections.ArrayList
+		[void]$argList.Add('-sS')
+		[void]$argList.Add('-L')
+		[void]$argList.Add('--max-time')
+		[void]$argList.Add("$TimeoutSec")
+		[void]$argList.Add('-X')
+		[void]$argList.Add(([string]$Method).ToUpperInvariant())
+		if (-not $VerifySsl) { [void]$argList.Add('-k') }
+		[void]$argList.Add('-D')
+		[void]$argList.Add($hdrFile)
+		[void]$argList.Add('-o')
+		[void]$argList.Add($bodyFile)
+		[void]$argList.Add('-w')
+		[void]$argList.Add('%{http_code}')
+
+		if ($Headers) {
+			foreach ($k in @($Headers.Keys)) {
+				$kn = [string]$k
+				if ([string]::IsNullOrWhiteSpace($kn)) { continue }
+				# Content-Type handled separately so it is not doubled
+				if ([string]::Equals($kn, 'Content-Type', [StringComparison]::OrdinalIgnoreCase)) { continue }
+				[void]$argList.Add('-H')
+				[void]$argList.Add(('{0}: {1}' -f $kn, [string]$Headers[$k]))
+			}
+		}
+		if ($ContentType) {
+			[void]$argList.Add('-H')
+			[void]$argList.Add(('Content-Type: {0}' -f $ContentType))
+		}
+		if ($null -ne $Body -and "$Body" -ne '') {
+			$dataFile = Join-Path $tmp 'req.body'
+			[System.IO.File]::WriteAllText($dataFile, [string]$Body, (New-Object System.Text.UTF8Encoding $false))
+			[void]$argList.Add('--data-binary')
+			[void]$argList.Add(('@' + $dataFile))
+		}
+		[void]$argList.Add([string]$Url)
+
+		$nativeTimeout = $TimeoutSec + 15
+		if ($nativeTimeout -lt 20) { $nativeTimeout = 20 }
+		$r = Invoke-MBSetupNative -File $CurlPath -ArgumentList @($argList.ToArray()) -TimeoutSec $nativeTimeout
+		$codeStr = (([string]$r.out) + '').Trim()
+		$status = 0
+		if ($codeStr -match '(\d{3})\s*$') { $status = [int]$Matches[1] }
+		elseif ($codeStr -match '^\d{3}$') { $status = [int]$codeStr }
+
+		$respHeaders = @{}
+		if ($hdrFile -and (Test-Path -LiteralPath $hdrFile)) {
+			try {
+				$rawH = [System.IO.File]::ReadAllText($hdrFile)
+				# Keep last header block after redirects
+				$blocks = @([regex]::Split($rawH, '(?m)(?=^HTTP/\d)'))
+				$block = ''
+				foreach ($b in $blocks) { if ($b -and $b.Trim()) { $block = $b } }
+				foreach ($line in ($block -split "`r?`n")) {
+					if ($line -match '^(?i)HTTP/') { continue }
+					if ($line -match '^\s*$') { continue }
+					if ($line -match '^\s*([^:]+)\s*:\s*(.*)$') {
+						$hk = $Matches[1].Trim()
+						$hv = $Matches[2].Trim()
+						if ($respHeaders.ContainsKey($hk)) {
+							$respHeaders[$hk] = [string]$respHeaders[$hk] + ', ' + $hv
+						} else {
+							$respHeaders[$hk] = $hv
+						}
+					}
+				}
+			} catch {}
+		}
+
+		$bodyText = ''
+		if ($bodyFile -and (Test-Path -LiteralPath $bodyFile)) {
+			try { $bodyText = [System.IO.File]::ReadAllText($bodyFile) } catch { $bodyText = '' }
+		}
+
+		# curl exit 0 = transport ok (even for 4xx/5xx). Non-zero = network/TLS/etc.
+		if (-not $r.ok -and $status -lt 100) {
+			$err = (([string]$r.err) + ' ' + ([string]$r.out)).Trim()
+			if (-not $err) { $err = "curl exit $($r.exit)" }
+			return @{
+				ok          = $false
+				error       = $err
+				status_code = $(if ($status -gt 0) { $status } else { $null })
+				headers     = $respHeaders
+				body_text   = $bodyText
+				final_url   = $Url
+				method      = 'curl'
+			}
+		}
+
+		return @{
+			ok          = $true
+			status_code = $status
+			headers     = $respHeaders
+			body_text   = $bodyText
+			final_url   = $Url
+			method      = 'curl'
+			exit        = $r.exit
+		}
+	} catch {
+		return @{ ok = $false; error = $_.Exception.Message; method = 'curl' }
+	} finally {
+		if ($tmp -and (Test-Path -LiteralPath $tmp)) {
+			try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+		}
+	}
+}
+
+function Read-MBHttpErrorResponseBody {
+	param($Response, [int]$MaxChars = 32000)
+	if ($null -eq $Response) { return $null }
+	try {
+		$stream = $Response.GetResponseStream()
+		if ($null -eq $stream) { return $null }
+		$reader = New-Object System.IO.StreamReader($stream)
+		try {
+			$text = $reader.ReadToEnd()
+			if ($null -eq $text) { return $null }
+			if ($text.Length -gt $MaxChars) {
+				return $text.Substring(0, $MaxChars) + "`n... [truncated]"
+			}
+			return $text
+		} finally {
+			try { $reader.Close() } catch {}
+			try { $stream.Close() } catch {}
+		}
+	} catch {
+		return $null
+	}
+}
+
+function ConvertFrom-MBHttpBodyPreferJson {
+	param([string]$BodyText, [int]$MaxChars = 120000)
+	$t = if ($null -eq $BodyText) { '' } else { [string]$BodyText }
+	$truncated = $false
+	if ($t.Length -gt $MaxChars) {
+		$t = $t.Substring(0, $MaxChars) + "`n... [truncated]"
+		$truncated = $true
+	}
+	$parsed = $t
+	if (-not $truncated -and $t.Length -gt 0) {
+		$trim = $t.TrimStart()
+		if ($trim.StartsWith('{') -or $trim.StartsWith('[')) {
+			try { $parsed = $t | ConvertFrom-Json -ErrorAction Stop } catch { $parsed = $t }
+		}
+	}
+	return @{ text = $t; body = $parsed; truncated = $truncated }
+}
+
+function ConvertTo-MBFormUrlEncoded {
+	param($FormData)
+	if ($null -eq $FormData) { return '' }
+	$parts = New-Object System.Collections.ArrayList
+	if ($FormData -is [hashtable] -or $FormData -is [System.Collections.IDictionary]) {
+		foreach ($k in @($FormData.Keys)) {
+			[void]$parts.Add(('{0}={1}' -f [uri]::EscapeDataString([string]$k), [uri]::EscapeDataString([string]$FormData[$k])))
+		}
+	} else {
+		try {
+			foreach ($p in $FormData.PSObject.Properties) {
+				if ($p.Name -and $p.Name -notmatch '^PS') {
+					[void]$parts.Add(('{0}={1}' -f [uri]::EscapeDataString([string]$p.Name), [uri]::EscapeDataString([string]$p.Value)))
+				}
+			}
+		} catch {
+			return [string]$FormData
+		}
+	}
+	return ($parts -join '&')
+}
+
 function Invoke-MakeHttpRequest {
 	param(
-		[string]$method = "GET",
+		[string]$method = 'GET',
 		[Parameter(Mandatory = $true)][string]$url,
 		[object]$headers = $null,
 		[object]$params = $null,
@@ -18159,10 +20407,27 @@ function Invoke-MakeHttpRequest {
 		[string]$basic_auth_password = $null,
 		[object]$cookies = $null,
 		[string]$content_type = $null,
-		[bool]$verify_ssl = $true,
+		# Default false: self-signed / host-mismatch certs common on LAN gear
+		[object]$verify_ssl = $false,
 		[string]$user_agent = $null,
 		[int]$timeout = 0
 	)
+
+	$url = ([string]$url).Trim()
+	if ([string]::IsNullOrWhiteSpace($url)) {
+		return ConvertTo-MBJson @{ success = $false; error = 'url required' }
+	}
+	if ($url -notmatch '^(?i)https?://') {
+		return ConvertTo-MBJson @{ success = $false; error = 'url must start with http:// or https://'; url = $url }
+	}
+
+	$methodU = ([string]$method).Trim().ToUpperInvariant()
+	if ($methodU -notin @('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS')) {
+		return ConvertTo-MBJson @{ success = $false; error = "unsupported method '$method'" }
+	}
+
+	$doVerify = $true
+	try { $doVerify = Convert-MBToBool -Value $verify_ssl -Default $false } catch { $doVerify = $false }
 
 	$headers   = Convert-IfJson $headers
 	$params    = Convert-IfJson $params
@@ -18170,25 +20435,25 @@ function Invoke-MakeHttpRequest {
 	$form_data = Convert-IfJson $form_data
 	$cookies   = Convert-IfJson $cookies
 
-	$headerHash = @{}
-	if ($headers) {
-		if ($headers -is [hashtable]) { $headerHash = $headers.Clone() }
-		else {
-			foreach ($p in $headers.PSObject.Properties) { $headerHash[$p.Name] = [string]$p.Value }
-		}
-	}
-	if ($user_agent) { $headerHash['User-Agent'] = $user_agent }
-	elseif (-not $headerHash.ContainsKey('User-Agent')) {
+	$headerHash = ConvertTo-MBHttpHeaderHash -headers $headers
+	if ($user_agent) {
+		Remove-MBHttpHeaderInsensitive -Headers $headerHash -Name 'User-Agent'
+		$headerHash['User-Agent'] = [string]$user_agent
+	} elseif (-not (Get-MBHttpHeaderInsensitive -Headers $headerHash -Name 'User-Agent')) {
 		$headerHash['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 MiniBot/1.0'
 	}
 
 	if ($params) {
-		$q = @()
-		if ($params -is [hashtable]) {
-			foreach ($k in $params.Keys) { $q += ("{0}={1}" -f [uri]::EscapeDataString([string]$k), [uri]::EscapeDataString([string]$params[$k])) }
+		$q = New-Object System.Collections.ArrayList
+		if ($params -is [hashtable] -or $params -is [System.Collections.IDictionary]) {
+			foreach ($k in @($params.Keys)) {
+				[void]$q.Add(('{0}={1}' -f [uri]::EscapeDataString([string]$k), [uri]::EscapeDataString([string]$params[$k])))
+			}
 		} else {
 			foreach ($p in $params.PSObject.Properties) {
-				$q += ("{0}={1}" -f [uri]::EscapeDataString($p.Name), [uri]::EscapeDataString([string]$p.Value))
+				if ($p.Name -and $p.Name -notmatch '^PS') {
+					[void]$q.Add(('{0}={1}' -f [uri]::EscapeDataString([string]$p.Name), [uri]::EscapeDataString([string]$p.Value)))
+				}
 			}
 		}
 		if ($q.Count -gt 0) {
@@ -18197,95 +20462,176 @@ function Invoke-MakeHttpRequest {
 		}
 	}
 
-	$iwr = @{
-		Uri             = $url
-		Method          = $method.ToUpper()
-		Headers         = $headerHash
-		UseBasicParsing = $true
-		TimeoutSec      = $(if ($timeout -gt 0) { $timeout } else { 30 })
-	}
-
-	if (-not $verify_ssl -and $PSVersionTable.PSVersion.Major -ge 7) {
-		$iwr['SkipCertificateCheck'] = $true
-	}
-
-	if ($basic_auth_username -and $basic_auth_password) {
-		$pair = "{0}:{1}" -f $basic_auth_username, $basic_auth_password
-		$headerHash['Authorization'] = "Basic " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
-		$iwr['Headers'] = $headerHash
+	if ($basic_auth_username -and $null -ne $basic_auth_password) {
+		$pair = '{0}:{1}' -f $basic_auth_username, $basic_auth_password
+		Remove-MBHttpHeaderInsensitive -Headers $headerHash -Name 'Authorization'
+		$headerHash['Authorization'] = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
 	} elseif ($bearer_token) {
-		$headerHash['Authorization'] = "Bearer $bearer_token"
-		$iwr['Headers'] = $headerHash
-	}
-
-	if ($content_type) {
-		$headerHash['Content-Type'] = $content_type
-		$iwr['Headers'] = $headerHash
-	}
-
-	if ($json_body) {
-		$iwr['Body'] = ($json_body | ConvertTo-Json -Depth 10 -Compress)
-		if (-not $headerHash.ContainsKey('Content-Type')) {
-			$headerHash['Content-Type'] = 'application/json'
-			$iwr['Headers'] = $headerHash
-		}
-	} elseif ($form_data) {
-		$iwr['Body'] = $form_data
-	} elseif ($raw_data) {
-		$iwr['Body'] = $raw_data
+		Remove-MBHttpHeaderInsensitive -Headers $headerHash -Name 'Authorization'
+		$headerHash['Authorization'] = 'Bearer ' + ([string]$bearer_token).Trim()
 	}
 
 	if ($cookies) {
-		$cookieParts = @()
-		if ($cookies -is [hashtable]) {
-			foreach ($k in $cookies.Keys) { $cookieParts += "$k=$($cookies[$k])" }
+		$cookieParts = New-Object System.Collections.ArrayList
+		if ($cookies -is [hashtable] -or $cookies -is [System.Collections.IDictionary]) {
+			foreach ($k in @($cookies.Keys)) { [void]$cookieParts.Add(('{0}={1}' -f $k, $cookies[$k])) }
 		} else {
-			foreach ($p in $cookies.PSObject.Properties) { $cookieParts += "$($p.Name)=$($p.Value)" }
+			foreach ($p in $cookies.PSObject.Properties) {
+				if ($p.Name -and $p.Name -notmatch '^PS') { [void]$cookieParts.Add(('{0}={1}' -f $p.Name, $p.Value)) }
+			}
 		}
 		if ($cookieParts.Count -gt 0) {
+			Remove-MBHttpHeaderInsensitive -Headers $headerHash -Name 'Cookie'
 			$headerHash['Cookie'] = ($cookieParts -join '; ')
-			$iwr['Headers'] = $headerHash
 		}
 	}
 
-	$hasCreds = $false
-	if ($bearer_token -or ($basic_auth_username -and $basic_auth_password)) { $hasCreds = $true }
-	if ($headerHash.ContainsKey('Authorization') -or $headerHash.ContainsKey('authorization')) { $hasCreds = $true }
-	if (-not (Request-MBNetworkApproval -Method $method -Url $url -HasCredentials $hasCreds -ToolName 'MakeHttpRequest')) {
-		return "BLOCKED BY USER: HTTP request denied by operator."
+	# Body + Content-Type (PS 5.1 IWR: use -ContentType, not Content-Type header)
+	$body = $null
+	$ct = ([string]$content_type).Trim()
+	if (-not $ct) { $ct = Get-MBHttpHeaderInsensitive -Headers $headerHash -Name 'Content-Type' }
+	Remove-MBHttpHeaderInsensitive -Headers $headerHash -Name 'Content-Type'
+
+	if ($null -ne $json_body -and "$json_body" -ne '') {
+		if ($json_body -is [string]) {
+			$body = [string]$json_body
+		} else {
+			$body = ($json_body | ConvertTo-Json -Depth 12 -Compress)
+		}
+		if (-not $ct) { $ct = 'application/json; charset=utf-8' }
+	} elseif ($null -ne $form_data -and "$form_data" -ne '') {
+		if ($form_data -is [string]) {
+			$body = [string]$form_data
+		} else {
+			$body = ConvertTo-MBFormUrlEncoded -FormData $form_data
+		}
+		if (-not $ct) { $ct = 'application/x-www-form-urlencoded; charset=utf-8' }
+	} elseif ($null -ne $raw_data -and "$raw_data" -ne '') {
+		$body = [string]$raw_data
 	}
 
+	$timeoutSec = if ($timeout -gt 0) { [int]$timeout } else { 30 }
+	if ($timeoutSec -lt 1) { $timeoutSec = 1 }
+	if ($timeoutSec -gt 600) { $timeoutSec = 600 }
+
+	$hasCreds = $false
+	if ($bearer_token -or ($basic_auth_username -and $null -ne $basic_auth_password)) { $hasCreds = $true }
+	if (Get-MBHttpHeaderInsensitive -Headers $headerHash -Name 'Authorization') { $hasCreds = $true }
+	if (-not (Request-MBNetworkApproval -Method $methodU -Url $url -HasCredentials $hasCreds -ToolName 'MakeHttpRequest')) {
+		return 'BLOCKED BY USER: HTTP request denied by operator.'
+	}
+
+	# Insecure HTTPS: use system curl.exe -k (no process-wide cert callback — that trips AV).
+	$needInsecureHttps = ((-not $doVerify) -and ($url -match '^(?i)https:'))
+	if ($needInsecureHttps) {
+		$curl = Resolve-MBCurlExe
+		if (-not $curl) {
+			return ConvertTo-MBJson ([ordered]@{
+				success    = $false
+				error      = 'Bad/self-signed HTTPS needs system curl.exe (System32). Install curl or use verify_ssl=true with a valid cert.'
+				url        = $url
+				verify_ssl = $false
+			})
+		}
+		$cr = Invoke-MBCurlHttp -CurlPath $curl -Method $methodU -Url $url -Headers $headerHash -Body $body -ContentType $ct -TimeoutSec $timeoutSec -VerifySsl $false
+		if (-not $cr.ok -and -not $cr.status_code) {
+			return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
+				success     = $false
+				error       = $(if ($cr.error) { $cr.error } else { 'curl request failed' })
+				status_code = $cr.status_code
+				body        = $cr.body_text
+				method      = $methodU
+				url         = $url
+				verify_ssl  = $false
+				transport   = 'curl'
+			}) -Depth 8)
+		}
+		$bodyPack = ConvertFrom-MBHttpBodyPreferJson -BodyText ([string]$cr.body_text)
+		$okHttp = ($cr.status_code -ge 200 -and $cr.status_code -lt 400)
+		return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
+			success         = [bool]$okHttp
+			status_code     = [int]$cr.status_code
+			headers         = $cr.headers
+			body            = $bodyPack.body
+			body_truncated  = [bool]$bodyPack.truncated
+			final_url       = $(if ($cr.final_url) { $cr.final_url } else { $url })
+			content_length  = $(try { [int64]([string]$cr.body_text).Length } catch { $null })
+			method          = $methodU
+			verify_ssl      = $false
+			transport       = 'curl'
+			error           = $(if (-not $okHttp) { "HTTP $($cr.status_code)" } else { $null })
+		}) -Depth 10)
+	}
+
+	$iwr = @{
+		Uri             = $url
+		Method          = $methodU
+		Headers         = $headerHash
+		UseBasicParsing = $true
+		TimeoutSec      = $timeoutSec
+	}
+	if ($null -ne $body) { $iwr['Body'] = $body }
+	if ($ct) { $iwr['ContentType'] = $ct }
+
+	Enable-MBHttpTls
 	try {
 		$resp = Invoke-WebRequest @iwr -ErrorAction Stop
 		$respHeaders = @{}
-		foreach ($h in $resp.Headers.GetEnumerator()) {
-			$respHeaders[[string]$h.Key] = ($h.Value -join ', ')
-		}
-		$bodyText = [string]$resp.Content
-		$parsedBody = $bodyText
-		try { $parsedBody = $bodyText | ConvertFrom-Json -ErrorAction Stop } catch {}
-		if ($bodyText.Length -gt 120000) {
-			$bodyText = $bodyText.Substring(0, 120000) + "`n... [truncated]"
-			if ($parsedBody -is [string]) { $parsedBody = $bodyText }
-		}
+		try {
+			foreach ($h in $resp.Headers.GetEnumerator()) {
+				$respHeaders[[string]$h.Key] = ($h.Value -join ', ')
+			}
+		} catch {}
+		$bodyPack = ConvertFrom-MBHttpBodyPreferJson -BodyText ([string]$resp.Content)
 		$finalUrl = $url
 		try { $finalUrl = $resp.BaseResponse.ResponseUri.AbsoluteUri } catch {}
-		return Limit-MBResult (ConvertTo-MBJson @{
-			success        = $true
-			status_code    = [int]$resp.StatusCode
-			headers        = $respHeaders
-			body           = $parsedBody
-			final_url      = $finalUrl
-			content_length = $resp.RawContentLength
-		} -Depth 8)
+		$clen = $null
+		try { $clen = [int64]$resp.RawContentLength } catch {
+			try { $clen = [int64]([string]$resp.Content).Length } catch {}
+		}
+		return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
+			success         = $true
+			status_code     = [int]$resp.StatusCode
+			headers         = $respHeaders
+			body            = $bodyPack.body
+			body_truncated  = [bool]$bodyPack.truncated
+			final_url       = $finalUrl
+			content_length  = $clen
+			method          = $methodU
+			verify_ssl      = [bool]$doVerify
+			transport       = 'iwr'
+		}) -Depth 10)
 	} catch {
 		$status = $null
-		if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch {} }
-		return ConvertTo-MBJson @{
-			success     = $false
-			error       = $_.Exception.Message
-			status_code = $status
+		$errBody = $null
+		$webEx = $_.Exception
+		$respObj = $null
+		try { $respObj = $webEx.Response } catch {}
+		if ($null -eq $respObj) {
+			try { $respObj = $webEx.InnerException.Response } catch {}
 		}
+		if ($respObj) {
+			try { $status = [int]$respObj.StatusCode } catch {
+				try { $status = [int]$respObj.StatusCode.value__ } catch {}
+			}
+			$errBody = Read-MBHttpErrorResponseBody -Response $respObj
+		}
+		$parsedErr = $null
+		if ($errBody) {
+			$pack = ConvertFrom-MBHttpBodyPreferJson -BodyText $errBody -MaxChars 32000
+			$parsedErr = $pack.body
+			$errBody = $pack.text
+		}
+		return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
+			success     = $false
+			error       = $webEx.Message
+			status_code = $status
+			body        = $(if ($null -ne $parsedErr) { $parsedErr } else { $errBody })
+			method      = $methodU
+			url         = $url
+			verify_ssl  = [bool]$doVerify
+			transport   = 'iwr'
+		}) -Depth 8)
 	}
 }
 
@@ -18293,32 +20639,52 @@ function Invoke-BrowsePage {
 	param(
 		[Parameter(Mandatory = $true)][string]$url,
 		[int]$max_length = 12000,
-		[bool]$verify_ssl = $true,
+		[object]$verify_ssl = $false,
 		[string]$user_agent = $null,
 		[bool]$extract_links = $false
 	)
 	if (-not (Request-MBNetworkApproval -Method 'GET' -Url $url -HasCredentials $false -ToolName 'BrowsePage')) {
 		return "BLOCKED BY USER: BrowsePage denied by operator."
 	}
+	$doVerify = $true
+	try { $doVerify = Convert-MBToBool -Value $verify_ssl -Default $false } catch { $doVerify = $false }
 	$ua = if ($user_agent) { $user_agent } else {
 		'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 	}
-	$iwr = @{
-		Uri             = $url
-		UseBasicParsing = $true
-		TimeoutSec      = 30
-		Headers         = @{ 'User-Agent' = $ua }
-	}
-	if (-not $verify_ssl -and $PSVersionTable.PSVersion.Major -ge 7) {
-		$iwr['SkipCertificateCheck'] = $true
+	$url = ([string]$url).Trim()
+	$html = $null
+	$finalUrl = $url
+
+	# Insecure HTTPS via curl -k (avoid process cert-validation hooks that trip AV)
+	if ((-not $doVerify) -and ($url -match '^(?i)https:')) {
+		$curl = Resolve-MBCurlExe
+		if (-not $curl) {
+			return 'ERROR: Bad/self-signed HTTPS needs system curl.exe (System32). Install curl or pass verify_ssl=true.'
+		}
+		$cr = Invoke-MBCurlHttp -CurlPath $curl -Method 'GET' -Url $url -Headers @{ 'User-Agent' = $ua } -TimeoutSec 30 -VerifySsl $false
+		if (-not $cr.ok -and -not $cr.status_code) {
+			return "ERROR: $($cr.error)"
+		}
+		$html = [string]$cr.body_text
+		if ($cr.final_url) { $finalUrl = [string]$cr.final_url }
+	} else {
+		$iwr = @{
+			Uri             = $url
+			UseBasicParsing = $true
+			TimeoutSec      = 30
+			Headers         = @{ 'User-Agent' = $ua }
+		}
+		Enable-MBHttpTls
+		try {
+			$resp = Invoke-WebRequest @iwr -ErrorAction Stop
+			$html = [string]$resp.Content
+			try { $finalUrl = $resp.BaseResponse.ResponseUri.AbsoluteUri } catch {}
+		} catch {
+			return "ERROR: $($_.Exception.Message)"
+		}
 	}
 
 	try {
-		$resp = Invoke-WebRequest @iwr -ErrorAction Stop
-		$html = [string]$resp.Content
-		$finalUrl = $url
-		try { $finalUrl = $resp.BaseResponse.ResponseUri.AbsoluteUri } catch {}
-
 		if ($script:HasNative) {
 			$text = [MiniBot.Core.Native]::HtmlToText($html, $max_length)
 			$result = $text + "`n**URL:** $finalUrl"
@@ -18569,7 +20935,14 @@ function Test-ModelConnection {
 		$authType = Format-MBAuthDisplayLabel -Mode 'none' -BaseUrl $raw -Short
 	}
 
-	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+	try {
+		# TLS 1.2 + 1.3 when available (api.x.ai / modern HTTPS on PS 5.1)
+		$proto = [System.Net.SecurityProtocolType]::Tls12
+		try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
+		[System.Net.ServicePointManager]::SecurityProtocol = $proto
+	} catch {
+		try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+	}
 	try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
 
 	$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -19322,7 +21695,7 @@ function Get-MBToolFingerprint {
 			[void]$parts.Add($cmd)
 		}
 		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^FindFiles$|^HexView$|^HexEdit$|^SandBox$|^SandBoxWrite$' {
-			foreach ($k in @('path','path2','compare','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','annotate','next_diff','side_by_side','max_scan','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description')) {
+			foreach ($k in @('path','path2','compare','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','annotate','next_diff','side_by_side','max_scan','disasm','trace','at_entry','max_insns','max_steps','follow_calls','prefer_branch','arch','dump_hex','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description')) {
 				if (Test-MBHasProp $ArgsObj $k) {
 					$v = Get-MBProp $ArgsObj $k
 					if ($null -ne $v) {
@@ -19522,63 +21895,12 @@ function Reset-MBToolLoopGuard {
 
 # Setup / tune and installer tools
 function Ensure-MBAudioEndpoint {
-	if ('MiniBot.Core.AudioVolume' -as [type]) { return $true }
-	$cs = @'
-using System;
-using System.Runtime.InteropServices;
-namespace MiniBot.Core {
-	[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
-	class MMDeviceEnumeratorComObject { }
-	[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-	interface IMMDeviceEnumerator {
-		int NotImpl1();
-		[PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
-	}
-	[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-	interface IMMDevice {
-		[PreserveSig] int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
-	}
-	[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-	interface IAudioEndpointVolume {
-		int NotImpl1(); int NotImpl2();
-		[PreserveSig] int SetMasterVolumeLevelScalar(float fLevel, Guid pguidEventContext);
-		[PreserveSig] int GetMasterVolumeLevelScalar(out float pfLevel);
-		int NotImpl3(); int NotImpl4(); int NotImpl5(); int NotImpl6();
-		[PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, Guid pguidEventContext);
-		[PreserveSig] int GetMute(out bool pbMute);
-	}
-	public static class AudioVolume {
-		static IAudioEndpointVolume GetVol() {
-			var enu = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
-			IMMDevice dev;
-			Marshal.ThrowExceptionForHR(enu.GetDefaultAudioEndpoint(0, 1, out dev));
-			Guid iid = typeof(IAudioEndpointVolume).GUID;
-			object o;
-			Marshal.ThrowExceptionForHR(dev.Activate(ref iid, 23, IntPtr.Zero, out o));
-			return (IAudioEndpointVolume)o;
-		}
-		public static float GetLevel() {
-			float v; Marshal.ThrowExceptionForHR(GetVol().GetMasterVolumeLevelScalar(out v)); return v;
-		}
-		public static void SetLevel(float v) {
-			if (v < 0f) v = 0f; if (v > 1f) v = 1f;
-			Marshal.ThrowExceptionForHR(GetVol().SetMasterVolumeLevelScalar(v, Guid.Empty));
-		}
-		public static bool GetMute() {
-			bool m; Marshal.ThrowExceptionForHR(GetVol().GetMute(out m)); return m;
-		}
-		public static void SetMute(bool m) {
-			Marshal.ThrowExceptionForHR(GetVol().SetMute(m, Guid.Empty));
-		}
-	}
-}
-'@
-	try {
-		Add-Type -TypeDefinition $cs -Language CSharp -ErrorAction Stop
+	# Compiled at launch inside MiniBot.Core.
+	if ($script:HasAudioEndpoint -or ('MiniBot.Core.AudioEndpoint' -as [type])) {
+		$script:HasAudioEndpoint = $true
 		return $true
-	} catch {
-		return $false
 	}
+	return $false
 }
 
 function Invoke-AudioVolume {
@@ -19589,41 +21911,104 @@ function Invoke-AudioVolume {
 	$a = ([string]$action).Trim().ToLowerInvariant()
 	if ([string]::IsNullOrWhiteSpace($a)) { $a = 'get' }
 	if (-not (Ensure-MBAudioEndpoint)) {
-		return "ERROR: Audio endpoint helper failed to load (Core Audio COM)."
+		return ConvertTo-MBJson ([ordered]@{
+			ok      = $false
+			error   = 'Audio endpoint helper failed to load (Core Audio COM).'
+			level   = $null
+			mute    = $null
+		})
 	}
 	try {
 		if ($a -eq 'get') {
-			$pct = [int][math]::Round([MiniBot.Core.AudioVolume]::GetLevel() * 100)
-			$mute = [bool][MiniBot.Core.AudioVolume]::GetMute()
-			return ConvertTo-MBJson ([ordered]@{ ok = $true; level = $pct; mute = $mute })
+			$lv = 0.0
+			$mu = $false
+			$err = $null
+			$role = -1
+			$ok = [MiniBot.Core.AudioEndpoint]::TryGet([ref]$lv, [ref]$mu, [ref]$err, [ref]$role)
+			if (-not $ok) {
+				return ConvertTo-MBJson ([ordered]@{
+					ok           = $false
+					has_endpoint = $false
+					error        = $(if ($err) { [string]$err } else { 'No default playback endpoint' })
+					level        = $null
+					mute         = $null
+					note         = 'Common on headless sessions or when default device is missing after docking/undocking. Open Sound settings and set a default playback device.'
+				})
+			}
+			$pct = [int][math]::Round(([double]$lv) * 100)
+			$roleName = switch ([int]$role) {
+				0 { 'console' }
+				1 { 'multimedia' }
+				2 { 'communications' }
+				default { 'unknown' }
+			}
+			return ConvertTo-MBJson ([ordered]@{
+				ok           = $true
+				has_endpoint = $true
+				level        = $pct
+				mute         = [bool]$mu
+				role         = $roleName
+			})
 		}
 		if ($a -eq 'mute' -or $a -eq 'unmute' -or $a -eq 'set') {
 			$details = switch ($a) {
 				'mute' { 'Mute default playback device.' }
 				'unmute' { 'Unmute default playback device.' }
 				default {
-					if ($level -lt 0 -or $level -gt 100) { return "ERROR: level must be 0-100 for action=set." }
+					if ($level -lt 0 -or $level -gt 100) {
+						return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'level must be 0-100 for action=set' })
+					}
 					"Set default playback volume to $level%."
 				}
 			}
 			if (-not (Request-Confirmation -Title "AudioVolume requires approval" -Details $details)) {
-				return "BLOCKED BY USER: AudioVolume denied."
+				return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'AudioVolume denied by operator'; denied = $true })
 			}
-			if ($a -eq 'mute') { [MiniBot.Core.AudioVolume]::SetMute($true) }
-			elseif ($a -eq 'unmute') { [MiniBot.Core.AudioVolume]::SetMute($false) }
-			else {
-				[MiniBot.Core.AudioVolume]::SetLevel(($level / 100.0))
-				if ([MiniBot.Core.AudioVolume]::GetMute() -and $level -gt 0) {
-					[MiniBot.Core.AudioVolume]::SetMute($false)
+			$err = $null
+			$setOk = $false
+			if ($a -eq 'mute') {
+				$setOk = [MiniBot.Core.AudioEndpoint]::TrySetMute($true, [ref]$err)
+			} elseif ($a -eq 'unmute') {
+				$setOk = [MiniBot.Core.AudioEndpoint]::TrySetMute($false, [ref]$err)
+			} else {
+				$setOk = [MiniBot.Core.AudioEndpoint]::TrySetLevel(([float]($level / 100.0)), [ref]$err)
+				if ($setOk) {
+					# Unmute when raising volume above 0
+					$lv2 = 0.0; $mu2 = $false; $e2 = $null; $r2 = -1
+					if ([MiniBot.Core.AudioEndpoint]::TryGet([ref]$lv2, [ref]$mu2, [ref]$e2, [ref]$r2)) {
+						if ($mu2 -and $level -gt 0) {
+							[void][MiniBot.Core.AudioEndpoint]::TrySetMute($false, [ref]$err)
+						}
+					}
 				}
 			}
-			$pct = [int][math]::Round([MiniBot.Core.AudioVolume]::GetLevel() * 100)
-			$mute = [bool][MiniBot.Core.AudioVolume]::GetMute()
-			return ConvertTo-MBJson ([ordered]@{ ok = $true; action = $a; level = $pct; mute = $mute })
+			if (-not $setOk) {
+				return ConvertTo-MBJson ([ordered]@{
+					ok           = $false
+					has_endpoint = $false
+					action       = $a
+					error        = $(if ($err) { [string]$err } else { 'Set failed' })
+				})
+			}
+			$lv = 0.0; $mu = $false; $e3 = $null; $r3 = -1
+			[void][MiniBot.Core.AudioEndpoint]::TryGet([ref]$lv, [ref]$mu, [ref]$e3, [ref]$r3)
+			$pct = [int][math]::Round(([double]$lv) * 100)
+			return ConvertTo-MBJson ([ordered]@{
+				ok           = $true
+				has_endpoint = $true
+				action       = $a
+				level        = $pct
+				mute         = [bool]$mu
+			})
 		}
-		return "ERROR: action must be get|set|mute|unmute."
+		return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'action must be get|set|mute|unmute' })
 	} catch {
-		return "ERROR: AudioVolume failed: $($_.Exception.Message)"
+		return ConvertTo-MBJson ([ordered]@{
+			ok    = $false
+			error = $_.Exception.Message
+			level = $null
+			mute  = $null
+		})
 	}
 }
 
@@ -19914,6 +22299,94 @@ function Enable-MBFirewallGroup {
 	}
 }
 
+function Get-MBWindowsOptionSnapshot {
+	# Semantic before/after value for SetWindowsOption responses
+	param(
+		[string]$Option,
+		[string]$Drive = 'C:'
+	)
+	$opt = ([string]$Option).Trim().ToLowerInvariant()
+	try {
+		switch -Regex ($opt) {
+			'^explorer\.hidden_files$' {
+				$v = $null
+				try { $v = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name Hidden -ErrorAction SilentlyContinue).Hidden } catch {}
+				if ($v -eq 1) { return 'show' }
+				if ($v -eq 2) { return 'hide' }
+				return $v
+			}
+			'^explorer\.file_extensions$' {
+				$v = $null
+				try { $v = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name HideFileExt -ErrorAction SilentlyContinue).HideFileExt } catch {}
+				if ($v -eq 0) { return 'show' }
+				if ($v -eq 1) { return 'hide' }
+				return $v
+			}
+			'^explorer\.compact_mode$' {
+				$v = $null
+				try { $v = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name UseCompactMode -ErrorAction SilentlyContinue).UseCompactMode } catch {}
+				if ($v -eq 1) { return 'on' }
+				if ($v -eq 0) { return 'off' }
+				return $v
+			}
+			'^explorer\.classic_context_menu$' {
+				$p = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
+				if (Test-Path -LiteralPath $p) { return 'on' }
+				return 'off'
+			}
+			'^uac$' {
+				$v = $null
+				try { $v = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA } catch {}
+				if ($v -eq 1) { return 'enable' }
+				if ($v -eq 0) { return 'disable' }
+				return $v
+			}
+			'^power\.plan$' {
+				$r = Invoke-MBSetupNative -File 'powercfg.exe' -ArgumentList @('/getactivescheme') -TimeoutSec 10
+				$blob = (([string]$r.out) + ' ' + ([string]$r.err))
+				if ($blob -match '(?i)8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c') { return 'high_performance' }
+				if ($blob -match '(?i)381b4222-f694-41f0-9685-ff5bb260df2e') { return 'balanced' }
+				if ($blob -match '(?i)a1841308-3541-4fab-bc81-f71556f20b4a') { return 'power_saver' }
+				return $(if ($blob.Trim()) { $blob.Trim().Substring(0, [math]::Min(120, $blob.Trim().Length)) } else { $null })
+			}
+			'^timezone$' {
+				$r = Invoke-MBSetupNative -File 'tzutil.exe' -ArgumentList @('/g') -TimeoutSec 10
+				return ([string]$r.out).Trim()
+			}
+			'^boot\.f8_legacy$' {
+				$r = Invoke-MBSetupNative -File 'bcdedit.exe' -ArgumentList @('/enum', '{default}') -TimeoutSec 15
+				$blob = ([string]$r.out)
+				if ($blob -match '(?i)bootmenupolicy\s+Legacy') { return 'on' }
+				if ($blob -match '(?i)bootmenupolicy\s+Standard') { return 'off' }
+				return $null
+			}
+			default { return $null }
+		}
+	} catch { return $null }
+}
+
+function Format-MBSetWindowsOptionResult {
+	param(
+		[hashtable]$Body,
+		$Before = $null,
+		$After = $null
+	)
+	if ($null -eq $Body) { $Body = @{} }
+	$ord = [ordered]@{}
+	foreach ($k in @($Body.Keys)) { $ord[$k] = $Body[$k] }
+	if (-not $ord.Contains('ok')) { $ord['ok'] = $true }
+	$ord['before'] = $Before
+	if ($null -eq $After) {
+		if ($ord.Contains('value')) { $After = $ord['value'] }
+		elseif ($ord.Contains('applied')) { $After = $ord['applied'] }
+	}
+	$ord['after'] = $After
+	$b = if ($null -eq $Before) { '' } else { [string]$Before }
+	$a = if ($null -eq $After) { '' } else { [string]$After }
+	$ord['changed'] = ($b -ne $a)
+	return ConvertTo-MBJson $ord -Depth 8
+}
+
 function Invoke-SetWindowsOption {
 	param(
 		[string]$option,
@@ -19941,22 +22414,28 @@ function Invoke-SetWindowsOption {
 		return "BLOCKED BY USER: SetWindowsOption denied."
 	}
 
+	$before = $null
+	try { $before = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv } catch { $before = $null }
+
 	try {
 		switch -Regex ($opt) {
 			'^explorer\.hidden_files$' {
 				$d = if ($valL -in @('show','on','1','true')) { 1 } elseif ($valL -in @('hide','off','0','false')) { 2 } else { return "ERROR: value show|hide" }
 				reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v Hidden /t REG_DWORD /d $d /f | Out-Null
-				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL; applied = $d }
+				$after = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body @{ ok = $true; option = $opt; value = $valL; applied = $d } -Before $before -After $after)
 			}
 			'^explorer\.file_extensions$' {
 				$d = if ($valL -in @('show','on','1','true')) { 0 } elseif ($valL -in @('hide','off','0','false')) { 1 } else { return "ERROR: value show|hide" }
 				reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v HideFileExt /t REG_DWORD /d $d /f | Out-Null
-				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL; applied = $d }
+				$after = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body @{ ok = $true; option = $opt; value = $valL; applied = $d } -Before $before -After $after)
 			}
 			'^explorer\.compact_mode$' {
 				$d = if ($valL -in @('on','1','true','enable')) { 1 } elseif ($valL -in @('off','0','false','disable')) { 0 } else { return "ERROR: value on|off" }
 				reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v UseCompactMode /t REG_DWORD /d $d /f | Out-Null
-				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL }
+				$after = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body @{ ok = $true; option = $opt; value = $valL } -Before $before -After $after)
 			}
 			'^explorer\.classic_context_menu$' {
 				$key = 'HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
@@ -19965,12 +22444,14 @@ function Invoke-SetWindowsOption {
 				} elseif ($valL -in @('off','0','false','disable')) {
 					reg.exe delete 'HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}' /f 2>$null | Out-Null
 				} else { return "ERROR: value on|off" }
-				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL; note = 'Explorer restart may be required' }
+				$after = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body @{ ok = $true; option = $opt; value = $valL; note = 'Explorer restart may be required' } -Before $before -After $after)
 			}
 			'^uac$' {
 				$d = if ($valL -in @('enable','on','1','true')) { 1 } elseif ($valL -in @('disable','off','0','false')) { 0 } else { return "ERROR: value enable|disable" }
 				reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' /v EnableLUA /t REG_DWORD /d $d /f | Out-Null
-				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL; note = 'Reboot may be required for UAC change' }
+				$after = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body @{ ok = $true; option = $opt; value = $valL; note = 'Reboot may be required for UAC change' } -Before $before -After $after)
 			}
 			'^power\.plan$' {
 				$map = @{
@@ -19980,7 +22461,8 @@ function Invoke-SetWindowsOption {
 				}
 				if (-not $map.ContainsKey($valL)) { return "ERROR: value high_performance|balanced|power_saver" }
 				$r = Invoke-MBSetupNative -File 'powercfg.exe' -ArgumentList @('/setactive', $map[$valL])
-				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $valL; exit = $r.exit; out = $r.out; err = $r.err })
+				$after = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $r.ok; option = $opt; value = $valL; exit = $r.exit; out = $r.out; err = $r.err }) -Before $before -After $after)
 			}
 			'^power\.max_performance$' {
 				$cmds = @(
@@ -20005,37 +22487,40 @@ function Invoke-SetWindowsOption {
 					$r = Invoke-MBSetupNative -File 'powercfg.exe' -ArgumentList $c
 					$steps += [ordered]@{ args = ($c -join ' '); ok = $r.ok; exit = $r.exit }
 				}
-				return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; steps = $steps }) -Depth 6
+				$after = Get-MBWindowsOptionSnapshot -Option 'power.plan' -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $true; option = $opt; value = 'on'; steps = $steps }) -Before $before -After $after)
 			}
 			'^boot\.f8_legacy$' {
 				$pol = if ($valL -in @('on','1','true','legacy','enable')) { 'LEGACY' } elseif ($valL -in @('off','0','false','standard','disable')) { 'STANDARD' } else { return "ERROR: value on|off" }
 				$r = Invoke-MBSetupNative -File 'bcdedit.exe' -ArgumentList @('/set','{default}','bootmenupolicy', $pol)
-				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $pol; exit = $r.exit; out = $r.out; err = $r.err })
+				$after = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $r.ok; option = $opt; value = $(if ($pol -eq 'LEGACY') { 'on' } else { 'off' }); exit = $r.exit; out = $r.out; err = $r.err }) -Before $before -After $after)
 			}
 			'^network\.discovery$' {
 				$en = if ($valL -in @('on','1','true','enable','yes')) { 'Yes' } elseif ($valL -in @('off','0','false','disable','no')) { 'No' } else { return "ERROR: value on|off" }
 				if ($en -eq 'Yes') {
 					$r = Enable-MBFirewallGroup -GroupName 'Network Discovery' -TimeoutSec 15
-					return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; value = $en; method = $r.method; detail = $r.detail })
+					return (Format-MBSetWindowsOptionResult -Body (@{ ok = $true; option = $opt; value = 'on'; method = $r.method; detail = $r.detail }) -Before $before -After 'on')
 				}
 				$arg = 'advfirewall firewall set rule group="Network Discovery" new enable=No'
 				$r = Invoke-MBSetupNative -File 'netsh.exe' -ArgumentList @($arg) -TimeoutSec 15
-				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $en; exit = $r.exit; out = $r.out; err = $r.err })
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $r.ok; option = $opt; value = 'off'; exit = $r.exit; out = $r.out; err = $r.err }) -Before $before -After 'off')
 			}
 			'^network\.file_sharing$' {
 				$en = if ($valL -in @('on','1','true','enable','yes')) { 'Yes' } elseif ($valL -in @('off','0','false','disable','no')) { 'No' } else { return "ERROR: value on|off" }
 				if ($en -eq 'Yes') {
 					$r = Enable-MBFirewallGroup -GroupName 'File and Printer Sharing' -TimeoutSec 15
-					return ConvertTo-MBJson ([ordered]@{ ok = $true; option = $opt; value = $en; method = $r.method; detail = $r.detail })
+					return (Format-MBSetWindowsOptionResult -Body (@{ ok = $true; option = $opt; value = 'on'; method = $r.method; detail = $r.detail }) -Before $before -After 'on')
 				}
 				$arg = 'advfirewall firewall set rule group="File and Printer Sharing" new enable=No'
 				$r = Invoke-MBSetupNative -File 'netsh.exe' -ArgumentList @($arg) -TimeoutSec 15
-				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $en; exit = $r.exit; out = $r.out; err = $r.err })
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $r.ok; option = $opt; value = 'off'; exit = $r.exit; out = $r.out; err = $r.err }) -Before $before -After 'off')
 			}
 			'^timezone$' {
 				if ([string]::IsNullOrWhiteSpace($val)) { return "ERROR: value must be a tzutil id (e.g. Eastern Standard Time)" }
 				$r = Invoke-MBSetupNative -File 'tzutil.exe' -ArgumentList @('/s', $val)
-				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; value = $val; exit = $r.exit; out = $r.out; err = $r.err })
+				$after = Get-MBWindowsOptionSnapshot -Option $opt -Drive $drv
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $r.ok; option = $opt; value = $val; exit = $r.exit; out = $r.out; err = $r.err }) -Before $before -After $after)
 			}
 			'^time\.sync$' {
 				$null = Invoke-MBSetupNative -File 'w32tm.exe' -ArgumentList @('/config','/manualpeerlist:time.windows.com')
@@ -20044,31 +22529,742 @@ function Invoke-SetWindowsOption {
 				$null = Invoke-MBSetupNative -File 'sc.exe' -ArgumentList @('config','w32time','start=','demand')
 				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('start','w32time')
 				$r = Invoke-MBSetupNative -File 'w32tm.exe' -ArgumentList @('/resync')
-				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; exit = $r.exit; out = $r.out; err = $r.err })
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $r.ok; option = $opt; value = 'now'; exit = $r.exit; out = $r.out; err = $r.err }) -Before $before -After 'now')
 			}
 			'^bitlocker\.off$' {
 				$r = Invoke-MBSetupNative -File 'manage-bde.exe' -ArgumentList @('-off', $drv) -TimeoutSec 300
-				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; drive = $drv; exit = $r.exit; out = $r.out; err = $r.err })
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $r.ok; option = $opt; value = 'off'; drive = $drv; exit = $r.exit; out = $r.out; err = $r.err }) -Before $before -After 'off')
 			}
 			'^edge\.web_widget$' {
 				$d = if ($valL -in @('off','0','false','disable')) { 0 } elseif ($valL -in @('on','1','true','enable')) { 1 } else { return "ERROR: value on|off" }
 				reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\Edge' /v WebWidgetAllowed /t REG_DWORD /d $d /f | Out-Null
-				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL }
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $true; option = $opt; value = $valL }) -Before $before -After $valL)
 			}
 			'^registry\.periodic_backup$' {
 				$d = if ($valL -in @('on','1','true','enable')) { 1 } elseif ($valL -in @('off','0','false','disable')) { 0 } else { return "ERROR: value on|off" }
 				reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\Session Manager\Configuration Manager' /v EnablePeriodicBackup /t REG_DWORD /d $d /f | Out-Null
-				return ConvertTo-MBJson @{ ok = $true; option = $opt; value = $valL }
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $true; option = $opt; value = $valL }) -Before $before -After $valL)
 			}
 			'^cleanmgr\.autoclean$' {
 				$letter = $drv.TrimEnd(':')
 				$r = Invoke-MBSetupNative -File 'cleanmgr.exe' -ArgumentList @("/d",$letter,'/Autoclean') -TimeoutSec 600
-				return ConvertTo-MBJson ([ordered]@{ ok = $r.ok; option = $opt; drive = $drv; exit = $r.exit })
+				return (Format-MBSetWindowsOptionResult -Body (@{ ok = $r.ok; option = $opt; value = 'run'; drive = $drv; exit = $r.exit }) -Before $before -After 'run')
 			}
 			default { return "ERROR: Unhandled option '$opt'." }
 		}
 	} catch {
 		return "ERROR: SetWindowsOption failed: $($_.Exception.Message)"
+	}
+}
+
+# --- Local Group Policy (registry-based Policies keys; not domain RSAT GPO editor) ---
+function Get-MBGroupPolicyCatalog {
+	# Common Administrative Template-style settings via Policies registry.
+	# path = relative under SOFTWARE\Policies or full hive path; value name; type; on/off or free values.
+	return [ordered]@{
+		'windows.update.no_auto_update' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; name = 'NoAutoUpdate'
+			type = 'DWord'; values = @('0','1'); desc = '1=disable automatic updates via policy; 0=allow'
+		}
+		'windows.update.au_options' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; name = 'AUOptions'
+			type = 'DWord'; values = @('2','3','4','5'); desc = '2=notify 3=auto DL notify install 4=auto DL schedule 5=local admin choice'
+		}
+		'explorer.no_control_panel' = @{
+			scope = 'user'; path = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; name = 'NoControlPanel'
+			type = 'DWord'; values = @('0','1'); desc = '1=prohibit Control Panel access'
+		}
+		'explorer.no_run' = @{
+			scope = 'user'; path = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; name = 'NoRun'
+			type = 'DWord'; values = @('0','1'); desc = '1=remove Run from Start menu'
+		}
+		'explorer.disable_taskmgr' = @{
+			scope = 'user'; path = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'DisableTaskMgr'
+			type = 'DWord'; values = @('0','1'); desc = '1=disable Task Manager'
+		}
+		'explorer.disable_cmd' = @{
+			scope = 'user'; path = 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\System'; name = 'DisableCMD'
+			type = 'DWord'; values = @('0','1','2'); desc = '1=disable cmd 2=disable cmd+scripts 0=allow'
+		}
+		'system.disable_registry_tools' = @{
+			scope = 'user'; path = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'DisableRegistryTools'
+			type = 'DWord'; values = @('0','1'); desc = '1=disable regedit (dangerous; hard to undo without policy remove)'
+		}
+		'system.legal_notice_caption' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'LegalNoticeCaption'
+			type = 'String'; values = @('<text>'); desc = 'Logon legal notice title'
+		}
+		'system.legal_notice_text' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'LegalNoticeText'
+			type = 'String'; values = @('<text>'); desc = 'Logon legal notice body'
+		}
+		'system.dontdisplaylastusername' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'DontDisplayLastUserName'
+			type = 'DWord'; values = @('0','1'); desc = '1=do not display last signed-in user at logon'
+		}
+		'system.inactivity_timeout_secs' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; name = 'InactivityTimeoutSecs'
+			type = 'DWord'; values = @('<seconds>'); desc = 'Interactive logon machine inactivity limit (seconds)'
+		}
+		'cloudcontent.disable_windows_consumer' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; name = 'DisableWindowsConsumerFeatures'
+			type = 'DWord'; values = @('0','1'); desc = '1=turn off Microsoft consumer experiences'
+		}
+		'cloudcontent.disable_softlanding' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; name = 'DisableSoftLanding'
+			type = 'DWord'; values = @('0','1'); desc = '1=disable Windows tips / soft landing'
+		}
+		'search.allow_cortana' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; name = 'AllowCortana'
+			type = 'DWord'; values = @('0','1'); desc = '0=disable Cortana; 1=allow'
+		}
+		'search.disable_web_search' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; name = 'DisableWebSearch'
+			type = 'DWord'; values = @('0','1'); desc = '1=disable web search from Start/search'
+		}
+		'search.connected_search_safe' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; name = 'ConnectedSearchUseWeb'
+			type = 'DWord'; values = @('0','1'); desc = '0=don''t search the web; 1=allow'
+		}
+		'store.removepush' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'; name = 'DisableStoreApps'
+			type = 'DWord'; values = @('0','1'); desc = '1=turn off Store application (policy)'
+		}
+		'store.disable_os_upgrade' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'; name = 'DisableOSUpgrade'
+			type = 'DWord'; values = @('0','1'); desc = '1=block Store OS upgrade offers'
+		}
+		'edge.hide_first_run' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; name = 'HideFirstRunExperience'
+			type = 'DWord'; values = @('0','1'); desc = '1=hide Edge first-run experience'
+		}
+		'chrome.homepage' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Google\Chrome'; name = 'HomepageLocation'
+			type = 'String'; values = @('<url>'); desc = 'Chrome homepage URL (requires Chrome policy support)'
+		}
+		'password.minimum_length' = @{
+			scope = 'machine'; path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'; name = ''
+			type = 'note'; values = @(); desc = 'Use action=export_security / domain policy; local password length is via secedit not this reg path'
+		}
+		'removable.deny_all' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices'; name = 'Deny_All'
+			type = 'DWord'; values = @('0','1'); desc = '1=deny all removable storage (strong lock-down)'
+		}
+		'powershell.execution_policy' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell'; name = 'ExecutionPolicy'
+			type = 'String'; values = @('Restricted','RemoteSigned','AllSigned','Unrestricted','Bypass'); desc = 'Machine PowerShell execution policy via GPO'
+		}
+		'powershell.script_block_logging' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'; name = 'EnableScriptBlockLogging'
+			type = 'DWord'; values = @('0','1'); desc = '1=enable PowerShell script block logging'
+		}
+		'defender.disable_antispyware' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'; name = 'DisableAntiSpyware'
+			type = 'DWord'; values = @('0','1'); desc = '1=disable Defender anti-spyware policy (not recommended)'
+		}
+		'telemetry.allow_telemetry' = @{
+			scope = 'machine'; path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; name = 'AllowTelemetry'
+			type = 'DWord'; values = @('0','1','2','3'); desc = '0=Security 1=Basic 2=Enhanced 3=Full (edition-limited)'
+		}
+	}
+}
+
+function Test-MBGroupPolicyPathAllowed {
+	param([string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+	$p = $Path.Trim()
+	# Only policy hives / well-known policy branches (prevents arbitrary registry as "GPO")
+	if ($p -match '(?i)^(HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER):\\SOFTWARE\\Policies\\') { return $true }
+	if ($p -match '(?i)^(HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER):\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\') { return $true }
+	if ($p -match '(?i)^(HKLM|HKEY_LOCAL_MACHINE):\\SOFTWARE\\Microsoft\\Windows Defender\\') { return $true }
+	if ($p -match '(?i)^(HKLM|HKEY_LOCAL_MACHINE):\\SOFTWARE\\Policies\\') { return $true }
+	return $false
+}
+
+function ConvertTo-MBGroupPolicyRegPath {
+	param([string]$Path)
+	$p = ([string]$Path).Trim()
+	if ([string]::IsNullOrWhiteSpace($p)) { return $null }
+	$p = $p -replace '(?i)^HKEY_LOCAL_MACHINE\\', 'HKLM:\'
+	$p = $p -replace '(?i)^HKEY_CURRENT_USER\\', 'HKCU:\'
+	$p = $p -replace '(?i)^HKLM\\', 'HKLM:\'
+	$p = $p -replace '(?i)^HKCU\\', 'HKCU:\'
+	if ($p -notmatch '^(?i)(HKLM|HKCU):') {
+		# Bare relative under Policies
+		if ($p -match '(?i)^SOFTWARE\\') {
+			$p = 'HKLM:\' + $p
+		} else {
+			$p = 'HKLM:\SOFTWARE\Policies\' + $p.TrimStart('\')
+		}
+	}
+	return $p
+}
+
+function Get-MBGroupPolicyResolvedTarget {
+	param(
+		[string]$Key = '',
+		[string]$Path = '',
+		[string]$Name = '',
+		[string]$Type = '',
+		[string]$Scope = ''
+	)
+	$cat = Get-MBGroupPolicyCatalog
+	if (-not [string]::IsNullOrWhiteSpace($Key)) {
+		$k = $Key.Trim()
+		if (-not $cat.Contains($k)) {
+			# fuzzy
+			$hit = $null
+			foreach ($ck in @($cat.Keys)) {
+				if ($ck -like "*$k*" -or $k -like "*$ck*") { $hit = $ck; break }
+			}
+			if (-not $hit) {
+				return @{ ok = $false; error = "Unknown catalog key '$Key'. action=list_catalog for keys." }
+			}
+			$k = $hit
+		}
+		$e = $cat[$k]
+		if ([string]$e.type -eq 'note') {
+			return @{ ok = $false; error = "Catalog key '$k' is informational only: $($e.desc)" }
+		}
+		return @{
+			ok    = $true
+			key   = $k
+			path  = [string]$e.path
+			name  = [string]$e.name
+			type  = [string]$e.type
+			scope = [string]$e.scope
+			desc  = [string]$e.desc
+		}
+	}
+	$regPath = ConvertTo-MBGroupPolicyRegPath -Path $Path
+	if (-not $regPath) {
+		return @{ ok = $false; error = 'path= or key= required.' }
+	}
+	if (-not (Test-MBGroupPolicyPathAllowed -Path $regPath)) {
+		return @{
+			ok = $false
+			error = "Path not allowed for GroupPolicy. Only SOFTWARE\\Policies\\... and SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\... (got $regPath)"
+		}
+	}
+	$t = if ([string]::IsNullOrWhiteSpace($Type)) { 'DWord' } else { $Type.Trim() }
+	return @{
+		ok    = $true
+		key   = $null
+		path  = $regPath
+		name  = [string]$Name
+		type  = $t
+		scope = $(if ($Scope) { $Scope } else { 'custom' })
+		desc  = ''
+	}
+}
+
+function Convert-MBGroupPolicyRegValue {
+	param(
+		[string]$Type,
+		$value
+	)
+	$t = ([string]$Type).Trim().ToLowerInvariant() -replace '[\s_-]', ''
+	switch -Regex ($t) {
+		'^(dword|int|int32)$' {
+			$n = 0
+			if ($value -is [bool]) { return $(if ($value) { 1 } else { 0 }) }
+			if (-not [int]::TryParse([string]$value, [ref]$n)) {
+				if ([string]$value -match '^(?i)true|on|yes|enable') { return 1 }
+				if ([string]$value -match '^(?i)false|off|no|disable') { return 0 }
+				throw "Cannot parse DWord value: $value"
+			}
+			return [int]$n
+		}
+		'^(qword|int64)$' {
+			$n = [int64]0
+			if (-not [int64]::TryParse([string]$value, [ref]$n)) { throw "Cannot parse QWord: $value" }
+			return [int64]$n
+		}
+		'^(string|sz|reg_sz)$' { return [string]$value }
+		'^(expandstring|expand_sz)$' { return [string]$value }
+		'^(multistring|multi_sz)$' {
+			if ($value -is [System.Array]) { return @($value | ForEach-Object { [string]$_ }) }
+			return @(([string]$value) -split '[;\r\n]+' | Where-Object { $_ })
+		}
+		default { throw "Unsupported type '$Type' (use DWord|String|ExpandString|MultiString|QWord)." }
+	}
+}
+
+function Get-MBGroupPolicyRegTypeName {
+	param([string]$Type)
+	$t = ([string]$Type).Trim().ToLowerInvariant() -replace '[\s_-]', ''
+	switch -Regex ($t) {
+		'^(dword|int|int32)$' { return 'DWord' }
+		'^(qword|int64)$' { return 'QWord' }
+		'^(expandstring|expand_sz)$' { return 'ExpandString' }
+		'^(multistring|multi_sz)$' { return 'MultiString' }
+		default { return 'String' }
+	}
+}
+
+function Invoke-GroupPolicy {
+	param(
+		[string]$action = 'status',
+		[string]$key = '',
+		[string]$path = '',
+		[string]$name = '',
+		$value = $null,
+		[string]$type = 'DWord',
+		[string]$scope = '',
+		[string]$pattern = '',
+		[int]$max = 80,
+		[object]$gpupdate = $false
+	)
+	$a = ([string]$action).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($a)) { $a = 'status' }
+	if ($max -le 0) { $max = 80 }
+	if ($max -gt 300) { $max = 300 }
+	$doGpu = $false
+	if ($gpupdate -is [bool]) { $doGpu = $gpupdate }
+	elseif ([string]$gpupdate -match '^(?i)1|true|yes|y|on$') { $doGpu = $true }
+
+	$editionOk = $true
+	try { $editionOk = [bool](Test-MBWindowsHasLocalGroupPolicy) } catch { $editionOk = $true }
+	$editionWhy = ''
+	try { $editionWhy = Get-MBGroupPolicyUnavailableReason } catch { $editionWhy = '' }
+	$edSnap = $null
+	try { $edSnap = Get-MBWindowsEditionSnapshot } catch { $edSnap = $null }
+
+	# Mutating / deep actions blocked on Home/Core (UI paints tool orange). status still works.
+	if (-not $editionOk -and $a -notmatch '^(status|info)$') {
+		return ConvertTo-MBJson ([ordered]@{
+			ok                    = $false
+			supported             = $false
+			unavailable           = $true
+			action                = $a
+			error                 = $(if ($editionWhy) { $editionWhy } else { 'Local Group Policy not available on this Windows edition (Home/Core).' })
+			edition_id            = $(if ($edSnap) { $edSnap.EditionID } else { $null })
+			product_name          = $(if ($edSnap) { $edSnap.ProductName } else { $null })
+			caption               = $(if ($edSnap) { $edSnap.Caption } else { $null })
+			gpedit_msc            = $(if ($edSnap) { [bool]$edSnap.GpeditMsc } else { $false })
+			note                  = 'GroupPolicy requires Windows Pro or higher (Local Group Policy / gpedit). Tool stays listed but is unavailable (orange) on Home/Core.'
+		}) -Depth 5
+	}
+
+	try {
+		switch -Regex ($a) {
+			'^(status|info)$' {
+				$domain = $null
+				$partOfDomain = $false
+				try {
+					$cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+					if ($cs) {
+						$partOfDomain = [bool]$cs.PartOfDomain
+						$domain = [string]$cs.Domain
+					}
+				} catch {}
+				$gpedit = $false
+				try {
+					if ($edSnap) { $gpedit = [bool]$edSnap.GpeditMsc }
+					else {
+						$gp = Join-Path $env:SystemRoot 'System32\gpedit.msc'
+						$gpedit = Test-Path -LiteralPath $gp
+					}
+				} catch {}
+				$polRoots = @(
+					'HKLM:\SOFTWARE\Policies',
+					'HKCU:\SOFTWARE\Policies',
+					'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies',
+					'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies'
+				)
+				$counts = @{}
+				if ($editionOk) {
+					foreach ($r in $polRoots) {
+						$n = 0
+						try {
+							if (Test-Path -LiteralPath $r) {
+								$n = @(Get-ChildItem -LiteralPath $r -Recurse -ErrorAction SilentlyContinue | Select-Object -First 500).Count
+							}
+						} catch { $n = -1 }
+						$counts[$r] = $n
+					}
+				}
+				return ConvertTo-MBJson ([ordered]@{
+					ok              = $true
+					action          = 'status'
+					supported       = [bool]$editionOk
+					unavailable     = (-not $editionOk)
+					unavailable_reason = $(if (-not $editionOk) { $editionWhy } else { $null })
+					computer        = $env:COMPUTERNAME
+					part_of_domain  = $partOfDomain
+					domain          = $domain
+					edition_id      = $(if ($edSnap) { $edSnap.EditionID } else { $null })
+					product_name    = $(if ($edSnap) { $edSnap.ProductName } else { $null })
+					caption         = $(if ($edSnap) { $edSnap.Caption } else { $null })
+					gpedit_msc      = $gpedit
+					note            = $(if ($editionOk) {
+						'Local registry Policies editor (Administrative Template-style). Not RSAT domain GPO. Mutates write under Policies keys + optional gpupdate.'
+					} else {
+						'Local Group Policy editor not available on this edition (typically Windows Home/Core). Upgrade to Pro+ for gpedit / full GPO support. Tool shows orange in the UI when unsupported.'
+					})
+					policy_tree_sample_counts = $counts
+					actions         = @('status','list_catalog','get','set','remove','list_key','search','gpupdate','export_security')
+				}) -Depth 6
+			}
+			'^(list_catalog|catalog|list)$' {
+				$cat = Get-MBGroupPolicyCatalog
+				$rows = New-Object System.Collections.ArrayList
+				$pat = ([string]$pattern).Trim()
+				foreach ($k in @($cat.Keys)) {
+					if ($pat -and ($k -notlike "*$pat*") -and ([string]$cat[$k].desc -notlike "*$pat*") -and ([string]$cat[$k].path -notlike "*$pat*")) {
+						continue
+					}
+					[void]$rows.Add([ordered]@{
+						key    = $k
+						scope  = [string]$cat[$k].scope
+						path   = [string]$cat[$k].path
+						name   = [string]$cat[$k].name
+						type   = [string]$cat[$k].type
+						values = @($cat[$k].values)
+						desc   = [string]$cat[$k].desc
+					})
+					if ($rows.Count -ge $max) { break }
+				}
+				return ConvertTo-MBJson ([ordered]@{
+					ok      = $true
+					action  = 'list_catalog'
+					count   = $rows.Count
+					entries = @($rows)
+					hint    = 'get/set/remove with key=catalog_key OR path= + name=. set/remove ALWAYS prompt.'
+				}) -Depth 6
+			}
+			'^(get|read)$' {
+				$t = Get-MBGroupPolicyResolvedTarget -Key $key -Path $path -Name $name -Type $type -Scope $scope
+				if (-not $t.ok) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = $t.error })
+				}
+				$regPath = [string]$t.path
+				$valName = [string]$t.name
+				if (-not (Test-Path -LiteralPath $regPath)) {
+					return ConvertTo-MBJson ([ordered]@{
+						ok      = $true
+						exists  = $false
+						key     = $t.key
+						path    = $regPath
+						name    = $valName
+						value   = $null
+						note    = 'Policy key path does not exist (policy not configured).'
+					})
+				}
+				if ([string]::IsNullOrWhiteSpace($valName)) {
+					# list value names on key
+					$props = @()
+					try {
+						$item = Get-ItemProperty -LiteralPath $regPath -ErrorAction Stop
+						foreach ($p in @($item.PSObject.Properties)) {
+							if ($p.Name -match '^PS') { continue }
+							$props += [ordered]@{ name = $p.Name; value = $p.Value; type = $p.TypeNameOfValue }
+							if ($props.Count -ge $max) { break }
+						}
+					} catch {
+						return ConvertTo-MBJson ([ordered]@{ ok = $false; error = $_.Exception.Message; path = $regPath })
+					}
+					return ConvertTo-MBJson ([ordered]@{
+						ok     = $true
+						exists = $true
+						path   = $regPath
+						values = $props
+						count  = $props.Count
+					}) -Depth 6
+				}
+				try {
+					$raw = Get-ItemProperty -LiteralPath $regPath -Name $valName -ErrorAction Stop
+					$v = $raw.$valName
+					return ConvertTo-MBJson ([ordered]@{
+						ok     = $true
+						exists = $true
+						key    = $t.key
+						path   = $regPath
+						name   = $valName
+						value  = $v
+						desc   = $t.desc
+					}) -Depth 5
+				} catch {
+					return ConvertTo-MBJson ([ordered]@{
+						ok     = $true
+						exists = $false
+						key    = $t.key
+						path   = $regPath
+						name   = $valName
+						value  = $null
+						note   = 'Value not present (not configured).'
+					})
+				}
+			}
+			'^(list_key|ls)$' {
+				$regPath = ConvertTo-MBGroupPolicyRegPath -Path $(if ($path) { $path } elseif ($key) {
+					$t0 = Get-MBGroupPolicyResolvedTarget -Key $key
+					if ($t0.ok) { $t0.path } else { '' }
+				} else { 'HKLM:\SOFTWARE\Policies' })
+				if (-not $regPath) { return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'path= required' }) }
+				if (-not (Test-MBGroupPolicyPathAllowed -Path $regPath)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = "Path not allowed: $regPath" })
+				}
+				if (-not (Test-Path -LiteralPath $regPath)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $true; path = $regPath; exists = $false; children = @(); values = @() })
+				}
+				$children = @()
+				$vals = @()
+				try {
+					$children = @(Get-ChildItem -LiteralPath $regPath -ErrorAction SilentlyContinue |
+						Select-Object -First $max |
+						ForEach-Object { [ordered]@{ name = $_.PSChildName; path = $_.PSPath -replace 'Microsoft\.PowerShell\.Core\\Registry::','' } })
+				} catch {}
+				try {
+					$item = Get-ItemProperty -LiteralPath $regPath -ErrorAction SilentlyContinue
+					foreach ($p in @($item.PSObject.Properties)) {
+						if ($p.Name -match '^PS') { continue }
+						$vals += [ordered]@{ name = $p.Name; value = $p.Value }
+						if ($vals.Count -ge $max) { break }
+					}
+				} catch {}
+				return ConvertTo-MBJson ([ordered]@{
+					ok       = $true
+					path     = $regPath
+					exists   = $true
+					children = $children
+					values   = $vals
+				}) -Depth 6
+			}
+			'^(search)$' {
+				$pat = ([string]$pattern).Trim()
+				if ([string]::IsNullOrWhiteSpace($pat)) { $pat = ([string]$key).Trim() }
+				if ([string]::IsNullOrWhiteSpace($pat)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'pattern= (or key= as substring) required for search' })
+				}
+				# Catalog hits + shallow policy tree name match
+				$cat = Get-MBGroupPolicyCatalog
+				$hits = New-Object System.Collections.ArrayList
+				# Support multi-token OR search: telemetry|update or "telemetry update"
+				$tokens = @()
+				foreach ($rawTok in @(($pat -split '[\|,;\s]+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+					$tokens += $rawTok.Trim()
+				}
+				if ($tokens.Count -eq 0) { $tokens = @($pat) }
+				$matchAny = {
+					param([string]$text)
+					if ([string]::IsNullOrWhiteSpace($text)) { return $false }
+					$tl = $text.ToLowerInvariant()
+					foreach ($tk in $tokens) {
+						if ($tl.Contains($tk.ToLowerInvariant())) { return $true }
+					}
+					return $false
+				}
+				foreach ($k in @($cat.Keys)) {
+					$e = $cat[$k]
+					$hay = (@($k, [string]$e.desc, [string]$e.path, [string]$e.name, [string]$e.scope) -join ' ')
+					if (& $matchAny $hay) {
+						[void]$hits.Add([ordered]@{ source = 'catalog'; key = $k; path = $e.path; name = $e.name; desc = $e.desc })
+					}
+					if ($hits.Count -ge $max) { break }
+				}
+				$roots = @(
+					'HKLM:\SOFTWARE\Policies',
+					'HKCU:\SOFTWARE\Policies',
+					'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies',
+					'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies'
+				)
+				foreach ($root in $roots) {
+					if ($hits.Count -ge $max) { break }
+					if (-not (Test-Path -LiteralPath $root)) { continue }
+					try {
+						Get-ChildItem -LiteralPath $root -Recurse -ErrorAction SilentlyContinue |
+							Where-Object {
+								$n = [string]$_.PSChildName
+								$full = [string]$_.Name
+								$okHit = $false
+								foreach ($tk in $tokens) {
+									if ($n -like "*$tk*" -or $full -like "*$tk*") { $okHit = $true; break }
+								}
+								$okHit
+							} |
+							Select-Object -First ([math]::Max(1, $max - $hits.Count)) |
+							ForEach-Object {
+								[void]$hits.Add([ordered]@{
+									source = 'registry'
+									path   = ($_.PSPath -replace 'Microsoft\.PowerShell\.Core\\Registry::','')
+									name   = $_.PSChildName
+								})
+							}
+					} catch {}
+				}
+				return ConvertTo-MBJson ([ordered]@{
+					ok      = $true
+					action  = 'search'
+					pattern = $pat
+					tokens  = @($tokens)
+					count   = $hits.Count
+					hits    = @($hits)
+					note    = 'Catalog keys match any token (OR). Example: telemetry|update or windows.update'
+				}) -Depth 6
+			}
+			'^(set|write)$' {
+				$t = Get-MBGroupPolicyResolvedTarget -Key $key -Path $path -Name $name -Type $type -Scope $scope
+				if (-not $t.ok) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = $t.error })
+				}
+				$regPath = [string]$t.path
+				$valName = [string]$t.name
+				if ([string]::IsNullOrWhiteSpace($valName)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'name= (value name) required for set (or use catalog key= that defines name).' })
+				}
+				if ($null -eq $value -or ([string]$value -eq '' -and $t.type -notmatch '(?i)string')) {
+					# allow empty string for String type
+					if ($null -eq $value) {
+						return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'value= required for set' })
+					}
+				}
+				$regType = Get-MBGroupPolicyRegTypeName -Type $(if ($type) { $type } else { $t.type })
+				try {
+					$coerced = Convert-MBGroupPolicyRegValue -Type $regType -value $value
+				} catch {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = $_.Exception.Message })
+				}
+				$details = @"
+Local Group Policy registry set (Administrative Template-style):
+
+  Catalog:  $(if ($t.key) { $t.key } else { '(custom path)' })
+  Path:     $regPath
+  Name:     $valName
+  Type:     $regType
+  Value:    $coerced
+  Scope:    $($t.scope)
+  gpupdate: $doGpu
+
+Writes under Policies registry. Domain GPOs may override. Prefer catalog key= when possible.
+"@
+				if (-not (Request-Confirmation -Title "GroupPolicy set requires approval" -Details $details)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; denied = $true; error = 'GroupPolicy set denied by operator' })
+				}
+				if (-not (Test-Path -LiteralPath $regPath)) {
+					New-Item -Path $regPath -Force -ErrorAction Stop | Out-Null
+				}
+				# Remove if wrong type then set
+				try {
+					$existing = Get-ItemProperty -LiteralPath $regPath -Name $valName -ErrorAction SilentlyContinue
+					if ($null -ne $existing) {
+						Remove-ItemProperty -LiteralPath $regPath -Name $valName -Force -ErrorAction SilentlyContinue
+					}
+				} catch {}
+				New-ItemProperty -LiteralPath $regPath -Name $valName -Value $coerced -PropertyType $regType -Force -ErrorAction Stop | Out-Null
+				$after = (Get-ItemProperty -LiteralPath $regPath -Name $valName -ErrorAction Stop).$valName
+				$gpuResult = $null
+				if ($doGpu) {
+					$gpuResult = Invoke-MBSetupNative -File 'gpupdate.exe' -ArgumentList @('/force') -TimeoutSec 120
+				}
+				$prefix = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+				return ConvertTo-MBJson ([ordered]@{
+					ok      = $true
+					message = "$prefix`: GroupPolicy set $valName"
+					key     = $t.key
+					path    = $regPath
+					name    = $valName
+					type    = $regType
+					value   = $after
+					gpupdate = $(if ($null -ne $gpuResult) {
+						[ordered]@{ ok = $gpuResult.ok; exit = $gpuResult.exit; out = ([string]$gpuResult.out).Trim(); err = ([string]$gpuResult.err).Trim() }
+					} else { $null })
+					note    = 'Some policies need sign-out or reboot. Domain GPO may override local Policies keys.'
+				}) -Depth 6
+			}
+			'^(remove|delete|clear)$' {
+				$t = Get-MBGroupPolicyResolvedTarget -Key $key -Path $path -Name $name -Type $type -Scope $scope
+				if (-not $t.ok) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = $t.error })
+				}
+				$regPath = [string]$t.path
+				$valName = [string]$t.name
+				if ([string]::IsNullOrWhiteSpace($valName)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = 'name= required for remove (removes one value, not whole trees).' })
+				}
+				$details = "Remove Group Policy registry value:`n`n  Path: $regPath`n  Name: $valName`n  gpupdate: $doGpu"
+				if (-not (Request-Confirmation -Title "GroupPolicy remove requires approval" -Details $details)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; denied = $true; error = 'GroupPolicy remove denied by operator' })
+				}
+				if (-not (Test-Path -LiteralPath $regPath)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $true; removed = $false; note = 'Path already absent'; path = $regPath; name = $valName })
+				}
+				try {
+					Remove-ItemProperty -LiteralPath $regPath -Name $valName -Force -ErrorAction Stop
+					$removed = $true
+				} catch {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; error = $_.Exception.Message; path = $regPath; name = $valName })
+				}
+				$gpuResult = $null
+				if ($doGpu) {
+					$gpuResult = Invoke-MBSetupNative -File 'gpupdate.exe' -ArgumentList @('/force') -TimeoutSec 120
+				}
+				return ConvertTo-MBJson ([ordered]@{
+					ok      = $true
+					removed = $removed
+					path    = $regPath
+					name    = $valName
+					gpupdate = $(if ($null -ne $gpuResult) {
+						[ordered]@{ ok = $gpuResult.ok; exit = $gpuResult.exit }
+					} else { $null })
+				}) -Depth 5
+			}
+			'^(gpupdate|refresh)$' {
+				$details = "Run gpupdate /force to refresh local/domain policy on this machine."
+				if (-not (Request-Confirmation -Title "GroupPolicy gpupdate requires approval" -Details $details)) {
+					return ConvertTo-MBJson ([ordered]@{ ok = $false; denied = $true; error = 'gpupdate denied by operator' })
+				}
+				$r = Invoke-MBSetupNative -File 'gpupdate.exe' -ArgumentList @('/force') -TimeoutSec 180
+				$out = ([string]$r.out).Trim()
+				if ($out.Length -gt 1200) { $out = $out.Substring($out.Length - 1200) }
+				return ConvertTo-MBJson ([ordered]@{
+					ok     = [bool]$r.ok
+					action = 'gpupdate'
+					exit   = $r.exit
+					stdout = $out
+					stderr = ([string]$r.err).Trim()
+				}) -Depth 4
+			}
+			'^(export_security|secedit|security)$' {
+				# Read-only dump of local security policy via secedit (not full gpedit)
+				$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mb-secpol-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.inf')
+				try {
+					$r = Invoke-MBSetupNative -File 'secedit.exe' -ArgumentList @('/export', '/cfg', $tmp) -TimeoutSec 60
+					if (-not (Test-Path -LiteralPath $tmp)) {
+						return ConvertTo-MBJson ([ordered]@{
+							ok = $false
+							error = "secedit export failed (exit $($r.exit)). $($r.err)"
+						})
+					}
+					$raw = [System.IO.File]::ReadAllText($tmp)
+					# Cap for model context
+					$cap = 12000
+					$truncated = $false
+					if ($raw.Length -gt $cap) {
+						$raw = $raw.Substring(0, $cap) + "`n...[truncated]..."
+						$truncated = $true
+					}
+					return ConvertTo-MBJson ([ordered]@{
+						ok         = $true
+						action     = 'export_security'
+						exit       = $r.exit
+						truncated = $truncated
+						inf        = $raw
+						note       = 'Local security policy export (secedit). Not the full gpedit.msc tree. Import/edit via secedit is out of band / high risk — not auto-applied.'
+					}) -Depth 4
+				} finally {
+					try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch {}
+				}
+			}
+			default {
+				return ConvertTo-MBJson ([ordered]@{
+					ok = $false
+					error = "Unknown action '$action'. Use: status|list_catalog|get|set|remove|list_key|search|gpupdate|export_security"
+				})
+			}
+		}
+	} catch {
+		return ConvertTo-MBJson ([ordered]@{ ok = $false; error = $_.Exception.Message })
 	}
 }
 
@@ -20121,8 +23317,70 @@ function Invoke-SystemRestore {
 			if (-not (Request-Confirmation -Title "SystemRestore requires approval" -Details "Create restore point:`n  $desc")) {
 				return "BLOCKED BY USER: SystemRestore create denied."
 			}
+			$beforeSeq = @()
+			try {
+				$beforeSeq = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.SequenceNumber })
+			} catch { $beforeSeq = @() }
+			$createdAt = Get-Date
 			Checkpoint-Computer -Description $desc -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-			return ConvertTo-MBJson @{ ok = $true; action = 'create'; description = $desc }
+			# Verify via list: find new sequence (not in before set), prefer matching description
+			$seq = $null
+			$matched = $null
+			$verified = $false
+			try {
+				# SAM/SystemRestore can lag briefly
+				for ($attempt = 0; $attempt -lt 6; $attempt++) {
+					if ($attempt -gt 0) { try { Start-Sleep -Milliseconds 400 } catch {} }
+					$pts = @()
+					try { $pts = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue) } catch { $pts = @() }
+					$candidates = @($pts | Where-Object {
+						$sn = 0
+						try { $sn = [int]$_.SequenceNumber } catch { $sn = 0 }
+						-not ($beforeSeq -contains $sn)
+					})
+					if ($candidates.Count -eq 0) {
+						# Fallback: match description on newest
+						$candidates = @($pts | Where-Object {
+							([string]$_.Description) -eq $desc -or ([string]$_.Description) -like "*$desc*"
+						} | Sort-Object SequenceNumber -Descending | Select-Object -First 3)
+					}
+					if ($candidates.Count -gt 0) {
+						$matched = $candidates | Sort-Object SequenceNumber -Descending | Select-Object -First 1
+						try { $seq = [int]$matched.SequenceNumber } catch { $seq = $null }
+						if ($null -ne $seq) {
+							$verified = ($beforeSeq -notcontains $seq) -or (([string]$matched.Description) -like "*$desc*")
+							if ($verified -or $seq -gt 0) { break }
+						}
+					}
+				}
+			} catch {}
+			if ($null -eq $seq -or -not $verified) {
+				return ConvertTo-MBJson ([ordered]@{
+					ok          = $false
+					action      = 'create'
+					description = $desc
+					sequence    = $seq
+					verified    = $false
+					error       = 'Checkpoint-Computer returned but new restore point was not found in Get-ComputerRestorePoint list yet (policy lag, SR disabled, or frequency limit).'
+					hint        = 'Check action=list; System Restore may be off or limited to one point per 24h on some editions.'
+				}) -Depth 5
+			}
+			return ConvertTo-MBJson ([ordered]@{
+				ok          = $true
+				action      = 'create'
+				description = $desc
+				sequence    = $seq
+				verified    = $true
+				creation_time = $(try { $matched.CreationTime.ToString('s') } catch { $createdAt.ToString('s') })
+				point       = $(try {
+					[ordered]@{
+						SequenceNumber   = $seq
+						Description      = [string]$matched.Description
+						CreationTime     = $matched.CreationTime
+						RestorePointType = [string]$matched.RestorePointType
+					}
+				} catch { $null })
+			}) -Depth 5
 		}
 		return "ERROR: action must be status|enable|disable|create|list."
 	} catch {
@@ -20204,6 +23462,51 @@ function Get-MBMaskedSecret {
 	return ('*' * [Math]::Min(12, $Text.Length))
 }
 
+function Test-MBLocalUserExists {
+	# LocalAccounts → ADSI → short net user query.
+	param([string]$Username)
+	$user = ([string]$Username).Trim()
+	if ([string]::IsNullOrWhiteSpace($user)) {
+		return @{ exists = $false; method = 'empty'; enabled = $null }
+	}
+	if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+		try {
+			$lu = Get-LocalUser -Name $user -ErrorAction Stop
+			$en = $true
+			try { $en = [bool]$lu.Enabled } catch {}
+			return @{ exists = $true; method = 'Get-LocalUser'; enabled = $en }
+		} catch {
+			return @{ exists = $false; method = 'Get-LocalUser'; enabled = $null }
+		}
+	}
+	try {
+		$adsi = [ADSI]"WinNT://./$user,user"
+		$null = $adsi.Name
+		return @{ exists = $true; method = 'ADSI'; enabled = $null }
+	} catch {}
+	try {
+		$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 8
+		$blob = (([string]$chk.out) + "`n" + ([string]$chk.err))
+		if ($chk.ok -or $blob -match '(?i)User name\s+' -or $blob -match ('(?i)^\s*' + [regex]::Escape($user) + '\s*$')) {
+			return @{ exists = $true; method = 'net user'; enabled = $null }
+		}
+		if ($blob -match '(?i)(The user name could not be found|does not exist|2221)') {
+			return @{ exists = $false; method = 'net user'; enabled = $null }
+		}
+		if ($chk.exit -eq -1 -or $blob -match '(?i)timeout') {
+			return @{ exists = $false; method = 'net user timeout'; enabled = $null; uncertain = $true }
+		}
+	} catch {}
+	return @{ exists = $false; method = 'none'; enabled = $null }
+}
+
+function Test-MBNetUserAlreadyExistsMessage {
+	param([string]$Text)
+	$t = [string]$Text
+	if ([string]::IsNullOrWhiteSpace($t)) { return $false }
+	return [bool]($t -match '(?i)(already exists|2224|The account already exists|exists and is currently)')
+}
+
 function Invoke-AddLocalUser {
 	param(
 		[string]$username,
@@ -20227,56 +23530,100 @@ function Invoke-AddLocalUser {
 		return "BLOCKED BY USER: AddLocalUser denied."
 	}
 	try {
+		$ex = Test-MBLocalUserExists -Username $user
+		if ($ex.exists) {
+			return ConvertTo-MBJson ([ordered]@{
+				ok             = $false
+				exists         = $true
+				username       = $user
+				error          = "Local user '$user' already exists."
+				check_method   = $ex.method
+			}) -Depth 4
+		}
+
 		$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
 		$created = $false
 		$method = ''
-		if (Get-Command Add-LocalUser -ErrorAction SilentlyContinue) {
+		$addCmd = $null
+		if (Get-Command New-LocalUser -ErrorAction SilentlyContinue) { $addCmd = 'New-LocalUser' }
+		elseif (Get-Command Add-LocalUser -ErrorAction SilentlyContinue) { $addCmd = 'Add-LocalUser' }
+
+		if ($addCmd) {
 			$p = @{ Name = $user; Password = $sec; PasswordNeverExpires = $true; UserMayNotChangePassword = $false; ErrorAction = 'Stop' }
 			if ($fn) { $p['FullName'] = $fn }
 			if ($desc) { $p['Description'] = $desc }
 			try {
-				$null = Get-LocalUser -Name $user -ErrorAction Stop
-				return "ERROR: Local user '$user' already exists."
-			} catch {}
-			Add-LocalUser @p | Out-Null
-			$created = $true
-			$method = 'Add-LocalUser'
+				if ($addCmd -eq 'New-LocalUser') { New-LocalUser @p | Out-Null }
+				else { Add-LocalUser @p | Out-Null }
+				$created = $true
+				$method = $addCmd
+			} catch {
+				$em = $_.Exception.Message
+				if ($em -match '(?i)already exists|AccountAlreadyExists') {
+					return ConvertTo-MBJson ([ordered]@{
+						ok = $false; exists = $true; username = $user; error = "Local user '$user' already exists."; method = $addCmd
+					})
+				}
+				throw
+			}
 			if ($isAdmin) {
 				try { Add-LocalGroupMember -Group 'Administrators' -Member $user -ErrorAction Stop } catch {
-					try { net.exe localgroup Administrators $user /add 2>&1 | Out-Null } catch {}
+					try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators', $user, '/add') -TimeoutSec 12 } catch {}
 				}
 			}
 		} else {
-			try {
-				$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
-				if ($chk.ok -or ($chk.out -match '(?i)User name')) {
-					return "ERROR: Local user '$user' already exists."
-				}
-			} catch {}
-			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass, '/add') -TimeoutSec 30
+			# net user fallback
+			$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass, '/add') -TimeoutSec 20
+			$blob = (([string]$r.out) + "`n" + ([string]$r.err))
 			if (-not $r.ok) {
-				return ConvertTo-MBJson ([ordered]@{ ok = $false; username = $user; method = 'net user'; exit = $r.exit; out = $r.out; err = $r.err })
+				if (Test-MBNetUserAlreadyExistsMessage -Text $blob) {
+					return ConvertTo-MBJson ([ordered]@{
+						ok = $false; exists = $true; username = $user
+						error = "Local user '$user' already exists."
+						method = 'net user'; exit = $r.exit
+					})
+				}
+				# Race: created between check and add, or slow DC — re-check
+				$ex2 = Test-MBLocalUserExists -Username $user
+				if ($ex2.exists) {
+					return ConvertTo-MBJson ([ordered]@{
+						ok = $false; exists = $true; username = $user
+						error = "Local user '$user' already exists."
+						method = 'net user'; exit = $r.exit
+					})
+				}
+				return ConvertTo-MBJson ([ordered]@{
+					ok = $false; username = $user; method = 'net user'
+					exit = $r.exit; out = $r.out; err = $r.err
+					error = $(if ($r.exit -eq -1) { 'net user timed out.' } else { "net user failed (exit $($r.exit))" })
+				})
 			}
 			$created = $true
 			$method = 'net user'
 			if ($fn -or $desc) {
 				try {
 					$comment = $(if ($fn -and $desc) { "$fn; $desc" } elseif ($fn) { $fn } else { $desc })
-					$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/comment:' + $comment) -TimeoutSec 15
+					$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/comment:' + $comment) -TimeoutSec 12
 				} catch {}
 			}
 			if ($isAdmin) {
-				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators', $user, '/add') -TimeoutSec 15
+				$null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators', $user, '/add') -TimeoutSec 12
 			}
 		}
+		try { Register-MBShareSessionUser -Username $user -Password $pass } catch {}
 		return ConvertTo-MBJson ([ordered]@{
 			ok             = $created
+			exists         = $false
 			username       = $user
 			administrators = $isAdmin
 			method         = $method
 		})
 	} catch {
-		return "ERROR: AddLocalUser failed: $($_.Exception.Message)"
+		$em = $_.Exception.Message
+		if ($em -match '(?i)already exists') {
+			return ConvertTo-MBJson ([ordered]@{ ok = $false; exists = $true; username = $user; error = "Local user '$user' already exists." })
+		}
+		return "ERROR: AddLocalUser failed: $em"
 	}
 }
 
@@ -20547,19 +23894,41 @@ function Test-MBLocalAdminCredential {
 	foreach ($a in $admins) {
 		if ([string]$a.name -eq $user) { return $true }
 	}
-	# Last resort: net localgroup check
 	try {
 		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('localgroup', 'Administrators', $user) -TimeoutSec 10
 		if ($r.ok -or ([string]$r.out + [string]$r.err) -match '(?i)is a member|The command completed') {
-			# net localgroup Administrators user (without /add) is not valid; membership listing already done above
+			return $true
 		}
 	} catch {}
 	return $false
 }
 
+function Register-MBShareSessionUser {
+	# Session cache of share users created/reset this run.
+	param([string]$Username, [string]$Password)
+	try {
+		if ($null -eq $script:MB.ShareSessionUsers -or -not ($script:MB.ShareSessionUsers -is [hashtable])) {
+			$script:MB.ShareSessionUsers = @{}
+		}
+		$key = ([string]$Username).Trim().ToLowerInvariant()
+		if ($key) { $script:MB.ShareSessionUsers[$key] = [string]$Password }
+	} catch {}
+}
+
+function Test-MBShareSessionUser {
+	param([string]$Username, [string]$Password)
+	try {
+		if ($null -eq $script:MB.ShareSessionUsers -or -not ($script:MB.ShareSessionUsers -is [hashtable])) {
+			return $false
+		}
+		$key = ([string]$Username).Trim().ToLowerInvariant()
+		if (-not $key -or -not $script:MB.ShareSessionUsers.ContainsKey($key)) { return $false }
+		return ([string]$script:MB.ShareSessionUsers[$key] -eq [string]$Password)
+	} catch { return $false }
+}
+
 function Ensure-MBShareLocalUser {
-	# Existing user: verify password via local logon (do NOT overwrite). Missing user: create.
-	# force_password_update / reset_password = true: reset to access_password then re-verify.
+	# Existing: verify password (or force reset). Missing: create.
 	param(
 		[string]$Username = 'share',
 		[string]$Password,
@@ -20583,27 +23952,30 @@ function Ensure-MBShareLocalUser {
 		try { $forcePw = Convert-MBToBool -Value $reset_password -Default $false } catch {}
 	}
 	try {
-		$exists = $false
+		$exInfo = Test-MBLocalUserExists -Username $user
+		$exists = [bool]$exInfo.exists
 		$enabled = $true
-		if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
-			try {
-				$lu = Get-LocalUser -Name $user -ErrorAction Stop
-				$exists = $true
-				try { $enabled = [bool]$lu.Enabled } catch { $enabled = $true }
-			} catch { $exists = $false }
-		} else {
-			$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
-			if ($chk.ok -or ($chk.out -match '(?i)User name')) { $exists = $true }
-		}
+		if ($null -ne $exInfo.enabled) { $enabled = [bool]$exInfo.enabled }
 		if ($exists) {
 			if (-not $enabled) {
 				try { Enable-LocalUser -Name $user -ErrorAction SilentlyContinue } catch {}
-				try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/active:yes') -TimeoutSec 15 } catch {}
+				try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/active:yes') -TimeoutSec 12 } catch {}
 			}
 			# Verify password matches existing account (do not silently reset)
 			$authOk = $false
 			try { $authOk = [bool](Test-MBLocalUserCredential -Username $user -Password $pass) } catch { $authOk = $false }
+			if (-not $authOk -and (Test-MBShareSessionUser -Username $user -Password $pass)) {
+				$authOk = $true
+				return @{
+					ok       = $true
+					username = $user
+					created  = $false
+					method   = 'session_recent'
+					password_verified = $true
+				}
+			}
 			if ($authOk) {
+				try { Register-MBShareSessionUser -Username $user -Password $pass } catch {}
 				return @{
 					ok       = $true
 					username = $user
@@ -20622,10 +23994,8 @@ function Ensure-MBShareLocalUser {
 						error      = [string]$set.error
 						username   = $user
 						exists     = $true
-						hint       = 'Password reset failed (policy/elevation). Try a stronger password (complexity) or ensure MiniBot is running elevated.'
 					}
 				}
-				# Settle + retry verify (LSA / SAM can lag briefly after set)
 				$auth2 = $false
 				foreach ($delayMs in @(300, 700, 1200)) {
 					try { Start-Sleep -Milliseconds $delayMs } catch {}
@@ -20634,16 +24004,16 @@ function Ensure-MBShareLocalUser {
 					try { Clear-MBLocalUserLogonFlags -Username $user } catch {}
 				}
 				if (-not $auth2) {
-					# Password API reported success; logon check can still fail (policy lag / type). Proceed with warning.
+					try { Register-MBShareSessionUser -Username $user -Password $pass } catch {}
 					return @{
 						ok       = $true
 						username = $user
 						created  = $false
 						method   = ('force_password_update:' + [string]$set.method)
 						password_verified = $false
-						warning  = "Password was set via $($set.method) but immediate logon verify failed. Share grants will still proceed; if map fails, re-check password or try again."
 					}
 				}
+				try { Register-MBShareSessionUser -Username $user -Password $pass } catch {}
 				return @{
 					ok       = $true
 					username = $user
@@ -20663,10 +24033,46 @@ function Ensure-MBShareLocalUser {
 			}
 		}
 		$cr = New-MBLocalShareUserCore -username $user -password $pass -full_name 'Network share access'
-		if (-not $cr.ok) { return $cr }
+		if (-not $cr.ok) {
+			# Race / exists: treat as existing account and continue password verify path
+			$already = $false
+			try { if ($cr.exists) { $already = $true } } catch {}
+			if (-not $already -and ("$($cr.error)" -match '(?i)already exists')) { $already = $true }
+			if ($already) {
+				$authRace = $false
+				try { $authRace = [bool](Test-MBLocalUserCredential -Username $user -Password $pass) } catch {}
+				if (-not $authRace -and (Test-MBShareSessionUser -Username $user -Password $pass)) { $authRace = $true }
+				if ($authRace) {
+					try { Register-MBShareSessionUser -Username $user -Password $pass } catch {}
+					return @{
+						ok = $true; username = $user; created = $false
+						method = 'exists_after_create_attempt'; password_verified = $true
+					}
+				}
+				if ($forcePw) {
+					$set = Set-MBLocalUserPassword -Username $user -Password $pass
+					if ($set.ok) {
+						try { Register-MBShareSessionUser -Username $user -Password $pass } catch {}
+						return @{
+							ok = $true; username = $user; created = $false
+							method = ('force_password_update:' + [string]$set.method)
+							password_verified = $true
+						}
+					}
+				}
+				return @{
+					ok = $false; need_input = $true; missing = @('access_password')
+					error = "Local user '$user' already exists but the password does not match. Pass force_password_update=true to reset, or use the correct password."
+					username = $user; exists = $true
+				}
+			}
+			return $cr
+		}
 		try { Start-Sleep -Milliseconds 300 } catch {}
 		$authNew = $false
 		try { $authNew = [bool](Test-MBLocalUserCredential -Username $user -Password $pass) } catch { $authNew = $false }
+		# Always remember session-created accounts so next CreateShare breath trusts same password
+		try { Register-MBShareSessionUser -Username $user -Password $pass } catch {}
 		return @{
 			ok       = $true
 			username = $user
@@ -20830,25 +24236,27 @@ function Normalize-MBUncPath {
 	}
 	# Final: must start with \\ for UNC
 	if ($p -match '^\\[^\\]') { $p = '\' + $p }
+	# Local hostnames → 127.0.0.1 for reliable loopback
+	try {
+		if ($p -match '^\\\\(?<host>[^\\]+)\\(?<rest>.+)$') {
+			$h = [string]$Matches['host']
+			$rest = [string]$Matches['rest']
+			$isLocal = $false
+			try { $isLocal = [bool](Test-MBIsLocalHostTarget -HostName $h) } catch { $isLocal = $false }
+			if ($isLocal -and $h -notmatch '^(?i)127\.0\.0\.1$') {
+				$p = '\\127.0.0.1\' + $rest
+			}
+		}
+	} catch {}
 	return $p
 }
 
 function Test-MBDriveLetterFreeForMap {
-	# Port of RescueMaker :AVAILABLEDRIVELETTERS
-	#   FOR D..Z:
-	#     IF NOT EXIST L:\* (
-	#       FSUTIL FSINFO drivetype L:
-	#       IF token3 != CD-ROM AND token3 == "No"  (from "No such Drive")
-	#         → free letter
-	#     )
-	# Empty CD/DVD: EXIST may be false (no media) but drivetype is CD-ROM → skipped.
-	# Only "No such Drive" is accepted - Fixed/Remote/Removable/RAM are not free.
+	# Free only if the letter has no root and is not CD-ROM (empty optical looks free without media).
 	param([string]$Letter)
 	$L = ([string]$Letter).Trim().TrimEnd(':').ToUpperInvariant()
 	if ($L -notmatch '^[A-Z]$') { return $false }
 
-	# Step 1 - RescueMaker: IF NOT EXIST L:\*
-	# (cmd EXIST L:\* is false for empty CD and for truly unused letters)
 	try {
 		if (Test-Path -LiteralPath "${L}:\") { return $false }
 		if ([System.IO.Directory]::Exists("${L}:\")) { return $false }
@@ -20856,20 +24264,14 @@ function Test-MBDriveLetterFreeForMap {
 		return $false
 	}
 
-	# Step 2 - FSUTIL FSINFO drivetype L:
-	#   "E: - No such Drive"  → free
-	#   "D: - CD-ROM Drive"   → reserved (looks free without media; never use)
-	#   "C: - Fixed Drive" / "Remote Network Drive" / etc. → in use
 	try {
 		$r = Invoke-MBSetupNative -File 'fsutil.exe' -ArgumentList @('fsinfo', 'drivetype', "${L}:") -TimeoutSec 5
 		$blob = ((([string]$r.out) + ' ' + ([string]$r.err)).Trim())
 		if (-not $blob) { throw 'empty fsutil' }
-		# token3 of "X: - CD-ROM Drive" / "X: - No such Drive" style output
 		if ($blob -match '(?i)CD-ROM') { return $false }
 		if ($blob -match '(?i)No such') { return $true }
 		return $false
 	} catch {
-		# fsutil unavailable - DriveInfo fallback (same rules)
 		try {
 			$di = New-Object System.IO.DriveInfo ("${L}:")
 			if ($di.DriveType -eq [System.IO.DriveType]::CDRom) { return $false }
@@ -20882,12 +24284,11 @@ function Test-MBDriveLetterFreeForMap {
 }
 
 function Get-MBAvailableDriveLetter {
-	# RescueMaker: scan D..Z; only "No such Drive" and not CD-ROM. Optional Prefer= if free.
+	# Scan D–Z for a free letter; Prefer= used first when free. Never auto-picks A/B/C.
 	param([string]$Prefer = '')
 	$pref = ([string]$Prefer).Trim().TrimEnd(':').ToUpperInvariant()
 	$order = New-Object System.Collections.ArrayList
 	if ($pref -match '^[A-Z]$' -and $pref -notin @('A', 'B', 'C')) { [void]$order.Add($pref) }
-	# D through Z only (same as RescueMaker FOR D E F ... Z) - never auto-pick A/B/C
 	foreach ($code in 68..90) { # D=68 .. Z=90
 		$ch = [string][char]$code
 		if ($ch -ne $pref) { [void]$order.Add($ch) }
@@ -20914,7 +24315,7 @@ function Invoke-MapNetworkDrive {
 		return "ERROR: path must be a UNC share (\\\\server\\share). Got: $unc"
 	}
 
-	# Pick letter: prefer requested if free; else auto (RescueMaker-style, skip CD/DVD reserved)
+	# Prefer requested letter if free; else auto-pick (skip CD/DVD reserved)
 	$autoLetter = $false
 	$let = $null
 	if ($want -match '^[A-Z]$') {
@@ -21022,7 +24423,36 @@ function Invoke-MapNetworkDrive {
 
 		$verify = $null
 		$card = ''
+		$psDriveOk = $false
 		if ($ok) {
+			# Remember mapping for this MiniBot session so ListDirectory/S:\ can rewrite to UNC
+			# when the letter is invisible to elevated / isolated agent process.
+			try { Register-MBSessionDriveMap -Letter $let -Unc $unc } catch {}
+			# Process-local PSDrive so Test-Path/Get-ChildItem work in this process even if S:\ is missing
+			try {
+				if (Get-PSDrive -Name $let -ErrorAction SilentlyContinue) {
+					try { Remove-PSDrive -Name $let -Force -ErrorAction SilentlyContinue } catch {}
+				}
+				$pd = @{
+					Name        = $let
+					PSProvider  = 'FileSystem'
+					Root        = $unc
+					ErrorAction = 'Stop'
+				}
+				# Scope Global so tool calls in same runspace see it
+				New-PSDrive @pd -Scope 'Global' | Out-Null
+				$psDriveOk = $true
+			} catch {
+				try {
+					# Credentialed PSDrive when New-SmbMapping used different user
+					if ($user -and -not [string]::IsNullOrEmpty($pass)) {
+						$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+						$cred = New-Object System.Management.Automation.PSCredential ($user, $sec)
+						New-PSDrive -Name $let -PSProvider FileSystem -Root $unc -Credential $cred -Scope Global -ErrorAction Stop | Out-Null
+						$psDriveOk = $true
+					}
+				} catch { $psDriveOk = $false }
+			}
 			$verify = Test-MBMappedDrivePresent -Letter $let -Unc $unc
 			try { [void](Add-MBStickyNote -Text ("Mapped ${let}: -> $unc") -Kind finding) } catch {}
 			$card = Write-MBOperatorCard -Title 'DRIVE MAPPED' -Fields ([ordered]@{
@@ -21032,8 +24462,10 @@ function Invoke-MapNetworkDrive {
 				Persistent = $persist
 				Method     = $method
 				Verified   = $(if ($verify.ok) { 'yes (' + $verify.detail + ')' } else { 'NO - ' + $verify.detail })
+				AgentPath  = $(if ($psDriveOk) { "${let}: (PSDrive)" } else { $unc })
 			}) -Notes @(
-				$(if ($autoLetter) { 'Letter was auto-picked (CD/DVD reserved letters skipped).' } else { '' })
+				$(if ($autoLetter) { 'Letter was auto-picked (CD/DVD reserved letters skipped).' } else { '' }),
+				'If ListDirectory on the letter fails, use the UNC path (local shares prefer \\127.0.0.1\share).'
 			)
 		}
 
@@ -21050,6 +24482,9 @@ function Invoke-MapNetworkDrive {
 			err           = $err
 			verified      = $(if ($verify) { [bool]$verify.ok } else { $false })
 			verify_detail = $(if ($verify) { [string]$verify.detail } else { '' })
+			psdrive       = [bool]$psDriveOk
+			session_map   = $true
+			access_hint   = $unc
 			operator_card = $card
 		})
 	} catch {
@@ -21170,12 +24605,22 @@ function New-MBLocalShareUserCore {
 	$fn = ([string]$full_name).Trim()
 	if (-not $fn) { $fn = 'MiniBot share access' }
 	try {
+		$ex = Test-MBLocalUserExists -Username $user
+		if ($ex.exists) {
+			return @{
+				ok     = $false
+				exists = $true
+				error  = "Local user '$user' already exists"
+				method = $ex.method
+			}
+		}
+
 		$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
-		if (Get-Command Add-LocalUser -ErrorAction SilentlyContinue) {
-			try {
-				$null = Get-LocalUser -Name $user -ErrorAction Stop
-				return @{ ok = $false; error = "Local user '$user' already exists" }
-			} catch {}
+		$addCmd = $null
+		if (Get-Command New-LocalUser -ErrorAction SilentlyContinue) { $addCmd = 'New-LocalUser' }
+		elseif (Get-Command Add-LocalUser -ErrorAction SilentlyContinue) { $addCmd = 'Add-LocalUser' }
+
+		if ($addCmd) {
 			$p = @{
 				Name                     = $user
 				Password                 = $sec
@@ -21185,23 +24630,50 @@ function New-MBLocalShareUserCore {
 				UserMayNotChangePassword = $false
 				ErrorAction              = 'Stop'
 			}
-			Add-LocalUser @p | Out-Null
-			# Ensure not in Administrators
+			try {
+				if ($addCmd -eq 'New-LocalUser') { New-LocalUser @p | Out-Null }
+				else { Add-LocalUser @p | Out-Null }
+			} catch {
+				$em = $_.Exception.Message
+				if ($em -match '(?i)already exists|AccountAlreadyExists') {
+					return @{ ok = $false; exists = $true; error = "Local user '$user' already exists"; method = $addCmd }
+				}
+				$ex2 = Test-MBLocalUserExists -Username $user
+				if ($ex2.exists) {
+					return @{ ok = $false; exists = $true; error = "Local user '$user' already exists"; method = $addCmd }
+				}
+				return @{ ok = $false; error = $em; method = $addCmd }
+			}
 			try { Remove-LocalGroupMember -Group 'Administrators' -Member $user -ErrorAction SilentlyContinue } catch {}
-			return @{ ok = $true; username = $user; method = 'Add-LocalUser'; admin = $false }
+			return @{ ok = $true; username = $user; method = $addCmd; admin = $false; exists = $false }
 		}
-		$chk = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user) -TimeoutSec 15
-		if ($chk.ok -or ($chk.out -match '(?i)User name')) {
-			return @{ ok = $false; error = "Local user '$user' already exists" }
-		}
-		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass, '/add') -TimeoutSec 30
+
+		# net user fallback only when LocalAccounts missing
+		$r = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, $pass, '/add') -TimeoutSec 20
+		$blob = (([string]$r.out) + "`n" + ([string]$r.err))
 		if (-not $r.ok) {
-			return @{ ok = $false; error = "net user failed (exit $($r.exit)): $($r.err) $($r.out)" }
+			if (Test-MBNetUserAlreadyExistsMessage -Text $blob) {
+				return @{ ok = $false; exists = $true; error = "Local user '$user' already exists"; method = 'net user'; exit = $r.exit }
+			}
+			$ex3 = Test-MBLocalUserExists -Username $user
+			if ($ex3.exists) {
+				return @{ ok = $false; exists = $true; error = "Local user '$user' already exists"; method = 'net user'; exit = $r.exit }
+			}
+			$msg = if ($r.exit -eq -1) {
+				'net user timed out creating account.'
+			} else {
+				"net user failed (exit $($r.exit)): $($r.err) $($r.out)"
+			}
+			return @{ ok = $false; error = $msg; method = 'net user'; exit = $r.exit }
 		}
-		try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/comment:MiniBot network share access') -TimeoutSec 15 } catch {}
-		return @{ ok = $true; username = $user; method = 'net user'; admin = $false }
+		try { $null = Invoke-MBSetupNative -File 'net.exe' -ArgumentList @('user', $user, '/comment:MiniBot network share access') -TimeoutSec 12 } catch {}
+		return @{ ok = $true; username = $user; method = 'net user'; admin = $false; exists = $false }
 	} catch {
-		return @{ ok = $false; error = $_.Exception.Message }
+		$em = $_.Exception.Message
+		if ($em -match '(?i)already exists') {
+			return @{ ok = $false; exists = $true; error = "Local user '$user' already exists" }
+		}
+		return @{ ok = $false; error = $em }
 	}
 }
 
@@ -21829,7 +25301,7 @@ Create SMB share (password-protected):
 		}
 		Write-MBJobChecklist -Job 'CreateShare' -Step 5 -Total $chkTotal -Label 'access ACL' -Phase ok
 
-		Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify + clipboard' -Phase start
+		Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify' -Phase start
 		$createdList = @()
 		$createdPass = @{}
 		if ($acct.created) {
@@ -21837,18 +25309,20 @@ Create SMB share (password-protected):
 			$createdPass[$shareUser] = $pass
 		}
 		$uncOut = "\\$hostName\$shareName"
+		$uncLoop = "\\127.0.0.1\$shareName"
 		$verify = Test-MBLocalSharePresent -ShareName $shareName
-		$clipOk = Set-MBClipboardTextQuiet -Text $uncOut
+		$clipOk = $false
 		if ($verify.ok) {
-			Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify + clipboard' -Phase ok
+			Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify' -Phase ok
 		} else {
-			Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify + clipboard' -Phase fail
+			Write-MBJobChecklist -Job 'CreateShare' -Step 6 -Total $chkTotal -Label 'verify' -Phase fail
 		}
 		try { [void](Add-MBStickyNote -Text ("Share $uncOut (user $shareUser)") -Kind finding) } catch {}
 		$how = Format-MBShareAccessHowTo -HostName $hostName -ShareName $shareName -Users @($shareUser) -CreatedUsers $createdList -CreatedPass $createdPass -EveryoneFull $everyoneFull
 		$accessSummary = @($aclLog | Where-Object { $_.ok } | ForEach-Object { '{0}/{1}={2}' -f $_.layer, $_.account, $_.right })
 		$card = Write-MBOperatorCard -Title 'SHARE CREATED' -Fields ([ordered]@{
 			UNC             = $uncOut
+			'UNC (loopback)' = $uncLoop
 			Folder          = $folder
 			'Access user'   = $shareUser
 			Password        = $pass
@@ -21856,17 +25330,17 @@ Create SMB share (password-protected):
 			'User created'  = [bool]$acct.created
 			Everyone        = $everyoneFull
 			Verified        = $(if ($verify.ok) { 'yes (' + $verify.detail + ')' } else { 'NO - ' + $verify.detail })
-			Clipboard       = $(if ($clipOk) { 'UNC copied' } else { 'not copied' })
+			Clipboard       = 'not copied'
 			Access          = ($accessSummary -join '; ')
 		}) -Notes @(
-			'Map with: MapNetworkDrive path=UNC username=' + $shareUser + ' password=(above)',
-			'Tell the operator the Password and Access user so they can connect from another PC.'
+			'Map with: MapNetworkDrive path=' + $uncLoop + ' username=' + $shareUser + ' password=(above)'
 		)
 		$report = [ordered]@{
 			ok                 = $true
 			path               = $folder
 			name               = $shareName
 			unc                = $uncOut
+			unc_loopback       = $uncLoop
 			hostname           = $hostName
 			access_username    = $shareUser
 			access_user        = $shareUser
@@ -21883,7 +25357,7 @@ Create SMB share (password-protected):
 			access_summary     = @($accessSummary)
 			verified           = [bool]$verify.ok
 			verify_detail      = [string]$verify.detail
-			clipboard_unc      = [bool]$clipOk
+			clipboard_unc      = $false
 			operator_card      = $card
 			how_to_access      = $how
 		}
@@ -22937,7 +26411,7 @@ function Invoke-MBEnsureSevenZipForExtract {
 
 function Get-MBNewMachineSoftwareManifest {
 	param([string]$Profile)
-	# Release: full personal catalog every time (profile only affects settings notes).
+	# Release: full default catalog every time (profile only affects settings notes).
 	$cat = Get-MBInstallerCatalog
 	$list = New-Object System.Collections.ArrayList
 	foreach ($key in @($cat.Keys)) {
@@ -23136,7 +26610,7 @@ function Invoke-MBSetupInstallPackage {
 
 function Invoke-ListInstallers {
 	param([string]$profile = 'all')
-	# Release catalog is personal-only; list every package (profile filter ignored).
+	# Default catalog: list every package (profile filter ignored).
 	$cat = Get-MBInstallerCatalog
 	$rows = @()
 	foreach ($key in @($cat.Keys)) {
@@ -23404,7 +26878,7 @@ function Invoke-NewMachineSetup {
 	[void]$detailLines.Add("  $portableEncryptNote")
 	if (-not $skip_software) {
 		[void]$detailLines.Add('')
-		[void]$detailLines.Add('SOFTWARE (full personal catalog) - silent download/install:')
+		[void]$detailLines.Add('SOFTWARE (full catalog) - silent download/install:')
 		foreach ($pkg in $software) {
 			$runsScan = $false
 			try { $runsScan = [bool]$pkg.runs_scan } catch { $runsScan = ($pkg.id -eq 'adwcleaner') }
@@ -23559,7 +27033,7 @@ function Invoke-MBTool {
 			$hint = Get-MBToolEnableHint -ToolName $match
 			return "ERROR: Tool '$match' is not in the active tool list. $hint"
 		}
-		return "ERROR: Unknown tool '$Name'. Core has file/edit/shell tools. For others: EnableToolGroup using MAP (senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web) then call the real tool name. Do not invent tool names."
+		return "ERROR: Unknown tool '$Name'. Prefer ROUTER in system prompt (volume→AudioVolume, brightness→DisplayBrightness). For gated tools: EnableToolGroup using MAP then real tool name. Do not invent tools or shell COM for OS UX knobs."
 	}
 
 	$guard = Test-MBToolLoopGuard -Name $Name -ArgsObj $ArgsObj
@@ -23616,7 +27090,7 @@ function Invoke-MBTool {
 					$codeLang = if ([string]$shell -match '^(?i)cmd') { 'bat' } else { 'ps' }
 					if (-not (Request-Confirmation -Title "RunCommand requires approval" -Details $cmdDetails -Code ([string]$cmd) -CodeLang $codeLang)) {
 						Write-Host "    denied" -ForegroundColor Red
-						"BLOCKED BY USER: The user denied this command. Stop and explain why approval is needed."
+						"BLOCKED BY USER: Operator denied this RunCommand. Do NOT retry the same shell approach. Re-read ROUTER/MAP: volume/mute→EnableToolGroup system + AudioVolume; brightness→system + DisplayBrightness; services→system + ControlService. EnableToolGroup then call specialized tool same turn."
 					} else {
 						if ($script:MB.AutoApprove) {
 							if ($script:MB.ModeSwitch) { $script:MB.ModeSwitch = $false }
@@ -23664,6 +27138,15 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'next_diff') { $p['next_diff'] = [bool](Get-MBProp $ArgsObj 'next_diff') }
 				if (Test-MBHasProp $ArgsObj 'side_by_side') { $p['side_by_side'] = [bool](Get-MBProp $ArgsObj 'side_by_side') }
 				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = [int](Get-MBProp $ArgsObj 'max_scan') }
+				if (Test-MBHasProp $ArgsObj 'disasm') { $p['disasm'] = [bool](Get-MBProp $ArgsObj 'disasm') }
+				if (Test-MBHasProp $ArgsObj 'trace') { $p['trace'] = [bool](Get-MBProp $ArgsObj 'trace') }
+				if (Test-MBHasProp $ArgsObj 'at_entry') { $p['at_entry'] = [bool](Get-MBProp $ArgsObj 'at_entry') }
+				if (Test-MBHasProp $ArgsObj 'max_insns') { $p['max_insns'] = [int](Get-MBProp $ArgsObj 'max_insns') }
+				if (Test-MBHasProp $ArgsObj 'max_steps') { $p['max_steps'] = [int](Get-MBProp $ArgsObj 'max_steps') }
+				if (Test-MBHasProp $ArgsObj 'follow_calls') { $p['follow_calls'] = [bool](Get-MBProp $ArgsObj 'follow_calls') }
+				if (Test-MBHasProp $ArgsObj 'prefer_branch') { $p['prefer_branch'] = [string](Get-MBProp $ArgsObj 'prefer_branch') }
+				if (Test-MBHasProp $ArgsObj 'arch') { $p['arch'] = [string](Get-MBProp $ArgsObj 'arch') }
+				if (Test-MBHasProp $ArgsObj 'dump_hex') { $p['dump_hex'] = [bool](Get-MBProp $ArgsObj 'dump_hex') }
 				Invoke-HexView @p
 			}
 			"HexEdit" {
@@ -23752,9 +27235,10 @@ function Invoke-MBTool {
 			}
 			"GetBSODInfo"             { Invoke-GetBSODInfo }
 			"GetEventLogs" {
-				$h = 72
-				if (Test-MBHasProp $ArgsObj 'hours') { $h = [int](Get-MBProp $ArgsObj 'hours') }
-				Invoke-GetEventLogs -hours $h
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'hours') { $p['hours'] = [int](Get-MBProp $ArgsObj 'hours') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				Invoke-GetEventLogs @p
 			}
 			"GetDiskHealth"           { Invoke-GetDiskHealth }
 			"GetDiskSpace" {
@@ -23777,13 +27261,20 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'showAll') { $p['showAll'] = [bool](Get-MBProp $ArgsObj 'showAll') }
 				Invoke-GetDriverInfo @p
 			}
-			"GetStartupItems"         { Invoke-GetStartupItems }
+			"GetStartupItems" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'max_services') { $p['max_services'] = [int](Get-MBProp $ArgsObj 'max_services') }
+				if (Test-MBHasProp $ArgsObj 'include_all_services') { $p['include_all_services'] = [bool](Get-MBProp $ArgsObj 'include_all_services') }
+				Invoke-GetStartupItems @p
+			}
 			"GetMemoryInfo"           { Invoke-GetMemoryInfo }
 			"GetNetworkInfo"          { Invoke-GetNetworkInfo }
 			"GetLocalShares" {
 				$p = @{}
 				if (Test-MBHasProp $ArgsObj 'include_special') { $p['include_special'] = (Get-MBProp $ArgsObj 'include_special') }
 				if (Test-MBHasProp $ArgsObj 'include_ntfs') { $p['include_ntfs'] = (Get-MBProp $ArgsObj 'include_ntfs') }
+				if (Test-MBHasProp $ArgsObj 'copy_clipboard') { $p['copy_clipboard'] = (Get-MBProp $ArgsObj 'copy_clipboard') }
+				elseif (Test-MBHasProp $ArgsObj 'clipboard') { $p['copy_clipboard'] = (Get-MBProp $ArgsObj 'clipboard') }
 				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
 				Invoke-GetLocalShares @p
 			}
@@ -23918,6 +27409,7 @@ function Invoke-MBTool {
 			"FindPSModule" {
 				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
 				if (Test-MBHasProp $ArgsObj 'max_results') { $p['max_results'] = [int](Get-MBProp $ArgsObj 'max_results') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
 				Invoke-FindPSModule @p
 			}
 			"GetInstalledPSModule" {
@@ -23925,14 +27417,16 @@ function Invoke-MBTool {
 			}
 			"InstallPSModule" {
 				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
-				if (Test-MBHasProp $ArgsObj 'version')          { $p['version'] = (Get-MBProp $ArgsObj 'version') }
-				if (Test-MBHasProp $ArgsObj 'scope')            { $p['scope'] = (Get-MBProp $ArgsObj 'scope') }
+				if (Test-MBHasProp $ArgsObj 'version') { $p['version'] = [string](Get-MBProp $ArgsObj 'version') }
+				if (Test-MBHasProp $ArgsObj 'scope') { $p['scope'] = [string](Get-MBProp $ArgsObj 'scope') }
 				if (Test-MBHasProp $ArgsObj 'allow_prerelease') { $p['allow_prerelease'] = [bool](Get-MBProp $ArgsObj 'allow_prerelease') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
 				Invoke-InstallPSModule @p
 			}
 			"UpdatePSModule" {
 				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
-				if (Test-MBHasProp $ArgsObj 'scope') { $p['scope'] = (Get-MBProp $ArgsObj 'scope') }
+				if (Test-MBHasProp $ArgsObj 'scope') { $p['scope'] = [string](Get-MBProp $ArgsObj 'scope') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
 				Invoke-UpdatePSModule @p
 			}
 			"ReadRegistry"     { Invoke-ReadRegistry -path (Get-MBProp $ArgsObj 'path') }
@@ -23951,6 +27445,8 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'days')            { $p['days'] = [int](Get-MBProp $ArgsObj 'days') }
 				if (Test-MBHasProp $ArgsObj 'filter')          { $p['filter'] = (Get-MBProp $ArgsObj 'filter') }
 				if (Test-MBHasProp $ArgsObj 'includeDisabled') { $p['includeDisabled'] = [bool](Get-MBProp $ArgsObj 'includeDisabled') }
+				if (Test-MBHasProp $ArgsObj 'includeSystem')   { $p['includeSystem'] = [bool](Get-MBProp $ArgsObj 'includeSystem') }
+				if (Test-MBHasProp $ArgsObj 'max')             { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
 				if (Test-MBHasProp $ArgsObj 'exportPath')      { $p['exportPath'] = (Get-MBProp $ArgsObj 'exportPath') }
 				Invoke-GetScheduledTasks @p
 			}
@@ -24030,6 +27526,20 @@ function Invoke-MBTool {
 				}
 				if (Test-MBHasProp $ArgsObj 'drive') { $p['drive'] = (Get-MBProp $ArgsObj 'drive') }
 				Invoke-SetWindowsOption @p
+			}
+			"GroupPolicy" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'action') { $p['action'] = (Get-MBProp $ArgsObj 'action') }
+				if (Test-MBHasProp $ArgsObj 'key') { $p['key'] = (Get-MBProp $ArgsObj 'key') }
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'value') { $p['value'] = (Get-MBProp $ArgsObj 'value') }
+				if (Test-MBHasProp $ArgsObj 'type') { $p['type'] = (Get-MBProp $ArgsObj 'type') }
+				if (Test-MBHasProp $ArgsObj 'scope') { $p['scope'] = (Get-MBProp $ArgsObj 'scope') }
+				if (Test-MBHasProp $ArgsObj 'pattern') { $p['pattern'] = (Get-MBProp $ArgsObj 'pattern') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'gpupdate') { $p['gpupdate'] = (Get-MBProp $ArgsObj 'gpupdate') }
+				Invoke-GroupPolicy @p
 			}
 			"SystemRestore" {
 				$p = @{ action = (Get-MBProp $ArgsObj 'action') }
@@ -27298,6 +30808,36 @@ function Test-MBMdStyleOn {
 	}
 }
 
+function Find-MBMdBalancedParenClose {
+	# Index of the ) that closes a markdown ( ... ) target, allowing nested () in Windows paths
+	# e.g. C:\Music\Song (remix).mp3
+	param(
+		[string]$S,
+		[int]$OpenAfter  # index of first char AFTER the opening '('
+	)
+	if ([string]::IsNullOrEmpty($S) -or $OpenAfter -lt 0 -or $OpenAfter -ge $S.Length) { return -1 }
+	# Angle-bracket path: <C:\path with (parens) and spaces\file.mp3>
+	if ($S[$OpenAfter] -eq [char]'<') {
+		$gt = $S.IndexOf([char]'>', $OpenAfter + 1)
+		if ($gt -lt 0) { return -1 }
+		# optional whitespace then closing )
+		$j = $gt + 1
+		while ($j -lt $S.Length -and [char]::IsWhiteSpace($S[$j])) { $j++ }
+		if ($j -lt $S.Length -and $S[$j] -eq [char]')') { return $j }
+		return -1
+	}
+	$depth = 1
+	for ($i = $OpenAfter; $i -lt $S.Length; $i++) {
+		$ch = $S[$i]
+		if ($ch -eq [char]'(') { $depth++ }
+		elseif ($ch -eq [char]')') {
+			$depth--
+			if ($depth -eq 0) { return $i }
+		}
+	}
+	return -1
+}
+
 function Test-MBMdLinkHoldOpen {
 	# True while an incomplete markdown link/image is buffered across stream chunks.
 	param([string]$S)
@@ -27305,7 +30845,7 @@ function Test-MBMdLinkHoldOpen {
 	$idx = 0
 	$len = $S.Length
 	while ($idx -lt $len) {
-		# Image: ![alt](...
+		# Image: ![alt](...  — paths may contain spaces and ()
 		if ($S[$idx] -eq [char]'!' -and ($idx + 1) -lt $len -and $S[$idx + 1] -eq [char]'[') {
 			$close = $S.IndexOf([char]']', $idx + 2)
 			if ($close -lt 0) { return $true }
@@ -27315,7 +30855,7 @@ function Test-MBMdLinkHoldOpen {
 				continue
 			}
 			$urlStart = $close + 2
-			$paren = $S.IndexOf([char]')', $urlStart)
+			$paren = Find-MBMdBalancedParenClose -S $S -OpenAfter $urlStart
 			if ($paren -lt 0) { return $true }
 			$idx = $paren + 1
 			continue
@@ -27336,7 +30876,7 @@ function Test-MBMdLinkHoldOpen {
 		}
 		# Hold buffer only if URL looks like a link start
 		$urlStart = $close + 2
-		$paren = $S.IndexOf([char]')', $urlStart)
+		$paren = Find-MBMdBalancedParenClose -S $S -OpenAfter $urlStart
 		if ($paren -lt 0) {
 			$partial = ''
 			if ($urlStart -lt $len) { $partial = $S.Substring($urlStart) }
@@ -27988,13 +31528,25 @@ function Resolve-MBMediaSource {
 			return $out
 		}
 		$full = [System.IO.Path]::GetFullPath($found)
-		$out.Uri = (New-Object System.Uri -ArgumentList $full, ([System.UriKind]::Absolute)).AbsoluteUri
-		# MediaElement is happier with explicit file:/// form
+		# Absolute file Uri — encodes spaces; keeps () valid for MediaElement
+		$fileUri = $null
+		try {
+			$fileUri = New-Object System.Uri -ArgumentList $full, ([System.UriKind]::Absolute)
+		} catch {
+			try { $fileUri = [Uri]::new(('file:///' + ($full -replace '\', '/'))) } catch {}
+		}
+		if ($null -eq $fileUri) {
+			$out.Error = "cannot build file URI for: $full"
+			return $out
+		}
+		$out.Uri = $fileUri.AbsoluteUri
+		# Prefer file:/// form (MediaElement)
 		try {
 			if (-not $out.Uri.StartsWith('file:', [StringComparison]::OrdinalIgnoreCase)) {
-				$out.Uri = ([Uri]$full).AbsoluteUri
+				$out.Uri = $fileUri.AbsoluteUri
 			}
 		} catch {}
+		$out.Path = $full
 		$out.Display = $full
 		$out.Ok = $true
 		return $out
@@ -28314,16 +31866,30 @@ function global:Start-MBInlineVideoInHost {
 	$me.ScrubbingEnabled = $true
 	$me.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
 	$me.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
-	# MediaElement.Source must be a Uri (string assignment is flaky across PS hosts)
+	# MediaElement.Source must be a Uri (string assignment is flaky across PS hosts).
+	# Local paths with spaces/() must use Absolute Uri (file:///...%20...), not raw strings.
 	try {
 		if ($resolved.IsHttp) {
-			$me.Source = [Uri]$resolved.Uri
+			if ($resolved.Uri -is [Uri]) { $me.Source = $resolved.Uri }
+			else { $me.Source = [Uri]$resolved.Uri }
 		} else {
-			if ($null -ne $resolved.Uri) { $me.Source = [Uri]$resolved.Uri }
-			else { $me.Source = New-Object System.Uri -ArgumentList ([string]$resolved.Path), ([System.UriKind]::Absolute) }
+			$localUri = $null
+			if ($resolved.Uri -is [Uri]) {
+				$localUri = $resolved.Uri
+			} elseif ($resolved.Uri) {
+				try { $localUri = [Uri]$resolved.Uri } catch {}
+			}
+			if ($null -eq $localUri -and $resolved.Path) {
+				$localUri = New-Object System.Uri -ArgumentList ([string]$resolved.Path), ([System.UriKind]::Absolute)
+			}
+			if ($null -ne $localUri) { $me.Source = $localUri }
 		}
 	} catch {
-		try { $me.Source = New-Object System.Uri -ArgumentList ([string]$resolved.Path), ([System.UriKind]::Absolute) } catch {}
+		try {
+			if ($resolved.Path) {
+				$me.Source = New-Object System.Uri -ArgumentList ([string]$resolved.Path), ([System.UriKind]::Absolute)
+			}
+		} catch {}
 	}
 	[void]$root.Children.Add($me)
 
@@ -30033,9 +33599,10 @@ function Convert-MBMdMediaLabel {
 
 function Test-MBMdMediaMarkup {
 	# Parse ![alt](path) for image / video / audio.
-	# BOTH alt labels and paths may contain spaces:
-	#   ![My Song Title](C:\Users\Owner\Music\My Song.mp3)
-	#   ![vacation photo](C:\Users\Owner\Pictures\Lake Day.png)
+	# Paths may contain spaces and parentheses (Windows):
+	#   ![My Song](C:\Users\Public\Music\My Song.mp3)
+	#   ![clip](C:\Videos\clip (final).mp4)
+	#   ![clip](<C:\Videos\clip (final).mp4>)
 	# FullLine: entire string must be the markup. Else: match only at start (inline).
 	param(
 		[string]$Text,
@@ -30044,35 +33611,53 @@ function Test-MBMdMediaMarkup {
 	$s = [string]$Text
 	if ([string]::IsNullOrWhiteSpace($s)) { return @{ Ok = $false } }
 	if ($FullLine) { $s = $s.Trim() }
-	# Prefer greedy-to-last-) so names like "clip (final).mp4" work for all media kinds.
-	# Inline: try greedy first when the tail looks like a media path; else first ).
-	$tryPaths = New-Object System.Collections.ArrayList
-	if ($s -match '^!\[([^\]]*)\]\(\s*(.+)\s*\)$' -or ((-not $FullLine) -and $s -match '^!\[([^\]]*)\]\(\s*(.+)\s*\)')) {
-		[void]$tryPaths.Add(@{ Alt = [string]$Matches[1]; Raw = [string]$Matches[2]; Matched = [string]$Matches[0] })
+	if ($s.Length -lt 5 -or $s[0] -ne [char]'!' -or $s[1] -ne [char]'[') { return @{ Ok = $false } }
+
+	# Find end of [alt]
+	$altClose = $s.IndexOf([char]']', 2)
+	if ($altClose -lt 0) { return @{ Ok = $false } }
+	if (($altClose + 1) -ge $s.Length -or $s[$altClose + 1] -ne [char]'(') { return @{ Ok = $false } }
+	$pathStart = $altClose + 2
+	# skip whitespace after (
+	while ($pathStart -lt $s.Length -and [char]::IsWhiteSpace($s[$pathStart])) { $pathStart++ }
+	if ($pathStart -ge $s.Length) { return @{ Ok = $false } }
+
+	$pathEndParen = Find-MBMdBalancedParenClose -S $s -OpenAfter $pathStart
+	if ($pathEndParen -lt 0) { return @{ Ok = $false } }
+
+	$rawPath = $s.Substring($pathStart, $pathEndParen - $pathStart)
+	# trim trailing whitespace before closing )
+	$rawPath = $rawPath.Trim()
+	$path = Convert-MBMdMediaTarget -Raw $rawPath
+	if ([string]::IsNullOrWhiteSpace($path)) { return @{ Ok = $false } }
+
+	$kind = Get-MBMediaKindFromPath -PathOrUrl $path
+	if (-not $kind) {
+		# Fallback: if balanced path failed kind (rare), try last-media-extension before final )
+		# e.g. odd titles; keep balanced result first
+		return @{ Ok = $false }
 	}
-	if (-not $FullLine -and $s -match '^!\[([^\]]*)\]\(\s*(.+?)\s*\)') {
-		[void]$tryPaths.Add(@{ Alt = [string]$Matches[1]; Raw = [string]$Matches[2]; Matched = [string]$Matches[0] })
+
+	if ($FullLine) {
+		# allow only trailing whitespace after closing )
+		$tail = ''
+		if (($pathEndParen + 1) -lt $s.Length) { $tail = $s.Substring($pathEndParen + 1) }
+		if ($tail.Trim().Length -gt 0) { return @{ Ok = $false } }
 	}
-	foreach ($cand in @($tryPaths)) {
-		$path = Convert-MBMdMediaTarget -Raw ([string]$cand.Raw)
-		if ([string]::IsNullOrWhiteSpace($path)) { continue }
-		$kind = Get-MBMediaKindFromPath -PathOrUrl $path
-		if (-not $kind) { continue }
-		# Preserve multi-word labels (do not split on spaces)
-		$alt = [string]$cand.Alt
-		$alt = [regex]::Replace($alt, '[\r\n\t]+', ' ')
-		$alt = [regex]::Replace($alt, ' {2,}', ' ').Trim()
-		$matched = [string]$cand.Matched
-		return @{
-			Ok      = $true
-			Alt     = $alt
-			Path    = $path
-			Kind    = $kind
-			Matched = $matched
-			Length  = $matched.Length
-		}
+
+	$alt = ''
+	if ($altClose -gt 2) { $alt = $s.Substring(2, $altClose - 2) }
+	$alt = [regex]::Replace([string]$alt, '[\r\n\t]+', ' ')
+	$alt = [regex]::Replace($alt, ' {2,}', ' ').Trim()
+	$matched = $s.Substring(0, $pathEndParen + 1)
+	return @{
+		Ok      = $true
+		Alt     = $alt
+		Path    = $path
+		Kind    = $kind
+		Matched = $matched
+		Length  = $matched.Length
 	}
-	return @{ Ok = $false }
 }
 
 function Write-MBWpfMedia {
@@ -32900,13 +36485,6 @@ function Start-MBWpfHost {
 			$W.TitleBrandNameShadow = $window.FindName('TitleBrandNameShadow')
 			$W.TitlePath = $window.FindName('TitlePath')
 			$W.TitlePathShadow = $window.FindName('TitlePathShadow')
-			try {
-				if ($W.TitlePath -and $W.SetThemedToolTip) {
-					& $W.SetThemedToolTip $W.TitlePath 'Click to change working directory' 280
-				} elseif ($W.TitlePath) {
-					$W.TitlePath.ToolTip = 'Click to change working directory'
-				}
-			} catch {}
 			$W.TitlePoweredBy = $window.FindName('TitlePoweredBy')
 			$W.TitlePoweredByShadow = $window.FindName('TitlePoweredByShadow')
 			$W.TitlePoweredByLabel = $window.FindName('TitlePoweredByLabel')
@@ -34066,12 +37644,15 @@ function Start-MBWpfHost {
 				# Themed tooltips (title chrome)
 				try {
 					if ($W.SetThemedToolTip) {
+						if ($W.TitlePath) { & $W.SetThemedToolTip $W.TitlePath 'Click to change working directory' 280 }
 						if ($W.TitleBtnMin) { & $W.SetThemedToolTip $W.TitleBtnMin 'Minimize' 160 }
 						if ($W.TitleBtnMax) {
 							$mx = if ([bool]$W.IsWorkAreaMaximized) { 'Restore' } else { 'Maximize' }
 							& $W.SetThemedToolTip $W.TitleBtnMax $mx 160
 						}
 						if ($W.TitleBtnClose) { & $W.SetThemedToolTip $W.TitleBtnClose 'Close' 140 }
+					} elseif ($W.TitlePath) {
+						$W.TitlePath.ToolTip = 'Click to change working directory'
 					}
 				} catch {}
 				# Hover: exit red, min/max lighter grey (NoMouseOver - Background only)
@@ -35143,7 +38724,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				$W.MainChromeBorder = $window.FindName('MainChromeBorder')
 				$W.ApplyWindowChromeCorners = $applyWindowChromeCorners
 			} catch {}
-			# IPScanner-style vague border pulse: Base ↔ soft cyan, 6s forever on BorderBrush only.
+			# Soft border pulse on MainChromeBorder (BorderBrush only).
 			$W.StartChromeGlow = {
 				try {
 					if ($W.ChromeGlowStory) { return }
@@ -35156,7 +38737,6 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					# Unfrozen SolidColorBrush so Color can animate (frozen brushes cannot)
 					$brush = New-Object System.Windows.Media.SolidColorBrush
 					$cBase = [System.Windows.Media.ColorConverter]::ConvertFromString('#2A2A30')
-					# Soft deep-sky lift - IPScanner-style #CCCCCC↔#00BFFF, dialed for dark chrome (readable but not loud)
 					$cPeak = [System.Windows.Media.ColorConverter]::ConvertFromString('#4A8AB8')
 					$brush.Color = $cBase
 					$border.BorderBrush = $brush
@@ -36688,9 +40268,18 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$body.Child = $errTb
 								} elseif ($mediaKind -eq 'audio') {
 									# Minimal inline audio player (PowerPlayer-inspired: progress + volume 0-1 + mute + play/pause icons)
+									# Prefer display/path (keeps spaces/parens) over decoding file:// URIs
 									$filePath = ''
 									try {
-										if ($null -ne $uriObj -and $uriObj.IsFile) {
+										if (-not [string]::IsNullOrWhiteSpace([string]$mediaDisp)) {
+											$d0 = ([string]$mediaDisp).Trim().Trim('"').Trim("'")
+											if ($d0 -match '^(?i)https?://') { }
+											elseif (Test-Path -LiteralPath $d0 -PathType Leaf) { $filePath = [System.IO.Path]::GetFullPath($d0) }
+											else { $filePath = $d0 }
+										}
+									} catch {}
+									try {
+										if ([string]::IsNullOrWhiteSpace($filePath) -and $null -ne $uriObj -and $uriObj.IsFile) {
 											$filePath = [string]$uriObj.LocalPath
 											try { $filePath = [Uri]::UnescapeDataString($filePath) } catch {}
 										}
@@ -39183,6 +42772,14 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							$visionBlockedMap = @{}
 							try { $visionBlockedMap = $td.visionBlocked } catch { $visionBlockedMap = @{} }
 							if ($null -eq $visionBlockedMap) { $visionBlockedMap = @{} }
+							$gpoBlockedMap = @{}
+							try { $gpoBlockedMap = $td.gpoBlocked } catch { $gpoBlockedMap = @{} }
+							if ($null -eq $gpoBlockedMap) { $gpoBlockedMap = @{} }
+							$gpoBlockReason = ''
+							try { $gpoBlockReason = [string]$td.gpoBlockReason } catch { $gpoBlockReason = '' }
+							if ([string]::IsNullOrWhiteSpace($gpoBlockReason)) {
+								$gpoBlockReason = 'This Windows edition does not include Local Group Policy (typically Home/Core; needs Pro or higher).'
+							}
 							$mono = $null
 							try { $mono = $W.MonoFont } catch {}
 							$mkThemedTip = {
@@ -39439,9 +43036,30 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												}
 											}
 										} catch { $noVision = $false }
+										$noGpo = $false
+										try {
+											if ($gpoBlockedMap -is [hashtable]) {
+												if ($gpoBlockedMap.ContainsKey($tName)) { $noGpo = $true }
+												elseif ($gpoBlockedMap.Contains($tName)) { $noGpo = $true }
+												else {
+													foreach ($gk in @($gpoBlockedMap.Keys)) {
+														if ([string]::Equals([string]$gk, $tName, [StringComparison]::OrdinalIgnoreCase)) {
+															$noGpo = $true
+															break
+														}
+													}
+												}
+											}
+										} catch { $noGpo = $false }
+										$toolUnavailable = ($noVision -or $noGpo)
 										if ($noVision) {
 											if ($tTip -notmatch '(?i)does not support vision|no ''vision'' in Abilities') {
 												$tTip = ("{0}`n`nUnavailable: current model does not support vision (no 'vision' in Abilities)." -f $tTip.TrimEnd())
+											}
+										}
+										if ($noGpo) {
+											if ($tTip -notmatch '(?i)Local Group Policy|gpedit|Home/Core|does not include Local Group Policy') {
+												$tTip = ("{0}`n`nUnavailable: {1}" -f $tTip.TrimEnd(), $gpoBlockReason)
 											}
 										}
 										$wasUsed = $false
@@ -39457,13 +43075,13 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												}
 											}
 										} catch { $wasUsed = $false }
-										if ($wasUsed -and -not $noVision -and $tTip -notmatch '(?i)used this session') {
+										if ($wasUsed -and -not $toolUnavailable -and $tTip -notmatch '(?i)used this session') {
 											$tTip = ("{0}`n`nUsed this session." -f $tTip.TrimEnd())
 										}
 										$toolFg = $itemFg
-										if ($noVision -and $orangeB) { $toolFg = $orangeB }
-										# Vision-blocked: orange, never "used" highlight
-										[void]$cm.Items.Add((& $addToolItem $tName $toolFg $menuBg $tTip $(if ($noVision) { $false } else { $wasUsed })))
+										if ($toolUnavailable -and $orangeB) { $toolFg = $orangeB }
+										# Unavailable (vision / GPO edition): orange, never "used" highlight
+										[void]$cm.Items.Add((& $addToolItem $tName $toolFg $menuBg $tTip $(if ($toolUnavailable) { $false } else { $wasUsed })))
 									}
 								}
 								if ([string]$g -eq 'installers' -and $installerPkgs.Count -gt 0) {
