@@ -1,10 +1,10 @@
-<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
+﻿<# :: Hybrid CMD / Powershell Launcher - Rename to .CMD or .PS1 - CMD mode needs anything above this line removed to function properly
 @START /MIN "" POWERSHELL -nop -w hidden -c "iex ([io.file]::ReadAllText('%~f0'))">nul&EXIT
 #>
 
 <#
 .SYNOPSIS
-	MiniBot v2.35.1 - Mini Repair-Bot
+	MiniBot v2.35.2 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -40,7 +40,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.35.1",
+	[string]$Version = "2.35.2",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -5420,6 +5420,10 @@ function Start-MBLoginSession {
 				param($Window, $BitmapSource)
 				if (-not $Window -or -not $BitmapSource) { return }
 				try {
+					try {
+						if ($Window.Dispatcher -and $Window.Dispatcher.HasShutdownStarted) { return }
+						if (-not $Window.IsLoaded -and $Window.IsInitialized -eq $false) { return }
+					} catch { return }
 					if (-not ('MiniBot.UI.NativeIcon' -as [type])) {
 						Add-Type -Namespace MiniBot.UI -Name NativeIcon -MemberDefinition @"
 [System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Auto)]
@@ -5445,7 +5449,10 @@ public const int ICON_BIG = 1;
 							$hIcon = $gdi.GetHicon()
 							try {
 								$helper = New-Object System.Windows.Interop.WindowInteropHelper($Window)
-								$hwnd = $helper.EnsureHandle()
+								$hwnd = $helper.Handle
+								if ($hwnd -eq [IntPtr]::Zero) {
+									try { $hwnd = $helper.EnsureHandle() } catch { $hwnd = [IntPtr]::Zero }
+								}
 								if ($hwnd -ne [IntPtr]::Zero) {
 									$hSmall = [MiniBot.UI.NativeIcon]::CopyIcon($hIcon)
 									$hBig = [MiniBot.UI.NativeIcon]::CopyIcon($hIcon)
@@ -5886,9 +5893,54 @@ public const int ICON_BIG = 1;
 				} catch {}
 			}.GetNewClosure()
 
+			$loginUi = @{ Timer = $null; Finishing = $false }
+
+			$finishLoginCancel = {
+				param([bool]$Force = $true)
+				try {
+					if ($loginUi.Finishing -and -not $Force) { return }
+					$loginUi.Finishing = $true
+					try { $epWantCancel.Value = $true } catch {}
+					try { if ($loginUi.Timer) { $loginUi.Timer.Stop() } } catch {}
+					$B.Closed = $true
+					if ($null -eq $B.EndpointResult) {
+						$B.EndpointResult = @{
+							Cancelled = $true
+							Url       = ''
+							AuthMode  = 'none'
+							ApiKey    = ''
+						}
+					}
+					try {
+						if (-not [bool]$B.AuthOk) {
+							$B.CredResult = @{
+								User      = $null
+								Pass      = $null
+								Cancelled = $true
+								SoftExit  = $true
+								HardClose = $false
+							}
+						}
+					} catch {}
+					if ($null -eq $B.ConfirmResult) { try { $B.ConfirmResult = $false } catch {} }
+					try { [void]$B.EndpointWait.Set() } catch {}
+					try { [void]$B.CredWait.Set() } catch {}
+					try { [void]$B.ConfirmWait.Set() } catch {}
+					try {
+						if ($win) { $win.Close() }
+					} catch {}
+					try {
+						$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
+						if ($disp -and -not $disp.HasShutdownStarted) {
+							$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Background)
+						}
+					} catch {}
+				} catch {}
+			}.GetNewClosure()
+
 			$doConnectCancel = {
 				try {
-					if ($epBusy.Value) {
+					if ($epBusy.Value -and -not $epWantCancel.Value) {
 						$epWantCancel.Value = $true
 						try {
 							if ($epError) {
@@ -5897,6 +5949,13 @@ public const int ICON_BIG = 1;
 								$epError.Text = 'Cancelling...'
 							}
 						} catch {}
+						try {
+							[void]$win.Dispatcher.BeginInvoke([Action]{
+								try { & $finishLoginCancel $true } catch {}
+							}.GetNewClosure(), [System.Windows.Threading.DispatcherPriority]::Background)
+						} catch {
+							& $finishLoginCancel $true
+						}
 						return
 					}
 					$B.EndpointResult = @{
@@ -5905,10 +5964,7 @@ public const int ICON_BIG = 1;
 						AuthMode = 'none'
 						ApiKey = ''
 					}
-					try { [void]$B.EndpointWait.Set() } catch {}
-					try { [void]$B.CredWait.Set() } catch {}
-					try { [void]$B.ConfirmWait.Set() } catch {}
-					try { $win.Close() } catch {}
+					& $finishLoginCancel $true
 				} catch {}
 			}.GetNewClosure()
 
@@ -6048,9 +6104,10 @@ public const int ICON_BIG = 1;
 						User = $null; Pass = $null; Cancelled = $true
 						SoftExit = $true; HardClose = $false
 					}
-					try { [void]$B.CredWait.Set() } catch {}
-					try { [void]$B.ConfirmWait.Set() } catch {}
-					try { $win.Close() } catch {}
+					if ($null -eq $B.EndpointResult) {
+						$B.EndpointResult = @{ Cancelled = $true; Url = ''; AuthMode = 'none'; ApiKey = '' }
+					}
+					& $finishLoginCancel $true
 				} catch {}
 			}.GetNewClosure()
 			$cancel.add_Click({
@@ -6064,7 +6121,9 @@ public const int ICON_BIG = 1;
 						$onConnect = $false
 						try { $onConnect = ($connectLayer -and $connectLayer.Visibility -eq [System.Windows.Visibility]::Visible) } catch {}
 						if ($onConnect) { & $doConnectCancel } else { & $doLoginCancel }
-					} catch {}
+					} catch {
+						try { & $finishLoginCancel $true } catch {}
+					}
 				}.GetNewClosure())
 			}
 			# Back: leave Login (waiting for creds) and re-open Connect for another endpoint
@@ -6106,24 +6165,39 @@ public const int ICON_BIG = 1;
 
 			$timer = New-Object System.Windows.Threading.DispatcherTimer
 			$timer.Interval = [TimeSpan]::FromMilliseconds(40)
+			$loginUi.Timer = $timer
 			$timer.Add_Tick({
 				param($s, $e)
 				try {
+					if ([bool]$B.Closed -or $loginUi.Finishing) {
+						try { $timer.Stop() } catch {}
+						return
+					}
+					try {
+						if ($win.Dispatcher -and $win.Dispatcher.HasShutdownStarted) {
+							try { $timer.Stop() } catch {}
+							return
+						}
+					} catch {}
 					$cmd = [string]$B.Cmd
 					if ([string]::IsNullOrWhiteSpace($cmd)) { return }
 					$B.Cmd = ''
 					switch ($cmd) {
 						'show_login' {
+							if ([bool]$B.Closed -or $loginUi.Finishing) { return }
 							try { & $setLoginRobotFace 'default' } catch {}
 							& $showLogin
 						}
 						'show_connect' {
+							if ([bool]$B.Closed -or $loginUi.Finishing) { return }
 							& $showConnect
 						}
 						'show_confirm' {
+							if ([bool]$B.Closed -or $loginUi.Finishing) { return }
 							& $showConfirm ([string]$B.ConfirmPrompt) ([string]$B.ConfirmTitle)
 						}
 						'success' {
+							if ([bool]$B.Closed -or $loginUi.Finishing) { return }
 							try {
 								$B.AuthOk = $true
 								& $setLoginRobotFace 'happy'
@@ -6139,7 +6213,7 @@ public const int ICON_BIG = 1;
 							try {
 								$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
 								if ($disp -and -not $disp.HasShutdownStarted) {
-									$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
+									$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Background)
 								}
 							} catch {}
 						}
@@ -6149,14 +6223,16 @@ public const int ICON_BIG = 1;
 			$timer.Start()
 
 			$shutdownUi = {
-				try { $timer.Stop() } catch {}
-				try { $win.Close() } catch {}
-				try {
-					$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
-					if ($disp -and -not $disp.HasShutdownStarted) {
-						$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
-					}
-				} catch {}
+				try { & $finishLoginCancel $true } catch {
+					try { if ($loginUi.Timer) { $loginUi.Timer.Stop() } } catch {}
+					try { $win.Close() } catch {}
+					try {
+						$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
+						if ($disp -and -not $disp.HasShutdownStarted) {
+							$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Background)
+						}
+					} catch {}
+				}
 			}.GetNewClosure()
 
 			if ($cYes) {
@@ -6181,7 +6257,6 @@ public const int ICON_BIG = 1;
 						}
 						try { [void]$B.ConfirmWait.Set() } catch {}
 						try { [void]$B.CredWait.Set() } catch {}
-						# Close so single-instance lock can release
 						& $shutdownUi
 					} catch {}
 				}.GetNewClosure())
@@ -6190,8 +6265,10 @@ public const int ICON_BIG = 1;
 			$win.add_Closing({
 				param($s, $ev)
 				try {
-					$B.Closed = $true
+					try { if ($loginUi.Timer) { $loginUi.Timer.Stop() } } catch {}
 					try { $epWantCancel.Value = $true } catch {}
+					$loginUi.Finishing = $true
+					$B.Closed = $true
 					if ($null -eq $B.ConfirmResult) { $B.ConfirmResult = $false }
 					if (-not [bool]$B.AuthOk) {
 						$B.CredResult = @{
@@ -6210,6 +6287,8 @@ public const int ICON_BIG = 1;
 			$win.add_Closed({
 				param($s, $e)
 				try {
+					try { if ($loginUi.Timer) { $loginUi.Timer.Stop() } } catch {}
+					$loginUi.Finishing = $true
 					$B.Closed = $true
 					try { [void]$B.CredWait.Set() } catch {}
 					try { [void]$B.ConfirmWait.Set() } catch {}
@@ -6217,7 +6296,7 @@ public const int ICON_BIG = 1;
 					try {
 						$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
 						if ($disp -and -not $disp.HasShutdownStarted) {
-							$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Normal)
+							$disp.BeginInvokeShutdown([System.Windows.Threading.DispatcherPriority]::Background)
 						}
 					} catch {}
 				} catch {}
@@ -6233,10 +6312,14 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				$applyDarkTitle = {
 					param($w)
 					try {
+						if (-not $w) { return }
+						try {
+							if ($w.Dispatcher -and $w.Dispatcher.HasShutdownStarted) { return }
+						} catch { return }
 						$helper = New-Object System.Windows.Interop.WindowInteropHelper($w)
 						$hwnd = $helper.Handle
 						if ($hwnd -eq [IntPtr]::Zero) {
-							try { $hwnd = $helper.EnsureHandle() } catch {}
+							try { $hwnd = $helper.EnsureHandle() } catch { $hwnd = [IntPtr]::Zero }
 						}
 						if ($hwnd -eq [IntPtr]::Zero) { return }
 						$useDark = 1
@@ -6342,6 +6425,15 @@ function Close-MBLoginSession {
 			$Session.Cmd = 'close'
 			# Short wait for STA to shut down; always force-stop after
 			[void]$Session.Done.WaitOne(2000)
+		}
+	} catch {}
+	try {
+		if ($Session.Ps) {
+			try { $Session.Ps.Streams.Error.Clear() } catch {}
+			try { $Session.Ps.Streams.Warning.Clear() } catch {}
+			try { $Session.Ps.Streams.Verbose.Clear() } catch {}
+			try { $Session.Ps.Streams.Debug.Clear() } catch {}
+			try { $Session.Ps.Streams.Information.Clear() } catch {}
 		}
 	} catch {}
 	try { if ($Session.Ps) { $Session.Ps.Stop() } } catch {}
