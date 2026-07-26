@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.35.3 - Mini Repair-Bot
+	MiniBot v2.35.4 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -40,7 +40,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.35.3",
+	[string]$Version = "2.35.4",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -512,6 +512,10 @@ $script:MB = @{
 	ContextHardPct     = [double]$ContextHardPct
 	AutoCompact        = [bool]$AutoCompactEnabled
 	ModelCompact       = [bool]$ModelCompactEnabled
+	MaxTurns           = $(try { [int]$MaxTurns } catch { 30 })
+	TurnsLeft          = $(try { [int]$MaxTurns } catch { 30 })
+	TurnsUsed          = 0
+	TurnsInFlight      = $false
 	ActiveToolGroups   = New-Object System.Collections.ArrayList
 	ToolProfile        = [string]$ToolProfile
 	ToolsOverheadChars = 0
@@ -34526,9 +34530,133 @@ function Sync-MBAutoCompactFromWpf {
 	}
 }
 
+function Sync-MBMaxTurnsFromWpf {
+	if (-not $script:MB.Wpf) { return }
+	try {
+		if ([bool]$script:MB.Wpf.MaxTurnsDirty) {
+			$n = 30
+			try { $n = [int]$script:MB.Wpf.MaxTurnsSetting } catch { $n = 30 }
+			if ($n -lt 1) { $n = 1 }
+			if ($n -gt 200) { $n = 200 }
+			$script:MB.MaxTurns = $n
+			try { Set-Variable -Name MaxTurns -Scope Script -Value $n -Force -ErrorAction SilentlyContinue } catch {}
+			try {
+				if (-not [bool]$script:MB.TurnsInFlight) {
+					$script:MB.TurnsLeft = $n
+					$script:MB.Wpf.TurnsLeft = $n
+				} else {
+					$left = 0
+					try { $left = [int]$script:MB.TurnsLeft } catch { $left = $n }
+					if ($left -gt $n) { $left = $n }
+					$script:MB.TurnsLeft = $left
+					$script:MB.Wpf.TurnsLeft = $left
+				}
+			} catch {}
+			$script:MB.Wpf.MaxTurnsDirty = $false
+			$script:MB.Wpf.MaxTurnsSetting = $n
+		} else {
+			try {
+				$script:MB.Wpf.MaxTurnsSetting = [int]$script:MB.MaxTurns
+			} catch {
+				try { $script:MB.Wpf.MaxTurnsSetting = [int]$MaxTurns } catch {}
+			}
+		}
+	} catch {}
+}
+
+function Get-MBEffectiveMaxTurns {
+	$n = 30
+	try {
+		if ($null -ne $script:MB.MaxTurns -and [int]$script:MB.MaxTurns -gt 0) {
+			$n = [int]$script:MB.MaxTurns
+		} else {
+			$n = [int]$MaxTurns
+		}
+	} catch {
+		try { $n = [int]$MaxTurns } catch { $n = 30 }
+	}
+	if ($n -lt 1) { $n = 1 }
+	if ($n -gt 200) { $n = 200 }
+	return $n
+}
+
+function Get-MBWpfTurnsDisplayValue {
+	# In-flight: remaining. Idle: configured max.
+	try {
+		if ($script:MB.Wpf -and [bool]$script:MB.Wpf.TurnsInFlight) {
+			$left = 0
+			try { $left = [int]$script:MB.Wpf.TurnsLeft } catch { $left = 0 }
+			if ($left -lt 0) { $left = 0 }
+			return $left
+		}
+	} catch {}
+	try {
+		if ([bool]$script:MB.TurnsInFlight) {
+			$left = [int]$script:MB.TurnsLeft
+			if ($left -lt 0) { $left = 0 }
+			return $left
+		}
+	} catch {}
+	return (Get-MBEffectiveMaxTurns)
+}
+
+function Update-MBWpfTurnsNumText {
+	param([int]$Value)
+	try {
+		if (-not $script:MB.Wpf) { return }
+		$tb = $null
+		try { $tb = $script:MB.Wpf.AaTurnsNumTb } catch { $tb = $null }
+		if (-not $tb) { return }
+		$txt = [string][Math]::Max(0, [int]$Value)
+		$d = $null
+		try { $d = $script:MB.Wpf.Dispatcher } catch { $d = $null }
+		if (-not $d) { return }
+		$paint = {
+			try { if ($null -ne $tb) { $tb.Text = $txt } } catch {}
+		}.GetNewClosure()
+		try {
+			if ($d.CheckAccess()) {
+				& $paint
+			} else {
+				# Marshal to WPF STA (off-thread Text= is ignored / throws)
+				[void]$d.BeginInvoke([Action]$paint, [System.Windows.Threading.DispatcherPriority]::Normal)
+			}
+		} catch {
+			try { [void]$d.BeginInvoke([Action]$paint, [System.Windows.Threading.DispatcherPriority]::Background) } catch {}
+		}
+	} catch {}
+}
+
+function Update-MBTurnsCountdown {
+	param([int]$Turn = 0, [switch]$Idle)
+	try {
+		$max = Get-MBEffectiveMaxTurns
+		if ($Idle) {
+			$script:MB.TurnsInFlight = $false
+			$script:MB.TurnsUsed = 0
+			$script:MB.TurnsLeft = $max
+		} else {
+			$script:MB.TurnsInFlight = $true
+			$script:MB.TurnsUsed = [int]$Turn
+			$left = $max - [int]$Turn
+			if ($left -lt 0) { $left = 0 }
+			$script:MB.TurnsLeft = $left
+		}
+		if ($script:MB.Wpf) {
+			$script:MB.Wpf.TurnsLeft = [int]$script:MB.TurnsLeft
+			$script:MB.Wpf.TurnsUsed = [int]$(if ($Idle) { 0 } else { $Turn })
+			$script:MB.Wpf.TurnsInFlight = [bool]$script:MB.TurnsInFlight
+			$script:MB.Wpf.MaxTurnsSetting = $max
+			$disp = if ($Idle) { $max } else { [int]$script:MB.TurnsLeft }
+			Update-MBWpfTurnsNumText -Value $disp
+		}
+	} catch {}
+}
+
 function Get-MBWpfLowerRightText {
 	try { Sync-MBAutoApproveFromWpf } catch {}
 	try { Sync-MBAutoCompactFromWpf } catch {}
+	try { Sync-MBMaxTurnsFromWpf } catch {}
 	try { Sync-MBActiveModelFromWpf } catch {}
 	try {
 		if ($script:MB.Wpf -and [bool]$script:MB.Wpf.RemoteModelsRefreshWanted) {
@@ -35235,6 +35363,16 @@ function Start-MBWpfHost {
 		AutoApproveOn = $(try { [bool]$script:MB.AutoApprove } catch { $false })
 		AutoApproveDirty = $false
 		AutoCompactDirty = $false
+		MaxTurnsSetting = $(try { [int]$script:MB.MaxTurns } catch { try { [int]$MaxTurns } catch { 30 } })
+		MaxTurnsDirty = $false
+		TurnsLeft = $(try { [int]$script:MB.TurnsLeft } catch { try { [int]$MaxTurns } catch { 30 } })
+		TurnsUsed = 0
+		TurnsInFlight = $false
+		AaTurnsNumTb = $null
+		AaApprovePopup = $null
+		AaLabel = $null
+		AaPopupWantOpen = $false
+		ToolsUsedTb = $null
 		PendingUiCommand = $null
 		PendingWindowTitle = $null
 		CurrentCwd    = $(try { [string]$script:MB.WorkingDir } catch { '' })
@@ -42302,15 +42440,39 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								if ($txt -match '(x\d+)') { $compactPart = $Matches[1] }
 								elseif ($txt -match '(compact\s+\d+x)') { $compactPart = $Matches[1] }
 								if ($txt -match '(tools used\s+\d+)') { $toolsPart = $Matches[1] }
-								$sig = ('{0}|ac={1}|aa={2}|{3}' -f $compactPart, $(if ($acOn) { 'ON' } else { 'OFF' }), $(if ($autoOn) { 'ON' } else { 'OFF' }), $toolsPart)
+								# Do NOT include tools count / turns left in sig - rebuilds destroy open flyouts mid-loop
+								$sig = ('{0}|ac={1}|aa={2}' -f $compactPart, $(if ($acOn) { 'ON' } else { 'OFF' }), $(if ($autoOn) { 'ON' } else { 'OFF' }))
 								$isPanel = $false
 								try { $isPanel = ($lr -is [System.Windows.Controls.Panel]) } catch { $isPanel = $false }
 								if ($isPanel) {
 									if ([string]$W.LowerRightSig -eq $sig) {
-										# already painted for this state
+										# Same toggle state: refresh tools text + turns number in place only
+										try {
+											if ($W.ToolsUsedTb -and $toolsPart) { $W.ToolsUsedTb.Text = $toolsPart }
+										} catch {}
+										try {
+											$disp = 30
+											if ([bool]$W.TurnsInFlight) {
+												$disp = [int]$W.TurnsLeft
+											} else {
+												$disp = [int]$W.MaxTurnsSetting
+											}
+											if ($disp -lt 0) { $disp = 0 }
+											if ($W.AaTurnsNumTb) { $W.AaTurnsNumTb.Text = [string]$disp }
+										} catch {}
 									} else {
 										$W.LowerRightSig = $sig
+										# Close popups before tear-down (prevents stuck orphan flyouts)
+										$aaWantOpen = $false
+										try {
+											if ($W.AaApprovePopup -and [bool]$W.AaApprovePopup.IsOpen) { $aaWantOpen = $true }
+										} catch {}
+										try { if ($W.AcCompactPopup) { $W.AcCompactPopup.IsOpen = $false } } catch {}
+										try { if ($W.AaApprovePopup) { $W.AaApprovePopup.IsOpen = $false } } catch {}
+										$W.AaPopupWantOpen = $aaWantOpen
 										try { $lr.Children.Clear() } catch {}
+										$W.AaTurnsNumTb = $null
+										$W.ToolsUsedTb = $null
 										$mono = $null
 										try { $mono = $W.MonoFont } catch {}
 										$dot = [string][char]0x00B7
@@ -42597,6 +42759,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											param($s, $e)
 											try {
 												if ($null -ne $e) { $e.Handled = $true }
+												try { if ($W.AaApprovePopup) { $W.AaApprovePopup.IsOpen = $false } } catch {}
 												$acPopup.PlacementTarget = $acLabel
 												$acPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
 												$acPopup.HorizontalOffset = -2
@@ -42604,26 +42767,41 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												$acPopup.IsOpen = -not [bool]$acPopup.IsOpen
 											} catch {}
 										}.GetNewClosure())
-										# Click outside closes popup
+										# Click outside closes compact / auto-approve flyouts
 										try {
 											if ($W.Window -and -not $W.AcPopupOutsideHooked) {
 												$W.AcPopupOutsideHooked = $true
 												$W.Window.add_PreviewMouseDown({
 													param($s, $e)
 													try {
-														if (-not $W.AcCompactPopup -or -not [bool]$W.AcCompactPopup.IsOpen) { return }
 														$src = $null
 														try { $src = $e.OriginalSource } catch {}
-														# Keep open if click is on label or inside popup
-														$keep = $false
-														try {
-															$vis = $src
-															while ($null -ne $vis) {
-																if ($vis -eq $W.AcLabel -or $vis -eq $W.AcCompactPopup.Child) { $keep = $true; break }
-																try { $vis = [System.Windows.Media.VisualTreeHelper]::GetParent($vis) } catch { break }
-															}
-														} catch {}
-														if (-not $keep) { $W.AcCompactPopup.IsOpen = $false }
+														$inTree = {
+															param($root)
+															if ($null -eq $root -or $null -eq $src) { return $false }
+															try {
+																$vis = $src
+																while ($null -ne $vis) {
+																	if ($vis -eq $root) { return $true }
+																	try { $vis = [System.Windows.Media.VisualTreeHelper]::GetParent($vis) } catch { break }
+																}
+															} catch {}
+															return $false
+														}
+														if ($W.AcCompactPopup -and [bool]$W.AcCompactPopup.IsOpen) {
+															$keepAc = $false
+															try {
+																if ((& $inTree $W.AcLabel) -or (& $inTree $W.AcCompactPopup.Child)) { $keepAc = $true }
+															} catch {}
+															if (-not $keepAc) { $W.AcCompactPopup.IsOpen = $false }
+														}
+														if ($W.AaApprovePopup -and [bool]$W.AaApprovePopup.IsOpen) {
+															$keepAa = $false
+															try {
+																if ((& $inTree $W.AaLabel) -or (& $inTree $W.AaApprovePopup.Child)) { $keepAa = $true }
+															} catch {}
+															if (-not $keepAa) { $W.AaApprovePopup.IsOpen = $false }
+														}
 													} catch {}
 												}.GetNewClosure())
 											}
@@ -42659,11 +42837,10 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												} catch {}
 												# Keep sig in sync so next paint does not thrash
 												try {
-													$cp = ''; $tp = ''
+													$cp = ''
 													if ($txt -match '(x\d+)') { $cp = $Matches[1] }
-													if ($txt -match '(tools used\s+\d+)') { $tp = $Matches[1] }
 													$aa = $false; try { $aa = [bool]$W.AutoApproveOn } catch {}
-													$W.LowerRightSig = ('{0}|ac={1}|aa={2}|{3}' -f $cp, $(if ($nxt) { 'ON' } else { 'OFF' }), $(if ($aa) { 'ON' } else { 'OFF' }), $tp)
+													$W.LowerRightSig = ('{0}|ac={1}|aa={2}' -f $cp, $(if ($nxt) { 'ON' } else { 'OFF' }), $(if ($aa) { 'ON' } else { 'OFF' }))
 												} catch {}
 												try {
 													$msg = if ($nxt) { "`n  Auto-compact ON - context will trim automatically.`n" } else { "`n  Auto-compact OFF - context will not auto-trim.`n" }
@@ -42685,8 +42862,216 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$W.AutoCompactToggleTip = $acTog.Hit
 										[void]$lr.Children.Add($acTog.Outer)
 										& $addMuted ("  {0}  " -f $dot)
-										# auto-approve
-										& $addMuted 'auto-approve '
+										# auto-approve label (opens turns flyout) + ON/OFF toggle
+										$aaLabel = New-Object System.Windows.Controls.TextBlock
+										$aaLabel.Text = 'auto-approve '
+										$aaLabel.Foreground = $W.BrushCache[$grayHex]
+										$aaLabel.FontSize = 12
+										$aaLabel.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$aaLabel.Cursor = [System.Windows.Input.Cursors]::Hand
+										try {
+											if ($W.SetThemedToolTip) {
+												& $W.SetThemedToolTip $aaLabel 'Click for max tool-loop turns (adjust with - / +)' 300
+											} else {
+												$aaLabel.ToolTip = 'Click for max tool-loop turns'
+											}
+										} catch { $aaLabel.ToolTip = 'Click for max tool-loop turns' }
+										if ($mono) { try { $aaLabel.FontFamily = $mono } catch {} }
+										$W.AaLabel = $aaLabel
+										# Turns flyout: - Turns[N] +  (matches auto-compact popup chrome)
+										$aaMenuBgHex = '#1E1E24'
+										$aaMenuFgHex = '#C8C8D0'
+										$aaMenuBorderHex = '#3A3A42'
+										$aaHoverBgHex = '#243D2A'
+										$aaHoverBdHex = '#9ECE6A'
+										$aaHoverFgHex = '#C3E6A0'
+										foreach ($hx in @($aaMenuBgHex, $aaMenuFgHex, $aaMenuBorderHex, $aaHoverBgHex, $aaHoverBdHex, $aaHoverFgHex)) {
+											if (-not $W.BrushCache.ContainsKey($hx)) {
+												try { $W.BrushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+											}
+										}
+										$aaPopup = New-Object System.Windows.Controls.Primitives.Popup
+										$aaPopup.StaysOpen = $true
+										$aaPopup.AllowsTransparency = $true
+										$aaPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+										$aaPopup.PlacementTarget = $aaLabel
+										$aaPopup.HorizontalOffset = -2
+										$aaPopup.VerticalOffset = -9
+										$aaPopupShell = New-Object System.Windows.Controls.Border
+										$aaPopupShell.Background = $W.BrushCache[$aaMenuBgHex]
+										$aaPopupShell.BorderBrush = $W.BrushCache[$aaMenuBorderHex]
+										$aaPopupShell.BorderThickness = New-Object System.Windows.Thickness(1)
+										$aaPopupShell.Padding = New-Object System.Windows.Thickness(6, 4, 6, 4)
+										$aaPopupShell.CornerRadius = New-Object System.Windows.CornerRadius(0)
+										$aaPopupShell.SnapsToDevicePixels = $true
+										$aaTurnsRow = New-Object System.Windows.Controls.StackPanel
+										$aaTurnsRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+										$aaTurnsRow.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$mkAaStepBtn = {
+											param([string]$Content, [scriptblock]$OnClick)
+											$b = New-Object System.Windows.Controls.Button
+											$b.Content = $Content
+											$b.Cursor = [System.Windows.Input.Cursors]::Hand
+											$b.FontSize = 13
+											$b.FontWeight = [System.Windows.FontWeights]::SemiBold
+											$b.MinWidth = 28
+											$b.Padding = New-Object System.Windows.Thickness(8, 4, 8, 4)
+											$b.Margin = New-Object System.Windows.Thickness(0)
+											$b.BorderThickness = New-Object System.Windows.Thickness(1)
+											$b.Background = $W.BrushCache[$aaMenuBgHex]
+											$b.BorderBrush = $W.BrushCache[$aaMenuBgHex]
+											$b.Foreground = $W.BrushCache[$aaMenuFgHex]
+											$b.Focusable = $false
+											$b.IsTabStop = $false
+											try {
+												$b.Template = [System.Windows.Markup.XamlReader]::Parse(@'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+  <Border Background="{TemplateBinding Background}"
+          BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}"
+          Padding="{TemplateBinding Padding}"
+          CornerRadius="4"
+          SnapsToDevicePixels="True">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+</ControlTemplate>
+'@)
+											} catch {}
+											$b.add_MouseEnter({
+												try {
+													$b.Background = $W.BrushCache['#243D2A']
+													$b.BorderBrush = $W.BrushCache['#9ECE6A']
+													$b.Foreground = $W.BrushCache['#C3E6A0']
+												} catch {}
+											}.GetNewClosure())
+											$b.add_MouseLeave({
+												try {
+													$b.Background = $W.BrushCache['#1E1E24']
+													$b.BorderBrush = $W.BrushCache['#1E1E24']
+													$b.Foreground = $W.BrushCache['#C8C8D0']
+												} catch {}
+											}.GetNewClosure())
+											$b.add_Click($OnClick)
+											return $b
+										}.GetNewClosure()
+										$applyMaxTurnsUi = {
+											param([int]$Delta)
+											try {
+												$cur = 30
+												try { $cur = [int]$W.MaxTurnsSetting } catch { $cur = 30 }
+												$nxt = $cur + [int]$Delta
+												if ($nxt -lt 1) { $nxt = 1 }
+												if ($nxt -gt 200) { $nxt = 200 }
+												$W.MaxTurnsSetting = $nxt
+												$W.MaxTurnsDirty = $true
+												$disp = $nxt
+												try {
+													if ([bool]$W.TurnsInFlight) {
+														$used = 0
+														try { $used = [int]$W.TurnsUsed } catch { $used = 0 }
+														if ($used -lt 0) { $used = 0 }
+														$left = $nxt - $used
+														if ($left -lt 0) { $left = 0 }
+														$W.TurnsLeft = $left
+														$disp = $left
+													} else {
+														$W.TurnsLeft = $nxt
+														$disp = $nxt
+													}
+												} catch {}
+												try { if ($W.AaTurnsNumTb) { $W.AaTurnsNumTb.Text = [string]$disp } } catch {}
+											} catch {}
+										}.GetNewClosure()
+										$btnAaMinus = & $mkAaStepBtn '-' ({
+											param($s, $e)
+											try { if ($null -ne $e) { $e.Handled = $true } } catch {}
+											& $applyMaxTurnsUi -Delta (-1)
+										}.GetNewClosure())
+										$btnAaPlus = & $mkAaStepBtn '+' ({
+											param($s, $e)
+											try { if ($null -ne $e) { $e.Handled = $true } } catch {}
+											& $applyMaxTurnsUi -Delta 1
+										}.GetNewClosure())
+										$aaTurnsMid = New-Object System.Windows.Controls.StackPanel
+										$aaTurnsMid.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+										$aaTurnsMid.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$aaTurnsMid.Margin = New-Object System.Windows.Thickness(6, 0, 6, 0)
+										$mkAaMidTb = {
+											param([string]$t, [bool]$emph = $false)
+											$tb = New-Object System.Windows.Controls.TextBlock
+											$tb.Text = $t
+											$tb.FontSize = 12
+											$tb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+											$tb.Foreground = $W.BrushCache[$aaMenuFgHex]
+											if ($mono) { try { $tb.FontFamily = $mono } catch {} }
+											if ($emph) {
+												try { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+												try { $tb.Foreground = $W.BrushCache[$aaOnHex] } catch {}
+											}
+											return $tb
+										}.GetNewClosure()
+										$turnsShow = 30
+										try {
+											if ([bool]$W.TurnsInFlight) { $turnsShow = [int]$W.TurnsLeft }
+											else { $turnsShow = [int]$W.MaxTurnsSetting }
+										} catch {
+											try { $turnsShow = [int]$W.MaxTurnsSetting } catch { $turnsShow = 30 }
+										}
+										if ($turnsShow -lt 0) { $turnsShow = 0 }
+										[void]$aaTurnsMid.Children.Add((& $mkAaMidTb 'Turns[' $false))
+										$aaTurnsNum = & $mkAaMidTb ([string]$turnsShow) $true
+										$W.AaTurnsNumTb = $aaTurnsNum
+										[void]$aaTurnsMid.Children.Add($aaTurnsNum)
+										[void]$aaTurnsMid.Children.Add((& $mkAaMidTb ']' $false))
+										[void]$aaTurnsRow.Children.Add($btnAaMinus)
+										[void]$aaTurnsRow.Children.Add($aaTurnsMid)
+										[void]$aaTurnsRow.Children.Add($btnAaPlus)
+										$aaPopupShell.Child = $aaTurnsRow
+										$aaPopup.Child = $aaPopupShell
+										$W.AaApprovePopup = $aaPopup
+										$aaLabel.add_MouseLeftButtonUp({
+											param($s, $e)
+											try {
+												if ($null -ne $e) { $e.Handled = $true }
+												try { if ($W.AcCompactPopup) { $W.AcCompactPopup.IsOpen = $false } } catch {}
+												# Only one live popup instance
+												try {
+													if ($W.AaApprovePopup -and $W.AaApprovePopup -ne $aaPopup) {
+														$W.AaApprovePopup.IsOpen = $false
+													}
+												} catch {}
+												$aaPopup.PlacementTarget = $aaLabel
+												$aaPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+												$aaPopup.HorizontalOffset = -2
+												$aaPopup.VerticalOffset = -9
+												$opening = -not [bool]$aaPopup.IsOpen
+												if ($opening) {
+													try {
+														$disp = 30
+														if ([bool]$W.TurnsInFlight) {
+															$disp = [int]$W.TurnsLeft
+														} else {
+															$disp = [int]$W.MaxTurnsSetting
+														}
+														if ($disp -lt 0) { $disp = 0 }
+														if ($W.AaTurnsNumTb) { $W.AaTurnsNumTb.Text = [string]$disp }
+													} catch {}
+													$W.AaPopupWantOpen = $true
+													$aaPopup.IsOpen = $true
+												} else {
+													$W.AaPopupWantOpen = $false
+													$aaPopup.IsOpen = $false
+												}
+											} catch {}
+										}.GetNewClosure())
+										[void]$lr.Children.Add($aaLabel)
+										# Restore open flyout after a full bar rebuild (toggle change, etc.)
+										try {
+											if ([bool]$W.AaPopupWantOpen) {
+												$aaPopup.PlacementTarget = $aaLabel
+												$aaPopup.IsOpen = $true
+											}
+										} catch {}
 										$aaClick = {
 											param($s, $e)
 											try {
@@ -42706,11 +43091,10 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 														$nxt $W.AaOnFg $W.AaOffFg $W.AaOnBg $W.AaOffBg $W.AaTipOn $W.AaTipOff
 												} catch {}
 												try {
-													$cp = ''; $tp = ''
+													$cp = ''
 													if ($txt -match '(x\d+)') { $cp = $Matches[1] }
-													if ($txt -match '(tools used\s+\d+)') { $tp = $Matches[1] }
 													$ac = $true; try { $ac = [bool]$W.AutoCompactOn } catch {}
-													$W.LowerRightSig = ('{0}|ac={1}|aa={2}|{3}' -f $cp, $(if ($ac) { 'ON' } else { 'OFF' }), $(if ($nxt) { 'ON' } else { 'OFF' }), $tp)
+													$W.LowerRightSig = ('{0}|ac={1}|aa={2}' -f $cp, $(if ($ac) { 'ON' } else { 'OFF' }), $(if ($nxt) { 'ON' } else { 'OFF' }))
 												} catch {}
 												try {
 													$msg = if ($nxt) {
@@ -42737,7 +43121,16 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										[void]$lr.Children.Add($aaTog.Outer)
 										if ($toolsPart) {
 											& $addMuted ("  {0}  " -f $dot)
-											& $addMuted $toolsPart
+											$toolsTb = New-Object System.Windows.Controls.TextBlock
+											$toolsTb.Text = $toolsPart
+											$toolsTb.Foreground = $W.BrushCache[$grayHex]
+											$toolsTb.FontSize = 12
+											$toolsTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+											if ($mono) { try { $toolsTb.FontFamily = $mono } catch {} }
+											$W.ToolsUsedTb = $toolsTb
+											[void]$lr.Children.Add($toolsTb)
+										} else {
+											$W.ToolsUsedTb = $null
 										}
 									}
 								} else {
@@ -44559,11 +44952,18 @@ function Start-LocalAgent {
 
 		Reset-MBInterrupt
 		$turn = 0
+		try { Sync-MBMaxTurnsFromWpf } catch {}
+		$maxTurnsNow = Get-MBEffectiveMaxTurns
+		try { Update-MBTurnsCountdown -Idle } catch {}
 		try {
-			while ($turn -lt $MaxTurns) {
+			while ($turn -lt $maxTurnsNow) {
 				$turn++
 				$script:MB.AgentTurns++
-				Write-MBDebugLog -Step 'TURN_MODEL_ITER' -Detail ("turn={0}" -f $turn)
+				try { Sync-MBMaxTurnsFromWpf } catch {}
+				$maxTurnsNow = Get-MBEffectiveMaxTurns
+				try { Update-MBTurnsCountdown -Turn $turn } catch {}
+				try { Update-MBWpfLiveChrome } catch {}
+				Write-MBDebugLog -Step 'TURN_MODEL_ITER' -Detail ("turn={0}/{1} left={2}" -f $turn, $maxTurnsNow, $script:MB.TurnsLeft)
 
 				# Sync sticky state and budget before model call
 				try {
@@ -44868,9 +45268,12 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 			}
 		}
 
-		if ($turn -ge $MaxTurns) {
-			Write-MBWarn "Hit max tool-loop turns ($MaxTurns). Summarizing context for next message."
+		$maxTurnsEnd = Get-MBEffectiveMaxTurns
+		if ($turn -ge $maxTurnsEnd) {
+			Write-MBWarn "Hit max tool-loop turns ($maxTurnsEnd). Summarizing context for next message."
 		}
+		try { Update-MBTurnsCountdown -Idle } catch {}
+		try { Update-MBWpfLiveChrome -Force } catch {}
 
 		try {
 			$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
