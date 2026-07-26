@@ -1,12 +1,12 @@
 # MiniBot
 
-**v2.35.4** — Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, and live media — on your machine.
+**v2.40.0** — Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations/reports** — on your machine.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
 </p>
 
-MiniBot is a single-file agent harness: progressive tools, operator approvals for host changes, multi-endpoint model switching, connect recovery when the endpoint is down, and a UI built for day-to-day work.
+MiniBot is a single-file agent harness: progressive tools, operator approvals for host changes, multi-endpoint model switching, connect recovery when the endpoint is down, LAN discovery and domain remoting, and a UI built for day-to-day work.
 
 ---
 
@@ -16,9 +16,13 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 |------|------------|
 | **Models** | llama.cpp, vLLM, Unsloth Studio, xAI Grok, and other OpenAI-compatible `/v1` servers |
 | **Endpoints** | Primary `-BaseUrl` plus optional extras; per-endpoint auth: **API key**, **NPM Basic**, or **none** |
-| **Connect** | If the default host is down (or `-BaseUrl` is empty), a **Connect** dialog collects URL + auth without hard-exiting |
+| **Connect** | Fast hard-timeout probe; if the host is down (or `-BaseUrl` is empty), **Connect** collects URL + auth without hard-exiting |
 | **UI** | Borderless dark WPF chrome, sticky status, tool-group chips, **PoweredBy** model/endpoint picker, approval strips |
 | **Media** | Inline images, video, and audio via `![label](path)` — external players only as a last resort |
+| **Visualize** | Inline **SVG** charts and visualizations, WPF **SvgView** (save SVG/HTML from the card) |
+| **Speed** | Prefill / generation timing under replies (**pp/s** · **t/s**) when the server or stream window provides it |
+| **Network** | **PortProbe**, **FindShares**, **FindWebHosts**, **FindRdp** — targeted host(s) or LAN search when hosts are omitted |
+| **Remote** | **RemoteCommand** (WinRM) for domain admins on domain-joined hosts — orange / unavailable off-domain |
 | **Safety** | Auto-approve off by default; mutating actions require Yes / No / All |
 | **Tools** | Progressive groups (volume/brightness, GPO, shares, CAB/ISO, Gallery, HTTP with bad-cert support, …) |
 | **Deploy** | One `.ps1` (or hybrid `.cmd`), optional elevation, single-instance lock |
@@ -42,9 +46,10 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 |-------------|--------|
 | **Windows 10 / 11** | WPF desktop host |
 | **Windows PowerShell 5.1** | `%SystemRoot%\System32\WindowsPowerShell\v1.0` |
-| **OpenAI-compatible API** | Chat completions (default probe `http://127.0.0.1:8080/v1`) |
+| **OpenAI-compatible API** | Chat completions (set `-BaseUrl` to your server) |
 | **Elevation** | Re-launches elevated when repair, setup, share, or identity tools need it |
 | **Optional** | `System.Speech` for voice; **curl.exe** (System32) for HTTPS with bad/self-signed certs via tools; Poppler / ImageMagick / Ghostscript for richer PDF rendering |
+| **RemoteCommand** | Domain-joined PC + signed-in **domain user**; WinRM enabled and reachable on the **remote** target (5985 / 5986) |
 
 ---
 
@@ -71,10 +76,11 @@ The file begins with a hybrid CMD header. Rename to `.cmd` for double-click laun
 
 ### First session
 
-1. If nothing is listening on the default base, the **Connect** dialog opens (enter URL + auth mode).
+1. MiniBot probes the primary base with a **short hard timeout**. If nothing answers (or `-BaseUrl` is empty), the **Connect** dialog opens (URL + auth mode).
 2. Authenticate if required (optional save to Windows Credential Manager).
 3. Type a task and press **Enter**.
 4. Use the title bar for working directory, context budget, and **PoweredBy** (model / endpoint picker).
+5. Tool-group chips show active groups; some tools paint **orange** when unavailable (no vision, Home/Core GPO, or off-domain RemoteCommand).
 
 ---
 
@@ -82,12 +88,12 @@ The file begins with a hybrid CMD header. Rename to `.cmd` for double-click laun
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `-BaseUrl` | `http://127.0.0.1:8080/v1` | Primary API base (port lives in the URL). Prefer `…/v1` for vLLM / Unsloth; bare `:8080` is fine for many llama.cpp builds. Empty `""` opens Connect immediately (no probe timeout). |
+| `-BaseUrl` | *(script default)* | Primary API base (port lives in the URL). Prefer `…/v1` for vLLM / Unsloth; bare `:8080` is fine for many llama.cpp builds. Empty `""` opens Connect immediately (no probe wait). |
 | `-Model` | *(empty)* | Preferred model id; empty → auto-pick from `/models` or PoweredBy. Slash ids OK (`unsloth/…`). |
 | `-ModelAlias` | *(empty)* | Display label in PoweredBy; empty → live server model id |
 | `-ApiKey` | `none` | HTTP **Bearer** only (not chat text). Use `none` to skip. Examples: Unsloth `sk-unsloth-…`, vLLM `--api-key`, xAI `xai-…` |
 | `-AgentName` | `MiniBot` | Window brand / agent identity |
-| `-Version` | `2.35.1` | Version string |
+| `-Version` | `2.35.2` | Version string |
 | `-MaxTokens` | `0` | Max completion tokens. **`0` = auto** (`n_ctx / 8` from server). Pass a value to lock. |
 | `-ContextWindowTokens` | `0` | Fallback `n_ctx` for budget math. **`0` = use server `/props` + `/models` only** |
 | `-Temperature` | `0.15` | Sampling temperature |
@@ -167,17 +173,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
   -Model "grok-4.5"
 ```
 
+Boot probes use a short **HttpClient** timeout (not a long hang) so Connect / Login can appear quickly when the primary host is unreachable.
+
 ---
 
 ## User interface
 
-- Borderless dark chrome: drag, minimize, maximize to work area, close  
+- Borderless dark chrome with rounded corners: drag, minimize, maximize to work area, close  
 - Title bar brand, path, context budget, **PoweredBy** model / endpoint menu (click toggles open/close; **+** adds an endpoint)  
-- Chat log with banners, code, tables, and **inline media** cards  
-- Sticky header: path, budget, auto-approve / auto-compact, tool-group chips  
+- Chat log with banners, code, tables, **inline media**, and **SVG visualization** cards  
+- Sticky header: path, budget, auto-approve / auto-compact, tool-group chips (orange = gated / unavailable)  
 - Approval strips: **Yes** / **No** / **All**  
 - **Send** ↔ **Stop** while the agent runs (Stop ≈ Esc interrupt)  
-- **Connect / Login** shared window: recover from a dead endpoint, switch auth mode (None / API / Basic NPM)
+- **Connect / Login** shared window: recover from a dead endpoint, switch auth mode (None / API / Basic NPM)  
+- Reply footers may show stream speed (**pp/s** · **t/s**) when timings are available  
 
 ### Keyboard
 
@@ -214,6 +223,37 @@ Supported: common images (`png` / `jpg` / `gif` / `webp` / `bmp` / `tif`), video
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Image.png" alt="Inline Image Display"><br>
   Inline Images
+</p>
+
+### Inline visualization (SVG)
+
+Reports and charts use a pure WPF **SvgView** (no browser control). The model wraps SVG between markers on their own lines:
+
+```text
+@@@RenderOpen
+<svg width="680" height="240" viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg">
+  <!-- numeric width/height required; viewBox + xmlns required -->
+</svg>
+@@@RenderClose
+```
+
+| Rule | Detail |
+|------|--------|
+| **Format** | SVG only (`rect` / `circle` / `line` / `path` / `text` / …) — not WPF XAML, not markdown fences around the body |
+| **Size** | Always set numeric `width` and `height` (pixels). Avoid `width="100%"` / `height="auto"` |
+| **Theme** | Dark palette: `#121216` / `#1A1A1E` bg, `#E5E7EB` text, `#7AA2F7` accent |
+| **Save** | Card actions can export **SVG** or **HTML** for the rendered viz |
+| **Reports** | Prefer one clear chart interleaved with short markdown over empty decoration |
+
+---
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Visualize1.png" alt="Inline Visualization"><br>
+  Inline Visualization
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Visualize2.png" alt="Inline Visualization"><br>
+  Inline Visualization
 </p>
 
 ---
@@ -257,9 +297,9 @@ The agent calls **EnableToolGroup** as needed (`group=network,shares` or `groups
 | Group | Role |
 |-------|------|
 | **core** | Read/write/edit/patch, find/search, hex view/edit, shell (last resort), CWD, env, EnableToolGroup |
-| **senses** | Vision (ReadImage, ReadPdf, ViewScreen), SpeakText — orange/disabled when the model has no vision |
+| **senses** | Vision (ReadImage, ReadPdf, ViewScreen), SpeakText — orange when the model has no vision |
 | **system** | OS inventory, processes, memory, power, services, software, updates, uptime, **AudioVolume**, **DisplayBrightness** |
-| **network** | Adapters, LAN scan, **ProbeShares**, local shares / maps / printers (lists) |
+| **network** | Adapters, LAN scan, **PortProbe**, **FindShares** / **FindWebHosts** / **FindRdp**, maps/printers lists, **RemoteCommand** |
 | **diag** | BSOD, events, disk, startup/tasks/drivers, StopProcess, quick diagnostics |
 | **repair** | sfc / DISM / chkdsk |
 | **setup** | Windows options, **GroupPolicy** (local Policies registry), restore, uninstall, reboot, NewMachineSetup |
@@ -279,11 +319,23 @@ The agent calls **EnableToolGroup** as needed (`group=network,shares` or `groups
 |------|----------|
 | **Volume / brightness** | **AudioVolume** / **DisplayBrightness** in the **system** group (not core, not RunCommand / COM shells) |
 | **Group Policy** | **GroupPolicy** under **setup** — local Policies registry editor. Orange / unavailable on Windows Home/Core (no gpedit) |
-| **Shares** | **ProbeShares** finds remote shares; **CreateShare** creates local users if missing, verifies passwords if they exist; clipboard UNC is **opt-in** |
-| **Map drive** | Auto-picks free letters (skips empty CD/DVD); session maps stay resolvable for elevated agents |
-| **HTTP** | **MakeHttpRequest**: default `verify_ssl=false` uses system **curl.exe -k** for bad/self-signed HTTPS (no process-wide cert hooks). `verify_ssl=true` = strict `Invoke-WebRequest` |
+| **PortProbe** | Native TCP open/closed. `computer=` / `hosts=` for targeted; omit hosts for LAN flood-alive then probe. Profiles: `winrm` / `ssh` / `rdp` / `web` / `smb` |
+| **FindShares** | Required for locating network shares (not net-view loops). Targeted or auto LAN search, then SMB ports + timed share guess |
+| **FindWebHosts** / **FindRdp** | LAN (or targeted) discovery for web ports / RDP 3389 via PortProbe |
+| **RemoteCommand** | Run a command on another PC over **WinRM** (approval). Domain-admin tool: domain-joined host + domain user. Orange off-domain. Port check before auth; closed ports stop thrash |
+| **Map drive** | Auto-picks free letters (skips empty CD/DVD); blank share passwords allowed when the account is blank |
+| **HTTP** | **MakeHttpRequest**: default `verify_ssl=false` uses system **curl.exe -k** for bad/self-signed HTTPS. `verify_ssl=true` = strict `Invoke-WebRequest` |
 | **Gallery** | Find/Install/Update run in a child PowerShell with timeout; Esc aborts the process tree |
 | **Hex** | HexView / HexEdit for PE-friendly dumps, disasm, and patch workflows |
+
+### Network discovery modes
+
+| Mode | How |
+|------|-----|
+| **Targeted** | Pass `computer=IP` or `hosts=['IP',…]` — only those machines (self always skipped) |
+| **Search** | Omit hosts — ICMP flood on the local prefix, then service ports / share guesses |
+
+**RemoteCommand** is always single-host (`host=` + `command=`). It does not LAN-flood. Prefer **PortProbe** first when checking reachability.
 
 ### Files & archives
 
@@ -340,14 +392,15 @@ Default completion size is **auto** (`-MaxTokens 0` → about `n_ctx / 8`) so sm
 - **`/retry`** after transient API errors.  
 - Single-instance lock per application id.  
 - Optional elevation re-launch preserves bound parameters while honoring `-HideConsole`.  
-- Working directory and sticky banners stay aligned when tools change CWD.
+- Working directory and sticky banners stay aligned when tools change CWD.  
+- Model list refresh runs **after** the main WPF host is up so login/connect is not blocked by long `/models` scrapes.
 
 ---
 
 ## Example launches
 
 ```powershell
-# Default: probe localhost:8080/v1 (Connect dialog if nothing is listening)
+# Default script base (Connect dialog if nothing is listening)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 -HideConsole:$false
 
 # Local llama.cpp-style base without /v1
@@ -362,7 +415,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
   -ApiKey "token-abc123" `
   -ModelAlias "vLLM"
 
-# Skip the probe timeout — open Connect immediately
+# Skip the probe — open Connect immediately
 powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 -BaseUrl ""
 
 # Full tool surface + speech + stored login
@@ -382,7 +435,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1
 
 | Symptom | What to try |
 |---------|-------------|
-| No connection | Use Connect dialog; check `-BaseUrl`, firewall, server health; run `/status` |
+| No connection / blank after hide console | Wait for Connect (probes are short); check `-BaseUrl`, firewall, server health; `-HideConsole:$false`; run `/status` |
 | Auth loop | Hold Caps Lock at launch or `$env:clear=1`; re-login; `-StoreCredentials:$true` |
 | Empty model list | Confirm auth mode (API vs None vs NPM); wait for `/models` after Connect |
 | 401 on cloud host | Use Auth = **API** and a Bearer key — not None/NPM |
@@ -390,6 +443,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1
 | Context pressure | `/compact`, `/clear`; raise server `n_ctx`; avoid huge tool dumps |
 | Tools missing | `/tools list`, `/tools <group>`, or `-ToolProfile full` |
 | GroupPolicy orange | Windows Home/Core has no local GPO editor — expected |
+| Vision tools orange | Active model has no `vision` ability |
+| RemoteCommand orange | Host/user not on a domain (workgroup or local login) — domain-admin tool only |
+| Remote port closed | Enable WinRM / firewall on the **remote** PC; do not thrash with shell probes |
 | Bad HTTPS in tools | Install **System32\curl.exe** (Win10+); `verify_ssl=false` uses `curl -k` |
 | Console needed | `-HideConsole:$false` |
 | Diagnostics | `-DebugLog:$true` or `$env:debug=1` → Desktop / TEMP `MiniBot-debug.log` |
@@ -401,7 +457,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1
 1. **Local first** — your model, your network, your approvals.  
 2. **Progressive surface** — lean cold start; unlock capability by task.  
 3. **Operator in the loop** — privileged host actions stay visible and confirmable.  
-4. **UI that works** — sticky chrome, interruptible tools, inline media, connect recovery, clear status.
+4. **UI that works** — sticky chrome, interruptible tools, inline media & SVG viz, connect recovery, clear status.  
+5. **Native Windows** — WPF + built-in remoting/file tools; no third-party browser host for charts.
 
 ---
 
@@ -412,5 +469,5 @@ MiniBot is a **self-contained Windows PowerShell agent** for OpenAI-compatible l
 ---
 
 <p align="center">
-  <sub>MiniBot · v2.35.4 · Windows PowerShell 5.1 · WPF</sub>
+  <sub>MiniBot · v2.40.0 · Windows PowerShell 5.1 · WPF</sub>
 </p>

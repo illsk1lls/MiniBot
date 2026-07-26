@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.35.4 - Mini Repair-Bot
+	MiniBot v2.40.0 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -40,7 +40,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.35.4",
+	[string]$Version = "2.40.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -516,6 +516,10 @@ $script:MB = @{
 	TurnsLeft          = $(try { [int]$MaxTurns } catch { 30 })
 	TurnsUsed          = 0
 	TurnsInFlight      = $false
+	VizHostState       = $null
+	VizCaptureReady    = $false
+	MdVizActive        = $false
+	MdVizBuf           = ''
 	ActiveToolGroups   = New-Object System.Collections.ArrayList
 	ToolProfile        = [string]$ToolProfile
 	ToolsOverheadChars = 0
@@ -549,6 +553,8 @@ $script:MB = @{
 	LastToolPreview    = ''
 	LoopConfirmedFps   = New-Object System.Collections.ArrayList
 	LoopGuardsFired    = 0
+	# RemoteCommand: host|transport -> last port-closed message (cleared each user turn)
+	RemotePortClosedBlocks = @{}
 	ApiFailures        = 0
 	InputHistory       = New-Object System.Collections.ArrayList
 	IsWorking          = $false
@@ -556,6 +562,17 @@ $script:MB = @{
 	CallStartTick      = 0
 	ThinkStartTick     = 0
 	FirstTokenTick     = 0
+	StreamHeadersTick  = 0
+	StreamFirstTokTick = 0
+	StreamEndTick      = 0
+	LastPrefillSec     = 0.0
+	LastGenSec         = 0.0
+	LastReplyChars     = 0
+	ServerPpS          = 0.0
+	ServerTgS          = 0.0
+	SpeedPromptN       = 0    # timings.prompt_n (new/eval'd prompt tokens this call)
+	SpeedPredictedN    = 0    # timings.predicted_n (generated tokens this call)
+	SpeedSource        = ''   # server | wall
 	ThoughtStampEmitted = $false
 	WorkedStampEmitted  = $false
 	SandboxRoot        = $null
@@ -983,6 +1000,7 @@ function Write-MBDebugLog {
 		} catch {}
 	}
 }
+
 
 
 function Normalize-MBApiBase {
@@ -2471,7 +2489,7 @@ function Get-MBServerPropsFromBase {
 		[string]$Username = '',
 		[string]$Password = '',
 		[string]$BearerToken = '',
-		[int]$TimeoutSeconds = 8
+		[int]$TimeoutSeconds = 3
 	)
 	$raw = Normalize-MBApiBase -Url $BaseUrl
 	if ([string]::IsNullOrWhiteSpace($raw)) {
@@ -2501,51 +2519,47 @@ function Get-MBServerPropsFromBase {
 		$credBytes = [System.Text.Encoding]::UTF8.GetBytes("${user}:${pass}")
 		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
 	}
-	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
-	$prev = $Global:ProgressPreference
-	$Global:ProgressPreference = 'SilentlyContinue'
-	try {
-		foreach ($root in $roots) {
-			if ([string]::IsNullOrWhiteSpace($root)) { continue }
-			try {
-				$resp = Invoke-WebRequest -Uri "$root/props" -Method GET -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
-				if ([int]$resp.StatusCode -ne 200) { continue }
-				$body = [string]$resp.Content
-				if ($body.TrimStart().StartsWith('<')) { continue }
-				$obj = $body | ConvertFrom-Json -ErrorAction Stop
-				$nCtx = 0
-				try { $nCtx = [int]$obj.default_generation_settings.n_ctx } catch { $nCtx = 0 }
-				if ($nCtx -le 0) {
-					try { $nCtx = [int]$obj.n_ctx } catch { $nCtx = 0 }
-				}
-				$alias = ''
-				try { $alias = [string]$obj.model_alias } catch { $alias = '' }
-				if (Test-MBLooksLikeModelPath -S $alias) { $alias = '' }
-				$vision = $false
-				$audio = $false
-				try { $vision = [bool]$obj.modalities.vision } catch {}
-				try { $audio = [bool]$obj.modalities.audio } catch {}
-				$slots = 0
-				try { $slots = [int]$obj.total_slots } catch { $slots = 0 }
-				return @{
-					Ok          = $true
-					Base        = $root
-					NCtx        = $nCtx
-					ModelAlias  = $alias
-					Vision      = $vision
-					Audio       = $audio
-					TotalSlots  = $slots
-					# path kept internally only - never shown / never used as model id
-					ModelPath   = $(try { [string]$obj.model_path } catch { '' })
-					IsSleeping  = $(try { [bool]$obj.is_sleeping } catch { $false })
-					BuildInfo   = $(try { [string]$obj.build_info } catch { '' })
-				}
-			} catch {
-				continue
+	$deadline = [Environment]::TickCount + ([Math]::Max(1, $TimeoutSeconds) * 1000) + 250
+	foreach ($root in $roots) {
+		if ([string]::IsNullOrWhiteSpace($root)) { continue }
+		$leftMs = $deadline - [Environment]::TickCount
+		if ($leftMs -lt 300) { break }
+		$tSec = [Math]::Max(1, [Math]::Min($TimeoutSeconds, [int][Math]::Ceiling($leftMs / 1000.0)))
+		try {
+			$resp = Invoke-MBHttpGetQuick -Url "$root/props" -Headers $headers -TimeoutSeconds $tSec
+			if (-not $resp.Ok -or [int]$resp.StatusCode -ne 200) { continue }
+			$body = [string]$resp.Content
+			if ([string]::IsNullOrWhiteSpace($body) -or $body.TrimStart().StartsWith('<')) { continue }
+			$obj = $body | ConvertFrom-Json -ErrorAction Stop
+			$nCtx = 0
+			try { $nCtx = [int]$obj.default_generation_settings.n_ctx } catch { $nCtx = 0 }
+			if ($nCtx -le 0) {
+				try { $nCtx = [int]$obj.n_ctx } catch { $nCtx = 0 }
 			}
+			$alias = ''
+			try { $alias = [string]$obj.model_alias } catch { $alias = '' }
+			if (Test-MBLooksLikeModelPath -S $alias) { $alias = '' }
+			$vision = $false
+			$audio = $false
+			try { $vision = [bool]$obj.modalities.vision } catch {}
+			try { $audio = [bool]$obj.modalities.audio } catch {}
+			$slots = 0
+			try { $slots = [int]$obj.total_slots } catch { $slots = 0 }
+			return @{
+				Ok          = $true
+				Base        = $root
+				NCtx        = $nCtx
+				ModelAlias  = $alias
+				Vision      = $vision
+				Audio       = $audio
+				TotalSlots  = $slots
+				ModelPath   = $(try { [string]$obj.model_path } catch { '' })
+				IsSleeping  = $(try { [bool]$obj.is_sleeping } catch { $false })
+				BuildInfo   = $(try { [string]$obj.build_info } catch { '' })
+			}
+		} catch {
+			continue
 		}
-	} finally {
-		$Global:ProgressPreference = $prev
 	}
 	return @{ Ok = $false }
 }
@@ -2962,12 +2976,14 @@ function Sync-MBActiveModelFromWpf {
 function Get-MBRemoteModelsFromBase {
 	# Probe one OpenAI-compat base (llama.cpp / Unsloth / vLLM / ...)
 	# -> @{ Ok; Base; Models=@(id strings); Entries=@(rich); Props }
+	# /models first (auth path); /props only after success or as short fallback.
 	param(
 		[string]$BaseUrl = '',
 		[string]$Username = '',
 		[string]$Password = '',
 		[string]$BearerToken = '',
-		[int]$TimeoutSeconds = 8
+		[int]$TimeoutSeconds = 3,
+		[switch]$SkipProps
 	)
 	$raw = Normalize-MBApiBase -Url $BaseUrl
 	if ([string]::IsNullOrWhiteSpace($raw)) { return @{ Ok = $false; Base = ''; Models = @(); Entries = @(); Props = $null } }
@@ -2985,9 +3001,7 @@ function Get-MBRemoteModelsFromBase {
 
 	$user = [string]$Username
 	$pass = [string]$Password
-	# Per-endpoint auth only — extras do not inherit primary llama.cpp NPM
 	$headers = @{}
-	# Prefer explicit BearerToken; else resolved key for this base (xAI / cloud)
 	$bt = [string]$BearerToken
 	if (-not (Test-MBApiKeyUsable -Key $bt)) {
 		try { $bt = Get-MBApiKeyForBase -BaseUrl $raw } catch { $bt = '' }
@@ -3000,131 +3014,135 @@ function Get-MBRemoteModelsFromBase {
 		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
 	}
 
-	$props = Get-MBServerPropsFromBase -BaseUrl $raw -Username $Username -Password $Password -BearerToken $bt -TimeoutSeconds $TimeoutSeconds
-
-	try {
-		$proto = [System.Net.SecurityProtocolType]::Tls12
-		try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
-		[System.Net.ServicePointManager]::SecurityProtocol = $proto
-	} catch {
-		try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
-	}
-	$OriginalProgressPreference = $Global:ProgressPreference
-	$Global:ProgressPreference = 'SilentlyContinue'
-	try {
-		foreach ($base in $bases) {
-			$url = "$base/models"
-			try {
-				$response = Invoke-WebRequest -Uri $url -Method GET -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
-				if ([int]$response.StatusCode -ne 200) { continue }
-				if (-not (Test-MBModelsApiResponse -Response $response)) { continue }
-				$body = [string]$response.Content
-				$obj = $body | ConvertFrom-Json -ErrorAction Stop
-				$rows = New-Object System.Collections.ArrayList
-				if ($obj.data) {
-					foreach ($row in @($obj.data)) { [void]$rows.Add($row) }
-				} elseif ($obj.models) {
-					foreach ($row in @($obj.models)) { [void]$rows.Add($row) }
-				} elseif ($obj -is [System.Array]) {
-					foreach ($row in @($obj)) { [void]$rows.Add($row) }
-				} elseif ($obj.id -or $obj.model -or $obj.name) {
-					[void]$rows.Add($obj)
+	$props = $null
+	$deadline = [Environment]::TickCount + ([Math]::Max(1, $TimeoutSeconds) * 1000) + 400
+	foreach ($base in $bases) {
+		$leftMs = $deadline - [Environment]::TickCount
+		if ($leftMs -lt 300) { break }
+		$tSec = [Math]::Max(1, [Math]::Min($TimeoutSeconds, [int][Math]::Ceiling($leftMs / 1000.0)))
+		$url = "$base/models"
+		try {
+			$resp = Invoke-MBHttpGetQuick -Url $url -Headers $headers -TimeoutSeconds $tSec
+			if ([int]$resp.StatusCode -in 401, 403) {
+				return @{ Ok = $false; Base = $raw; Models = @(); Entries = @(); Props = $null; StatusCode = [int]$resp.StatusCode }
+			}
+			if (-not $resp.Ok -or [int]$resp.StatusCode -ne 200) { continue }
+			# Shape check without full WebResponse object
+			$body = [string]$resp.Content
+			if ([string]::IsNullOrWhiteSpace($body) -or $body.TrimStart().StartsWith('<')) { continue }
+			$obj = $null
+			try { $obj = $body | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+			$rows = New-Object System.Collections.ArrayList
+			if ($obj.data) {
+				foreach ($row in @($obj.data)) { [void]$rows.Add($row) }
+			} elseif ($obj.models) {
+				foreach ($row in @($obj.models)) { [void]$rows.Add($row) }
+			} elseif ($obj -is [System.Array]) {
+				foreach ($row in @($obj)) { [void]$rows.Add($row) }
+			} elseif ($obj.id -or $obj.model -or $obj.name) {
+				[void]$rows.Add($obj)
+			}
+			$ids = New-Object System.Collections.ArrayList
+			$entries = New-Object System.Collections.ArrayList
+			foreach ($row in $rows) {
+				$id = ''
+				if ($row -is [string]) {
+					if (-not (Test-MBLooksLikeModelPath -S $row)) { $id = $row.Trim() }
+				} else {
+					$id = Get-MBPreferredModelAlias -Row $row -PropsAlias ''
+					if ([string]::IsNullOrWhiteSpace($id)) {
+						try {
+							if ($row.id) { $id = ([string]$row.id).Trim() }
+							elseif ($row.model) { $id = ([string]$row.model).Trim() }
+							elseif ($row.name) { $id = ([string]$row.name).Trim() }
+						} catch {}
+					}
 				}
-				$ids = New-Object System.Collections.ArrayList
-				$entries = New-Object System.Collections.ArrayList
-				$propsAlias = ''
-				if ($props -and $props.Ok) { $propsAlias = [string]$props.ModelAlias }
-				foreach ($row in $rows) {
-					$id = ''
-					if ($row -is [string]) {
-						if (-not (Test-MBLooksLikeModelPath -S $row)) { $id = $row.Trim() }
-					} else {
-						$id = Get-MBPreferredModelAlias -Row $row -PropsAlias $propsAlias
-						# Cloud OpenAI-compat (xAI etc.): id is authoritative
-						if ([string]::IsNullOrWhiteSpace($id)) {
-							try {
-								if ($row.id) { $id = ([string]$row.id).Trim() }
-								elseif ($row.model) { $id = ([string]$row.model).Trim() }
-								elseif ($row.name) { $id = ([string]$row.name).Trim() }
-							} catch {}
+				if ([string]::IsNullOrWhiteSpace($id)) { continue }
+				if (Test-MBLooksLikeModelPath -S $id) { continue }
+				if ($ids -contains $id) { continue }
+				[void]$ids.Add($id)
+				$nCtx = 0; $nCtxTrain = 0; $nParams = 0; $sizeB = 0
+				try { if ($row.meta.n_ctx) { $nCtx = [int]$row.meta.n_ctx } } catch {}
+				try { if ($row.meta.n_ctx_train) { $nCtxTrain = [int]$row.meta.n_ctx_train } } catch {}
+				try { if ($row.meta.n_params) { $nParams = [double]$row.meta.n_params } } catch {}
+				try { if ($row.meta.size) { $sizeB = [double]$row.meta.size } } catch {}
+				try { if ($nCtx -le 0 -and $row.context_length) { $nCtx = [int]$row.context_length } } catch {}
+				try { if ($nCtx -le 0 -and $row.max_context_length) { $nCtx = [int]$row.max_context_length } } catch {}
+				try { if ($nCtx -le 0 -and $row.max_model_len) { $nCtx = [int]$row.max_model_len } } catch {}
+				try {
+					if ($nCtx -le 0 -and $row.PSObject.Properties['max_model_len']) {
+						$nCtx = [int]$row.PSObject.Properties['max_model_len'].Value
+					}
+				} catch {}
+				$vision = $false
+				try {
+					$caps = @($row.capabilities)
+					if ($caps -contains 'multimodal' -or $caps -contains 'vision') { $vision = $true }
+				} catch {}
+				try {
+					$mods = $row.modalities
+					if ($mods) {
+						if ($mods -is [System.Array] -and ($mods -contains 'vision' -or $mods -contains 'image')) { $vision = $true }
+						else {
+							try { if ($mods.vision -or $mods.image) { $vision = $true } } catch {}
 						}
 					}
-					if ([string]::IsNullOrWhiteSpace($id)) { continue }
-					if (Test-MBLooksLikeModelPath -S $id) { continue }
-					if ($ids -contains $id) { continue }
-					[void]$ids.Add($id)
-					$nCtx = 0; $nCtxTrain = 0; $nParams = 0; $sizeB = 0
-					try { if ($row.meta.n_ctx) { $nCtx = [int]$row.meta.n_ctx } } catch {}
-					try { if ($row.meta.n_ctx_train) { $nCtxTrain = [int]$row.meta.n_ctx_train } } catch {}
-					try { if ($row.meta.n_params) { $nParams = [double]$row.meta.n_params } } catch {}
-					try { if ($row.meta.size) { $sizeB = [double]$row.meta.size } } catch {}
-					# Unsloth Studio / OpenAI-compat fields (top-level, not under meta)
-					try { if ($nCtx -le 0 -and $row.context_length) { $nCtx = [int]$row.context_length } } catch {}
-					try { if ($nCtx -le 0 -and $row.max_context_length) { $nCtx = [int]$row.max_context_length } } catch {}
-					# Do not map native_context_length -> NCtxTrain (would show a misleading "train" banner field)
-					# vLLM OpenAI server: max_model_len on model card
-					try { if ($nCtx -le 0 -and $row.max_model_len) { $nCtx = [int]$row.max_model_len } } catch {}
-					try {
-						if ($nCtx -le 0 -and $row.PSObject.Properties['max_model_len']) {
-							$nCtx = [int]$row.PSObject.Properties['max_model_len'].Value
-						}
-					} catch {}
-					$vision = $false
-					if ($props -and $props.Ok) {
-						try { $vision = [bool]$props.Vision } catch {}
-						if ($nCtx -le 0 -and [int]$props.NCtx -gt 0) { $nCtx = [int]$props.NCtx }
-					}
-					try {
-						$caps = @($row.capabilities)
-						if ($caps -contains 'multimodal' -or $caps -contains 'vision') { $vision = $true }
-					} catch {}
-					try {
-						# Some OpenAI-compat servers advertise modalities as array/object
-						$mods = $row.modalities
-						if ($mods) {
-							if ($mods -is [System.Array] -and ($mods -contains 'vision' -or $mods -contains 'image')) { $vision = $true }
-							else {
-								try { if ($mods.vision -or $mods.image) { $vision = $true } } catch {}
+				} catch {}
+				[void]$entries.Add([pscustomobject]@{
+					Id        = $id
+					NCtx      = $nCtx
+					NCtxTrain = $nCtxTrain
+					NParams   = $nParams
+					Size      = $sizeB
+					Vision    = $vision
+				})
+			}
+			if ($ids.Count -gt 0) {
+				# Optional props enrichment after models succeed (short remaining budget)
+				if (-not $SkipProps) {
+					$leftMs = $deadline - [Environment]::TickCount
+					if ($leftMs -ge 400) {
+						$pt = [Math]::Max(1, [Math]::Min(2, [int][Math]::Ceiling($leftMs / 1000.0)))
+						try {
+							$props = Get-MBServerPropsFromBase -BaseUrl $raw -Username $Username -Password $Password -BearerToken $bt -TimeoutSeconds $pt
+						} catch { $props = $null }
+						if ($props -and $props.Ok) {
+							$propsAlias = [string]$props.ModelAlias
+							foreach ($en in $entries) {
+								if ($en.NCtx -le 0 -and [int]$props.NCtx -gt 0) { $en.NCtx = [int]$props.NCtx }
+								if (-not $en.Vision) {
+									try { if ($props.Vision) { $en.Vision = $true } } catch {}
+								}
+							}
+							if ($propsAlias -and -not ($ids -contains $propsAlias) -and -not (Test-MBLooksLikeModelPath -S $propsAlias)) {
+								# keep models list authoritative; do not invent extra ids
 							}
 						}
-					} catch {}
-					[void]$entries.Add([pscustomobject]@{
-						Id        = $id
-						NCtx      = $nCtx
-						NCtxTrain = $nCtxTrain
-						NParams   = $nParams
-						Size      = $sizeB
-						Vision    = $vision
-					})
-				}
-				# Props-only alias if /models empty but props has alias
-				if ($ids.Count -eq 0 -and $props -and $props.Ok -and $props.ModelAlias) {
-					$pa = [string]$props.ModelAlias
-					if (-not (Test-MBLooksLikeModelPath -S $pa)) {
-						[void]$ids.Add($pa)
-						[void]$entries.Add([pscustomobject]@{
-							Id = $pa; NCtx = [int]$props.NCtx; NCtxTrain = 0
-							NParams = 0; Size = 0; Vision = [bool]$props.Vision
-						})
 					}
 				}
-				if ($ids.Count -gt 0) {
-					return @{
-						Ok      = $true
-						Base    = [string]$base
-						Models  = @($ids)
-						Entries = @($entries)
-						Props   = $props
-					}
+				return @{
+					Ok      = $true
+					Base    = [string]$base
+					Models  = @($ids)
+					Entries = @($entries)
+					Props   = $props
 				}
-			} catch {
-				continue
 			}
+		} catch {
+			continue
 		}
-	} finally {
-		$Global:ProgressPreference = $OriginalProgressPreference
 	}
-	# props-only fallback
+	# props-only fallback (slow path only when /models empty)
+	if (-not $SkipProps) {
+		$leftMs = $deadline - [Environment]::TickCount
+		if ($leftMs -ge 400) {
+			$pt = [Math]::Max(1, [Math]::Min($TimeoutSeconds, [int][Math]::Ceiling($leftMs / 1000.0)))
+			try {
+				$props = Get-MBServerPropsFromBase -BaseUrl $raw -Username $Username -Password $Password -BearerToken $bt -TimeoutSeconds $pt
+			} catch { $props = $null }
+		}
+	}
 	if ($props -and $props.Ok -and $props.ModelAlias -and -not (Test-MBLooksLikeModelPath -S ([string]$props.ModelAlias))) {
 		$pa = [string]$props.ModelAlias
 		return @{
@@ -3147,7 +3165,7 @@ function Get-MBRemoteModelList {
 		[string]$BaseUrl = '',
 		[string]$Username = '',
 		[string]$Password = '',
-		[int]$TimeoutSeconds = 8
+		[int]$TimeoutSeconds = 3
 	)
 	$r = Get-MBRemoteModelsFromBase -BaseUrl $BaseUrl -Username $Username -Password $Password -TimeoutSeconds $TimeoutSeconds
 	if ($r.Ok) {
@@ -3164,7 +3182,7 @@ function Add-MBApiBaseEndpoint {
 		[string]$BearerToken = '',
 		[ValidateSet('npm', 'apikey', 'none', '')]
 		[string]$AuthMode = '',
-		[int]$TimeoutSeconds = 8
+		[int]$TimeoutSeconds = 3
 	)
 	$n = Normalize-MBApiBase -Url $Url
 	if ([string]::IsNullOrWhiteSpace($n)) {
@@ -3280,13 +3298,13 @@ function Refresh-MBRemoteModels {
 		foreach ($b in $apiBases) {
 			$bt = ''
 			try { $bt = Get-MBApiKeyForBase -BaseUrl $b } catch { $bt = '' }
-			$r = Get-MBRemoteModelsFromBase -BaseUrl $b -BearerToken $bt
+			$r = Get-MBRemoteModelsFromBase -BaseUrl $b -BearerToken $bt -TimeoutSeconds 3
 			if (-not $r.Ok) {
 				# Retry once with launch -ApiKey if base is primary
 				try {
 					$lk = [string]$ApiKey
 					if ((Test-MBApiKeyUsable -Key $lk) -and -not (Test-MBApiKeyUsable -Key $bt)) {
-						$r = Get-MBRemoteModelsFromBase -BaseUrl $b -BearerToken $lk
+						$r = Get-MBRemoteModelsFromBase -BaseUrl $b -BearerToken $lk -TimeoutSeconds 3
 					}
 				} catch {}
 			}
@@ -3611,6 +3629,11 @@ function Show-MBWorkingHint {
 	$script:MB.CallStartTick = 0
 	$script:MB.ThinkStartTick = 0
 	$script:MB.FirstTokenTick = 0
+	try { Reset-MBStreamSpeedState } catch {
+		$script:MB.LastPrefillSec = 0.0
+		$script:MB.LastGenSec = 0.0
+		$script:MB.LastReplyChars = 0
+	}
 	$script:MB.ThoughtStampEmitted = $false
 	$script:MB.WorkedStampEmitted = $false
 	try {
@@ -3651,18 +3674,219 @@ function Format-MBThoughtDurationSec {
 	return ('{0}m{1:0}s' -f $mins, $rem)
 }
 
+function Reset-MBStreamSpeedState {
+	$script:MB.StreamHeadersTick = 0
+	$script:MB.StreamFirstTokTick = 0
+	$script:MB.StreamEndTick = 0
+	$script:MB.LastPrefillSec = 0.0
+	$script:MB.LastGenSec = 0.0
+	$script:MB.ServerPpS = 0.0
+	$script:MB.ServerTgS = 0.0
+	$script:MB.SpeedPromptN = 0
+	$script:MB.SpeedPredictedN = 0
+	$script:MB.SpeedSource = ''
+	$script:MB.LastReplyChars = 0
+}
+
+function Update-MBStreamTimingsFromChunk {
+	# Prefer llama.cpp/server timings (prompt_per_second / predicted_per_second) when present.
+	param($Chunk)
+	if ($null -eq $Chunk) { return }
+	$tim = $null
+	try { $tim = Get-MBProp $Chunk 'timings' } catch { $tim = $null }
+	if (-not $tim) {
+		try {
+			$u = Get-MBProp $Chunk 'usage'
+			if ($u) { $tim = Get-MBProp $u 'timings' }
+		} catch { $tim = $null }
+	}
+	if (-not $tim) { return }
+	# Token counts for this call (prompt_n is often only *new* tokens after KV cache)
+	try {
+		$pn = Get-MBProp $tim 'prompt_n'
+		if ($null -ne $pn -and [int]$pn -gt 0) { $script:MB.SpeedPromptN = [int]$pn }
+	} catch {}
+	try {
+		$tn = Get-MBProp $tim 'predicted_n'
+		if ($null -eq $tn) { $tn = Get-MBProp $tim 'eval_n' }
+		if ($null -ne $tn -and [int]$tn -gt 0) { $script:MB.SpeedPredictedN = [int]$tn }
+	} catch {}
+	try {
+		$pps = Get-MBProp $tim 'prompt_per_second'
+		if ($null -eq $pps) { $pps = Get-MBProp $tim 'prompt_tokens_per_second' }
+		if ($null -ne $pps -and [double]$pps -gt 0) {
+			$script:MB.ServerPpS = [double]$pps
+			$script:MB.SpeedSource = 'server'
+		}
+	} catch {}
+	try {
+		$tps = Get-MBProp $tim 'predicted_per_second'
+		if ($null -eq $tps) { $tps = Get-MBProp $tim 'tokens_per_second' }
+		if ($null -eq $tps) { $tps = Get-MBProp $tim 'completion_per_second' }
+		if ($null -ne $tps -and [double]$tps -gt 0) {
+			$script:MB.ServerTgS = [double]$tps
+			$script:MB.SpeedSource = 'server'
+		}
+	} catch {}
+	# Also harvest n/ms if rates missing
+	try {
+		if ([double]$script:MB.ServerPpS -le 0) {
+			$pn = Get-MBProp $tim 'prompt_n'
+			$pms = Get-MBProp $tim 'prompt_ms'
+			if ($null -ne $pn -and $null -ne $pms -and [double]$pms -gt 0) {
+				$script:MB.ServerPpS = [double]$pn / ([double]$pms / 1000.0)
+				$script:MB.SpeedSource = 'server'
+			}
+		}
+	} catch {}
+	try {
+		if ([double]$script:MB.ServerTgS -le 0) {
+			$tn = Get-MBProp $tim 'predicted_n'
+			if ($null -eq $tn) { $tn = Get-MBProp $tim 'eval_n' }
+			$tms = Get-MBProp $tim 'predicted_ms'
+			if ($null -eq $tms) { $tms = Get-MBProp $tim 'eval_ms' }
+			if ($null -ne $tn -and $null -ne $tms -and [double]$tms -gt 0) {
+				$script:MB.ServerTgS = [double]$tn / ([double]$tms / 1000.0)
+				$script:MB.SpeedSource = 'server'
+			}
+		}
+	} catch {}
+}
+
+function Complete-MBStreamSpeedMetrics {
+	# Finalize wall-clock windows at stream end (before UI flush). Does not override server timings.
+	param([int]$EndTick = 0)
+	if ($EndTick -eq 0) { $EndTick = [Environment]::TickCount }
+	$script:MB.StreamEndTick = $EndTick
+	$http0 = 0
+	$first0 = 0
+	try { $http0 = [int]$script:MB.StreamHeadersTick } catch { $http0 = 0 }
+	try { $first0 = [int]$script:MB.StreamFirstTokTick } catch { $first0 = 0 }
+	if ($first0 -eq 0) {
+		try { $first0 = [int]$script:MB.FirstTokenTick } catch { $first0 = 0 }
+	}
+	# Prefill: headers → first token (server work after accept; matches streaming SSE timing)
+	if ($http0 -ne 0 -and $first0 -ne 0) {
+		$ms = ($first0 - $http0) -band 0x7fffffff
+		if ($ms -lt 0) { $ms = 0 }
+		$script:MB.LastPrefillSec = [double]($ms / 1000.0)
+	}
+	# Generation: first token → stream end (exclude markdown flush / worked-stamp UI)
+	if ($first0 -ne 0) {
+		$msG = ($EndTick - $first0) -band 0x7fffffff
+		if ($msG -lt 0) { $msG = 0 }
+		$script:MB.LastGenSec = [double]($msG / 1000.0)
+	}
+}
+
+function Test-MBSpeedStampWorthShowing {
+	# Skip micro follow-ups (tool-result rounds / continues): tiny prompt_n or predicted_n
+	# makes pp/s look artificially low (batch not warm) and confuses the main-reply rates.
+	param(
+		[int]$PromptN = 0,
+		[int]$PredictedN = 0,
+		[double]$PrefillSec = 0,
+		[double]$GenSec = 0,
+		[int]$CompletionTok = 0,
+		[int]$ReplyChars = 0
+	)
+	if ($PredictedN -le 0) { $PredictedN = $CompletionTok }
+	if ($PredictedN -le 0 -and $ReplyChars -gt 0) {
+		$PredictedN = [Math]::Max(1, [int][Math]::Round($ReplyChars / 4.0))
+	}
+	# Meaningful decode (main answer or long continue)
+	if ($PredictedN -ge 48) { return $true }
+	if ($GenSec -ge 1.5 -and $PredictedN -ge 16) { return $true }
+	# Meaningful prefill with some output (first shot on a real prompt)
+	if ($PromptN -ge 128 -and $PredictedN -ge 8) { return $true }
+	if ($PrefillSec -ge 0.75 -and $PredictedN -ge 16) { return $true }
+	return $false
+}
+
+function Format-MBSpeedBits {
+	# pp/s = prompt-processing (prefill); t/s = generation.
+	# Prefer llama.cpp/server timings when present; else wall-clock windows finalized at stream end.
+	# Omit entirely on tiny post-tool / ack streams (see Test-MBSpeedStampWorthShowing).
+	$parts = New-Object System.Collections.ArrayList
+	$pps = 0.0
+	$tps = 0.0
+	try { $pps = [double]$script:MB.ServerPpS } catch { $pps = 0.0 }
+	try { $tps = [double]$script:MB.ServerTgS } catch { $tps = 0.0 }
+	$prefill = 0.0
+	$gen = 0.0
+	try { $prefill = [double]$script:MB.LastPrefillSec } catch { $prefill = 0.0 }
+	try { $gen = [double]$script:MB.LastGenSec } catch { $gen = 0.0 }
+	$pt = 0
+	$ct = 0
+	$pn = 0
+	$tn = 0
+	try { $pt = [int]$script:MB.LastServerPromptTokens } catch { $pt = 0 }
+	try { $ct = [int]$script:MB.LastServerCompletionTokens } catch { $ct = 0 }
+	try { $pn = [int]$script:MB.SpeedPromptN } catch { $pn = 0 }
+	try { $tn = [int]$script:MB.SpeedPredictedN } catch { $tn = 0 }
+	$chars = 0
+	try { $chars = [int]$script:MB.LastReplyChars } catch { $chars = 0 }
+	if ($ct -le 0 -and $chars -gt 0) {
+		$ct = [Math]::Max(1, [int][Math]::Round($chars / 4.0))
+	}
+	if ($pps -le 0 -or $tps -le 0) {
+		# Wall fallback. Prefer timings.prompt_n (tokens actually evaluated this call).
+		# Avoid dividing full usage.prompt_tokens (whole context) by a short TTFT window.
+		$ptWall = 0
+		if ($pn -gt 0) { $ptWall = $pn }
+		elseif ($pt -gt 0 -and $pt -le 4000) { $ptWall = $pt }
+		elseif ($pt -gt 4000 -and $prefill -ge 1.0) { $ptWall = $pt }
+		if ($pps -le 0 -and $ptWall -gt 0 -and $prefill -ge 0.05) {
+			$pps = [double]$ptWall / $prefill
+		}
+		if ($tps -le 0 -and $ct -gt 0 -and $gen -ge 0.05) {
+			$tps = [double]$ct / $gen
+		}
+	}
+	$show = Test-MBSpeedStampWorthShowing -PromptN $pn -PredictedN $tn -PrefillSec $prefill -GenSec $gen -CompletionTok $ct -ReplyChars $chars
+	if (-not $show) {
+		try {
+			Write-MBDebugLog -Step 'STREAM_SPEED_SKIP' -Detail ("micro call pn={0} tn={1} ct={2} chars={3} prefill={4:0.00}s gen={5:0.00}s" -f $pn, $tn, $ct, $chars, $prefill, $gen)
+		} catch {}
+		return ''
+	}
+	# Whole-stamp gate already dropped micro tool-followups. Show both rates when present;
+	# do not hide pp/s just because prompt_n is modest (KV cache often reports only *new* tokens).
+	if ($pps -gt 0) {
+		$script:MB.SpeedSource = $(if ([double]$script:MB.ServerPpS -gt 0) { 'server' } else { 'wall' })
+		[void]$parts.Add(('{0:0.0} pp/s' -f $pps))
+	}
+	if ($tps -gt 0) {
+		if ([string]$script:MB.SpeedSource -ne 'server' -and [double]$script:MB.ServerTgS -gt 0) {
+			$script:MB.SpeedSource = 'server'
+		} elseif ([string]::IsNullOrWhiteSpace([string]$script:MB.SpeedSource)) {
+			$script:MB.SpeedSource = 'wall'
+		}
+		[void]$parts.Add(('{0:0.0} t/s' -f $tps))
+	}
+	if ($parts.Count -eq 0) { return '' }
+	# Build middot at runtime (literal · in source mojibakes under PS 5.1 without BOM)
+	$sep = ('  {0}  ' -f [string][char]0x00B7)
+	return ($parts -join $sep)
+}
+
 function Write-MBTimingStamp {
 	param(
 		[Parameter(Mandatory = $true)]
 		[ValidateSet('thought', 'worked')]
 		[string]$Kind,
-		[double]$Seconds = 0
+		[double]$Seconds = 0,
+		[string]$Extra = ''
 	)
 	if ($Seconds -lt 0) { $Seconds = 0 }
 	if ($Kind -eq 'thought') {
 		$line = ('Thought for {0}' -f (Format-MBThoughtDurationSec -Seconds $Seconds))
 	} else {
 		$line = ('Worked for {0}' -f (Format-MBDurationSec -Seconds $Seconds))
+	}
+	if (-not [string]::IsNullOrWhiteSpace($Extra)) {
+		$sep = ('  {0}  ' -f [string][char]0x00B7)
+		$line = $line + $sep + $Extra.Trim()
 	}
 	if (Test-MBWpfActive) {
 		if (-not $script:MB.Wpf.WriteQueue) {
@@ -3687,7 +3911,12 @@ function Write-MBThoughtStamp {
 	if ([bool]$script:MB.ThoughtStampEmitted) { return }
 	$think0 = [int]$script:MB.ThinkStartTick
 	if ($think0 -eq 0) { return }
+	# UX "Thought for" only — wall clock from think start to first token.
+	# Speed metrics (pp/s) are finalized later in Complete-MBStreamSpeedMetrics / server timings.
 	$tok0 = [int]$script:MB.FirstTokenTick
+	if ($tok0 -eq 0) {
+		try { $tok0 = [int]$script:MB.StreamFirstTokTick } catch { $tok0 = 0 }
+	}
 	if ($tok0 -ne 0) {
 		$ms = ($tok0 - $think0) -band 0x7fffffff
 		if ($ms -lt 0) { $ms = 0 }
@@ -3697,20 +3926,32 @@ function Write-MBThoughtStamp {
 	}
 	$script:MB.ThoughtStampEmitted = $true
 	$script:MB.ThinkStartTick = 0
-	$script:MB.FirstTokenTick = 0
 }
 
 function Write-MBWorkedStamp {
-	param([double]$Seconds = -1)
+	param(
+		[double]$Seconds = -1,
+		[switch]$NoSpeed
+	)
 	if ($script:MB.Interrupt) { return }
-	if ($Seconds -ge 0) {
-		Write-MBTimingStamp -Kind worked -Seconds $Seconds
-		return
+	$sec = $Seconds
+	if ($sec -lt 0) {
+		# Prefer stream-end gen window (excludes post-stream UI flush)
+		try {
+			if ([double]$script:MB.LastGenSec -gt 0) { $sec = [double]$script:MB.LastGenSec }
+		} catch {}
+		if ($sec -lt 0) {
+			$work0 = [int]$script:MB.WorkStartTick
+			if ($work0 -eq 0) { return }
+			$sec = Get-MBElapsedSec -StartTick $work0
+		}
 	}
-	$work0 = [int]$script:MB.WorkStartTick
-	if ($work0 -eq 0) { return }
-	Write-MBTimingStamp -Kind worked -Seconds (Get-MBElapsedSec -StartTick $work0)
-	$script:MB.WorkStartTick = 0
+	$speed = ''
+	if (-not $NoSpeed) {
+		try { $speed = Format-MBSpeedBits } catch { $speed = '' }
+	}
+	Write-MBTimingStamp -Kind worked -Seconds $sec -Extra $speed
+	if ($Seconds -lt 0) { $script:MB.WorkStartTick = 0 }
 }
 
 function Hide-MBPromptForWork {
@@ -3813,7 +4054,7 @@ function Write-MBConnectionTail {
 			$sw = [System.Diagnostics.Stopwatch]::StartNew()
 			$probe = $null
 			if (-not [string]::IsNullOrWhiteSpace($base)) {
-				$probe = Test-ModelConnection -BaseUrl $base -TimeoutSeconds 6
+				$probe = Test-ModelConnection -BaseUrl $base -TimeoutSeconds 3
 			}
 			if ($probe -and $null -ne $probe.ElapsedMs) {
 				$ms = [int]$probe.ElapsedMs
@@ -3841,17 +4082,15 @@ function Write-MBConnectionTail {
 	Write-MBOk ("Connected ({0}, {1} ms)" -f $authLabel, $ms)
 
 	if ($IncludeNativeHelpers) {
+		# Capability list (what MiniBot can use), not a runtime-load probe.
 		$nativeBits = New-Object System.Collections.ArrayList
-		if ($script:HasNative) {
-			[void]$nativeBits.Add('ProcHelper')
-			[void]$nativeBits.Add('HTML extract')
-		}
-		if ($script:HasCredMan) { [void]$nativeBits.Add('CredMan') }
-		if ($script:HasDiskWalk) { [void]$nativeBits.Add('DiskWalk') }
-		if ($script:HasDpiScreen) { [void]$nativeBits.Add('VisionHelper') }
-		if ($nativeBits.Count -gt 0) {
-			Write-MBInfo ("Native helpers loaded ({0})" -f ($nativeBits -join ', '))
-		}
+		[void]$nativeBits.Add('ProcHelper')
+		[void]$nativeBits.Add('HTML extract')
+		[void]$nativeBits.Add('CredMan')
+		[void]$nativeBits.Add('DiskWalk')
+		[void]$nativeBits.Add('VisionHelper')
+		[void]$nativeBits.Add('SvgView')
+		Write-MBInfo ("Native helpers ({0})" -f ($nativeBits -join ', '))
 		if ($script:MB.SpeechEnabled -and (Test-MBSpeechUiOk)) {
 			$dict = if ($script:MB.SpeechEngine) { 'PTT+TTS' } elseif ($script:MB.SpeechReady) { 'TTS only' } else { 'init failed' }
 			Write-MBInfo ("Speech: ON ({0}) - hold Right-Ctrl to talk" -f $dict)
@@ -4539,6 +4778,94 @@ function Get-MBSharedHttpClient {
 	$script:MB.HttpClient = $client
 	$script:MB.HttpClientOwned = $true
 	return $client
+}
+
+function Invoke-MBHttpGetQuick {
+	# Hard-timeout GET for boot/auth probes (HttpClient.Timeout; avoids rare IWR hangs past TimeoutSec).
+	param(
+		[string]$Url,
+		[hashtable]$Headers = $null,
+		[int]$TimeoutSeconds = 3
+	)
+	if ($TimeoutSeconds -lt 1) { $TimeoutSeconds = 1 }
+	if ($TimeoutSeconds -gt 15) { $TimeoutSeconds = 15 }
+	$out = @{
+		Ok         = $false
+		StatusCode = 0
+		Content    = ''
+		Error      = ''
+		TimedOut   = $false
+	}
+	if ([string]::IsNullOrWhiteSpace($Url)) {
+		$out.Error = 'empty url'
+		return $out
+	}
+	$handler = $null
+	$client = $null
+	try {
+		try {
+			$proto = [System.Net.SecurityProtocolType]::Tls12
+			try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
+			[System.Net.ServicePointManager]::SecurityProtocol = $proto
+		} catch {}
+		try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
+		$handler = New-Object System.Net.Http.HttpClientHandler
+		$handler.AllowAutoRedirect = $true
+		try { $handler.UseCookies = $false } catch {}
+		$client = New-Object System.Net.Http.HttpClient ($handler)
+		$client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+		try { $client.DefaultRequestHeaders.ExpectContinue = $false } catch {}
+		$req = New-Object System.Net.Http.HttpRequestMessage ([System.Net.Http.HttpMethod]::Get, $Url)
+		if ($Headers) {
+			foreach ($k in @($Headers.Keys)) {
+				try {
+					[void]$req.Headers.TryAddWithoutValidation([string]$k, [string]$Headers[$k])
+				} catch {}
+			}
+		}
+		$resp = $client.SendAsync($req).GetAwaiter().GetResult()
+		$out.StatusCode = [int]$resp.StatusCode
+		try {
+			$out.Content = [string]$resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+		} catch { $out.Content = '' }
+		$out.Ok = ($out.StatusCode -ge 200 -and $out.StatusCode -lt 300)
+		if (-not $out.Ok -and [string]::IsNullOrWhiteSpace($out.Error)) {
+			$out.Error = ("HTTP {0}" -f $out.StatusCode)
+		}
+		return $out
+	} catch [System.Threading.Tasks.TaskCanceledException] {
+		$out.TimedOut = $true
+		$out.Error = 'timeout'
+		return $out
+	} catch [System.OperationCanceledException] {
+		$out.TimedOut = $true
+		$out.Error = 'timeout'
+		return $out
+	} catch {
+		$msg = ''
+		try { $msg = [string]$_.Exception.Message } catch { $msg = 'request failed' }
+		# Unwrap AggregateException from .Result/GetAwaiter patterns
+		try {
+			$ex = $_.Exception
+			while ($ex.InnerException) {
+				$ex = $ex.InnerException
+				if ($ex -is [System.Threading.Tasks.TaskCanceledException] -or $ex -is [System.OperationCanceledException]) {
+					$out.TimedOut = $true
+					$out.Error = 'timeout'
+					return $out
+				}
+			}
+			if ($ex -and $ex.Message) { $msg = [string]$ex.Message }
+		} catch {}
+		$out.Error = $msg
+		if ($msg -match '(?i)\b(401|403)\b' -or $msg -match '(?i)unauthorized|forbidden') {
+			if ($msg -match '403') { $out.StatusCode = 403 } else { $out.StatusCode = 401 }
+		}
+		return $out
+	} finally {
+		try { if ($null -ne $client) { $client.Dispose() } } catch {}
+		try { if ($null -ne $handler) { $handler.Dispose() } } catch {}
+	}
 }
 
 function Dispose-MBSharedHttpClient {
@@ -6384,7 +6711,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 	}).AddArgument($bag).AddArgument($hint).AddArgument($ver)
 
 	[void]$ps.BeginInvoke()
-	[void]$bag.ReadyWait.WaitOne(15000)
+	[void]$bag.ReadyWait.WaitOne(8000)
 	if ($bag.Failed -or -not $bag.Ready) {
 		try { $ps.Stop(); $ps.Dispose() } catch {}
 		try { $rs.Close(); $rs.Dispose() } catch {}
@@ -6856,7 +7183,7 @@ function Show-MBEndpointConnectDialog {
 
 function Connect-MBModelEndpoint {
 	param(
-		[int]$TimeoutSeconds = 8
+		[int]$TimeoutSeconds = 3
 	)
 
 	$resolveBase = {
@@ -8583,7 +8910,7 @@ function New-MBChatRequestBody {
 $script:MBGroupQuickMap = [ordered]@{
 	senses = 'vision/TTS'
 	system = 'inventory+services+volume+brightness'
-	network = 'LAN/shares-find'
+	network = 'LAN/PortProbe/Find*/RemoteCommand'
 	diag = 'BSOD/disk/events'; repair = 'sfc/dism/chkdsk'
 	setup = 'options/GroupPolicy/restore/uninstall/reboot/NewMachine'
 	identity = 'users/domain'; shares = 'map/share/print'; installers = 'apps'
@@ -8596,19 +8923,30 @@ You are $AgentName v$Version - local Windows tool-first agent (PS 5.1). Evidence
 No delete/destroy unless operator asked for that specific target. Mutate after read when possible; deny = stop + replan (never retry the same blocked approach). Prefer specialized tools; RunCommand is LAST resort.
 Never ReadFile images/video/PDF/binary (crashes servers) — vision: senses ReadImage/ReadPdf; operator display: markdown below.
 INLINE MEDIA (chat UI) — REQUIRED for play/show/hear: always embed on its own line as ![label](absolute-path). Prefer absolute Windows paths. Images png/jpg/gif/webp/bmp/tif; video mp4/m4v/mov/wmv; audio mp3/wav/flac/m4a/aac/ogg/wma. After DownloadFile / ViewScreen save / FindFiles pick / any "play or show" ask: emit ![...](...) so it plays in-chat. NEVER Start-Process/Invoke-Item/explorer/VLC/default-app first. External player ONLY if format not inline-compatible or operator explicitly asked external. Do not reply with a bare path alone when they should see/hear it.
+INLINE VISUALS — emit SVG between @@@RenderOpen and @@@RenderClose (own lines). Host renders pure WPF SvgView (scrolls/clips like media, centered in the card). Not WPF XAML. No markdown fences. SVG body only. ALWAYS set numeric width AND height on <svg> (pixels). Never width="100%" or height="auto". Include xmlns + viewBox. Colors: #E5E7EB / #9CA3AF text; #121216 / #1A1A1E / #252530 bg; #3A3A42 border; #7AA2F7 / #7DCFFF accent. Optional per-shape <title> for tooltips only. Do NOT put a chart title on the drawing unless the operator asked or labels are needed (axes/legend). Prefer data geometry first. Example:
+@@@RenderOpen
+<svg width="680" height="240" viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg"><rect width="680" height="240" fill="#1A1A1E"/><rect x="80" y="40" width="40" height="160" fill="#7AA2F7"/><rect x="160" y="80" width="40" height="120" fill="#9ECE6A"/><line x1="60" y1="200" x2="620" y2="200" stroke="#3A3A42" stroke-width="1"/></svg>
+@@@RenderClose
+Do not stream bare SVG outside those markers.
+REPORTS: when summarizing data, comparisons, trends, inventories, disk/RAM/top processes, network findings, or multi-metric status — interleave short markdown with SVG charts/tables where a visual helps (bar/line/sparkline/simple table geometry). Place each viz between narrative sections (not only at the end). Skip empty decoration; one clear chart beats three noisy ones.
+VIZ RULES: SVG only (rect/circle/ellipse/line/path/polyline/polygon/text/g; fill/stroke attr or style=). REQUIRED width="N" height="N" + viewBox + xmlns. No JavaScript, CDNs, or WPF/XAML. No decorative title banner unless relevant. Flyer/poster layouts: be careful with text size and alignment (readable hierarchy, consistent columns, no overlapping labels, text-anchor when centering).
 Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration). If a tool is missing: ERROR may say missing_tool=X group=Y — EnableToolGroup group=Y then call X same turn; do NOT invent COM/shell.
 ROUTER (intent->tool; enable group first if off; do not shell these):
  volume|mute|unmute|speaker -> EnableToolGroup group=system then AudioVolume (action=get|set|mute|unmute; level=0-100)
  brightness|dim display -> EnableToolGroup group=system then DisplayBrightness (action=get|set; level=0-100)
  service start/stop/restart -> EnableToolGroup group=system then ControlService
  kill process -> EnableToolGroup group=diag then StopProcess
- find shares/LAN -> EnableToolGroup group=network then ProbeShares/ScanNetwork
+ find shares/LAN -> EnableToolGroup group=network then FindShares/ScanNetwork
+ find web servers/http hosts -> network then FindWebHosts (or PortProbe profile=web)
+ find rdp/remote desktop hosts -> network then FindRdp (or PortProbe profile=rdp)
+ port open check / winrm 5985 -> network then PortProbe (before RemoteCommand)
+ remote shell|winrm|invoke-command on other PC -> EnableToolGroup group=network then RemoteCommand (domain-admin WinRM only; unavailable orange off-domain; not local RunCommand)
  sfc|dism|chkdsk -> EnableToolGroup group=repair then RunRepairTool
  reboot/shutdown -> EnableToolGroup group=setup then Reboot
  group policy / gpedit / Policies registry -> EnableToolGroup group=setup then GroupPolicy (list_catalog|get|set|remove|gpupdate)
  NEVER RunCommand for volume/mute/brightness/endpoint COM/AudioEndpointVolume/IAudioEndpointVolume/nircmd volume — use AudioVolume/DisplayBrightness (system group).
  NEVER raw reg.exe for policy keys if GroupPolicy tool available (setup group).
-MAP: senses=vision/TTS | system=inventory+services+AudioVolume+DisplayBrightness | network=LAN+ProbeShares+lists | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=options+GroupPolicy+restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso | packages=PSGallery | registry | clipboard | web=HTTP/GitHub
+MAP: senses=vision/TTS | system=inventory+services+AudioVolume+DisplayBrightness | network=LAN+PortProbe+FindShares+FindWebHosts+FindRdp+RemoteCommand | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=options+GroupPolicy+restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso | packages=PSGallery | registry | clipboard | web=HTTP/GitHub
 FindFiles: multi-ext one call; truncated=normal (use rows); specific ask->narrow; vague play/show->pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice->tell operator. User text = results only.
 "@
 
@@ -8623,7 +8961,7 @@ SENSES: ReadImage (vision, auto-downscale); ReadPdf page=1 first; ViewScreen loo
 SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime; AudioVolume (volume/mute); DisplayBrightness. Prefer over Get-ComputerInfo / shell COM. Services: ControlService not shell.
 "@
 	network = @"
-NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; ProbeShares (REQUIRED to find shares - never net view loops); GetLocalShares/MappedDrives/Printers. Known host->ProbeShares computer=; search->omit hosts. Then shares group to map/create.
+NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; PortProbe (TCP open/closed); FindShares (REQUIRED for shares — never net view loops); FindWebHosts; FindRdp; GetLocalShares/MappedDrives/Printers; RemoteCommand (domain-admin: domain-joined + domain user only; PortProbe first; orange off-domain). If remote_command_unavailable=1 or remote_port_closed=1 / TOOLS_DONE=1: STOP tools and tell operator. Do not RunCommand/Test-NetConnection thrash. NEED_INPUT when ports open but auth failed — DOMAIN\\DomainAdmin + password. Search=omit hosts; targeted=computer=/hosts=.
 "@
 	diag = @"
 DIAG: BSOD/events/disk/startup/tasks/drivers/StopProcess/RunQuickDiagnostics. Never dump .dmp bytes. Kill only if asked.
@@ -8638,7 +8976,7 @@ SETUP: List/SetWindowsOption; GroupPolicy (local Policies registry editor: list_
 IDENTITY: Add/RemoveLocalUser; Join/LeaveDomain. Leave needs local admin creds in chat (NEED_INPUT if missing).
 "@
 	shares = @"
-SHARES mutate: Map/Unmap; CreateShare (path,name,user,pass,everyone_full required); RemoveShare; printers. Lists=network. Find remote=ProbeShares then Map.
+SHARES mutate: Map/Unmap; CreateShare (path,name,user,pass,everyone_full required); RemoveShare; printers. Lists=network. Find remote=FindShares then Map.
 "@
 	installers = @"
 INSTALLERS: ListInstallers / InstallPackage (prompt; silent).
@@ -8709,6 +9047,7 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "EditFile"; description = "Search/replace (unique match default). replaceAll / occurrence / edits[] supported. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" }; edits = @{ type = "array"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply unified diff / *** Update File patch. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string" }; path = @{ type = "string" } }; required = @("patch") } } },
 	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell (default) or cmd. Pass exact command text. Mutating/multi-statement/redirects need approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string" }; shell = @{ type = "string"; enum = @("powershell","cmd") }; timeout_sec = @{ type = "integer" } }; required = @("command") } } },
+	@{ type = "function"; function = @{ name = "RemoteCommand"; description = "Domain-administrator remoting tool (WinRM only). REQUIRES this host domain-joined with a signed-in domain user (orange/unavailable on workgroup or local-user sessions). Run a command on a REMOTE host (not this PC). ALWAYS approval. Native WinRM/PowerShell remoting. host= + command= required. shell=powershell|cmd|pwsh. Prefer username=DOMAIN\\DomainAdmin + password. Empty password only if account is truly blank. Optional port, use_ssl, timeout_sec. transport=winrm only. On auth failure NEED_INPUT for domain admin credentials. Do not use local RunCommand for remote hosts."; parameters = @{ type = "object"; properties = @{ host = @{ type = "string"; description = "Remote IP or hostname (also accepts user@host or host:port)" }; computer = @{ type = "string"; description = "Alias for host" }; command = @{ type = "string"; description = "Command/script to run on the remote host" }; transport = @{ type = "string"; description = "winrm only (default)" }; shell = @{ type = "string"; description = "powershell (default), cmd, or pwsh" }; username = @{ type = "string"; description = "Domain account preferred: DOMAIN\\DomainAdmin (domain admin tool)" }; password = @{ type = "string"; description = "Domain account password (WinRM). Empty only if truly blank" }; port = @{ type = "integer"; description = "WinRM port (default 5985 / 5986 with use_ssl)" }; use_ssl = @{ type = "boolean"; description = "WinRM over HTTPS" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default harness CommandTimeout)" } }; required = @("host","command") } } },
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents under path."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" } }; required = @("path","pattern") } } },
 	@{ type = "function"; function = @{ name = "DiffText"; description = "Line diff of two strings or files."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" } }; required = @("left","right") } } },
@@ -8737,11 +9076,14 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services (capped; default max_services=25, system noise deprioritized)."; parameters = @{ type = "object"; properties = @{ max_services = @{ type = "integer"; description = "Max auto services to return (default 25)" }; include_all_services = @{ type = "boolean"; description = "true = dump all auto services up to max (default false prioritizes non-system)" } } } } },
 	@{ type = "function"; function = @{ name = "GetMemoryInfo"; description = "RAM usage + top consumers."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetNetworkInfo"; description = "Adapters + connectivity test."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "GetLocalShares"; description = "List SMB shares published on THIS PC (not remote discovery). Read-only. Returns share name, path, and who has access: share_access / access_summary (share ACL via Get-SmbShareAccess) plus optional ntfs_access on the folder. Special shares (C$, ADMIN$, IPC$) omitted unless include_special=true. include_ntfs=false for share ACL only. Clipboard copy is opt-in: copy_clipboard=true. For remote shares use ProbeShares; to create use CreateShare; to unpublish use RemoveShare."; parameters = @{ type = "object"; properties = @{ include_special = @{ type = "boolean"; description = "Include admin/special shares ending in $ (default false)" }; include_ntfs = @{ type = "boolean"; description = "Include NTFS ACL on share path (default true)" }; copy_clipboard = @{ type = "boolean"; description = "Copy first UNC to clipboard (default false, opt-in)" }; max = @{ type = "integer"; description = "Max shares (default 80)" } } } } },
-	@{ type = "function"; function = @{ name = "GetMappedDrives"; description = "List network drive mappings on THIS PC (letter -> UNC, status). Read-only. Combines Get-SmbMapping, PSDrive, net use. include_disconnected=false to hide Unavailable. Not for finding remote shares (ProbeShares) or mapping (MapNetworkDrive). To disconnect use RemoveMappedDrive (setup group)."; parameters = @{ type = "object"; properties = @{ include_disconnected = @{ type = "boolean"; description = "Include Unavailable/Disconnected maps (default true)" } } } } },
+	@{ type = "function"; function = @{ name = "GetLocalShares"; description = "List SMB shares published on THIS PC (not remote discovery). Read-only. Returns share name, path, and who has access: share_access / access_summary (share ACL via Get-SmbShareAccess) plus optional ntfs_access on the folder. Special shares (C$, ADMIN$, IPC$) omitted unless include_special=true. include_ntfs=false for share ACL only. Clipboard copy is opt-in: copy_clipboard=true. For remote shares use FindShares; to create use CreateShare; to unpublish use RemoveShare."; parameters = @{ type = "object"; properties = @{ include_special = @{ type = "boolean"; description = "Include admin/special shares ending in $ (default false)" }; include_ntfs = @{ type = "boolean"; description = "Include NTFS ACL on share path (default true)" }; copy_clipboard = @{ type = "boolean"; description = "Copy first UNC to clipboard (default false, opt-in)" }; max = @{ type = "integer"; description = "Max shares (default 80)" } } } } },
+	@{ type = "function"; function = @{ name = "GetMappedDrives"; description = "List network drive mappings on THIS PC (letter -> UNC, status). Read-only. Combines Get-SmbMapping, PSDrive, net use. include_disconnected=false to hide Unavailable. Not for finding remote shares (FindShares) or mapping (MapNetworkDrive). To disconnect use RemoveMappedDrive (setup group)."; parameters = @{ type = "object"; properties = @{ include_disconnected = @{ type = "boolean"; description = "Include Unavailable/Disconnected maps (default true)" } } } } },
 	@{ type = "function"; function = @{ name = "GetPrinters"; description = "List printers on THIS PC (local + network connections). Read-only. Returns name, port, driver, default, shared. Use RemoveNetworkPrinter to remove; AddNetworkPrinter to add a UNC printer."; parameters = @{ type = "object"; properties = @{ include_remote = @{ type = "boolean"; description = "Include network/UNC printers (default true)" }; max = @{ type = "integer"; description = "Max rows (default 80)" } } } } },
-	@{ type = "function"; function = @{ name = "ScanNetwork"; description = "Scan the local LAN for machines and identify them (IP, MAC, hostname, MAC vendor). Harness-native LAN discovery (no GUI). Discovery: active=true (default) uses fast flood-ping - Test-Connection -Count 1 -AsJob for the whole subnet at once then Wait-Job. Then ARP/neighbors + SendARP MAC discovery (required for vendor OUI), reverse DNS, macvendorlookup. active=false = ARP only (quieter). Default auto primary private /24. Returns sorted hosts. To find which hosts export a share, call ProbeShares next (not RunCommand)."; parameters = @{ type = "object"; properties = @{ subnet = @{ type = "string"; description = "Optional CIDR or prefix e.g. 192.168.1.0/24 or 192.168.1. (default auto)" }; active = @{ type = "boolean"; description = "Flood-ping subnet then ARP/MAC resolve (default true). false = neighbors only" }; resolve_mac = @{ type = "boolean"; description = "SendARP MAC discovery for IPs missing MAC (default true; required for vendors)" }; resolve_hostnames = @{ type = "boolean"; description = "Reverse DNS (default true)" }; resolve_vendors = @{ type = "boolean"; description = "MAC OUI vendor lookup (default true; needs internet + MAC)" }; timeout_ms = @{ type = "integer"; description = "Wait-Job timeout budget ms for flood (default 4000 effective floor)" }; max_hosts = @{ type = "integer"; description = "Max addresses to flood-ping (default 254, max 1022)" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "ProbeShares"; description = "REQUIRED tool when the user asks to find/locate/discover a network share (or which PC has a named share). Do not use RunCommand. TARGETED: computer=IP or hosts=['IP'] only those machines. SEARCH: omit hosts = auto LAN flood then probe. Then TCP 445/139 + timed net use guess (share_name=temp or common names). Optional username/password; access-denied still means share exists. Returns found_uncs/hosts_with_match - next call MapNetworkDrive (setup group). Not for creating shares (use CreateShare)."; parameters = @{ type = "object"; properties = @{ hosts = @{ type = "array"; items = @{ type = "string" }; description = "Known host IPs (targeted). Omit for auto LAN search." }; computer = @{ type = "string"; description = "Single known host (targeted)" }; share_name = @{ type = "string"; description = "Share name to try first e.g. temp" }; share_names = @{ type = "array"; items = @{ type = "string" }; description = "Extra share names to try" }; username = @{ type = "string"; description = "Optional HOST\\share for probe" }; password = @{ type = "string"; description = "Optional password for probe" }; port_timeout_ms = @{ type = "integer"; description = "TCP timeout ms (default 300)" }; probe_timeout_sec = @{ type = "integer"; description = "net use timeout sec per guess (default 3)" }; stop_on_first_match = @{ type = "boolean"; description = "Stop after first hit (default false)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ScanNetwork"; description = "Scan the local LAN for machines and identify them (IP, MAC, hostname, MAC vendor). Harness-native LAN discovery (no GUI). Discovery: active=true (default) uses fast flood-ping - Test-Connection -Count 1 -AsJob for the whole subnet at once then Wait-Job. Then ARP/neighbors + SendARP MAC discovery (required for vendor OUI), reverse DNS, macvendorlookup. active=false = ARP only (quieter). Default auto primary private /24. Returns sorted hosts. To find which hosts export a share, call FindShares next (not RunCommand)."; parameters = @{ type = "object"; properties = @{ subnet = @{ type = "string"; description = "Optional CIDR or prefix e.g. 192.168.1.0/24 or 192.168.1. (default auto)" }; active = @{ type = "boolean"; description = "Flood-ping subnet then ARP/MAC resolve (default true). false = neighbors only" }; resolve_mac = @{ type = "boolean"; description = "SendARP MAC discovery for IPs missing MAC (default true; required for vendors)" }; resolve_hostnames = @{ type = "boolean"; description = "Reverse DNS (default true)" }; resolve_vendors = @{ type = "boolean"; description = "MAC OUI vendor lookup (default true; needs internet + MAC)" }; timeout_ms = @{ type = "integer"; description = "Wait-Job timeout budget ms for flood (default 4000 effective floor)" }; max_hosts = @{ type = "integer"; description = "Max addresses to flood-ping (default 254, max 1022)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "FindShares"; description = "REQUIRED tool when the user asks to find/locate/discover a network share (or which PC has a named share). Do not use RunCommand. TARGETED: computer=IP or hosts=['IP'] only those machines. SEARCH: omit hosts = auto LAN flood then probe. Then TCP 445/139 (PortProbe) + timed net use guess (share_name=temp or common names). Optional username/password; access-denied still means share exists. Returns found_uncs/hosts_with_match - next call MapNetworkDrive (setup group). Not for creating shares (use CreateShare)."; parameters = @{ type = "object"; properties = @{ hosts = @{ type = "array"; items = @{ type = "string" }; description = "Known host IPs (targeted). Omit for auto LAN search." }; computer = @{ type = "string"; description = "Single known host (targeted)" }; share_name = @{ type = "string"; description = "Share name to try first e.g. temp" }; share_names = @{ type = "array"; items = @{ type = "string" }; description = "Extra share names to try" }; username = @{ type = "string"; description = "Optional HOST\\share for probe" }; password = @{ type = "string"; description = "Optional password for probe" }; port_timeout_ms = @{ type = "integer"; description = "TCP timeout ms (default 300)" }; probe_timeout_sec = @{ type = "integer"; description = "net use timeout sec per guess (default 3)" }; stop_on_first_match = @{ type = "boolean"; description = "Stop after first hit (default false)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "PortProbe"; description = "Native TCP port probe (connect test). Read-only. computer= or hosts=[] (or omit for LAN flood-alive). ports=[80,443,3389] and/or profile=winrm|ssh|rdp|web|smb. Returns open/closed per host. Use before RemoteCommand or to find services. Not nmap banner scan."; parameters = @{ type = "object"; properties = @{ computer = @{ type = "string"; description = "Single host/IP" }; host = @{ type = "string"; description = "Alias for computer" }; hosts = @{ type = "array"; items = @{ type = "string" }; description = "Multiple hosts" }; ports = @{ type = "array"; items = @{ type = "integer" }; description = "TCP ports e.g. [22,80,443,3389,5985]" }; profile = @{ type = "string"; description = "winrm | ssh | rdp | web | smb (port set shortcut)" }; timeout_ms = @{ type = "integer"; description = "Per-port timeout ms (default 800)" }; max_hosts = @{ type = "integer"; description = "Max hosts when scanning (default 32)" }; use_ssl = @{ type = "boolean"; description = "For profile=winrm prefer 5986 only" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "FindWebHosts"; description = "Find LAN hosts with web ports open (80,443,8080,8443) via PortProbe. TARGETED: computer=/hosts=. SEARCH: omit hosts = ICMP flood then probe. Read-only. Not for scraping pages (use BrowsePage/MakeHttpRequest on a known URL)."; parameters = @{ type = "object"; properties = @{ computer = @{ type = "string" }; hosts = @{ type = "array"; items = @{ type = "string" } }; timeout_ms = @{ type = "integer" }; max_hosts = @{ type = "integer" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "FindRdp"; description = "Find LAN hosts with RDP open (TCP 3389) via PortProbe. TARGETED: computer=/hosts=. SEARCH: omit hosts = ICMP flood then probe. Read-only."; parameters = @{ type = "object"; properties = @{ computer = @{ type = "string" }; hosts = @{ type = "array"; items = @{ type = "string" } }; timeout_ms = @{ type = "integer" }; max_hosts = @{ type = "integer" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetWindowsUpdateStatus"; description = "Pending Windows updates via native Microsoft.Update.Session COM (no PSGallery). Optional PSWindowsUpdate module fallback only if COM fails."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetSystemUptime"; description = "Uptime and last boot."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle: BSOD, events (24h collapsed), disk health, one-level disk space, memory. Embeds objects not nested JSON strings."; parameters = @{ type = "object"; properties = @{} } } },
@@ -8785,7 +9127,7 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "AddLocalUser"; description = "Create a local Windows user. ALWAYS prompts. Optional full_name, description, admin=true (Administrators group). Password is operator-visible (pass what they said; show it back in the result). If the account already exists returns ok=false exists=true. To delete use RemoveLocalUser."; parameters = @{ type = "object"; properties = @{ username = @{ type = "string" }; password = @{ type = "string" }; full_name = @{ type = "string" }; description = @{ type = "string" }; admin = @{ type = "boolean"; description = "Add to local Administrators (default false)" } }; required = @("username","password") } } },
 	@{ type = "function"; function = @{ name = "JoinDomain"; description = "Join this PC to an Active Directory domain. ALWAYS prompts. Requires domain + domain join credentials. Optional ou= distinguished name, new_name= rename before join, reboot=true to restart after success."; parameters = @{ type = "object"; properties = @{ domain = @{ type = "string"; description = "Domain FQDN e.g. corp.example.com" }; username = @{ type = "string"; description = "Domain account authorized to join (DOMAIN\\user or user@domain)" }; password = @{ type = "string" }; ou = @{ type = "string"; description = "Optional target OU DN" }; new_name = @{ type = "string"; description = "Optional new computer name before join" }; reboot = @{ type = "boolean"; description = "Restart after successful join (default false)" } }; required = @("domain","username","password") } } },
 	@{ type = "function"; function = @{ name = "LeaveDomain"; description = "Leave the Active Directory domain (join workgroup). ALWAYS prompts. REQUIRED: local_username + local_password of a local admin that can sign in after disjoin. No UI password popup - if missing or auth fails, returns NEED_INPUT so you ASK the operator in chat. If no local admin exists, call AddLocalUser admin=true with a password the operator chooses, then LeaveDomain with those creds. workgroup= default WORKGROUP; reboot=true optional. Show the local admin password back to the operator when they provide it."; parameters = @{ type = "object"; properties = @{ workgroup = @{ type = "string"; description = "Target workgroup name (default WORKGROUP)" }; reboot = @{ type = "boolean"; description = "Restart after successful leave (default false)" }; local_username = @{ type = "string"; description = "REQUIRED local admin username" }; local_password = @{ type = "string"; description = "REQUIRED local admin password (operator-visible; no popup)" } }; required = @("local_username","local_password") } } },
-			@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional - if omitted or busy, auto-picks free letter D-Z (skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. If username is set, password is required (no popup - NEED_INPUT if missing; ask operator in chat). Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M - omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string"; description = "Required when username set; ask operator if missing" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
+			@{ type = "function"; function = @{ name = "MapNetworkDrive"; description = "Map a network share to a drive letter. ALWAYS prompts. path=\\\\server\\share required. letter= optional - if omitted or busy, auto-picks free letter D-Z (skips CD/DVD reserved letters even when empty). Prefer username=share (bare, like working net use /user:share) or domain=HOST username=share. If username is set, pass password= (empty string allowed for blank-password accounts; no popup). Matches: net use M: \\\\IP\\temp /user:share pass /persistent:yes. force=true remaps requested letter."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Preferred letter e.g. M - omit to auto-pick free non-CD letter" }; path = @{ type = "string"; description = "UNC \\\\server\\share" }; username = @{ type = "string"; description = "Bare share often works; or HOST\\\\user in JSON" }; domain = @{ type = "string"; description = "Optional host if username is bare" }; password = @{ type = "string"; description = "Required when username set; ask operator if missing" }; persistent = @{ type = "boolean"; description = "default true" }; force = @{ type = "boolean"; description = "Delete existing mapping on letter first" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "RemoveMappedDrive"; description = "Disconnect a mapped network drive letter on THIS PC. ALWAYS approval. REQUIRED: letter= (e.g. Z). Call GetMappedDrives first if unknown. Does not delete remote share data. Prefer over net use /delete in RunCommand."; parameters = @{ type = "object"; properties = @{ letter = @{ type = "string"; description = "Drive letter e.g. Z or Z:" }; path = @{ type = "string"; description = "Optional expected UNC (for display/verify)" }; force = @{ type = "boolean"; description = "Force remove (default true)" } }; required = @("letter") } } },
 @{ type = "function"; function = @{ name = "AddNetworkPrinter"; description = "Connect a network/shared printer (\\\\server\\printer). ALWAYS prompts. Optional name= friendly name, set_default=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Printer share UNC \\\\server\\printer" }; name = @{ type = "string"; description = "Optional local display name" }; set_default = @{ type = "boolean"; description = "Set as default printer (default false)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "RemoveNetworkPrinter"; description = "Remove a printer from THIS PC. ALWAYS approval. REQUIRED: name= exact printer name from GetPrinters (or path= UNC). Prefer over printui in RunCommand."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Printer name from GetPrinters" }; path = @{ type = "string"; description = "Alias - UNC or name" } }; required = @("name") } } },
@@ -8818,7 +9160,8 @@ $script:MBToolCatalog = [ordered]@{
 		'AudioVolume','DisplayBrightness'
 	)
 	network = @(
-		'GetNetworkInfo','GetNetConnections','ScanNetwork','ProbeShares','GetLocalShares','GetMappedDrives','GetPrinters'
+		'GetNetworkInfo','GetNetConnections','ScanNetwork','PortProbe','FindShares','FindWebHosts','FindRdp',
+		'GetLocalShares','GetMappedDrives','GetPrinters','RemoteCommand'
 	)
 	diag = @(
 		'GetBSODInfo','GetEventLogs','GetDiskHealth','GetDiskSpace','GetStartupItems','GetScheduledTasks',
@@ -8862,7 +9205,7 @@ $script:MBToolGroupMeta = [ordered]@{
 	}
 	network = @{
 		Label       = 'Network'
-		Description = 'Scan the LAN, discover shares, list mapped drives/printers, and view connections.'
+		Description = 'LAN scan, PortProbe, FindShares/WebHosts/Rdp, mapped drives/printers, RemoteCommand (domain-admin WinRM; orange off-domain).'
 	}
 	diag = @{
 		Label       = 'Diag'
@@ -9042,6 +9385,20 @@ function Get-MBToolUiTips {
 		}
 	}
 
+	# RemoteCommand tooltip: name + WinRM how-to
+	$howTo = ''
+	try { $howTo = Get-MBRemoteCommandHowToText } catch { $howTo = '' }
+	foreach ($rt in @(Get-MBRemoteCommandToolNames)) {
+		$base = $rt
+		try {
+			if ($toolTips.ContainsKey($rt)) {
+				$first = ([string]$toolTips[$rt] -split "`r?`n", 2)[0].Trim()
+				if ($first) { $base = $first }
+			}
+		} catch {}
+		$toolTips[$rt] = if ($howTo) { ("{0}`n`n{1}" -f $base, $howTo.TrimEnd()) } else { $base }
+	}
+
 	return @{
 		groups = $groupTips
 		labels = $groupLabels
@@ -9082,7 +9439,9 @@ function Update-MBWpfToolGroupBar {
 	try { $hasVision = [bool](Test-MBModelHasVision) } catch { $hasVision = $false }
 	$hasGpo = $true
 	try { $hasGpo = [bool](Test-MBWindowsHasLocalGroupPolicy) } catch { $hasGpo = $true }
-	$fp = ((@($activeList) -join ',') + '|u:' + ($usedList -join ',') + '|v:' + $(if ($hasVision) { '1' } else { '0' }) + '|gpo:' + $(if ($hasGpo) { '1' } else { '0' }))
+	$onDomain = $false
+	try { $onDomain = [bool](Test-MBHostOnDomain) } catch { $onDomain = $false }
+	$fp = ((@($activeList) -join ',') + '|u:' + ($usedList -join ',') + '|v:' + $(if ($hasVision) { '1' } else { '0' }) + '|gpo:' + $(if ($hasGpo) { '1' } else { '0' }) + '|dom:' + $(if ($onDomain) { '1' } else { '0' }))
 	if (-not $Force) {
 		try {
 			if ($W.ToolGroupsFp -eq $fp -and $W.ToolGroupsBuilt -and -not $W.ToolGroupsDirty) { return }
@@ -9109,6 +9468,10 @@ function Update-MBWpfToolGroupBar {
 	if (-not $hasGpo) {
 		$gpoBlockReason = Get-MBGroupPolicyUnavailableReason
 		foreach ($gt in @(Get-MBGroupPolicyToolNames)) { $gpoBlocked[$gt] = $true }
+	}
+	$domainBlocked = @{}
+	if (-not $onDomain) {
+		foreach ($rt in @(Get-MBRemoteCommandToolNames)) { $domainBlocked[$rt] = $true }
 	}
 
 	# Active chips first so they stay visible on the first wrap line
@@ -9158,6 +9521,7 @@ function Update-MBWpfToolGroupBar {
 			hasLocalGroupPolicy = $hasGpo
 			gpoBlocked         = $gpoBlocked
 			gpoBlockReason     = $gpoBlockReason
+			domainBlocked      = $domainBlocked
 			fp                 = $fp
 		}
 		$W.ToolGroupsDirty = $true
@@ -9253,6 +9617,9 @@ function Resolve-MBToolName {
 		'read_file' = 'ReadFile'; 'write_file' = 'WriteFile'; 'edit_file' = 'EditFile'
 		'run' = 'RunCommand'; 'run_command' = 'RunCommand'; 'shell' = 'RunCommand'
 		'exec' = 'RunCommand'; 'bash' = 'RunCommand'; 'powershell' = 'RunCommand'
+		'remote' = 'RemoteCommand'; 'remote_command' = 'RemoteCommand'; 'remote_shell' = 'RemoteCommand'
+		'winrm' = 'RemoteCommand'; 'invoke_command' = 'RemoteCommand'
+		'psremoting' = 'RemoteCommand'; 'remote_ps' = 'RemoteCommand'; 'remote_powershell' = 'RemoteCommand'
 		'list_dir' = 'ListDirectory'; 'ls' = 'ListDirectory'; 'dir' = 'ListDirectory'
 		'search' = 'SearchFiles'; 'grep' = 'SearchFiles'; 'find' = 'FindFiles'
 		'hex' = 'HexView'; 'hexview' = 'HexView'; 'hex_view' = 'HexView'; 'hexdump' = 'HexView'
@@ -9269,8 +9636,12 @@ function Resolve-MBToolName {
 		'netstat' = 'GetNetConnections'; 'ports' = 'GetNetConnections'
 		'scan_network' = 'ScanNetwork'; 'lan_scan' = 'ScanNetwork'; 'ip_scan' = 'ScanNetwork'
 		'arp_scan' = 'ScanNetwork'; 'network_scan' = 'ScanNetwork'
-		'probe_shares' = 'ProbeShares'; 'find_shares' = 'ProbeShares'
-		'smb_probe' = 'ProbeShares'; 'find_share' = 'ProbeShares'
+		'probe_shares' = 'FindShares'; 'find_shares' = 'FindShares'
+		'smb_probe' = 'FindShares'; 'find_share' = 'FindShares'
+		'port_probe' = 'PortProbe'; 'probe_ports' = 'PortProbe'; 'tcp_probe' = 'PortProbe'
+		'portscan' = 'PortProbe'; 'port_scan' = 'PortProbe'
+		'find_web' = 'FindWebHosts'; 'find_web_hosts' = 'FindWebHosts'; 'web_hosts' = 'FindWebHosts'
+		'find_rdp' = 'FindRdp'; 'rdp_hosts' = 'FindRdp'; 'find_remote_desktop' = 'FindRdp'
 		'list_shares' = 'GetLocalShares'; 'local_shares' = 'GetLocalShares'; 'get_local_shares' = 'GetLocalShares'
 		'smb_shares' = 'GetLocalShares'; 'who_has_share_access' = 'GetLocalShares'
 		'mapped_drives' = 'GetMappedDrives'; 'map_list' = 'GetMappedDrives'; 'net_use' = 'GetMappedDrives'
@@ -9335,6 +9706,10 @@ function Get-MBToolEnableHint {
 	if ((Test-MBToolNeedsGroupPolicyEdition -Name $resolved) -and -not (Test-MBWindowsHasLocalGroupPolicy)) {
 		$why = Get-MBGroupPolicyUnavailableReason
 		return "unavailable_tool=$resolved reason=windows_edition. $why Do not use RunCommand/reg to fake gpedit on Home."
+	}
+	if ((Test-MBToolNeedsDomainMembership -Name $resolved) -and -not (Test-MBHostOnDomain)) {
+		$why = Get-MBRemoteCommandUnavailableReason
+		return "unavailable_tool=$resolved reason=not_domain_joined. $why Do not thrash with RunCommand workarounds."
 	}
 	$grp = Get-MBToolGroupForName -Name $resolved
 	if ($grp -and $grp -ne 'core') {
@@ -9521,6 +9896,124 @@ function Get-MBGroupPolicyUnavailableReason {
 		$r = 'This Windows edition does not include Local Group Policy (typically Home/Core). Upgrade to Pro or higher for gpedit / full GPO editor support.'
 	}
 	return $r
+}
+
+function Get-MBRemoteCommandToolNames {
+	@('RemoteCommand')
+}
+
+function Get-MBRemoteCommandHowToText {
+	@(
+		'Remote target: Windows Remote Management must already be enabled and reachable (typical ports 5985 / 5986).'
+		'If ports are closed, enable remote management on that PC via Windows settings / domain policy / IT standard process, then allow the firewall for remote management. Do not use this tool to push remoting onto unmanaged machines.'
+		'Probe ports first; if closed, stop and tell the operator — do not thrash alternate probes.'
+	) -join "`n"
+}
+
+function Test-MBToolNeedsDomainMembership {
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+	$t = $Name.Trim()
+	foreach ($n in @(Get-MBRemoteCommandToolNames)) {
+		if ([string]::Equals($n, $t, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+	}
+	return $false
+}
+
+function Get-MBDomainMembershipSnapshot {
+	# Cached: domain-joined + domain user (RemoteCommand gate / orange UI).
+	if ($script:MB.DomainMembershipSnap -and $script:MB.DomainMembershipSnap.At) {
+		try {
+			$age = ((Get-Date) - [datetime]$script:MB.DomainMembershipSnap.At).TotalMinutes
+			if ($age -ge 0 -and $age -lt 10) { return $script:MB.DomainMembershipSnap }
+		} catch {}
+	}
+	$partOfDomain = $false
+	$domain = ''
+	$workgroup = ''
+	$computerName = ''
+	try { if ($env:COMPUTERNAME) { $computerName = [string]$env:COMPUTERNAME } } catch {}
+	try {
+		$cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+		if (-not $cs) {
+			try { $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue } catch {}
+		}
+		if ($cs) {
+			try { $partOfDomain = [bool]$cs.PartOfDomain } catch { $partOfDomain = $false }
+			try { $domain = [string]$cs.Domain } catch { $domain = '' }
+			try {
+				if (-not $computerName -and $cs.Name) { $computerName = [string]$cs.Name }
+			} catch {}
+		}
+	} catch {}
+	if (-not $partOfDomain) {
+		$workgroup = $domain
+		if ([string]::IsNullOrWhiteSpace($workgroup)) { $workgroup = 'WORKGROUP' }
+	}
+	$userDomain = ''
+	$userName = ''
+	try { if ($env:USERDOMAIN) { $userDomain = [string]$env:USERDOMAIN } } catch {}
+	try { if ($env:USERNAME) { $userName = [string]$env:USERNAME } } catch {}
+	$userIsDomainAccount = $false
+	if ($partOfDomain -and $userDomain -and $computerName) {
+		if (-not [string]::Equals($userDomain, $computerName, [StringComparison]::OrdinalIgnoreCase)) {
+			$userIsDomainAccount = $true
+		}
+	}
+	$onDomain = [bool]($partOfDomain -and $userIsDomainAccount)
+	if (-not $partOfDomain) {
+		$reason = ("This PC is not domain-joined (workgroup={0})." -f $(if ($workgroup) { $workgroup } else { 'WORKGROUP' }))
+	} elseif (-not $userIsDomainAccount) {
+		$reason = ("PC is domain-joined ({0}) but signed-in user is local ({1}\{2})." -f $domain, $userDomain, $userName)
+	} else {
+		$reason = ("Domain-joined ({0}); user {1}\{2}" -f $domain, $userDomain, $userName)
+	}
+	$snap = [pscustomobject]@{
+		PartOfDomain        = [bool]$partOfDomain
+		Domain              = $domain
+		Workgroup           = $workgroup
+		ComputerName        = $computerName
+		UserDomain          = $userDomain
+		UserName            = $userName
+		UserIsDomainAccount = [bool]$userIsDomainAccount
+		OnDomain            = [bool]$onDomain
+		Reason              = [string]$reason
+		At                  = Get-Date
+	}
+	$script:MB.DomainMembershipSnap = $snap
+	$script:MB.HostOnDomain = [bool]$onDomain
+	$script:MB.HostOnDomainReason = [string]$reason
+	return $snap
+}
+
+function Test-MBHostOnDomain {
+	try {
+		$snap = Get-MBDomainMembershipSnapshot
+		return [bool]$snap.OnDomain
+	} catch {
+		return $false
+	}
+}
+
+function Get-MBRemoteCommandUnavailableReason {
+	if (Test-MBHostOnDomain) { return '' }
+	$r = [string]$script:MB.HostOnDomainReason
+	if ([string]::IsNullOrWhiteSpace($r)) {
+		try { $r = [string](Get-MBDomainMembershipSnapshot).Reason } catch {}
+	}
+	if ([string]::IsNullOrWhiteSpace($r)) {
+		$r = 'Host/user is not on a domain. RemoteCommand requires a domain-joined PC and domain user.'
+	}
+	return $r
+}
+
+function Get-MBRemoteCommandDomainBlockMessage {
+	$why = Get-MBRemoteCommandUnavailableReason
+	return @(
+		'ERROR: remote_command_unavailable=1 reason=not_domain_joined TOOLS_DONE=1 NO_MORE_TOOLS=1'
+		$why
+		'Requires domain-joined host + domain user (domain administrators). Do not retry RemoteCommand or invent credentials.'
+	) -join "`n"
 }
 
 function Get-MBActiveToolNames {
@@ -12318,6 +12811,652 @@ function Invoke-RunCommand {
 	}
 }
 
+function New-MBPlainToSecureString {
+	# Empty plain text -> empty SecureString (ConvertTo-SecureString rejects '').
+	param([AllowEmptyString()][string]$PlainText = '')
+	if ($null -eq $PlainText) { $PlainText = '' }
+	if ([string]::IsNullOrEmpty($PlainText)) {
+		return (New-Object System.Security.SecureString)
+	}
+	return ConvertTo-SecureString -String $PlainText -AsPlainText -Force
+}
+
+function New-MBRemoteCredential {
+	param(
+		[string]$Username = '',
+		[AllowEmptyString()][string]$Password = ''
+	)
+	if ([string]::IsNullOrWhiteSpace($Username)) { return $null }
+	if ($null -eq $Password) { $Password = '' }
+	$sec = New-MBPlainToSecureString -PlainText ([string]$Password)
+	return New-Object System.Management.Automation.PSCredential ($Username.Trim(), $sec)
+}
+
+function Get-MBRemoteMachineName {
+	# Short NETBIOS-style name for local account form: RemoteMachineName\user
+	param([string]$Target = '')
+	$t = ([string]$Target).Trim()
+	if ([string]::IsNullOrWhiteSpace($t)) { return 'REMOTEPC' }
+	if ($t -match '^\d{1,3}(\.\d{1,3}){3}$') {
+		try {
+			$he = [System.Net.Dns]::GetHostEntry($t)
+			if ($he -and $he.HostName) { $t = [string]$he.HostName }
+		} catch {}
+	}
+	$t = $t -replace '\.$', ''
+	if ($t -match '^(?i)([A-Za-z0-9_-]+)\.') { return $Matches[1].ToUpperInvariant() }
+	return $t.ToUpperInvariant()
+}
+
+function Get-MBRemoteNeedCredsMessage {
+	param(
+		[string]$Target = '',
+		[string]$Detail = '',
+		[string]$Transport = 'winrm'
+	)
+	$pc = Get-MBRemoteMachineName -Target $Target
+	$domHint = ''
+	try {
+		$snap = Get-MBDomainMembershipSnapshot
+		if ($snap -and $snap.PartOfDomain -and $snap.Domain) { $domHint = [string]$snap.Domain }
+	} catch {}
+	$lines = New-Object System.Collections.ArrayList
+	[void]$lines.Add(('NEED_INPUT: RemoteCommand cannot run on {0} (transport={1}) without working domain credentials (or auth failed).' -f $Target, $Transport))
+	if (-not [string]::IsNullOrWhiteSpace($Detail)) {
+		[void]$lines.Add(('Detail: {0}' -f ($Detail -replace '[\r\n]+', ' ')))
+	}
+	[void]$lines.Add('ASK operator for a domain admin (or remoting-authorized domain) account, then retry username= + password=.')
+	[void]$lines.Add('Blank password only if the account truly has none — do not invent passwords.')
+	if ($domHint) {
+		[void]$lines.Add(('- Prefer: username={0}\AdminUser  (or AdminUser@{0})' -f $domHint))
+	} else {
+		[void]$lines.Add('- Prefer: username=DOMAIN\AdminUser  (or AdminUser@DOMAIN)')
+	}
+	[void]$lines.Add(('- Domain account with remoting rights; not local {0}\user.' -f $pc))
+	[void]$lines.Add('Transport: winrm only.')
+	return ($lines -join "`n")
+}
+
+function Test-MBRemoteWinRmAuthError {
+	param([string]$Text = '')
+	$t = [string]$Text
+	if ([string]::IsNullOrWhiteSpace($t)) { return $false }
+	return [bool]($t -match '(?i)(access is denied|access denied|unauthorized|logon failure|logon_failure|bad username|unknown user|wrong password|failed to authenticate|authentication failed|user name or password|credentials were rejected|WinRM cannot process|cannot find the computer|not a member of|TrustedHosts|explicit credentials)')
+}
+
+function Test-MBPortProbe {
+	# Unified native TCP port probe (single or multi-port). Flat int ports only.
+	# Returns: Target, Open[], Closed[], AnyOpen, PreferredPort, Ports[], ElapsedMs
+	param(
+		[string]$Computer = '',
+		[Alias('Address', 'HostName')]
+		[string]$Target = '',
+		$Port = 0,
+		$Ports = $null,
+		[int]$TimeoutMs = 800
+	)
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	$addr = ([string]$Computer).Trim()
+	if ([string]::IsNullOrWhiteSpace($addr)) { $addr = ([string]$Target).Trim() }
+	if ([string]::IsNullOrWhiteSpace($addr)) {
+		return @{
+			Target = ''
+			Open = [int[]]@()
+			Closed = [int[]]@()
+			AnyOpen = $false
+			PreferredPort = 0
+			Ports = [int[]]@()
+			ElapsedMs = 0
+			Error = 'empty target'
+		}
+	}
+	if ($TimeoutMs -lt 50) { $TimeoutMs = 50 }
+	if ($TimeoutMs -gt 10000) { $TimeoutMs = 10000 }
+
+	$portList = New-Object System.Collections.ArrayList
+	$addPort = {
+		param($v)
+		if ($null -eq $v) { return }
+		if ($v -is [System.Array] -and -not ($v -is [string])) {
+			foreach ($x in @($v)) { & $addPort $x }
+			return
+		}
+		$n = 0
+		try { $n = [int]$v } catch { return }
+		if ($n -lt 1 -or $n -gt 65535) { return }
+		if (-not $portList.Contains($n)) { [void]$portList.Add($n) }
+	}
+	if ($null -ne $Ports) { & $addPort $Ports }
+	if ($null -ne $Port) { & $addPort $Port }
+	if ($portList.Count -lt 1) {
+		return @{
+			Target = $addr
+			Open = [int[]]@()
+			Closed = [int[]]@()
+			AnyOpen = $false
+			PreferredPort = 0
+			Ports = [int[]]@()
+			ElapsedMs = [int]$sw.ElapsedMilliseconds
+			Error = 'no ports'
+		}
+	}
+
+	$open = New-Object System.Collections.ArrayList
+	$closed = New-Object System.Collections.ArrayList
+	foreach ($pn in @($portList)) {
+		if ((Test-MBInterrupt)) { break }
+		$ok = $false
+		$tcp = $null
+		try {
+			$tcp = New-Object System.Net.Sockets.TcpClient
+			$iar = $tcp.BeginConnect($addr, [int]$pn, $null, $null)
+			$waited = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+			if ($waited) {
+				try { $tcp.EndConnect($iar) } catch { $ok = $false }
+				try { $ok = [bool]$tcp.Connected } catch { $ok = $false }
+			} else {
+				try { $tcp.Close() } catch {}
+				$ok = $false
+			}
+		} catch {
+			$ok = $false
+		} finally {
+			try { if ($tcp) { $tcp.Close() } } catch {}
+		}
+		if ($ok) { [void]$open.Add([int]$pn) } else { [void]$closed.Add([int]$pn) }
+	}
+	$pref = 0
+	if ($open.Count -gt 0) { try { $pref = [int]$open[0] } catch { $pref = 0 } }
+	$openArr = [int[]]@()
+	$closedArr = [int[]]@()
+	$allArr = [int[]]@()
+	try { if ($open.Count -gt 0) { $openArr = [int[]]$open.ToArray() } } catch { $openArr = @($open) | ForEach-Object { [int]$_ } }
+	try { if ($closed.Count -gt 0) { $closedArr = [int[]]$closed.ToArray() } } catch { $closedArr = @($closed) | ForEach-Object { [int]$_ } }
+	try { if ($portList.Count -gt 0) { $allArr = [int[]]$portList.ToArray() } } catch { $allArr = @($portList) | ForEach-Object { [int]$_ } }
+	$sw.Stop()
+	return @{
+		Target        = $addr
+		Open          = $openArr
+		Closed        = $closedArr
+		AnyOpen       = ($open.Count -gt 0)
+		PreferredPort = $pref
+		Ports         = $allArr
+		ElapsedMs     = [int]$sw.ElapsedMilliseconds
+		Error         = ''
+	}
+}
+
+function Get-MBPortProbeProfilePorts {
+	# Named profiles for remoting / discovery tools. Always flat [int[]].
+	param(
+		[string]$Profile = '',
+		$Port = 0,
+		$Ports = $null,
+		[bool]$UseSsl = $false
+	)
+	$list = New-Object System.Collections.ArrayList
+	$add = {
+		param($v)
+		if ($null -eq $v) { return }
+		if ($v -is [System.Array] -and -not ($v -is [string])) {
+			foreach ($x in @($v)) { & $add $x }
+			return
+		}
+		if ($v -is [string] -and ([string]$v) -match '[,;\s]') {
+			foreach ($p in ([string]$v -split '[,;\s]+')) {
+				if ($p.Trim()) { & $add $p.Trim() }
+			}
+			return
+		}
+		$n = 0
+		try { $n = [int]$v } catch { return }
+		if ($n -ge 1 -and $n -le 65535 -and -not $list.Contains($n)) { [void]$list.Add($n) }
+	}
+	if ($null -ne $Ports) { & $add $Ports }
+	if ($null -ne $Port) { & $add $Port }
+	if ($list.Count -gt 0) { return [int[]]$list.ToArray() }
+
+	$prof = ([string]$Profile).Trim().ToLowerInvariant()
+	switch -regex ($prof) {
+		'^(ssh)$' { return [int[]]@(22) }
+		'^(rdp|remote.?desktop|terminal.?services)$' { return [int[]]@(3389) }
+		'^(web|http|https|www)$' { return [int[]]@(80, 443, 8080, 8443) }
+		'^(smb|share|cifs)$' { return [int[]]@(445, 139) }
+		'^(winrm|wsman|psremoting)$' {
+			if ($UseSsl) { return [int[]]@(5986) }
+			return [int[]]@(5985, 5986)
+		}
+		default {
+			if ($UseSsl) { return [int[]]@(5986) }
+			return [int[]]@(5985, 5986)
+		}
+	}
+}
+
+function Test-MBRemoteServicePorts {
+	# Compat wrapper for RemoteCommand gate — uses unified PortProbe.
+	param(
+		[Parameter(Mandatory = $true)][string]$Address,
+		[string]$Transport = 'winrm',
+		$Port = 0,
+		[bool]$UseSsl = $false,
+		[int]$TimeoutMs = 900
+	)
+	$ports = Get-MBPortProbeProfilePorts -Profile $Transport -Port $Port -UseSsl $UseSsl
+	return (Test-MBPortProbe -Computer $Address -Ports $ports -TimeoutMs $TimeoutMs)
+}
+
+function Test-MBTcpPortOpen {
+	# Compat wrapper (FindShares / SMB) — single-port bool via PortProbe.
+	param(
+		[string]$Computer,
+		[int]$Port,
+		[int]$TimeoutMs = 300
+	)
+	$r = Test-MBPortProbe -Computer $Computer -Port $Port -TimeoutMs $TimeoutMs
+	return [bool]$r.AnyOpen
+}
+
+function Get-MBRemotePortClosedBlockKey {
+	param([string]$Target = '', [string]$Transport = 'winrm')
+	$t = ([string]$Target).Trim().ToLowerInvariant()
+	$tx = ([string]$Transport).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($tx)) { $tx = 'winrm' }
+	return ('{0}|{1}' -f $tx, $t)
+}
+
+function Set-MBRemotePortClosedBlock {
+	param([string]$Target = '', [string]$Transport = 'winrm', [string]$Message = '')
+	try {
+		if ($null -eq $script:MB.RemotePortClosedBlocks -or -not ($script:MB.RemotePortClosedBlocks -is [hashtable])) {
+			$script:MB.RemotePortClosedBlocks = @{}
+		}
+		$k = Get-MBRemotePortClosedBlockKey -Target $Target -Transport $Transport
+		$script:MB.RemotePortClosedBlocks[$k] = [string]$Message
+	} catch {}
+}
+
+function Get-MBRemotePortClosedBlock {
+	param([string]$Target = '', [string]$Transport = 'winrm')
+	try {
+		if ($null -eq $script:MB.RemotePortClosedBlocks) { return $null }
+		$k = Get-MBRemotePortClosedBlockKey -Target $Target -Transport $Transport
+		if ($script:MB.RemotePortClosedBlocks.ContainsKey($k)) {
+			return [string]$script:MB.RemotePortClosedBlocks[$k]
+		}
+	} catch {}
+	return $null
+}
+
+function Get-MBRemotePortListString {
+	param($Ports)
+	$nums = New-Object System.Collections.ArrayList
+	foreach ($x in @($Ports)) {
+		try {
+			if ($x -is [System.Array]) {
+				foreach ($y in @($x)) { try { [void]$nums.Add([int]$y) } catch {} }
+			} else {
+				[void]$nums.Add([int]$x)
+			}
+		} catch {}
+	}
+	if ($nums.Count -lt 1) { return '' }
+	return (($nums | Select-Object -Unique) -join ',')
+}
+
+function Get-MBRemotePortClosedMessage {
+	param(
+		[string]$Target = '',
+		[string]$Transport = 'winrm',
+		$Probed = @()
+	)
+	$pc = Get-MBRemoteMachineName -Target $Target
+	$portList = Get-MBRemotePortListString -Ports $Probed
+	if ([string]::IsNullOrWhiteSpace($portList)) { $portList = '5985,5986' }
+	$lines = New-Object System.Collections.ArrayList
+	[void]$lines.Add(("ERROR: remote_port_closed=1 transport=winrm host={0} ports={1}" -f $Target, $portList))
+	[void]$lines.Add('TOOLS_DONE=1  NO_MORE_TOOLS=1  FINISH_TURN=1')
+	[void]$lines.Add('')
+	[void]$lines.Add('REQUIRED: Reply to the operator only — no more tools, no RunCommand/Test-NetConnection workarounds.')
+	[void]$lines.Add('')
+	[void]$lines.Add(("**{0}** (``{1}``) — WinRM ports 5985/5986 not open (service off or firewall)." -f $pc, $Target))
+	[void]$lines.Add('Options: enable Windows Remote Management on the remote (IT/domain process) and open firewall, or run the work locally on that machine.')
+	$msg = ($lines -join "`n")
+	try { Set-MBRemotePortClosedBlock -Target $Target -Transport 'winrm' -Message $msg } catch {}
+	return $msg
+}
+
+function Test-MBRemoteCommandPortGate {
+	# Returns $null if OK to proceed; otherwise ERROR string (ports closed).
+	param(
+		[string]$RemoteHost = '',
+		[string]$Transport = 'winrm',
+		$Port = 0,
+		[bool]$UseSsl = $false
+	)
+	$target = ([string]$RemoteHost).Trim()
+	if ([string]::IsNullOrWhiteSpace($target)) { return 'ERROR: host= is required (IP or hostname).' }
+	$target = $target -replace '^(?i)https?://', '' -replace '^(?i)ssh://', ''
+	$target = ($target -split '/')[0].Trim()
+	if ($target -match '^(?i)[^@]+@(.+)$') { $target = $Matches[1] }
+	$portN = 0
+	try {
+		if ($Port -is [System.Array]) {
+			if (@($Port).Count -ge 1) { $portN = [int](@($Port)[0]) }
+		} elseif ($null -ne $Port -and [string]$Port -ne '') {
+			$portN = [int]$Port
+		}
+	} catch { $portN = 0 }
+	if ($target -match '^\[([^\]]+)\](?::(\d+))?$') {
+		$target = $Matches[1]
+		if ($portN -le 0 -and $Matches[2]) { try { $portN = [int]$Matches[2] } catch {} }
+	} elseif ($target -match '^([^:]+):(\d+)$' -and $Matches[1] -notmatch '^[A-Za-z]$') {
+		if ($portN -le 0) { try { $portN = [int]$Matches[2] } catch {} }
+		$target = $Matches[1]
+	}
+	$probe = $null
+	try {
+		$probe = Test-MBRemoteServicePorts -Address $target -Transport 'winrm' -Port $portN -UseSsl $UseSsl -TimeoutMs 800
+	} catch {
+		return ("ERROR: remote_port_probe_failed host={0} detail={1}" -f $target, $_.Exception.Message)
+	}
+	$any = $false
+	try { $any = [bool]$probe['AnyOpen'] } catch {
+		try { $any = [bool]$probe.AnyOpen } catch { $any = $false }
+	}
+	if ($any) {
+		return $null
+	}
+	$probed = @()
+	try { $probed = @($probe['Probed']) } catch {
+		try { $probed = @($probe.Probed) } catch { $probed = @() }
+	}
+	return (Get-MBRemotePortClosedMessage -Target $target -Transport 'winrm' -Probed $probed)
+}
+
+function Invoke-RemoteCommand {
+	# WinRM remoting (domain-admin tool). Parameter must not be named $host (automatic $Host).
+	param(
+		[Alias('ComputerName')]
+		[string]$RemoteHost = '',
+		[string]$command = '',
+		[string]$transport = 'winrm',
+		[string]$shell = 'powershell',
+		[string]$username = '',
+		[string]$password = '',
+		[int]$port = 0,
+		[int]$timeout_sec = 0,
+		[object]$use_ssl = $null
+	)
+	try {
+		if (-not (Test-MBHostOnDomain)) { return (Get-MBRemoteCommandDomainBlockMessage) }
+	} catch {
+		return (Get-MBRemoteCommandDomainBlockMessage)
+	}
+	$target = ([string]$RemoteHost).Trim()
+	$cmd = [string]$command
+	if ([string]::IsNullOrWhiteSpace($target)) { return 'ERROR: host= is required (IP or hostname).' }
+	if ([string]::IsNullOrWhiteSpace($cmd)) { return 'ERROR: command= is required.' }
+	$target = $target -replace '^(?i)https?://', '' -replace '^(?i)ssh://', ''
+	$target = ($target -split '/')[0].Trim()
+	if ($target -match '^(?i)([^@]+)@(.+)$') {
+		if ([string]::IsNullOrWhiteSpace($username)) { $username = $Matches[1] }
+		$target = $Matches[2]
+	}
+	if ($target -match '^\[([^\]]+)\]:(\d+)$') {
+		$target = $Matches[1]
+		if ($port -le 0) { $port = [int]$Matches[2] }
+	} elseif ($target -match '^([^:]+):(\d+)$' -and $Matches[1] -notmatch '^[A-Za-z]$') {
+		$target = $Matches[1]
+		if ($port -le 0) { $port = [int]$Matches[2] }
+	}
+
+	$tx = ([string]$transport).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($tx) -or $tx -in @('psremoting', 'remoting', 'wsman', 'ps')) { $tx = 'winrm' }
+	if ($tx -ne 'winrm') { return 'ERROR: transport must be winrm.' }
+
+	$sh = ([string]$shell).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($sh)) { $sh = 'powershell' }
+	if ($sh -notin @('powershell', 'cmd', 'pwsh')) { $sh = 'powershell' }
+
+	$timeoutSec = if ($timeout_sec -gt 0) { [int]$timeout_sec } else { [Math]::Min(90, [int]$CommandTimeoutSec) }
+	if ($timeoutSec -lt 10) { $timeoutSec = 10 }
+	if ($timeoutSec -gt 300) { $timeoutSec = 300 }
+	$useSsl = Convert-MBToBool -Value $use_ssl -Default $false
+
+	if ((Test-MBInterrupt)) { return 'CANCELLED: Interrupted by user (ESC)' }
+
+	$gate = Test-MBRemoteCommandPortGate -RemoteHost $target -Transport 'winrm' -Port $port -UseSsl $useSsl
+	if (-not [string]::IsNullOrWhiteSpace($gate)) { return $gate }
+
+	if ($port -le 0) {
+		try {
+			$p2 = Test-MBRemoteServicePorts -Address $target -Transport 'winrm' -Port 0 -UseSsl $false -TimeoutMs 500
+			$open = @()
+			try { $open = @($p2['Open']) } catch { try { $open = @($p2.Open) } catch {} }
+			if ($open -contains 5986 -and -not ($open -contains 5985)) {
+				$port = 5986
+				$useSsl = $true
+			} elseif ($open -contains 5985) {
+				$port = 5985
+			}
+		} catch {}
+	}
+
+	return (Invoke-RemoteCommandWinRm -Target $target -Command $cmd -Shell $sh -Username $username -Password $password -Port $port -TimeoutSec $timeoutSec -UseSsl $useSsl)
+}
+
+function Invoke-RemoteCommandWinRm {
+	# Child powershell.exe + hard timeout (Invoke-Command -AsJob can hang on bad creds / dead hosts).
+	param(
+		[string]$Target,
+		[string]$Command,
+		[string]$Shell = 'powershell',
+		[string]$Username = '',
+		[string]$Password = '',
+		[int]$Port = 0,
+		[int]$TimeoutSec = 60,
+		[bool]$UseSsl = $false
+	)
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	$openMs = 10000
+	$opMs = [Math]::Max(15000, $TimeoutSec * 1000)
+	$childTimeoutMs = [Math]::Min(320000, $openMs + $opMs + 5000)
+
+	# Serialize args for child (avoid expandable parent strings eating $)
+	$payload = @{
+		Target   = [string]$Target
+		Command  = [string]$Command
+		Shell    = [string]$Shell
+		User     = [string]$Username
+		Pass     = [string]$Password
+		Port     = [int]$Port
+		UseSsl   = [bool]$UseSsl
+		OpenMs   = [int]$openMs
+		OpMs     = [int]$opMs
+	}
+	$json = ConvertTo-MBJson $payload -Depth 6
+	$jsonB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+
+	$child = @'
+$ErrorActionPreference = "Stop"
+$WarningPreference = "SilentlyContinue"
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$ProgressPreference = "SilentlyContinue"
+$raw = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:MB_RC_PAYLOAD))
+$p = $raw | ConvertFrom-Json
+$target = [string]$p.Target
+$cmd = [string]$p.Command
+$shell = [string]$p.Shell
+$user = [string]$p.User
+$pass = [string]$p.Pass
+$port = 0
+try { $port = [int]$p.Port } catch { $port = 0 }
+$useSsl = $false
+try { $useSsl = [bool]$p.UseSsl } catch { $useSsl = $false }
+$openMs = 10000
+$opMs = 60000
+try { $openMs = [int]$p.OpenMs } catch {}
+try { $opMs = [int]$p.OpMs } catch {}
+function Emit($obj) {
+  $j = $obj | ConvertTo-Json -Compress -Depth 6
+  [Console]::Out.WriteLine($j)
+}
+try {
+  $opt = New-PSSessionOption -OpenTimeout $openMs -OperationTimeout $opMs -CancelTimeout 3000 -MaxConnectionRetryCount 0
+  $sp = @{
+    ComputerName = $target
+    ErrorAction = "Stop"
+    SessionOption = $opt
+  }
+  if ($port -gt 0) { $sp["Port"] = $port }
+  if ($useSsl) { $sp["UseSSL"] = $true }
+  if (-not [string]::IsNullOrWhiteSpace($user)) {
+    if ([string]::IsNullOrEmpty($pass)) { $sec = New-Object System.Security.SecureString }
+    else { $sec = ConvertTo-SecureString -String $pass -AsPlainText -Force }
+    $sp["Credential"] = New-Object System.Management.Automation.PSCredential ($user, $sec)
+  }
+  # Probe: can we open a session? (fails fast on bad creds with OpenTimeout)
+  $sess = $null
+  try {
+    $sess = New-PSSession @sp
+  } catch {
+    Emit @{ ok = $false; phase = "connect"; error = $_.Exception.Message }
+    exit 2
+  }
+  try {
+    $remote = {
+      param($RemoteCommand, $RemoteShell)
+      $out = ""; $err = ""; $code = 0
+      try {
+        if ($RemoteShell -match "^(?i)cmd") {
+          $of = Join-Path $env:TEMP ("mb-rc-o-" + $PID + ".txt")
+          $ef = Join-Path $env:TEMP ("mb-rc-e-" + $PID + ".txt")
+          try {
+            $pr = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $RemoteCommand) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $of -RedirectStandardError $ef
+            try { $out = [IO.File]::ReadAllText($of) } catch {}
+            try { $err = [IO.File]::ReadAllText($ef) } catch {}
+            $code = [int]$pr.ExitCode
+          } finally {
+            Remove-Item -LiteralPath $of,$ef -Force -ErrorAction SilentlyContinue
+          }
+        } else {
+          $sb = [scriptblock]::Create($RemoteCommand)
+          $r = & $sb 2>&1
+          $ol = New-Object System.Collections.ArrayList
+          $el = New-Object System.Collections.ArrayList
+          foreach ($x in @($r)) {
+            if ($x -is [System.Management.Automation.ErrorRecord]) { [void]$el.Add([string]$x) }
+            else { [void]$ol.Add([string]$x) }
+          }
+          $out = ($ol -join "`n"); $err = ($el -join "`n")
+          if ($el.Count -gt 0 -and $ol.Count -eq 0) { $code = 1 }
+        }
+      } catch {
+        $err = $_.Exception.Message; $code = 1
+      }
+      [pscustomobject]@{ Stdout = $out; Stderr = $err; ExitCode = $code }
+    }
+    $res = Invoke-Command -Session $sess -ScriptBlock $remote -ArgumentList $cmd, $shell -ErrorAction Stop
+    $one = $res | Select-Object -First 1
+    Emit @{
+      ok = $true
+      phase = "run"
+      stdout = [string]$one.Stdout
+      stderr = [string]$one.Stderr
+      exit_code = [int]$one.ExitCode
+    }
+    exit 0
+  } catch {
+    Emit @{ ok = $false; phase = "run"; error = $_.Exception.Message }
+    exit 3
+  } finally {
+    if ($sess) { try { Remove-PSSession $sess -ErrorAction SilentlyContinue } catch {} }
+  }
+} catch {
+  Emit @{ ok = $false; phase = "setup"; error = $_.Exception.Message }
+  exit 1
+}
+'@
+
+	$psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+	if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+	$enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
+	$prevPayload = $null
+	try { $prevPayload = [Environment]::GetEnvironmentVariable('MB_RC_PAYLOAD', 'Process') } catch {}
+	try {
+		[Environment]::SetEnvironmentVariable('MB_RC_PAYLOAD', $jsonB64, 'Process')
+		$rr = Invoke-MBProcessCapture -FileName $psExe -Arguments ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $enc) -TimeoutMs $childTimeoutMs
+	} finally {
+		try {
+			if ($null -eq $prevPayload) {
+				[Environment]::SetEnvironmentVariable('MB_RC_PAYLOAD', $null, 'Process')
+			} else {
+				[Environment]::SetEnvironmentVariable('MB_RC_PAYLOAD', $prevPayload, 'Process')
+			}
+		} catch {}
+	}
+
+	if ($rr.Cancelled) {
+		$script:MB.Interrupt = $true
+		return 'CANCELLED: Interrupted by user (ESC)'
+	}
+	if ($rr.TimedOut) {
+		return (Get-MBRemoteNeedCredsMessage -Target $Target -Transport 'winrm' -Detail ("Timed out after {0}s (connect OpenTimeout={1}ms). Host unreachable, WinRM blocked, or credentials hung auth." -f $TimeoutSec, $openMs))
+	}
+
+	$line = ''
+	try {
+		$stdout = [string]$rr.StdOut
+		# Last non-empty JSON line
+		foreach ($ln in ($stdout -split "`r?`n")) {
+			$t = $ln.Trim()
+			if ($t.StartsWith('{') -and $t.EndsWith('}')) { $line = $t }
+		}
+	} catch {}
+	$obj = $null
+	if ($line) {
+		try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { $obj = $null }
+	}
+	if ($null -eq $obj) {
+		$blob = (([string]$rr.StdOut) + "`n" + ([string]$rr.StdErr)).Trim()
+		if ([string]::IsNullOrWhiteSpace($blob)) { $blob = ("exit={0}" -f $rr.ExitCode) }
+		if ((Test-MBRemoteWinRmAuthError -Text $blob) -or ($rr.ExitCode -eq 2)) {
+			return (Get-MBRemoteNeedCredsMessage -Target $Target -Transport 'winrm' -Detail $blob)
+		}
+		return ("ERROR: WinRM RemoteCommand failed for {0}: {1}" -f $Target, ($blob -replace '[\r\n]+', ' '))
+	}
+
+	$ok = $false
+	try { $ok = [bool]$obj.ok } catch { $ok = $false }
+	if (-not $ok) {
+		$err = ''
+		try { $err = [string]$obj.error } catch { $err = 'unknown' }
+		$phase = ''
+		try { $phase = [string]$obj.phase } catch {}
+		if ($phase -eq 'connect' -or (Test-MBRemoteWinRmAuthError -Text $err) -or [string]::IsNullOrWhiteSpace([string]$Username)) {
+			return (Get-MBRemoteNeedCredsMessage -Target $Target -Transport 'winrm' -Detail $err)
+		}
+		return ("ERROR: WinRM RemoteCommand failed for {0} (phase={1}): {2}" -f $Target, $phase, $err)
+	}
+
+	$sw.Stop()
+	$stdout = ''
+	$stderr = ''
+	$exit = 0
+	try { $stdout = [string]$obj.stdout } catch {}
+	try { $stderr = [string]$obj.stderr } catch {}
+	try { $exit = [int]$obj.exit_code } catch {}
+	$parts = New-Object System.Collections.ArrayList
+	[void]$parts.Add(("REMOTE: {0}  transport=winrm  shell={1}  user={2}" -f $Target, $Shell, $(if ($Username) { $Username } else { '(default/SSO)' })))
+	$sc = Sanitize-MBProcessOutput -Text $stdout
+	$se = Sanitize-MBProcessOutput -Text $stderr
+	if ($sc) { [void]$parts.Add($sc.TrimEnd()) }
+	if ($se) { [void]$parts.Add("STDERR:`n$($se.TrimEnd())") }
+	[void]$parts.Add(("EXIT_CODE: {0} ({1} ms)" -f $exit, $sw.ElapsedMilliseconds))
+	return Limit-MBResult ($parts -join "`n`n")
+}
+
 function Invoke-ListDirectory {
 	param([string]$path = ".")
 	$path = Resolve-MBPath $path
@@ -14817,7 +15956,7 @@ function Invoke-GetMappedDrives {
 		map_count     = $sorted.Count
 		mappings      = $sorted
 		operator_card = $card
-		note          = 'Network drive letters on THIS PC (not remote share discovery). Map with MapNetworkDrive; list local published shares with GetLocalShares; find remote shares with ProbeShares.'
+		note          = 'Network drive letters on THIS PC (not remote share discovery). Map with MapNetworkDrive; list local published shares with GetLocalShares; find remote shares with FindShares.'
 	}) -Depth 6
 }
 
@@ -15406,7 +16545,7 @@ function Invoke-ScanNetwork {
 		with_vendor       = $withVend
 		elapsed_ms        = $sw.ElapsedMilliseconds
 		hosts             = @($hosts)
-		note              = 'Active probe uses flood ping (Test-Connection -AsJob x subnet). MAC via ARP + SendARP (iphlpapi); vendors need MAC OUI. To find shares on hosts, use ProbeShares (not RunCommand Get-SmbShare/CimSession).'
+		note              = 'Active probe uses flood ping (Test-Connection -AsJob x subnet). MAC via ARP + SendARP (iphlpapi); vendors need MAC OUI. To find shares on hosts, use FindShares (not RunCommand Get-SmbShare/CimSession).'
 	}) -Depth 6
 }
 
@@ -15528,7 +16667,7 @@ function Test-MBShareMapGuess {
 	}
 }
 
-function Invoke-ProbeShares {
+function Invoke-FindShares {
 	# 1) Port-scan 445/139 (fast filter)
 	# 2) On SMB-open hosts, guess-and-test share names via timed net use (no net view / CimSession hang)
 	param(
@@ -15639,7 +16778,7 @@ function Invoke-ProbeShares {
 	}
 	$mode = if ($autoDiscover) { 'search' } elseif ($targets.Count -eq 1) { 'targeted' } else { 'targeted_list' }
 	if ($targets.Count -gt 64) {
-		return "ERROR: max 64 hosts per ProbeShares call (got $($targets.Count))."
+		return "ERROR: max 64 hosts per FindShares call (got $($targets.Count))."
 	}
 
 	# Candidate share names to try (guess list)
@@ -15697,7 +16836,7 @@ function Invoke-ProbeShares {
 	$hostTotal = @($targets).Count
 	$hostIdx = 0
 	try {
-		Write-Host ("  ProbeShares: {0} host(s), candidates={1}" -f $hostTotal, ((@($candidates) -join ','))) -ForegroundColor DarkGray
+		Write-Host ("  FindShares: {0} host(s), candidates={1}" -f $hostTotal, ((@($candidates) -join ','))) -ForegroundColor DarkGray
 	} catch {}
 
 	foreach ($h in $targets) {
@@ -15714,7 +16853,7 @@ function Invoke-ProbeShares {
 			best_status       = ''
 		}
 		try {
-			Write-Host ("  ProbeShares {0}/{1} {2} ..." -f $hostIdx, $hostTotal, $h) -ForegroundColor DarkGray -NoNewline
+			Write-Host ("  FindShares {0}/{1} {2} ..." -f $hostIdx, $hostTotal, $h) -ForegroundColor DarkGray -NoNewline
 		} catch {}
 		$row.port_445_smb2 = Test-MBTcpPortOpen -Computer $h -Port 445 -TimeoutMs $port_timeout_ms
 		$row.port_139_smb1 = Test-MBTcpPortOpen -Computer $h -Port 139 -TimeoutMs $port_timeout_ms
@@ -15772,7 +16911,7 @@ function Invoke-ProbeShares {
 	foreach ($u in @($uniqueUncs | Select-Object -First 8)) { [void]$notes.Add([string]$u) }
 	if ($uniqueUncs.Count -gt 8) { [void]$notes.Add(('... +{0} more' -f ($uniqueUncs.Count - 8))) }
 	if ($uniqueUncs.Count -eq 0) { [void]$notes.Add('No share matches. Try credentials or exact share_name.') }
-	$card = Write-MBOperatorCard -Title 'PROBE SHARES' -Fields ([ordered]@{
+	$card = Write-MBOperatorCard -Title 'FIND SHARES' -Fields ([ordered]@{
 		Mode       = $mode
 		Hosts      = $hostTotal
 		'SMB open' = $smbOpen
@@ -15780,7 +16919,7 @@ function Invoke-ProbeShares {
 		Elapsed_ms = $sw.ElapsedMilliseconds
 	}) -Notes @($notes)
 	if ($uniqueUncs.Count -gt 0) {
-		try { [void](Add-MBStickyNote -Text ("ProbeShares: " + ($uniqueUncs -join ', ')) -Kind finding) } catch {}
+		try { [void](Add-MBStickyNote -Text ("FindShares: " + ($uniqueUncs -join ', ')) -Kind finding) } catch {}
 	}
 
 	return ConvertTo-MBJson ([ordered]@{
@@ -15804,6 +16943,283 @@ function Invoke-ProbeShares {
 		results           = @($results)
 		note              = 'Modes: known machine -> computer=IP or hosts=[IP] (only those; self IP/hostname always skipped). Unknown -> omit hosts (auto LAN flood then same guess; self excluded). Port filter then timed net use \\host\share. exists_auth_required = share found, needs MapNetworkDrive + creds.'
 	}) -Depth 8
+}
+
+function Get-MBLanProbeHostList {
+	# Shared host list for PortProbe multi-host / FindWebHosts / FindRdp / FindShares-style discovery.
+	param(
+		$Hosts = $null,
+		[string]$Computer = '',
+		[int]$MaxHosts = 64,
+		[switch]$AutoDiscover
+	)
+	$targets = New-Object System.Collections.ArrayList
+	if ($null -ne $Hosts) {
+		if ($Hosts -is [string]) {
+			foreach ($p in ([string]$Hosts -split '[,;\s]+')) {
+				if ($p.Trim()) { [void]$targets.Add($p.Trim()) }
+			}
+		} elseif ($Hosts -is [System.Collections.IEnumerable]) {
+			foreach ($h in @($Hosts)) {
+				$s = [string]$h
+				if ($s.Trim()) { [void]$targets.Add($s.Trim()) }
+			}
+		}
+	}
+	if (-not [string]::IsNullOrWhiteSpace($Computer)) {
+		[void]$targets.Add(([string]$Computer).Trim())
+	}
+	$seen = @{}
+	$uniq = New-Object System.Collections.ArrayList
+	foreach ($t in @($targets)) {
+		$key = $t.ToLowerInvariant()
+		if ($seen.ContainsKey($key)) { continue }
+		$seen[$key] = $true
+		[void]$uniq.Add($t)
+	}
+	$targets = $uniq
+	$selfIds = Get-MBLocalHostIdentitySet
+	$excludedSelf = New-Object System.Collections.ArrayList
+	$discoverNote = ''
+	$auto = $false
+	if ($targets.Count -eq 0 -or $AutoDiscover) {
+		if ($targets.Count -eq 0) { $auto = $true }
+		if ($auto) {
+			$ctx = Get-MBPrimaryLanContext
+			if (-not $ctx.ok -or [string]::IsNullOrWhiteSpace([string]$ctx.prefix)) {
+				return @{
+					Ok = $false
+					Error = 'No hosts= and could not detect local subnet. Pass computer=IP or hosts=[...].'
+					Targets = @()
+					ExcludedSelf = @()
+					AutoDiscover = $true
+					Discover = ''
+				}
+			}
+			$range = @(Get-MBScanIpRange -Subnet '' -DefaultPrefix $ctx.prefix -MaxHosts ([Math]::Min(254, [Math]::Max(1, $MaxHosts * 4))))
+			$alive = @(Invoke-MBFloodPingSubnet -Targets $range -TimeoutMs 4000)
+			$targets = New-Object System.Collections.ArrayList
+			foreach ($a in $alive) {
+				$as = [string]$a
+				if (Test-MBIsLocalHostTarget -HostName $as -IdentitySet $selfIds) {
+					[void]$excludedSelf.Add($as)
+					continue
+				}
+				[void]$targets.Add($as)
+			}
+			$discoverNote = ("auto_discover prefix={0} flood_alive={1}" -f $ctx.prefix, $targets.Count)
+		}
+	}
+	$filtered = New-Object System.Collections.ArrayList
+	foreach ($t in @($targets)) {
+		if (Test-MBIsLocalHostTarget -HostName $t -IdentitySet $selfIds) {
+			[void]$excludedSelf.Add([string]$t)
+			continue
+		}
+		[void]$filtered.Add($t)
+	}
+	$targets = $filtered
+	if ($targets.Count -gt $MaxHosts) {
+		$trim = New-Object System.Collections.ArrayList
+		foreach ($x in @($targets | Select-Object -First $MaxHosts)) { [void]$trim.Add($x) }
+		$targets = $trim
+	}
+	return @{
+		Ok = $true
+		Error = ''
+		Targets = @($targets)
+		ExcludedSelf = @($excludedSelf | Select-Object -Unique)
+		AutoDiscover = $auto
+		Discover = $discoverNote
+	}
+}
+
+function Invoke-PortProbe {
+	# Tool: TCP port probe using unified Test-MBPortProbe.
+	# Dispatcher must pass computer=/hosts= (never splat key 'host' — collides with $Host).
+	param(
+		[string]$computer = '',
+		$hosts = $null,
+		$ports = $null,
+		[string]$profile = '',
+		[int]$timeout_ms = 800,
+		[int]$max_hosts = 32,
+		[object]$use_ssl = $null
+	)
+	$useSsl = Convert-MBToBool -Value $use_ssl -Default $false
+	if ($timeout_ms -lt 50) { $timeout_ms = 50 }
+	if ($timeout_ms -gt 5000) { $timeout_ms = 5000 }
+	if ($max_hosts -lt 1) { $max_hosts = 1 }
+	if ($max_hosts -gt 64) { $max_hosts = 64 }
+
+	$portList = Get-MBPortProbeProfilePorts -Profile $profile -Ports $ports -UseSsl $useSsl
+	if (@($portList).Count -lt 1) {
+		return "ERROR: Provide ports=[80,443] or profile=winrm|ssh|rdp|web|smb"
+	}
+
+	$hl = Get-MBLanProbeHostList -Hosts $hosts -Computer $computer -MaxHosts $max_hosts
+	if (-not $hl.Ok) { return ("ERROR: {0}" -f $hl.Error) }
+	$targets = @($hl.Targets)
+	if ($targets.Count -lt 1) {
+		$hl = Get-MBLanProbeHostList -MaxHosts $max_hosts -AutoDiscover
+		if (-not $hl.Ok) { return ("ERROR: {0}" -f $hl.Error) }
+		$targets = @($hl.Targets)
+	}
+	if ($targets.Count -lt 1) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok = $true
+			host_count = 0
+			ports = @($portList)
+			profile = $profile
+			open_hosts = @()
+			results = @()
+			note = 'No hosts to probe. Pass computer= or hosts=[...] or ensure LAN peers answer ping for auto discover.'
+		}) -Depth 4
+	}
+
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	$results = New-Object System.Collections.ArrayList
+	$openHosts = New-Object System.Collections.ArrayList
+	foreach ($t in $targets) {
+		if ((Test-MBInterrupt)) { break }
+		$r = Test-MBPortProbe -Computer $t -Ports $portList -TimeoutMs $timeout_ms
+		$row = [ordered]@{
+			host = $t
+			open = @($r.Open)
+			closed = @($r.Closed)
+			any_open = [bool]$r.AnyOpen
+			elapsed_ms = [int]$r.ElapsedMs
+		}
+		[void]$results.Add($row)
+		if ($r.AnyOpen) { [void]$openHosts.Add($t) }
+	}
+	$sw.Stop()
+	return ConvertTo-MBJson ([ordered]@{
+		ok = $true
+		profile = ([string]$profile)
+		ports = @($portList)
+		host_count = $targets.Count
+		open_host_count = $openHosts.Count
+		open_hosts = @($openHosts)
+		auto_discover = [bool]$hl.AutoDiscover
+		discover = [string]$hl.Discover
+		timeout_ms = $timeout_ms
+		elapsed_ms = [int]$sw.ElapsedMilliseconds
+		results = @($results)
+		note = 'Native TCP connect probe (no nmap). open[] = listening/reachable ports from this PC.'
+	}) -Depth 6
+}
+
+function Invoke-FindLanService {
+	# FindWebHosts / FindRdp — flood-alive hosts then PortProbe profile ports.
+	param(
+		[Parameter(Mandatory = $true)][string]$Service,
+		$Hosts = $null,
+		[string]$Computer = '',
+		[int]$TimeoutMs = 600,
+		[int]$MaxHosts = 64
+	)
+	$svc = ([string]$Service).Trim().ToLowerInvariant()
+	$profile = $svc
+	$label = $svc
+	if ($svc -match '^(web|http|https|www)$') { $profile = 'web'; $label = 'web' }
+	elseif ($svc -match '^(rdp|remote.?desktop)$') { $profile = 'rdp'; $label = 'rdp' }
+	else { return "ERROR: unknown service '$Service' (use web or rdp)" }
+
+	$ports = Get-MBPortProbeProfilePorts -Profile $profile
+	$hl = Get-MBLanProbeHostList -Hosts $Hosts -Computer $Computer -MaxHosts $MaxHosts
+	if ($hl.Targets.Count -lt 1) {
+		$hl = Get-MBLanProbeHostList -MaxHosts $MaxHosts -AutoDiscover
+	}
+	if (-not $hl.Ok) { return ("ERROR: {0}" -f $hl.Error) }
+	$targets = @($hl.Targets)
+	if ($targets.Count -lt 1) {
+		return ConvertTo-MBJson ([ordered]@{
+			ok = $true
+			service = $label
+			ports = @($ports)
+			host_count = 0
+			match_count = 0
+			hosts = @()
+			note = 'No LAN hosts to scan. Pass computer=/hosts= or check subnet.'
+		}) -Depth 4
+	}
+
+	$sw = [System.Diagnostics.Stopwatch]::StartNew()
+	$matches = New-Object System.Collections.ArrayList
+	$results = New-Object System.Collections.ArrayList
+	try {
+		Write-Host ("  Find{0}: {1} host(s), ports={2}" -f $label.ToUpperInvariant(), $targets.Count, (($ports -join ','))) -ForegroundColor DarkGray
+	} catch {}
+	$idx = 0
+	foreach ($t in $targets) {
+		$idx++
+		if ((Test-MBInterrupt)) { break }
+		$r = Test-MBPortProbe -Computer $t -Ports $ports -TimeoutMs $TimeoutMs
+		$row = [ordered]@{
+			host = $t
+			open = @($r.Open)
+			closed = @($r.Closed)
+			match = [bool]$r.AnyOpen
+		}
+		[void]$results.Add($row)
+		if ($r.AnyOpen) {
+			[void]$matches.Add([ordered]@{
+				host = $t
+				open_ports = @($r.Open)
+			})
+		}
+	}
+	$sw.Stop()
+	$notes = New-Object System.Collections.ArrayList
+	foreach ($m in @($matches | Select-Object -First 12)) {
+		[void]$notes.Add(('{0} :{1}' -f $m.host, (($m.open_ports -join ','))))
+	}
+	if ($matches.Count -gt 12) { [void]$notes.Add(('... +{0} more' -f ($matches.Count - 12))) }
+	if ($matches.Count -eq 0) { [void]$notes.Add("No hosts with open $label ports.") }
+	$card = Write-MBOperatorCard -Title ("FIND {0}" -f $label.ToUpperInvariant()) -Fields ([ordered]@{
+		Hosts   = $targets.Count
+		Matches = $matches.Count
+		Ports   = ($ports -join ',')
+		Elapsed_ms = $sw.ElapsedMilliseconds
+	}) -Notes @($notes)
+
+	return ConvertTo-MBJson ([ordered]@{
+		ok = $true
+		service = $label
+		ports = @($ports)
+		host_count = $targets.Count
+		match_count = $matches.Count
+		hosts = @($matches)
+		auto_discover = [bool]$hl.AutoDiscover
+		discover = [string]$hl.Discover
+		excluded_self = @($hl.ExcludedSelf)
+		timeout_ms = $TimeoutMs
+		elapsed_ms = [int]$sw.ElapsedMilliseconds
+		operator_card = $card
+		results = @($results)
+		note = "TCP PortProbe for $label. Targeted: computer=/hosts=. Search: omit hosts (LAN flood then ports)."
+	}) -Depth 6
+}
+
+function Invoke-FindWebHosts {
+	param(
+		$Hosts = $null,
+		[string]$Computer = '',
+		[int]$timeout_ms = 600,
+		[int]$max_hosts = 64
+	)
+	Invoke-FindLanService -Service web -Hosts $Hosts -Computer $Computer -TimeoutMs $timeout_ms -MaxHosts $max_hosts
+}
+
+function Invoke-FindRdp {
+	param(
+		$Hosts = $null,
+		[string]$Computer = '',
+		[int]$timeout_ms = 600,
+		[int]$max_hosts = 64
+	)
+	Invoke-FindLanService -Service rdp -Hosts $Hosts -Computer $Computer -TimeoutMs $timeout_ms -MaxHosts $max_hosts
 }
 
 function Invoke-GetWindowsUpdateStatus {
@@ -20969,7 +22385,7 @@ function Test-ModelConnection {
 		[string]$Username,
 		[string]$Password,
 		[string]$BearerToken = '',
-		[int]$TimeoutSeconds = 8
+		[int]$TimeoutSeconds = 3
 	)
 	$raw = [string]$BaseUrl
 	if ([string]::IsNullOrWhiteSpace($raw)) {
@@ -20995,10 +22411,7 @@ function Test-ModelConnection {
 	}
 
 	$headers = @{}
-	# Display labels: None | API | Basic (NPM)
 	$authType = 'None'
-	# Bearer / per-base key first; explicit Username/Password only if no key
-	# (Basic (NPM) when session NPM credentials are used)
 	$auth = Get-MBAuthHeaderValue -BaseUrl $raw -BearerToken $BearerToken
 	if ($auth) {
 		$headers['Authorization'] = $auth
@@ -21006,102 +22419,92 @@ function Test-ModelConnection {
 	} elseif ($Username -and $Password) {
 		$credBytes = [System.Text.Encoding]::UTF8.GetBytes("${Username}:${Password}")
 		$headers['Authorization'] = "Basic " + [Convert]::ToBase64String($credBytes)
-		# Explicit user/pass — Basic (NPM) when matching session NPM login
-		try {
-			if ($script:MB.NpmUser -and $script:MB.NpmPass -and
-				[string]::Equals([string]$Username, [string]$script:MB.NpmUser, [StringComparison]::Ordinal) -and
-				[string]::Equals([string]$Password, [string]$script:MB.NpmPass, [StringComparison]::Ordinal)) {
-				$authType = 'Basic (NPM)'
-			} else {
-				$authType = 'Basic (NPM)'
-			}
-		} catch { $authType = 'Basic (NPM)' }
+		$authType = 'Basic (NPM)'
 	} else {
 		$authType = Format-MBAuthDisplayLabel -Mode 'none' -BaseUrl $raw -Short
 	}
 
-	try {
-		# TLS 1.2 + 1.3 when available (api.x.ai / modern HTTPS on PS 5.1)
-		$proto = [System.Net.SecurityProtocolType]::Tls12
-		try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
-		[System.Net.ServicePointManager]::SecurityProtocol = $proto
-	} catch {
-		try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
-	}
-	try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
-
 	$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 	$lastFail = $null
-	$OriginalProgressPreference = $Global:ProgressPreference
-	$Global:ProgressPreference = 'SilentlyContinue'
-	try {
-		foreach ($base in $bases) {
-			$testUrl = "$base/models"
-			try {
-				$response = Invoke-WebRequest -Uri $testUrl -Method GET -Headers $headers -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
-				if ([int]$response.StatusCode -ne 200) {
-					$lastFail = [pscustomobject]@{
-						Success = $false; StatusCode = [int]$response.StatusCode
-						Message = "HTTP $($response.StatusCode) from $testUrl"
-						AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
-					}
-					continue
-				}
-				if (-not (Test-MBModelsApiResponse -Response $response)) {
-					$lastFail = [pscustomobject]@{
-						Success = $false; StatusCode = 200
-						Message = "Got HTTP 200 from $testUrl but body is not a models API (need OpenAI JSON from vLLM/Unsloth/llama.cpp, not HTML). Use the API base (e.g. :8000/v1 or :8081), not a web UI port."
-						AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
-					}
-					continue
-				}
+	# Total budget across URL variants so boot cannot sit on two full timeouts
+	$deadline = [Environment]::TickCount + ([Math]::Max(1, $TimeoutSeconds) * 1000) + 350
+	foreach ($base in $bases) {
+		$leftMs = $deadline - [Environment]::TickCount
+		if ($leftMs -lt 250) { break }
+		$tSec = [Math]::Max(1, [Math]::Min($TimeoutSeconds, [int][Math]::Ceiling($leftMs / 1000.0)))
+		$testUrl = "$base/models"
+		try {
+			$resp = Invoke-MBHttpGetQuick -Url $testUrl -Headers $headers -TimeoutSeconds $tSec
+			$sc = 0
+			try { $sc = [int]$resp.StatusCode } catch { $sc = 0 }
+			if ($sc -in 401, 403) {
 				$stopwatch.Stop()
-				try { $script:MB.ResolvedApiBase = $base } catch {}
 				return [pscustomobject]@{
-					Success    = $true
-					StatusCode = 200
-					Message    = "Connection successful ($($stopwatch.ElapsedMilliseconds) ms) -> $base"
+					Success    = $false
+					StatusCode = $sc
+					Message    = "Authentication failed ($sc) for $base"
 					AuthType   = $authType
 					ElapsedMs  = $stopwatch.ElapsedMilliseconds
 					BaseUrl    = $base
 				}
-			} catch [System.Net.WebException] {
-				$statusCode = $null
-				try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-				if ($statusCode -in 401, 403) {
-					$stopwatch.Stop()
-					return [pscustomobject]@{
-						Success = $false; StatusCode = $statusCode
-						Message = "Authentication failed ($statusCode) for $base"
-						AuthType = $authType
-						ElapsedMs = $stopwatch.ElapsedMilliseconds
-						BaseUrl = $base
-					}
-				}
-				$msg = if ($statusCode) {
-					"Server returned HTTP $statusCode from $testUrl"
+			}
+			if (-not $resp.Ok -or $sc -ne 200) {
+				$msg = if ($resp.TimedOut) {
+					"Timed out connecting to: $testUrl"
+				} elseif ($sc -gt 0) {
+					"HTTP $sc from $testUrl"
 				} else {
-					"$($_.Exception.Message)`nFailed to connect to: $testUrl"
+					$err = if ($resp.Error) { [string]$resp.Error } else { 'connection failed' }
+					"$err`nFailed to connect to: $testUrl"
 				}
 				$lastFail = [pscustomobject]@{
-					Success = $false; StatusCode = $statusCode; Message = $msg
-					AuthType = $authType
-					ElapsedMs = $stopwatch.ElapsedMilliseconds
-					BaseUrl = $base
+					Success = $false; StatusCode = $(if ($sc -gt 0) { $sc } else { $null })
+					Message = $msg
+					AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
+				}
+				continue
+			}
+			$body = [string]$resp.Content
+			if ([string]::IsNullOrWhiteSpace($body) -or $body.TrimStart().StartsWith('<')) {
+				$lastFail = [pscustomobject]@{
+					Success = $false; StatusCode = 200
+					Message = "Got HTTP 200 from $testUrl but body is not a models API (need OpenAI JSON from vLLM/Unsloth/llama.cpp, not HTML). Use the API base (e.g. :8000/v1 or :8081), not a web UI port."
+					AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
+				}
+				continue
+			}
+			try {
+				$obj = $body | ConvertFrom-Json -ErrorAction Stop
+				if (-not ($obj.data -or $obj.models -or $obj.id -or $obj.model -or $obj -is [System.Array])) {
+					throw 'not models json'
 				}
 			} catch {
 				$lastFail = [pscustomobject]@{
-					Success = $false; StatusCode = $null
-					Message = "Unexpected error on $testUrl : $($_.Exception.Message)"
+					Success = $false; StatusCode = 200
+					Message = "Got HTTP 200 from $testUrl but body is not a models API (need OpenAI JSON from vLLM/Unsloth/llama.cpp, not HTML). Use the API base (e.g. :8000/v1 or :8081), not a web UI port."
 					AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
 				}
+				continue
+			}
+			$stopwatch.Stop()
+			try { $script:MB.ResolvedApiBase = $base } catch {}
+			return [pscustomobject]@{
+				Success    = $true
+				StatusCode = 200
+				Message    = "Connection successful ($($stopwatch.ElapsedMilliseconds) ms) -> $base"
+				AuthType   = $authType
+				ElapsedMs  = $stopwatch.ElapsedMilliseconds
+				BaseUrl    = $base
+			}
+		} catch {
+			$lastFail = [pscustomobject]@{
+				Success = $false; StatusCode = $null
+				Message = "Unexpected error on $testUrl : $($_.Exception.Message)"
+				AuthType = $authType; ElapsedMs = $stopwatch.ElapsedMilliseconds; BaseUrl = $base
 			}
 		}
-	} finally {
-		$Global:ProgressPreference = $OriginalProgressPreference
-		if ($stopwatch -and $stopwatch.IsRunning) { try { $stopwatch.Stop() | Out-Null } catch {} }
 	}
-
+	if ($stopwatch.IsRunning) { try { $stopwatch.Stop() | Out-Null } catch {} }
 	if ($lastFail) { return $lastFail }
 	return [pscustomobject]@{
 		Success = $false; StatusCode = $null
@@ -21155,6 +22558,7 @@ function Invoke-ModelStreaming {
 		$streamParseDrops = 0
 		$haveUsageThisStream = $false
 		$script:MB.LastServerCompletionTokens = 0
+		try { Reset-MBStreamSpeedState } catch {}
 		$client = $null
 		$stream = $null
 		$reader = $null
@@ -21251,7 +22655,7 @@ function Invoke-ModelStreaming {
 					try { $client.CancelPendingRequests() } catch {}
 					break
 				}
-				Start-Sleep -Milliseconds 40
+				Start-Sleep -Milliseconds 5
 			}
 
 			if ($script:MB.Interrupt -or $sendTask.IsCanceled) {
@@ -21265,6 +22669,8 @@ function Invoke-ModelStreaming {
 			}
 
 			$httpResponse = $sendTask.Result
+			# Wall-clock prefill window starts when headers arrive (SSE body follows prompt eval).
+			$script:MB.StreamHeadersTick = [Environment]::TickCount
 			Write-MBDebugLog -Step 'STREAM_HEADERS' -Detail ("status={0}" -f ([int]$httpResponse.StatusCode))
 
 			if (-not $httpResponse.IsSuccessStatusCode) {
@@ -21280,51 +22686,73 @@ function Invoke-ModelStreaming {
 			}
 
 			$stream = $httpResponse.Content.ReadAsStreamAsync().Result
-			$reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true, 8192, $true)
+			# Larger buffer + aggressive drain reduces chunk latency vs 8KB + 30ms poll.
+			$reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true, 65536, $true)
 			$script:MB.ActiveStream = $stream
 			$script:MB.ActiveReader = $reader
 			Write-MBDebugLog -Step 'STREAM_READ_LOOP'
 
+			# Mutable bag so nested helpers can update stream state reliably (PS closure assign pitfalls).
+			$st = @{
+				FullContent  = ''
+				StartedOut   = $false
+				FinishReason = $null
+				HasTools     = $false
+				HaveUsage    = $false
+				ParseDrops   = 0
+				ToolCalls    = $toolCalls
+			}
+
 			while ($true) {
 				if ((Test-MBInterrupt)) { break }
 
-				$readTask = $null
-				try {
-					$readTask = $reader.ReadLineAsync()
-				} catch {
-					if ($script:MB.Interrupt) { break }
-					throw
-				}
-
-				while ($readTask -and -not $readTask.IsCompleted) {
-					if ((Test-MBInterrupt)) {
-						try { $cts.Cancel() } catch {}
-						try { $client.CancelPendingRequests() } catch {}
-						try { $reader.Dispose() } catch {}
-						try { $stream.Dispose() } catch {}
+				$line = $null
+				# Drain already-buffered lines without async hop (much lower latency).
+				$peekOk = $false
+				try { $peekOk = ($reader.Peek() -ge 0) } catch { $peekOk = $false }
+				if ($peekOk) {
+					try { $line = $reader.ReadLine() } catch {
+						if ($script:MB.Interrupt) { break }
 						break
 					}
-					Start-Sleep -Milliseconds 30
+				} else {
+					$readTask = $null
+					try {
+						$readTask = $reader.ReadLineAsync()
+					} catch {
+						if ($script:MB.Interrupt) { break }
+						throw
+					}
+
+					while ($readTask -and -not $readTask.IsCompleted) {
+						if ((Test-MBInterrupt)) {
+							try { $cts.Cancel() } catch {}
+							try { $client.CancelPendingRequests() } catch {}
+							try { $reader.Dispose() } catch {}
+							try { $stream.Dispose() } catch {}
+							break
+						}
+						Start-Sleep -Milliseconds 1
+					}
+
+					if ($script:MB.Interrupt) { break }
+					if (-not $readTask) { break }
+					if ($readTask.IsCanceled) { break }
+					if ($readTask.IsFaulted) {
+						if ($script:MB.Interrupt) { break }
+						$exMsg = ""
+						try { $exMsg = $readTask.Exception.GetBaseException().Message } catch {}
+						if ($exMsg -match 'cancel|abort|disposed|closed') { break }
+						throw $readTask.Exception.GetBaseException()
+					}
+
+					try { $line = $readTask.Result } catch {
+						if ($script:MB.Interrupt) { break }
+						break
+					}
 				}
 
-				if ($script:MB.Interrupt) { break }
-				if (-not $readTask) { break }
-				if ($readTask.IsCanceled) { break }
-				if ($readTask.IsFaulted) {
-					if ($script:MB.Interrupt) { break }
-					$exMsg = ""
-					try { $exMsg = $readTask.Exception.GetBaseException().Message } catch {}
-					if ($exMsg -match 'cancel|abort|disposed|closed') { break }
-					throw $readTask.Exception.GetBaseException()
-				}
-
-				$line = $null
-				try { $line = $readTask.Result } catch {
-					if ($script:MB.Interrupt) { break }
-					break
-				}
 				if ($null -eq $line) { break }
-
 				if ([string]::IsNullOrWhiteSpace($line)) { continue }
 				if ($line -eq "data: [DONE]" -or $line.Trim() -eq "data: [DONE]") { break }
 				if (-not $line.StartsWith("data: ")) { continue }
@@ -21336,7 +22764,7 @@ function Invoke-ModelStreaming {
 				try {
 					$chunk = $json | ConvertFrom-Json -ErrorAction Stop
 				} catch {
-					$streamParseDrops++
+					$st.ParseDrops++
 					$rescued = $null
 					try {
 						if ($json -match '"content"\s*:\s*"((?:\\.|[^"\\])*)"') {
@@ -21359,25 +22787,26 @@ function Invoke-ModelStreaming {
 						}
 					} catch {}
 					if ($rescued) {
-						if (-not $startedOutput) {
-							if ([int]$script:MB.FirstTokenTick -eq 0) {
-								$script:MB.FirstTokenTick = [Environment]::TickCount
-							}
-							Stop-MBAnimation
+						$nowTok = [Environment]::TickCount
+						if ([int]$script:MB.StreamFirstTokTick -eq 0) { $script:MB.StreamFirstTokTick = $nowTok }
+						if ([int]$script:MB.FirstTokenTick -eq 0) { $script:MB.FirstTokenTick = $nowTok }
+						if (-not [bool]$st.StartedOut) {
+							Write-MBDebugLog -Step 'STREAM_FIRST_TOKEN' -Detail ("len={0}" -f $rescued.Length)
+							try { Stop-MBAnimation } catch {}
 							try { Write-MBThoughtStamp } catch {}
-							$nowWork = [Environment]::TickCount
-							$script:MB.WorkStartTick = $nowWork
-							try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = $nowWork } } catch {}
+							$script:MB.WorkStartTick = $nowTok
+							try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = $nowTok } } catch {}
 							try { Reset-MBMdStream } catch {}
-							Write-MBBrand -NoNewline
-							Write-Host " " -NoNewline
-							$startedOutput = $true
+							try { Write-MBBrand -NoNewline; Write-Host " " -NoNewline } catch {}
+							$st.StartedOut = $true
 						}
 						Write-MBStreamChunk -Text $rescued
-						$fullContent += $rescued
+						$st.FullContent = [string]$st.FullContent + $rescued
 					}
 					continue
 				}
+
+				try { Update-MBStreamTimingsFromChunk -Chunk $chunk } catch {}
 
 				$choice0 = $null
 				if ($chunk.choices -and @($chunk.choices).Count -gt 0) {
@@ -21387,7 +22816,7 @@ function Invoke-ModelStreaming {
 					$fr = Get-MBProp $choice0 'finish_reason'
 					if (-not $fr) { $fr = Get-MBProp (Get-MBProp $choice0 'delta') 'finish_reason' }
 					if ($fr -and [string]$fr -ne '' -and [string]$fr -ne 'null') {
-						$finishReason = [string]$fr
+						$st.FinishReason = [string]$fr
 					}
 				}
 
@@ -21398,35 +22827,36 @@ function Invoke-ModelStreaming {
 					if ($null -ne $pt) {
 						$script:MB.LastServerPromptTokens = [int]$pt
 						$script:MB.TokenCountSource = 'usage'
-						$script:MB.TokCacheKey = ''  # force recount after history changes
+						$script:MB.TokCacheKey = ''
 						$script:MB.LastCtxTokens = [int]$pt
 					}
 					if ($null -ne $ct) {
 						$script:MB.LastServerCompletionTokens = [int]$ct
-						$haveUsageThisStream = $true
+						$st.HaveUsage = $true
 					}
+					try { Update-MBStreamTimingsFromChunk -Chunk $usage } catch {}
 				}
 
 				if (-not $choice0) { continue }
 				$delta = Get-MBProp $choice0 'delta'
 
 				if ($delta -and $delta.tool_calls) {
-					$hasToolCalls = $true
+					$st.HasTools = $true
 					foreach ($tc in @($delta.tool_calls)) {
 						$idx = 0
 						if ($null -ne $tc.index) { $idx = [int]$tc.index }
-						if (-not $toolCalls.ContainsKey($idx)) {
-							$toolCalls[$idx] = @{
+						if (-not $st.ToolCalls.ContainsKey($idx)) {
+							$st.ToolCalls[$idx] = @{
 								id = $(if ($tc.id) { $tc.id } else { "call_$idx" })
 								type = $(if ($tc.type) { $tc.type } else { "function" })
 								function = @{ name = ""; arguments = "" }
 							}
 						}
-						if ($tc.id) { $toolCalls[$idx].id = $tc.id }
-						if ($tc.type) { $toolCalls[$idx].type = $tc.type }
+						if ($tc.id) { $st.ToolCalls[$idx].id = $tc.id }
+						if ($tc.type) { $st.ToolCalls[$idx].type = $tc.type }
 						if ($tc.function) {
-							if ($tc.function.name) { $toolCalls[$idx].function.name += [string]$tc.function.name }
-							if ($null -ne $tc.function.arguments) { $toolCalls[$idx].function.arguments += [string]$tc.function.arguments }
+							if ($tc.function.name) { $st.ToolCalls[$idx].function.name += [string]$tc.function.name }
+							if ($null -ne $tc.function.arguments) { $st.ToolCalls[$idx].function.arguments += [string]$tc.function.arguments }
 						}
 					}
 				}
@@ -21439,26 +22869,26 @@ function Invoke-ModelStreaming {
 					if ($msgObj) {
 						$mc = Get-MBProp $msgObj 'content'
 						if ($mc -is [string] -and $mc.Length -gt 0) {
-							if ($fullContent.Length -eq 0) {
+							$fc = [string]$st.FullContent
+							if ($fc.Length -eq 0) {
 								$piece = $mc
-							} elseif ($mc.Length -gt $fullContent.Length -and $mc.StartsWith($fullContent)) {
-								$piece = $mc.Substring($fullContent.Length)
+							} elseif ($mc.Length -gt $fc.Length -and $mc.StartsWith($fc)) {
+								$piece = $mc.Substring($fc.Length)
 							}
 						}
 					}
 				}
 
 				if ($null -ne $piece -and $piece.Length -gt 0) {
-					if (-not $startedOutput) {
+					$nowTok = [Environment]::TickCount
+					if ([int]$script:MB.StreamFirstTokTick -eq 0) { $script:MB.StreamFirstTokTick = $nowTok }
+					if ([int]$script:MB.FirstTokenTick -eq 0) { $script:MB.FirstTokenTick = $nowTok }
+					if (-not [bool]$st.StartedOut) {
 						Write-MBDebugLog -Step 'STREAM_FIRST_TOKEN' -Detail ("len={0}" -f $piece.Length)
-						if ([int]$script:MB.FirstTokenTick -eq 0) {
-							$script:MB.FirstTokenTick = [Environment]::TickCount
-						}
 						try { Stop-MBAnimation } catch { Write-MBDebugLog -Step 'STREAM_STOP_ANIM_ERR' -Detail $_.Exception.Message }
 						try { Write-MBThoughtStamp } catch {}
-						$nowWork = [Environment]::TickCount
-						$script:MB.WorkStartTick = $nowWork
-						try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = $nowWork } } catch {}
+						$script:MB.WorkStartTick = $nowTok
+						try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = $nowTok } } catch {}
 						try {
 							Write-MBDebugLog -Step 'STREAM_WRITE_BRAND'
 							try { Reset-MBMdStream } catch {}
@@ -21468,14 +22898,38 @@ function Invoke-ModelStreaming {
 						} catch {
 							Write-MBDebugLog -Step 'STREAM_WRITE_BRAND_ERR' -Detail $_.Exception.Message
 						}
-						$startedOutput = $true
+						$st.StartedOut = $true
 					}
 					try { Write-MBStreamChunk -Text $piece } catch {
 						Write-MBDebugLog -Step 'STREAM_CHUNK_ERR' -Detail $_.Exception.Message
 					}
-					$fullContent += $piece
+					$st.FullContent = [string]$st.FullContent + $piece
 				}
 			}
+
+			$fullContent = [string]$st.FullContent
+			$startedOutput = [bool]$st.StartedOut
+			$finishReason = $st.FinishReason
+			$hasToolCalls = [bool]$st.HasTools
+			$haveUsageThisStream = [bool]$st.HaveUsage
+			$streamParseDrops = [int]$st.ParseDrops
+			$toolCalls = $st.ToolCalls
+
+			# Finalize speeds at stream end — before markdown flush / UI (those were padding t/s down).
+			try {
+				$script:MB.LastReplyChars = $(if ($null -eq $fullContent) { 0 } else { $fullContent.Length })
+			} catch { $script:MB.LastReplyChars = 0 }
+			try { Complete-MBStreamSpeedMetrics } catch {}
+			try {
+				Write-MBDebugLog -Step 'STREAM_SPEED' -Detail ("src={0} pp={1:0.0} tg={2:0.0} prefill={3:0.000}s gen={4:0.000}s pt={5} ct={6}" -f `
+					$(try { [string]$script:MB.SpeedSource } catch { '?' }),
+					$(try { [double]$script:MB.ServerPpS } catch { 0 }),
+					$(try { [double]$script:MB.ServerTgS } catch { 0 }),
+					$(try { [double]$script:MB.LastPrefillSec } catch { 0 }),
+					$(try { [double]$script:MB.LastGenSec } catch { 0 }),
+					$(try { [int]$script:MB.LastServerPromptTokens } catch { 0 }),
+					$(try { [int]$script:MB.LastServerCompletionTokens } catch { 0 }))
+			} catch {}
 
 			if ($script:MB.IsThinking -or $script:MB.AnimPs) {
 				Stop-MBAnimation
@@ -21976,6 +23430,7 @@ function Reset-MBToolLoopGuard {
 	try { $script:MB.LoopConfirmedFps.Clear() } catch {
 		$script:MB.LoopConfirmedFps = New-Object System.Collections.ArrayList
 	}
+	try { $script:MB.RemotePortClosedBlocks = @{} } catch {}
 }
 
 # Setup / tune and installer tools
@@ -24425,18 +25880,7 @@ function Invoke-MapNetworkDrive {
 	}
 
 	$user = Resolve-MBWindowsAccountName -Username $username -Domain $domain
-	$pass = [string]$password
-	if ($user -and [string]::IsNullOrEmpty($pass)) {
-		return ConvertTo-MBJson ([ordered]@{
-			ok         = $false
-			need_input = $true
-			missing    = @('password')
-			message    = "NEED_INPUT: username is set ($user) but password is empty. Ask the operator in chat for the share password, then call MapNetworkDrive again with password= (show it back so they know what was used)."
-			path       = $unc
-			username   = $user
-			letter     = $(if ($let) { "${let}:" } else { '' })
-		}) -Depth 4
-	}
+	$pass = if ($null -eq $password) { '' } else { [string]$password }
 	$persist = $true
 	if ($persistent -is [bool]) { $persist = $persistent }
 	elseif ([string]$persistent -match '^(?i)0|false|no|off$') { $persist = $false }
@@ -24476,7 +25920,7 @@ function Invoke-MapNetworkDrive {
 				}
 				if ($user) {
 					$mapParams['UserName'] = $user
-					if (-not [string]::IsNullOrEmpty($pass)) { $mapParams['Password'] = $pass }
+					$mapParams['Password'] = $pass
 				}
 				New-SmbMapping @mapParams | Out-Null
 				$ok = $true
@@ -24529,9 +25973,8 @@ function Invoke-MapNetworkDrive {
 				$psDriveOk = $true
 			} catch {
 				try {
-					# Credentialed PSDrive when New-SmbMapping used different user
-					if ($user -and -not [string]::IsNullOrEmpty($pass)) {
-						$sec = ConvertTo-SecureString -String $pass -AsPlainText -Force
+					if ($user) {
+						$sec = New-MBPlainToSecureString -PlainText $pass
 						$cred = New-Object System.Management.Automation.PSCredential ($user, $sec)
 						New-PSDrive -Name $let -PSProvider FileSystem -Root $unc -Credential $cred -Scope Global -ErrorAction Stop | Out-Null
 						$psDriveOk = $true
@@ -27187,6 +28630,105 @@ function Invoke-MBTool {
 					}
 				}
 			}
+			"RemoteCommand" {
+				# Domain-admin tool: soft-block before ports/approval when host/user not on a domain.
+				try {
+					if (-not (Test-MBHostOnDomain)) {
+						Write-Host "    remote command unavailable (not on domain)" -ForegroundColor DarkYellow
+						return (Get-MBRemoteCommandDomainBlockMessage)
+					}
+				} catch {
+					Write-Host "    remote command unavailable (domain check failed)" -ForegroundColor DarkYellow
+					return (Get-MBRemoteCommandDomainBlockMessage)
+				}
+				# Never splat a key named 'host' — binds to automatic $Host and throws read-only/constant.
+				$p = @{}
+				$rh = ''
+				if (Test-MBHasProp $ArgsObj 'host') { $rh = [string](Get-MBProp $ArgsObj 'host') }
+				if ([string]::IsNullOrWhiteSpace($rh) -and (Test-MBHasProp $ArgsObj 'computer')) {
+					$rh = [string](Get-MBProp $ArgsObj 'computer')
+				}
+				if (-not [string]::IsNullOrWhiteSpace($rh)) { $p['RemoteHost'] = $rh.Trim() }
+				if (Test-MBHasProp $ArgsObj 'command') { $p['command'] = (Get-MBProp $ArgsObj 'command') }
+				if (Test-MBHasProp $ArgsObj 'transport') { $p['transport'] = (Get-MBProp $ArgsObj 'transport') }
+				if (Test-MBHasProp $ArgsObj 'shell') { $p['shell'] = (Get-MBProp $ArgsObj 'shell') }
+				if (Test-MBHasProp $ArgsObj 'username') { $p['username'] = (Get-MBProp $ArgsObj 'username') }
+				if (Test-MBHasProp $ArgsObj 'user') { $p['username'] = (Get-MBProp $ArgsObj 'user') }
+				if (Test-MBHasProp $ArgsObj 'password') { $p['password'] = (Get-MBProp $ArgsObj 'password') }
+				if (Test-MBHasProp $ArgsObj 'port') {
+					try {
+						$pv = Get-MBProp $ArgsObj 'port'
+						if ($pv -is [System.Array]) { $p['port'] = [int](@($pv)[0]) }
+						else { $p['port'] = [int]$pv }
+					} catch {}
+				}
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') {
+					try { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') } catch {}
+				}
+				if (Test-MBHasProp $ArgsObj 'use_ssl') { $p['use_ssl'] = (Get-MBProp $ArgsObj 'use_ssl') }
+
+				$hShow = ''
+				try { $hShow = [string]$p['RemoteHost'] } catch {}
+				$txShow = 'winrm'
+				try { if ($p['transport']) { $txShow = [string]$p['transport'] } } catch {}
+				$shShow = 'powershell'
+				try { if ($p['shell']) { $shShow = [string]$p['shell'] } } catch {}
+				$uShow = '(default)'
+				try { if ($p['username']) { $uShow = [string]$p['username'] } } catch {}
+				$cmdShow = ''
+				try { $cmdShow = [string]$p['command'] } catch {}
+				$portShow = 0
+				try {
+					if ($p.ContainsKey('port')) {
+						$pv = $p['port']
+						if ($pv -is [System.Array]) { $portShow = [int](@($pv)[0]) }
+						else { $portShow = [int]$pv }
+					}
+				} catch { $portShow = 0 }
+				$sslShow = $false
+				try { if ($p.ContainsKey('use_ssl')) { $sslShow = [bool](Convert-MBToBool -Value $p['use_ssl'] -Default $false) } } catch {}
+
+				# Port check FIRST (before approval). Closed ports => STOP message, no thrashing.
+				try {
+					$prior = Get-MBRemotePortClosedBlock -Target $hShow -Transport $txShow
+					if (-not [string]::IsNullOrWhiteSpace($prior)) {
+						# Short harness status only — full text is tool result for the model, not chat chrome
+						Write-Host ("    remote port closed ({0} {1}) — already reported" -f $txShow, $hShow) -ForegroundColor DarkGray
+						try { Write-MBDebugLog -Step 'REMOTE_PORT_CLOSED' -Detail ("already host={0} tx={1}" -f $hShow, $txShow) } catch {}
+						return (
+							"ERROR: remote_port_closed=1 already_reported=1 host=$hShow transport=$txShow`n" +
+							"TOOLS_DONE=1 NO_MORE_TOOLS=1 FINISH_TURN=1`n" +
+							"You already got a port-closed result for this host. Do NOT call more tools. Reply to the operator with the status below.`n`n" +
+							$prior
+						)
+					}
+					$gate = Test-MBRemoteCommandPortGate -RemoteHost $hShow -Transport $txShow -Port $portShow -UseSsl $sslShow
+					if (-not [string]::IsNullOrWhiteSpace($gate)) {
+						Write-Host ("    remote port closed ({0} {1})" -f $txShow, $hShow) -ForegroundColor DarkGray
+						try { Write-MBDebugLog -Step 'REMOTE_PORT_CLOSED' -Detail ("host={0} tx={1}" -f $hShow, $txShow) } catch {}
+						# Return to model only — do not Write-Host the full gate (leaks into chat as yellow ERROR)
+						return $gate
+					}
+				} catch {
+					Write-Host ("    remote port probe failed ({0})" -f $hShow) -ForegroundColor DarkGray
+					return ("ERROR: remote_port_probe_failed host={0} detail={1}" -f $hShow, $_.Exception.Message)
+				}
+
+				$details = "Host: $hShow`nTransport: $txShow`nShell: $shShow`nUser: $uShow`nRuns on the REMOTE machine (not this PC)."
+				$codeLang = if ([string]$shShow -match '^(?i)cmd') { 'bat' } else { 'ps' }
+				if (-not (Request-Confirmation -Title "RemoteCommand requires approval" -Details $details -Code $cmdShow -CodeLang $codeLang)) {
+					Write-Host "    denied" -ForegroundColor Red
+					"BLOCKED BY USER: Operator denied RemoteCommand to $hShow. Do not retry the same remote command without a new request. Prefer read-only checks first if the goal was inventory."
+				} else {
+					if ($script:MB.AutoApprove) {
+						if ($script:MB.ModeSwitch) { $script:MB.ModeSwitch = $false }
+						else { Write-Host "    auto-approve" -ForegroundColor Green }
+					} else {
+						Write-Host "    approved" -ForegroundColor Green
+					}
+					Invoke-RemoteCommand @p
+				}
+			}
 			"ListDirectory" { Invoke-ListDirectory -path (Get-MBProp $ArgsObj 'path' '.') }
 			"SearchFiles" {
 				$p = @{
@@ -27379,7 +28921,7 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'max_hosts') { $p['max_hosts'] = [int](Get-MBProp $ArgsObj 'max_hosts') }
 				Invoke-ScanNetwork @p
 			}
-			"ProbeShares" {
+			"FindShares" {
 				$p = @{}
 				if (Test-MBHasProp $ArgsObj 'hosts') { $p['hosts'] = (Get-MBProp $ArgsObj 'hosts') }
 				if (Test-MBHasProp $ArgsObj 'computer') { $p['computer'] = (Get-MBProp $ArgsObj 'computer') }
@@ -27392,7 +28934,38 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'probe_timeout_sec') { $p['probe_timeout_sec'] = [int](Get-MBProp $ArgsObj 'probe_timeout_sec') }
 				if (Test-MBHasProp $ArgsObj 'list_timeout_sec') { $p['probe_timeout_sec'] = [int](Get-MBProp $ArgsObj 'list_timeout_sec') }
 				if (Test-MBHasProp $ArgsObj 'stop_on_first_match') { $p['stop_on_first_match'] = (Get-MBProp $ArgsObj 'stop_on_first_match') }
-				Invoke-ProbeShares @p
+				Invoke-FindShares @p
+			}
+			"PortProbe" {
+				$p = @{}
+				# Never splat 'host' key (collides with $Host) — map to computer=
+				if (Test-MBHasProp $ArgsObj 'computer') { $p['computer'] = (Get-MBProp $ArgsObj 'computer') }
+				elseif (Test-MBHasProp $ArgsObj 'host') { $p['computer'] = (Get-MBProp $ArgsObj 'host') }
+				if (Test-MBHasProp $ArgsObj 'hosts') { $p['hosts'] = (Get-MBProp $ArgsObj 'hosts') }
+				if (Test-MBHasProp $ArgsObj 'ports') { $p['ports'] = (Get-MBProp $ArgsObj 'ports') }
+				if (Test-MBHasProp $ArgsObj 'profile') { $p['profile'] = (Get-MBProp $ArgsObj 'profile') }
+				if (Test-MBHasProp $ArgsObj 'timeout_ms') { $p['timeout_ms'] = [int](Get-MBProp $ArgsObj 'timeout_ms') }
+				if (Test-MBHasProp $ArgsObj 'max_hosts') { $p['max_hosts'] = [int](Get-MBProp $ArgsObj 'max_hosts') }
+				if (Test-MBHasProp $ArgsObj 'use_ssl') { $p['use_ssl'] = (Get-MBProp $ArgsObj 'use_ssl') }
+				Invoke-PortProbe @p
+			}
+			"FindWebHosts" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'computer') { $p['Computer'] = (Get-MBProp $ArgsObj 'computer') }
+				elseif (Test-MBHasProp $ArgsObj 'host') { $p['Computer'] = (Get-MBProp $ArgsObj 'host') }
+				if (Test-MBHasProp $ArgsObj 'hosts') { $p['Hosts'] = (Get-MBProp $ArgsObj 'hosts') }
+				if (Test-MBHasProp $ArgsObj 'timeout_ms') { $p['timeout_ms'] = [int](Get-MBProp $ArgsObj 'timeout_ms') }
+				if (Test-MBHasProp $ArgsObj 'max_hosts') { $p['max_hosts'] = [int](Get-MBProp $ArgsObj 'max_hosts') }
+				Invoke-FindWebHosts @p
+			}
+			"FindRdp" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'computer') { $p['Computer'] = (Get-MBProp $ArgsObj 'computer') }
+				elseif (Test-MBHasProp $ArgsObj 'host') { $p['Computer'] = (Get-MBProp $ArgsObj 'host') }
+				if (Test-MBHasProp $ArgsObj 'hosts') { $p['Hosts'] = (Get-MBProp $ArgsObj 'hosts') }
+				if (Test-MBHasProp $ArgsObj 'timeout_ms') { $p['timeout_ms'] = [int](Get-MBProp $ArgsObj 'timeout_ms') }
+				if (Test-MBHasProp $ArgsObj 'max_hosts') { $p['max_hosts'] = [int](Get-MBProp $ArgsObj 'max_hosts') }
+				Invoke-FindRdp @p
 			}
 			"GetWindowsUpdateStatus"  { Invoke-GetWindowsUpdateStatus }
 			"GetSystemUptime"         { Invoke-GetSystemUptime }
@@ -30726,23 +32299,56 @@ function Invoke-MBWpf {
 		[switch]$Async
 	)
 	if (-not (Test-MBWpfActive)) { return }
-	$d = $script:MB.Wpf.Dispatcher
+	$d = $null
+	try { $d = $script:MB.Wpf.Dispatcher } catch { $d = $null }
 	if (-not $d) { return }
-	if ($d.CheckAccess()) {
-		& $Action
+	# Window close / BeginInvokeShutdown cancels pending Invoke — not a real failure
+	try {
+		if ($d.HasShutdownStarted -or $d.HasShutdownFinished) { return }
+	} catch {}
+	try {
+		if ($d.CheckAccess()) {
+			& $Action
+			return
+		}
+	} catch {
 		return
 	}
 	$act = [Action]$Action
-	if ($Async) {
-		[void]$d.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, $act)
-	} else {
-		[void]$d.Invoke($act, [System.Windows.Threading.DispatcherPriority]::Background)
+	try {
+		if ($Async) {
+			[void]$d.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, $act)
+		} else {
+			try {
+				if ($d.HasShutdownStarted -or $d.HasShutdownFinished) { return }
+			} catch {}
+			[void]$d.Invoke($act, [System.Windows.Threading.DispatcherPriority]::Background)
+		}
+	} catch {
+		# TaskCanceledException / OperationCanceledException when dispatcher dies mid-Invoke
+		$msg = ''
+		try { $msg = [string]$_.Exception.Message } catch {}
+		try {
+			if ($_.Exception.InnerException) { $msg = $msg + ' ' + $_.Exception.InnerException.Message }
+		} catch {}
+		if ($msg -match '(?i)cancel') { return }
+		throw
 	}
 }
 
 
 function Reset-MBMdStream {
-	if ([bool]$script:MB.MdFence -and (Test-MBWpfActive)) {
+	if ([bool]$script:MB.MdVizActive -and (Test-MBWpfActive)) {
+		try {
+			$code = [string]$script:MB.MdVizBuf
+			try {
+				Write-MBDebugLog -Step 'VIZ_FLUSH_INCOMPLETE' -Detail ("bufChars={0} preview={1}" -f $code.Length, (Get-MBVizDebugPreview -Text $code -Max 160))
+			} catch {}
+			Write-MBMdViz -Markup $code -Lang 'iv'
+		} catch {
+			try { Write-MBDebugLog -Step 'VIZ_FLUSH_INCOMPLETE_ERR' -Detail $_.Exception.Message } catch {}
+		}
+	} elseif ([bool]$script:MB.MdFence -and (Test-MBWpfActive)) {
 		try { Write-MBMdCodeClose } catch {}
 	}
 	$script:MB.MdPending = ''
@@ -30754,6 +32360,8 @@ function Reset-MBMdStream {
 	$script:MB.MdFence = $false
 	$script:MB.MdFenceLang = ''
 	$script:MB.MdFenceBuf = ''
+	$script:MB.MdVizActive = $false
+	$script:MB.MdVizBuf = ''
 	$script:MB.MdLineBold = $false
 	$script:MB.MdLineItalic = $false
 	$script:MB.MdHeadLevel = 0
@@ -31468,6 +33076,876 @@ function Write-MBWpfSynText {
 	})
 }
 
+function Get-MBVizOpenMarker  { return '@@@RenderOpen' }
+function Get-MBVizCloseMarker { return '@@@RenderClose' }
+
+function Test-MBEndsWithMarkerPrefix {
+	# True if $Text ends with a non-empty proper/full prefix of $Marker (case-insensitive).
+	param([string]$Text, [string]$Marker)
+	$t = [string]$Text
+	$m = [string]$Marker
+	if ($t.Length -lt 1 -or $m.Length -lt 1) { return $false }
+	$max = [Math]::Min($t.Length, $m.Length)
+	for ($n = $max; $n -ge 1; $n--) {
+		$suf = $t.Substring($t.Length - $n)
+		$pre = $m.Substring(0, $n)
+		if ([string]::Equals($suf, $pre, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+	}
+	return $false
+}
+
+function Find-MBVizMarkerIndex {
+	param([string]$Text, [string]$Marker, [int]$Start = 0)
+	$t = [string]$Text
+	$m = [string]$Marker
+	if ($t.Length -lt 1 -or $m.Length -lt 1) { return -1 }
+	if ($Start -lt 0) { $Start = 0 }
+	if ($Start -ge $t.Length) { return -1 }
+	return $t.IndexOf($m, $Start, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-MBVizDebugPreview {
+	param([string]$Text = '', [int]$Max = 280)
+	$t = [string]$Text
+	if ($null -eq $t) { $t = '' }
+	$t = ($t -replace '[\r\n]+', ' ')
+	if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) + '...' }
+	return $t
+}
+
+function Initialize-MBVizCaptureType {
+	if ([bool]$script:MB.VizCaptureReady -and ('MiniBot.Live.SvgView' -as [type])) { return $true }
+	try {
+		Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+		Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+		Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+	} catch {
+		try { Write-MBDebugLog -Step 'VIZ_CAPTURE_ASM_ERR' -Detail $_.Exception.Message } catch {}
+		return $false
+	}
+	if ('MiniBot.Live.SvgView' -as [type]) {
+		$script:MB.VizCaptureReady = $true
+		return $true
+	}
+
+	$svgCs = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text.RegularExpressions;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using System.Xml;
+
+namespace MiniBot.Live {
+  public class SvgView : Border {
+    readonly Canvas _canvas;
+    readonly Viewbox _viewbox;
+    string _lastProbe = "";
+    bool _loadedOk;
+
+    public bool LoadedOk { get { return _loadedOk; } }
+    public string LastProbe { get { return _lastProbe; } }
+    public event EventHandler ShapeActivated;
+
+    public SvgView() {
+      SnapsToDevicePixels = true;
+      UseLayoutRounding = true;
+      ClipToBounds = true;
+      Margin = new Thickness(0);
+      Padding = new Thickness(0);
+      Background = new SolidColorBrush(Color.FromRgb(0x12, 0x12, 0x16));
+      BorderThickness = new Thickness(0);
+      BorderBrush = null;
+      HorizontalAlignment = HorizontalAlignment.Center;
+      VerticalAlignment = VerticalAlignment.Center;
+      _canvas = new Canvas();
+      _canvas.Margin = new Thickness(0);
+      _viewbox = new Viewbox();
+      _viewbox.Margin = new Thickness(0);
+      // Uniform + DownOnly: never upscale past intrinsic SVG size; host may letterbox.
+      _viewbox.Stretch = Stretch.Uniform;
+      _viewbox.StretchDirection = StretchDirection.DownOnly;
+      _viewbox.HorizontalAlignment = HorizontalAlignment.Center;
+      _viewbox.VerticalAlignment = VerticalAlignment.Center;
+      _viewbox.Child = _canvas;
+      // Grid reliably centers Uniform letterboxing; Border alone can pin top-left.
+      Grid host = new Grid();
+      host.ClipToBounds = true;
+      host.Margin = new Thickness(0);
+      host.Children.Add(_viewbox);
+      Child = host;
+    }
+
+    public void Configure(double widthDip, double heightDip) {
+      if (widthDip < 40) widthDip = 40;
+      if (heightDip < 40) heightDip = 40;
+      widthDip = Math.Round(widthDip);
+      heightDip = Math.Round(heightDip);
+      Width = widthDip;
+      Height = heightDip;
+      MinWidth = widthDip;
+      MinHeight = heightDip;
+      MaxWidth = widthDip;
+      MaxHeight = heightDip;
+    }
+
+    public void LoadMarkup(string markup) {
+      _loadedOk = false;
+      _lastProbe = "pending";
+      _canvas.Children.Clear();
+      try {
+        string svg = ExtractSvg(markup);
+        if (string.IsNullOrEmpty(svg)) {
+          _lastProbe = "no_svg";
+          ShowError("No SVG found in visualization markup.");
+          return;
+        }
+        XmlDocument doc = new XmlDocument();
+        doc.XmlResolver = null;
+        doc.LoadXml(svg);
+        XmlElement root = doc.DocumentElement;
+        if (root == null || !NameIs(root, "svg")) {
+          _lastProbe = "root_not_svg";
+          ShowError("Root element is not svg.");
+          return;
+        }
+
+        double vbX = 0, vbY = 0, vbW = 0, vbH = 0;
+        string viewBox = Attr(root, "viewBox");
+        if (!string.IsNullOrEmpty(viewBox)) {
+          string[] parts = Regex.Split(viewBox.Trim(), @"[\s,]+");
+          if (parts.Length >= 4) {
+            vbX = ParseD(parts[0], 0);
+            vbY = ParseD(parts[1], 0);
+            vbW = ParseD(parts[2], 0);
+            vbH = ParseD(parts[3], 0);
+          }
+        }
+        if (vbW <= 0) vbW = ParseD(Attr(root, "width"), 680);
+        if (vbH <= 0) vbH = ParseD(Attr(root, "height"), 320);
+        if (vbW < 1) vbW = 680;
+        if (vbH < 1) vbH = 320;
+
+        _canvas.Width = vbW;
+        _canvas.Height = vbH;
+        if (vbX != 0 || vbY != 0)
+          _canvas.RenderTransform = new TranslateTransform(-vbX, -vbY);
+        else
+          _canvas.RenderTransform = null;
+
+        // preserveAspectRatio: meet (default) → Uniform letterbox; slice → fill+crop; none → stretch
+        ApplyPreserveAspectRatio(Attr(root, "preserveAspectRatio"));
+
+        int shapes = 0, skipped = 0;
+        Walk(root, _canvas, null, ref shapes, ref skipped);
+        _loadedOk = shapes > 0;
+        _lastProbe = string.Format("svg w={0:0} h={1:0} shapes={2} skipped={3} stretch={4}", vbW, vbH, shapes, skipped, _viewbox.Stretch);
+        if (!_loadedOk) ShowError("SVG parsed but no drawable shapes.");
+      } catch (Exception ex) {
+        _lastProbe = "err:" + ex.Message;
+        ShowError("SVG parse failed: " + ex.Message);
+      }
+    }
+
+    void ApplyPreserveAspectRatio(string par) {
+      _viewbox.Stretch = Stretch.Uniform;
+      _viewbox.StretchDirection = StretchDirection.DownOnly;
+      if (string.IsNullOrEmpty(par)) return;
+      string p = par.Trim().ToLowerInvariant();
+      if (p.IndexOf("none") >= 0) {
+        _viewbox.Stretch = Stretch.Fill;
+        _viewbox.StretchDirection = StretchDirection.Both;
+        return;
+      }
+      if (p.IndexOf("slice") >= 0) {
+        _viewbox.Stretch = Stretch.UniformToFill;
+        _viewbox.StretchDirection = StretchDirection.Both;
+        return;
+      }
+      // meet (default): fit inside host, never upscale
+      _viewbox.Stretch = Stretch.Uniform;
+      _viewbox.StretchDirection = StretchDirection.DownOnly;
+    }
+
+    void ShowError(string msg) {
+      _canvas.Children.Clear();
+      _canvas.Width = 400;
+      _canvas.Height = 80;
+      TextBlock tb = new TextBlock();
+      tb.Text = msg;
+      tb.Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0xAF, 0x68));
+      tb.TextWrapping = TextWrapping.Wrap;
+      tb.Margin = new Thickness(12);
+      Canvas.SetLeft(tb, 0);
+      Canvas.SetTop(tb, 0);
+      _canvas.Children.Add(tb);
+    }
+
+    static string ExtractSvg(string markup) {
+      if (string.IsNullOrEmpty(markup)) return null;
+      string s = markup.Trim();
+      Match fence = Regex.Match(s, @"(?is)```(?:svg|html|xml|iv)?\s*(.*?)\s*```");
+      if (fence.Success) s = fence.Groups[1].Value.Trim();
+      int i = s.IndexOf("<svg", StringComparison.OrdinalIgnoreCase);
+      if (i < 0) return null;
+      int j = s.LastIndexOf("</svg>", StringComparison.OrdinalIgnoreCase);
+      if (j < 0) return s.Substring(i);
+      return s.Substring(i, j + 6 - i);
+    }
+
+    void Walk(XmlNode node, Canvas parent, Dictionary<string, string> inherit, ref int shapes, ref int skipped) {
+      if (node == null) return;
+      if (inherit == null) inherit = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+      foreach (XmlNode child in node.ChildNodes) {
+        XmlElement el = child as XmlElement;
+        if (el == null) continue;
+        Dictionary<string, string> ctx = MergePaint(inherit, el);
+        if (NameIs(el, "g") || NameIs(el, "svg")) {
+          // Nested layer: honor transform / nested-svg x,y (else content sits at 0,0 top-left)
+          Canvas layer = new Canvas();
+          layer.IsHitTestVisible = true;
+          Transform layerTf = BuildNodeTransform(el);
+          if (layerTf != null) layer.RenderTransform = layerTf;
+          double gOp = ParseD(Paint(ctx, el, "opacity"), 1);
+          if (gOp >= 0 && gOp < 1) layer.Opacity = gOp;
+          int before = shapes;
+          Walk(el, layer, ctx, ref shapes, ref skipped);
+          if (shapes > before || layer.Children.Count > 0)
+            parent.Children.Add(layer);
+          continue;
+        }
+        string ln = Local(el);
+        if (ln == "defs" || ln == "clipPath" || ln == "style" || ln == "title" || ln == "desc" || ln == "metadata" || ln == "symbol" || ln == "use" || ln == "image" || ln == "foreignObject" || ln == "mask" || ln == "filter" || ln == "linearGradient" || ln == "radialGradient" || ln == "pattern")
+          continue;
+        UIElement u = Build(el, ctx);
+        if (u == null) { skipped++; continue; }
+        ApplyNodeTransform(u, el);
+        parent.Children.Add(u);
+        shapes++;
+        WireInteractive(u, el);
+      }
+    }
+
+    // transform="" plus nested <svg x y>; style transform if present
+    static Transform BuildNodeTransform(XmlElement el) {
+      if (el == null) return null;
+      TransformGroup g = new TransformGroup();
+      double x = ParseD(Attr(el, "x"), 0);
+      double y = ParseD(Attr(el, "y"), 0);
+      // x/y on shapes are geometry; only treat as placement for nested svg / foreignObject-like hosts
+      string local = Local(el);
+      if ((local == "svg" || local == "g") && (x != 0 || y != 0))
+        g.Children.Add(new TranslateTransform(x, y));
+      string ts = Attr(el, "transform");
+      if (string.IsNullOrEmpty(ts)) {
+        string style = Attr(el, "style");
+        if (!string.IsNullOrEmpty(style)) {
+          Match sm = Regex.Match(style, @"(?:^|;)\s*transform\s*:\s*([^;]+)", RegexOptions.IgnoreCase);
+          if (sm.Success) ts = sm.Groups[1].Value.Trim();
+        }
+      }
+      Transform t = ParseSvgTransform(ts);
+      if (t != null) g.Children.Add(t);
+      if (g.Children.Count == 0) return null;
+      if (g.Children.Count == 1) return g.Children[0];
+      return g;
+    }
+
+    static void ApplyNodeTransform(UIElement u, XmlElement el) {
+      if (u == null || el == null) return;
+      // Element-level transform only (x/y already in geometry via Canvas.SetLeft/Top)
+      string ts = Attr(el, "transform");
+      if (string.IsNullOrEmpty(ts)) {
+        string style = Attr(el, "style");
+        if (!string.IsNullOrEmpty(style)) {
+          Match sm = Regex.Match(style, @"(?:^|;)\s*transform\s*:\s*([^;]+)", RegexOptions.IgnoreCase);
+          if (sm.Success) ts = sm.Groups[1].Value.Trim();
+        }
+      }
+      Transform t = ParseSvgTransform(ts);
+      if (t == null) return;
+      FrameworkElement fe = u as FrameworkElement;
+      // SVG transform is in parent user space; default origin top-left of element is OK for translate/scale after x/y placement
+      if (fe != null) fe.RenderTransformOrigin = new Point(0, 0);
+      if (u.RenderTransform == null || u.RenderTransform == Transform.Identity) {
+        u.RenderTransform = t;
+      } else {
+        TransformGroup tg = new TransformGroup();
+        tg.Children.Add(u.RenderTransform);
+        tg.Children.Add(t);
+        u.RenderTransform = tg;
+      }
+    }
+
+    // SVG transform list applied left-to-right (same as WPF TransformGroup order)
+    static Transform ParseSvgTransform(string s) {
+      if (string.IsNullOrEmpty(s)) return null;
+      s = s.Trim();
+      if (s.Length == 0 || s.Equals("none", StringComparison.OrdinalIgnoreCase)) return null;
+      TransformGroup g = new TransformGroup();
+      MatchCollection ms = Regex.Matches(s, @"(matrix|translate|scale|rotate|skewX|skewY)\s*\(\s*([^)]*)\)", RegexOptions.IgnoreCase);
+      foreach (Match m in ms) {
+        string fn = m.Groups[1].Value.ToLowerInvariant();
+        double[] a = ParseNumList(m.Groups[2].Value);
+        if (fn == "translate") {
+          double tx = a.Length > 0 ? a[0] : 0;
+          double ty = a.Length > 1 ? a[1] : 0;
+          g.Children.Add(new TranslateTransform(tx, ty));
+        } else if (fn == "scale") {
+          double sx = a.Length > 0 ? a[0] : 1;
+          double sy = a.Length > 1 ? a[1] : sx;
+          g.Children.Add(new ScaleTransform(sx, sy));
+        } else if (fn == "rotate") {
+          double ang = a.Length > 0 ? a[0] : 0;
+          if (a.Length >= 3)
+            g.Children.Add(new RotateTransform(ang, a[1], a[2]));
+          else
+            g.Children.Add(new RotateTransform(ang));
+        } else if (fn == "matrix" && a.Length >= 6) {
+          // SVG matrix(a b c d e f) == WPF Matrix(M11,M12,M21,M22,OffX,OffY)
+          g.Children.Add(new MatrixTransform(new Matrix(a[0], a[1], a[2], a[3], a[4], a[5])));
+        } else if (fn == "skewx") {
+          g.Children.Add(new SkewTransform(a.Length > 0 ? a[0] : 0, 0));
+        } else if (fn == "skewy") {
+          g.Children.Add(new SkewTransform(0, a.Length > 0 ? a[0] : 0));
+        }
+      }
+      if (g.Children.Count == 0) return null;
+      if (g.Children.Count == 1) return g.Children[0];
+      return g;
+    }
+
+    static double[] ParseNumList(string s) {
+      if (string.IsNullOrEmpty(s)) return new double[0];
+      MatchCollection ms = Regex.Matches(s, @"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?");
+      double[] a = new double[ms.Count];
+      for (int i = 0; i < ms.Count; i++) {
+        double v;
+        if (!double.TryParse(ms[i].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+          v = 0;
+        a[i] = v;
+      }
+      return a;
+    }
+
+    UIElement Build(XmlElement el, Dictionary<string, string> ctx) {
+      string n = Local(el);
+      if (n == "rect") return BuildRect(el, ctx);
+      if (n == "circle") return BuildCircle(el, ctx);
+      if (n == "ellipse") return BuildEllipse(el, ctx);
+      if (n == "line") return BuildLine(el, ctx);
+      if (n == "polyline") return BuildPoly(el, ctx, false);
+      if (n == "polygon") return BuildPoly(el, ctx, true);
+      if (n == "path") return BuildPath(el, ctx);
+      if (n == "text") return BuildText(el, ctx);
+      return null;
+    }
+
+    Shape BuildRect(XmlElement el, Dictionary<string, string> ctx) {
+      double x = ParseD(Paint(ctx, el, "x"), 0);
+      double y = ParseD(Paint(ctx, el, "y"), 0);
+      double w = ParseD(Paint(ctx, el, "width"), 0);
+      double h = ParseD(Paint(ctx, el, "height"), 0);
+      double rx = ParseD(Paint(ctx, el, "rx"), 0);
+      Rectangle r = new Rectangle();
+      r.Width = Math.Max(0, w);
+      r.Height = Math.Max(0, h);
+      if (rx > 0) { r.RadiusX = rx; r.RadiusY = ParseD(Paint(ctx, el, "ry"), rx); }
+      ApplyPaint(r, el, ctx, false);
+      Canvas.SetLeft(r, x);
+      Canvas.SetTop(r, y);
+      return r;
+    }
+
+    Shape BuildCircle(XmlElement el, Dictionary<string, string> ctx) {
+      double cx = ParseD(Paint(ctx, el, "cx"), 0);
+      double cy = ParseD(Paint(ctx, el, "cy"), 0);
+      double rad = ParseD(Paint(ctx, el, "r"), 0);
+      Ellipse e = new Ellipse();
+      e.Width = Math.Max(0, rad * 2);
+      e.Height = Math.Max(0, rad * 2);
+      ApplyPaint(e, el, ctx, false);
+      Canvas.SetLeft(e, cx - rad);
+      Canvas.SetTop(e, cy - rad);
+      return e;
+    }
+
+    Shape BuildEllipse(XmlElement el, Dictionary<string, string> ctx) {
+      double cx = ParseD(Paint(ctx, el, "cx"), 0);
+      double cy = ParseD(Paint(ctx, el, "cy"), 0);
+      double rx = ParseD(Paint(ctx, el, "rx"), 0);
+      double ry = ParseD(Paint(ctx, el, "ry"), 0);
+      Ellipse e = new Ellipse();
+      e.Width = Math.Max(0, rx * 2);
+      e.Height = Math.Max(0, ry * 2);
+      ApplyPaint(e, el, ctx, false);
+      Canvas.SetLeft(e, cx - rx);
+      Canvas.SetTop(e, cy - ry);
+      return e;
+    }
+
+    Shape BuildLine(XmlElement el, Dictionary<string, string> ctx) {
+      Line ln = new Line();
+      ln.X1 = ParseD(Paint(ctx, el, "x1"), 0);
+      ln.Y1 = ParseD(Paint(ctx, el, "y1"), 0);
+      ln.X2 = ParseD(Paint(ctx, el, "x2"), 0);
+      ln.Y2 = ParseD(Paint(ctx, el, "y2"), 0);
+      ApplyPaint(ln, el, ctx, true);
+      return ln;
+    }
+
+    Shape BuildPoly(XmlElement el, Dictionary<string, string> ctx, bool closed) {
+      PointCollection pts = ParsePoints(Paint(ctx, el, "points") ?? Attr(el, "points"));
+      if (pts == null || pts.Count < 2) return null;
+      if (closed) {
+        Polygon pg = new Polygon();
+        pg.Points = pts;
+        ApplyPaint(pg, el, ctx, false);
+        return pg;
+      }
+      Polyline pl = new Polyline();
+      pl.Points = pts;
+      ApplyPaint(pl, el, ctx, true);
+      return pl;
+    }
+
+    Shape BuildPath(XmlElement el, Dictionary<string, string> ctx) {
+      string d = Attr(el, "d");
+      if (string.IsNullOrEmpty(d)) return null;
+      d = NormalizePathD(d);
+      try {
+        System.Windows.Shapes.Path p = new System.Windows.Shapes.Path();
+        p.Data = Geometry.Parse(d);
+        ApplyPaint(p, el, ctx, true);
+        return p;
+      } catch {
+        try {
+          string d2 = Regex.Replace(d, @"[Aa][^MmLlHhVvCcSsQqTtZz]*", " ");
+          System.Windows.Shapes.Path p2 = new System.Windows.Shapes.Path();
+          p2.Data = Geometry.Parse(d2);
+          ApplyPaint(p2, el, ctx, true);
+          return p2;
+        } catch { return null; }
+      }
+    }
+
+    UIElement BuildText(XmlElement el, Dictionary<string, string> ctx) {
+      double x = ParseD(Paint(ctx, el, "x"), 0);
+      double y = ParseD(Paint(ctx, el, "y"), 0);
+      string text = el.InnerText == null ? "" : el.InnerText.Trim();
+      TextBlock tb = new TextBlock();
+      tb.Text = text;
+      tb.FontSize = ParseD(Paint(ctx, el, "font-size"), 12);
+      string ff = Paint(ctx, el, "font-family");
+      if (!string.IsNullOrEmpty(ff)) {
+        try { tb.FontFamily = new FontFamily(ff.Split(',')[0].Trim().Trim('\'', '"')); } catch { }
+      }
+      Brush fill = ParseBrush(Paint(ctx, el, "fill"), Brushes.White);
+      if (fill != null) tb.Foreground = fill;
+      double op = ParseD(Paint(ctx, el, "opacity"), 1);
+      if (op < 1 && op >= 0) tb.Opacity = op;
+      string anchor = (Paint(ctx, el, "text-anchor") ?? "").ToLowerInvariant();
+      double estH = tb.FontSize * 1.2;
+      double left = x;
+      double top = y - estH * 0.8;
+      tb.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+      if (anchor == "middle") left = x - tb.DesiredSize.Width / 2;
+      else if (anchor == "end") left = x - tb.DesiredSize.Width;
+      Canvas.SetLeft(tb, left);
+      Canvas.SetTop(tb, top);
+      return tb;
+    }
+
+    void ApplyPaint(Shape sh, XmlElement el, Dictionary<string, string> ctx, bool strokeDefault) {
+      string fill = Paint(ctx, el, "fill");
+      string stroke = Paint(ctx, el, "stroke");
+      if (string.IsNullOrEmpty(fill) && string.IsNullOrEmpty(stroke)) {
+        if (strokeDefault) {
+          sh.Fill = null;
+          sh.Stroke = new SolidColorBrush(Color.FromRgb(0x7A, 0xA2, 0xF7));
+        } else {
+          sh.Fill = new SolidColorBrush(Color.FromRgb(0x7A, 0xA2, 0xF7));
+        }
+      } else {
+        if (!string.IsNullOrEmpty(fill) && !IsNone(fill)) sh.Fill = ParseBrush(fill, null);
+        else if (IsNone(fill) || strokeDefault) sh.Fill = null;
+
+        if (!string.IsNullOrEmpty(stroke) && !IsNone(stroke))
+          sh.Stroke = ParseBrush(stroke, Brushes.White);
+        else if (strokeDefault && sh.Stroke == null)
+          sh.Stroke = new SolidColorBrush(Color.FromRgb(0x9C, 0xA3, 0xAF));
+      }
+      double sw = ParseD(Paint(ctx, el, "stroke-width"), 0);
+      if (sw > 0) sh.StrokeThickness = sw;
+      else if (sh.Stroke != null && sh.StrokeThickness <= 0) sh.StrokeThickness = strokeDefault ? 1.5 : 1;
+
+      double so = ParseD(Paint(ctx, el, "stroke-opacity"), 1);
+      if (so >= 0 && so < 1 && sh.Stroke != null) {
+        try { sh.Stroke = sh.Stroke.Clone(); sh.Stroke.Opacity = so; } catch { }
+      }
+      double op = ParseD(Paint(ctx, el, "opacity"), 1);
+      if (op >= 0 && op < 1) sh.Opacity = op;
+      double fo = ParseD(Paint(ctx, el, "fill-opacity"), 1);
+      if (fo >= 0 && fo < 1 && sh.Fill != null) {
+        try { sh.Fill = sh.Fill.Clone(); sh.Fill.Opacity = fo; } catch { }
+      }
+    }
+
+    static Dictionary<string, string> MergePaint(Dictionary<string, string> inherit, XmlElement el) {
+      Dictionary<string, string> d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+      if (inherit != null) {
+        foreach (KeyValuePair<string, string> kv in inherit) d[kv.Key] = kv.Value;
+      }
+      string[] keys = new string[] {
+        "fill","stroke","stroke-width","opacity","fill-opacity","stroke-opacity",
+        "font-size","font-family","text-anchor","stroke-linecap","stroke-linejoin"
+      };
+      for (int i = 0; i < keys.Length; i++) {
+        string a = Attr(el, keys[i]);
+        if (!string.IsNullOrEmpty(a)) d[keys[i]] = a;
+      }
+      string style = Attr(el, "style");
+      if (!string.IsNullOrEmpty(style)) {
+        string[] parts = style.Split(new char[] {';' }, StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < parts.Length; i++) {
+          string p = parts[i].Trim();
+          int c = p.IndexOf(':');
+          if (c <= 0) continue;
+          string k = p.Substring(0, c).Trim();
+          string v = p.Substring(c + 1).Trim();
+          if (k.Length > 0 && v.Length > 0) d[k] = v;
+        }
+      }
+      return d;
+    }
+
+    static string Paint(Dictionary<string, string> ctx, XmlElement el, string name) {
+      string a = Attr(el, name);
+      if (!string.IsNullOrEmpty(a)) return a;
+      if (ctx != null && ctx.ContainsKey(name)) return ctx[name];
+      return null;
+    }
+
+    static string NormalizePathD(string d) {
+      if (string.IsNullOrEmpty(d)) return d;
+      d = Regex.Replace(d, @"([MmLlHhVvCcSsQqTtAaZz])", " $1 ");
+      d = Regex.Replace(d, @"\s+", " ").Trim();
+      d = d.Replace(',', ' ');
+      return d;
+    }
+
+    void WireInteractive(UIElement u, XmlElement el) {
+      string tip = null;
+      foreach (XmlNode c in el.ChildNodes) {
+        XmlElement ce = c as XmlElement;
+        if (ce != null && NameIs(ce, "title")) { tip = c.InnerText; break; }
+      }
+      if (string.IsNullOrEmpty(tip)) tip = Attr(el, "data-label");
+      if (string.IsNullOrEmpty(tip)) tip = Attr(el, "id");
+      FrameworkElement fe = u as FrameworkElement;
+      if (fe != null && !string.IsNullOrEmpty(tip)) {
+        try { fe.ToolTip = tip; } catch { }
+      }
+      Shape sh = u as Shape;
+      if (sh == null) return;
+      sh.MouseLeftButtonUp += delegate {
+        try {
+          EventHandler h = ShapeActivated;
+          if (h != null) h(sh, EventArgs.Empty);
+        } catch { }
+      };
+    }
+
+    static PointCollection ParsePoints(string s) {
+      PointCollection pc = new PointCollection();
+      if (string.IsNullOrEmpty(s)) return pc;
+      MatchCollection ms = Regex.Matches(s.Trim(), @"(-?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*[,\s]\s*(-?\d*\.?\d+(?:[eE][-+]?\d+)?)");
+      foreach (Match m in ms)
+        pc.Add(new Point(ParseD(m.Groups[1].Value, 0), ParseD(m.Groups[2].Value, 0)));
+      return pc;
+    }
+
+    static Brush ParseBrush(string s, Brush fallback) {
+      if (string.IsNullOrEmpty(s) || IsNone(s)) return fallback;
+      s = s.Trim();
+      try {
+        if (s.StartsWith("#")) return new SolidColorBrush((Color)ColorConverter.ConvertFromString(s));
+        Match m = Regex.Match(s, @"rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", RegexOptions.IgnoreCase);
+        if (m.Success) {
+          byte r = (byte)Math.Min(255, int.Parse(m.Groups[1].Value));
+          byte g = (byte)Math.Min(255, int.Parse(m.Groups[2].Value));
+          byte b = (byte)Math.Min(255, int.Parse(m.Groups[3].Value));
+          return new SolidColorBrush(Color.FromRgb(r, g, b));
+        }
+        return new SolidColorBrush((Color)ColorConverter.ConvertFromString(s));
+      } catch { return fallback; }
+    }
+
+    static bool IsNone(string s) {
+      if (string.IsNullOrEmpty(s)) return false;
+      s = s.Trim();
+      return s.Equals("none", StringComparison.OrdinalIgnoreCase) || s.Equals("transparent", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static string Attr(XmlElement el, string name) {
+      if (el == null || !el.HasAttribute(name)) return null;
+      return el.GetAttribute(name);
+    }
+
+    static bool NameIs(XmlElement el, string local) {
+      return string.Equals(Local(el), local, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static string Local(XmlElement el) {
+      if (el == null) return "";
+      if (!string.IsNullOrEmpty(el.LocalName)) return el.LocalName;
+      string n = el.Name;
+      int i = n.IndexOf(':');
+      return i >= 0 ? n.Substring(i + 1) : n;
+    }
+
+    static double ParseD(string s, double def) {
+      if (string.IsNullOrEmpty(s)) return def;
+      s = s.Trim();
+      if (s.EndsWith("px", StringComparison.OrdinalIgnoreCase)) s = s.Substring(0, s.Length - 2);
+      double v;
+      if (double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) return v;
+      if (double.TryParse(s, NumberStyles.Float, CultureInfo.CurrentCulture, out v)) return v;
+      return def;
+    }
+  }
+}
+'@
+	$refs = New-Object System.Collections.ArrayList
+	foreach ($t in @(
+		[System.Windows.Window],
+		[System.Windows.UIElement],
+		[System.Windows.DependencyObject],
+		[System.Windows.Controls.Canvas],
+		[System.Windows.Shapes.Rectangle],
+		[System.Xml.XmlDocument]
+	)) {
+		try {
+			$loc = $t.Assembly.Location
+			if ($loc -and (Test-Path -LiteralPath $loc) -and -not $refs.Contains($loc)) { [void]$refs.Add($loc) }
+		} catch {}
+	}
+	try {
+		$xaml = [System.Xaml.XamlLanguage].Assembly.Location
+		if ($xaml -and (Test-Path -LiteralPath $xaml) -and -not $refs.Contains($xaml)) { [void]$refs.Add($xaml) }
+	} catch {}
+	try {
+		$sys = [Uri].Assembly.Location
+		if ($sys -and (Test-Path -LiteralPath $sys) -and -not $refs.Contains($sys)) { [void]$refs.Add($sys) }
+	} catch {}
+
+	try {
+		Add-Type -TypeDefinition $svgCs -ReferencedAssemblies @($refs.ToArray()) -ErrorAction Stop
+		$script:MB.VizCaptureReady = $true
+		try { Write-MBDebugLog -Step 'VIZ_CAPTURE_TYPE_OK' -Detail 'MiniBot.Live.SvgView' } catch {}
+		return $true
+	} catch {
+		$err = $_.Exception.Message
+		try { if ($_.Exception.InnerException) { $err = $err + ' | ' + $_.Exception.InnerException.Message } } catch {}
+		try { if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $err = $err + ' | ' + $_.ErrorDetails.Message } } catch {}
+		try {
+			$errs = $_.Exception.Errors
+			if ($errs) { foreach ($ce in @($errs)) { try { $err = $err + ' | ' + $ce.ToString() } catch {} } }
+		} catch {}
+		try { Write-MBDebugLog -Step 'VIZ_CAPTURE_TYPE_ERR' -Detail $err } catch {}
+		$script:MB.VizCaptureReady = $false
+		return $false
+	}
+}
+
+
+function Initialize-MBVizHost {
+	if ($null -ne $script:MB.VizHostState) {
+		$have = [bool]('MiniBot.Live.SvgView' -as [type])
+		if ([bool]$script:MB.VizHostState.Ok -and $have) {
+			try {
+				Write-MBDebugLog -Step 'VIZ_HOST_CACHED' -Detail ("ok={0} engine={1}" -f $script:MB.VizHostState.Ok, $script:MB.VizHostState.Engine)
+			} catch {}
+			return $script:MB.VizHostState
+		}
+		if (-not $have) {
+			$script:MB.VizHostState = $null
+			$script:MB.VizCaptureReady = $false
+		}
+	}
+	$state = @{ Ok = $false; Reason = ''; Engine = 'none' }
+	try {
+		$loaded = $false
+		try { $loaded = [bool](Initialize-MBVizCaptureType) } catch { $loaded = $false }
+		if ($loaded -and ('MiniBot.Live.SvgView' -as [type])) {
+			$state.Ok = $true
+			$state.Engine = 'svg-wpf'
+			$state.Reason = 'ready'
+		} else {
+			$state.Reason = 'MiniBot.Live.SvgView failed to load (see VIZ_CAPTURE_TYPE_ERR).'
+		}
+	} catch {
+		$state.Reason = $_.Exception.Message
+	}
+	$script:MB.VizHostState = $state
+	try {
+		Write-MBDebugLog -Step 'VIZ_HOST_INIT' -Detail ("ok={0} engine={1} reason={2}" -f $state.Ok, $state.Engine, $state.Reason)
+	} catch {}
+	return $state
+}
+
+function Get-MBVizFallbackMessage {
+	param([string]$Detail = '')
+	$msg = 'Inline visualization requires MiniBot.Live.SvgView.'
+	if ($Detail) { $msg = $msg + ' ' + $Detail }
+	return $msg
+}
+
+function Repair-MBVizSvgFragment {
+	param([string]$Body = '')
+	if ([string]::IsNullOrWhiteSpace($Body)) { return $Body }
+	$rx = New-Object System.Text.RegularExpressions.Regex '(?is)<svg\b([^>]*)>'
+	$eval = {
+		param($m)
+		$attrs = [string]$m.Groups[1].Value
+		if ($attrs -notmatch '(?i)\bxmlns\s*=') {
+			$attrs = ' xmlns="http://www.w3.org/2000/svg"' + $attrs
+		}
+		$vbW = 0.0
+		$vbH = 0.0
+		if ($attrs -match '(?i)\bviewBox\s*=\s*"\s*([0-9.eE+-]+)\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\s*"') {
+			$vbW = [double]$Matches[3]
+			$vbH = [double]$Matches[4]
+		} elseif ($attrs -match "(?i)\bviewBox\s*=\s*'\s*([0-9.eE+-]+)\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\s*'") {
+			$vbW = [double]$Matches[3]
+			$vbH = [double]$Matches[4]
+		}
+		$attrs = [regex]::Replace($attrs, '(?i)\s*\bwidth\s*=\s*("[^"]*"|''[^'']*'')', '')
+		$attrs = [regex]::Replace($attrs, '(?i)\s*\bheight\s*=\s*("[^"]*"|''[^'']*'')', '')
+		$w = 680
+		$h = 240
+		if ($vbW -gt 1) { $w = [int][Math]::Round($vbW) }
+		if ($vbH -gt 1) { $h = [int][Math]::Round($vbH) }
+		if ($w -lt 1) { $w = 680 }
+		if ($h -lt 1) { $h = 240 }
+		if ($w -gt 2400) { $w = 2400 }
+		if ($h -gt 1600) { $h = 1600 }
+		$attrs = (' width="{0}" height="{1}"' -f $w, $h) + $attrs
+		return ('<svg' + $attrs + '>')
+	}
+	return $rx.Replace($Body, $eval)
+}
+
+function ConvertTo-MBVizMarkup {
+	param([string]$Content = '', [string]$Lang = 'iv')
+	$body = [string]$Content
+	if ($null -eq $body) { $body = '' }
+	$body = $body.Trim()
+	if ($body -match '(?s)^\s*```(?:svg|html|xml|iv)?\s*(.*?)\s*```\s*$') {
+		$body = $Matches[1].Trim()
+	}
+	try {
+		Write-MBDebugLog -Step 'VIZ_CONVERT_BEGIN' -Detail ("lang={0} inChars={1} preview={2}" -f $Lang, $body.Length, (Get-MBVizDebugPreview -Text $body -Max 160))
+	} catch {}
+	$body = Repair-MBVizSvgFragment -Body $body
+	try {
+		Write-MBDebugLog -Step 'VIZ_CONVERT_OK' -Detail ("outChars={0} preview={1}" -f $body.Length, (Get-MBVizDebugPreview -Text $body -Max 200))
+	} catch {}
+	return $body
+}
+
+function Write-MBMdVizLoading {
+	if (-not (Test-MBWpfActive)) {
+		try { Write-MBDebugLog -Step 'VIZ_LOADING_SKIP' -Detail 'wpf_inactive' } catch {}
+		return
+	}
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'md-viz-loading'
+		Text      = ''
+		Color     = 'Cyan'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 0
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+	})
+	$script:MB.MdSkipBlankAfterBlock = $true
+	try { Write-MBDebugLog -Step 'VIZ_LOADING_ENQUEUE' -Detail 'md-viz-loading queued' } catch {}
+}
+
+function Write-MBMdViz {
+	param(
+		[string]$Markup = '',
+		[string]$Lang = 'iv'
+	)
+	try {
+		Write-MBDebugLog -Step 'VIZ_WRITE_BEGIN' -Detail ("lang={0} inChars={1} wpf={2} preview={3}" -f $Lang, $(if ($null -eq $Markup) { 0 } else { $Markup.Length }), (Test-MBWpfActive), (Get-MBVizDebugPreview -Text $Markup -Max 160))
+	} catch {}
+	if (-not (Test-MBWpfActive)) {
+		try { Write-MBDebugLog -Step 'VIZ_WRITE_SKIP' -Detail 'wpf_inactive' } catch {}
+		Write-Host ""
+		Write-Host ("  " + (Get-MBVizFallbackMessage)) -ForegroundColor DarkYellow
+		return
+	}
+	$st = $null
+	try { $st = Initialize-MBVizHost } catch {
+		try { Write-MBDebugLog -Step 'VIZ_HOST_ERR' -Detail $_.Exception.Message } catch {}
+		$st = $null
+	}
+	try {
+		$script:MB.Wpf.VizReady = [bool]($st -and $st.Ok)
+		$script:MB.Wpf.VizReason = $(if ($st -and $st.Reason) { [string]$st.Reason } else { 'ready' })
+		$script:MB.Wpf.VizEngine = $(if ($st -and $st.Engine) { [string]$st.Engine } else { 'svg-wpf' })
+	} catch {}
+	if (-not $script:MB.Wpf.WriteQueue) {
+		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+	}
+	$svg = ''
+	try {
+		$svg = ConvertTo-MBVizMarkup -Content $Markup -Lang $Lang
+	} catch {
+		try { Write-MBDebugLog -Step 'VIZ_CONVERT_THROW' -Detail $_.Exception.Message } catch {}
+		$svg = [string]$Markup
+	}
+	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+		Kind      = 'md-viz'
+		Text      = $svg
+		Lang      = $Lang
+		Color     = 'Cyan'
+		NoNewline = $true
+		MdBold    = 0
+		MdItalic  = 0
+		MdStrike  = 0
+		MdCode    = 0
+		MdFontSize = 0
+		MdHead    = 0
+		MdNoLinks = 1
+		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+		VizReady  = $(try { [bool]$script:MB.Wpf.VizReady } catch { $false })
+		VizReason = $(try { [string]$script:MB.Wpf.VizReason } catch { '' })
+		VizEngine = 'svg-wpf'
+	})
+	$script:MB.MdSkipBlankAfterBlock = $true
+	try {
+		Write-MBDebugLog -Step 'VIZ_WRITE_ENQUEUE' -Detail ("chars={0} ready={1} engine={2} reason={3}" -f `
+			$(if ($null -eq $svg) { 0 } else { $svg.Length }),
+			$(try { [bool]$script:MB.Wpf.VizReady } catch { $false }),
+			$(try { [string]$script:MB.Wpf.VizEngine } catch { '?' }),
+			$(try { [string]$script:MB.Wpf.VizReason } catch { '' }))
+	} catch {}
+}
+
 function Write-MBMdCodeOpen {
 	param([string]$Lang = '')
 	if (-not (Test-MBWpfActive)) { return }
@@ -31496,6 +33974,7 @@ function Write-MBMdCodeAppend {
 	param([AllowNull()][string]$Text)
 	if (-not (Test-MBWpfActive)) { return }
 	if ($null -eq $Text -or $Text.Length -eq 0) { return }
+	if ([bool]$script:MB.MdVizActive) { return }
 	try { $Text = ConvertTo-MBWpfSafeText -Text $Text } catch {}
 	if (-not $script:MB.Wpf.WriteQueue) {
 		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
@@ -33846,7 +36325,7 @@ function Write-MBMdFlushHold {
 			$script:MB.MdFence = $true
 			$script:MB.MdFenceLang = [string]$Matches[1]
 			$script:MB.MdFenceBuf = ''
-			$script:MB.MdAtLineStart = $false
+					$script:MB.MdAtLineStart = $false
 			if (Test-MBWpfActive) {
 				Write-MBMdCodeOpen -Lang $script:MB.MdFenceLang
 			}
@@ -33977,8 +36456,162 @@ function Write-MBMdStreamAppend {
 	$s = [string]$script:MB.MdPending
 	$i = 0
 	$len = $s.Length
+	$vizOpen = Get-MBVizOpenMarker
+	$vizClose = Get-MBVizCloseMarker
 
 	while ($i -lt $len) {
+		# Inline visualizer: @@@RenderOpen ... @@@RenderClose
+		if ([bool]$script:MB.MdVizActive) {
+			$cIdx = Find-MBVizMarkerIndex -Text $s -Marker $vizClose -Start $i
+			if ($cIdx -lt 0) {
+				$rest = $s.Substring($i)
+				if (Test-MBEndsWithMarkerPrefix -Text $rest -Marker $vizClose) {
+					$keepFrom = $rest.Length
+					for ($n = [Math]::Min($rest.Length, $vizClose.Length); $n -ge 1; $n--) {
+						$suf = $rest.Substring($rest.Length - $n)
+						$pre = $vizClose.Substring(0, $n)
+						if ([string]::Equals($suf, $pre, [StringComparison]::OrdinalIgnoreCase)) {
+							$keepFrom = $rest.Length - $n
+							break
+						}
+					}
+					if ($keepFrom -gt 0) {
+						$script:MB.MdVizBuf = [string]$script:MB.MdVizBuf + $rest.Substring(0, $keepFrom)
+					}
+					$script:MB.MdPending = $rest.Substring($keepFrom)
+					return
+				}
+				$script:MB.MdVizBuf = [string]$script:MB.MdVizBuf + $rest
+				$script:MB.MdPending = ''
+				return
+			}
+			if ($cIdx -gt $i) {
+				$script:MB.MdVizBuf = [string]$script:MB.MdVizBuf + $s.Substring($i, $cIdx - $i)
+			}
+			$code = [string]$script:MB.MdVizBuf
+			$script:MB.MdVizActive = $false
+			$script:MB.MdVizBuf = ''
+			$code = $code.Trim()
+			try {
+				Write-MBDebugLog -Step 'VIZ_CLOSE' -Detail ("bodyChars={0} wpf={1} preview={2}" -f $code.Length, (Test-MBWpfActive), (Get-MBVizDebugPreview -Text $code -Max 200))
+			} catch {}
+			if (Test-MBWpfActive) {
+				Write-MBMdViz -Markup $code -Lang 'iv'
+			} else {
+				try { Write-MBDebugLog -Step 'VIZ_CLOSE_NO_WPF' -Detail (Get-MBVizFallbackMessage) } catch {}
+				Write-Host ("  " + (Get-MBVizFallbackMessage)) -ForegroundColor DarkYellow
+			}
+			$i = $cIdx + $vizClose.Length
+			while ($i -lt $len -and ($s[$i] -eq [char]"`n" -or $s[$i] -eq [char]"`r" -or $s[$i] -eq [char]' ' -or $s[$i] -eq [char]"`t")) {
+				if ($s[$i] -eq [char]"`n") { $script:MB.MdAtLineStart = $true }
+				$i++
+			}
+			$script:MB.MdAtLineStart = $true
+			$script:MB.MdSkipBlankAfterBlock = $true
+			continue
+		}
+
+		if (-not [bool]$script:MB.MdFence) {
+			$oIdx = Find-MBVizMarkerIndex -Text $s -Marker $vizOpen -Start $i
+			if ($oIdx -ge $i) {
+				if ($oIdx -gt $i) {
+					$before = $s.Substring($i, $oIdx - $i)
+					$savePending = $script:MB.MdPending
+					$script:MB.MdPending = ''
+					$bi = 0
+					$blen = $before.Length
+					while ($bi -lt $blen) {
+						if ([char]::IsWhiteSpace($before[$bi])) {
+							$bj = $bi
+							while ($bj -lt $blen -and [char]::IsWhiteSpace($before[$bj])) { $bj++ }
+							$ws = $before.Substring($bi, $bj - $bi)
+							$bi = $bj
+							$hold = [string]$script:MB.MdHold
+							if ($hold.Length -gt 0) {
+								if (-not (Test-MBMdHoldOpen -S $hold)) {
+									Write-MBMdFlushHold
+									Write-MBMdEmitWhitespace -Ws $ws
+								} elseif ($ws -match '[\n]') {
+									Write-MBMdFlushHold -Force
+									Write-MBMdEmitWhitespace -Ws $ws
+								} else {
+									$script:MB.MdHold = $hold + $ws
+								}
+							} else {
+								Write-MBMdEmitWhitespace -Ws $ws
+							}
+							continue
+						}
+						$bj = $bi
+						while ($bj -lt $blen -and -not [char]::IsWhiteSpace($before[$bj])) { $bj++ }
+						$token = $before.Substring($bi, $bj - $bi)
+						$bi = $bj
+						$script:MB.MdHold = [string]$script:MB.MdHold + $token
+						if (-not (Test-MBMdHoldOpen -S ([string]$script:MB.MdHold))) {
+							Write-MBMdFlushHold
+						}
+					}
+					if ([string]$script:MB.MdHold.Length -gt 0) { Write-MBMdFlushHold -Force }
+					$script:MB.MdPending = $savePending
+				}
+				# Hold SVG source; show loading card
+				Complete-MBMdTableIfAny
+				$script:MB.MdInList = $false
+				$script:MB.MdVizActive = $true
+				$script:MB.MdVizBuf = ''
+				$i = $oIdx + $vizOpen.Length
+				while ($i -lt $len -and ($s[$i] -eq [char]"`r" -or $s[$i] -eq [char]' ' -or $s[$i] -eq [char]"`t")) { $i++ }
+				if ($i -lt $len -and $s[$i] -eq [char]"`n") { $i++ }
+				try {
+					Write-MBDebugLog -Step 'VIZ_OPEN' -Detail ("at={0} pendingLen={1} wpf={2}" -f $oIdx, $len, (Test-MBWpfActive))
+				} catch {}
+				if (Test-MBWpfActive) { Write-MBMdVizLoading }
+				$script:MB.MdAtLineStart = $true
+				continue
+			}
+			$rest = $s.Substring($i)
+			if (Test-MBEndsWithMarkerPrefix -Text $rest -Marker $vizOpen) {
+				$keepFrom = $rest.Length
+				for ($n = [Math]::Min($rest.Length, $vizOpen.Length); $n -ge 1; $n--) {
+					$suf = $rest.Substring($rest.Length - $n)
+					$pre = $vizOpen.Substring(0, $n)
+					if ([string]::Equals($suf, $pre, [StringComparison]::OrdinalIgnoreCase)) {
+						$keepFrom = $rest.Length - $n
+						break
+					}
+				}
+				if ($keepFrom -gt 0) {
+					$script:MB.MdPending = $rest.Substring($keepFrom)
+					$safe = $rest.Substring(0, $keepFrom)
+					if ($safe.Length -gt 0) {
+						$bi = 0
+						$blen = $safe.Length
+						while ($bi -lt $blen) {
+							if ([char]::IsWhiteSpace($safe[$bi])) {
+								$bj = $bi
+								while ($bj -lt $blen -and [char]::IsWhiteSpace($safe[$bj])) { $bj++ }
+								Write-MBMdEmitWhitespace -Ws $safe.Substring($bi, $bj - $bi)
+								$bi = $bj
+								continue
+							}
+							$bj = $bi
+							while ($bj -lt $blen -and -not [char]::IsWhiteSpace($safe[$bj])) { $bj++ }
+							$token = $safe.Substring($bi, $bj - $bi)
+							$bi = $bj
+							$script:MB.MdHold = [string]$script:MB.MdHold + $token
+							if (-not (Test-MBMdHoldOpen -S ([string]$script:MB.MdHold))) {
+								Write-MBMdFlushHold
+							}
+						}
+						if ([string]$script:MB.MdHold.Length -gt 0 -and -not (Test-MBMdHoldOpen -S ([string]$script:MB.MdHold))) {
+							Write-MBMdFlushHold
+						}
+					}
+					return
+				}
+			}
+		}
+
 		if ([bool]$script:MB.MdFence) {
 			$nIdx = $s.IndexOf([char]"`n", $i)
 			if ($nIdx -lt 0) {
@@ -33992,7 +36625,7 @@ function Write-MBMdStreamAppend {
 				$script:MB.MdFence = $false
 				$script:MB.MdFenceBuf = ''
 				$script:MB.MdFenceLang = ''
-				if (Test-MBWpfActive) {
+							if (Test-MBWpfActive) {
 					Write-MBMdCodeClose
 				} else {
 					if ($code.Length -gt 0) {
@@ -34087,7 +36720,9 @@ function Write-MBMdStreamFlush {
 	if ($null -eq $script:MB.MdTableLine) { $script:MB.MdTableLine = '' }
 
 	if ([string]$script:MB.MdPending.Length -gt 0) {
-		if ([bool]$script:MB.MdFence) {
+		if ([bool]$script:MB.MdVizActive) {
+			$script:MB.MdVizBuf = [string]$script:MB.MdVizBuf + [string]$script:MB.MdPending
+		} elseif ([bool]$script:MB.MdFence) {
 			$tail = [string]$script:MB.MdPending
 			$script:MB.MdFenceBuf = [string]$script:MB.MdFenceBuf + $tail
 			if (Test-MBWpfActive) { Write-MBMdCodeAppend -Text $tail }
@@ -34102,11 +36737,20 @@ function Write-MBMdStreamFlush {
 		$script:MB.MdPending = ''
 	}
 
-	if ([bool]$script:MB.MdFence) {
+	if ([bool]$script:MB.MdVizActive) {
+		$code = ([string]$script:MB.MdVizBuf).Trim()
+		try {
+			Write-MBDebugLog -Step 'VIZ_STREAM_FLUSH' -Detail ("no_close_marker bodyChars={0} preview={1}" -f $code.Length, (Get-MBVizDebugPreview -Text $code -Max 160))
+		} catch {}
+		if (Test-MBWpfActive) { Write-MBMdViz -Markup $code -Lang 'iv' }
+		else { Write-Host ("  " + (Get-MBVizFallbackMessage)) -ForegroundColor DarkYellow }
+		$script:MB.MdVizActive = $false
+		$script:MB.MdVizBuf = ''
+	} elseif ([bool]$script:MB.MdFence) {
+		$code = [string]$script:MB.MdFenceBuf
 		if (Test-MBWpfActive) {
 			Write-MBMdCodeClose
 		} else {
-			$code = [string]$script:MB.MdFenceBuf
 			if ($code.Length -gt 0) {
 				if ($code.EndsWith("`n")) { $code = $code.Substring(0, $code.Length - 1) }
 				Write-Host $code -ForegroundColor Cyan
@@ -34115,7 +36759,7 @@ function Write-MBMdStreamFlush {
 		$script:MB.MdFence = $false
 		$script:MB.MdFenceBuf = ''
 		$script:MB.MdFenceLang = ''
-	}
+		}
 	if ([string]$script:MB.MdTableLine.Length -gt 0) {
 		Write-MBMdFinishTableLine -Line ([string]$script:MB.MdTableLine)
 		$script:MB.MdTableLine = ''
@@ -35519,7 +38163,7 @@ function Start-MBWpfHost {
         Foreground="#C8C8D0"
         FontFamily="Consolas, Cascadia Mono, Courier New"
         FontSize="13">
-  <!-- Outer chrome radius -->
+  <!-- Transparent HWND so MainChromeBorder CornerRadius shows (opaque bg painted square corners). -->
   <shell:WindowChrome.WindowChrome>
     <shell:WindowChrome CaptionHeight="36"
                         ResizeBorderThickness="6"
@@ -35781,8 +38425,7 @@ function Start-MBWpfHost {
   </Window.Resources>
   <!-- WindowRoot: chrome + full-window overlays as SIBLINGS (not inside 2-row title/body grid). -->
   <Grid x:Name="WindowRoot">
-  <!-- Outer rounded chrome: transparent window + CornerRadius border.
-       ClipToBounds keeps content out of square corners; radius cleared when maximized. -->
+  <!-- Outer rounded chrome -->
   <Border x:Name="MainChromeBorder" BorderBrush="#2A2A30" BorderThickness="1" Background="#121216"
           CornerRadius="8" ClipToBounds="True" SnapsToDevicePixels="True">
     <Grid x:Name="RootOuter">
@@ -36024,7 +38667,6 @@ function Start-MBWpfHost {
               <Setter Property="LineHeight" Value="16"/>
             </Style>
           </RichTextBox.Resources>
- <!-- PageWidth: viewport when wrap on; content width when wrap off -->
           <FlowDocument PagePadding="0" LineHeight="16"
                         FontFamily="Consolas, Cascadia Mono, Segoe UI Emoji, Segoe UI Symbol, Courier New"/>
         </RichTextBox>
@@ -36439,6 +39081,8 @@ function Start-MBWpfHost {
 			$window = [Windows.Markup.XamlReader]::Load($reader)
 			$W.Window = $window
 			$W.Log = $window.FindName('LogBox')
+			$W.LogHost = $null
+			$W.VizLiveSlots = New-Object System.Collections.ArrayList
 			$W.Prompt = $window.FindName('PromptBox')
 			$W.SendBtn = $window.FindName('SendBtn')
 			$W.SendBtnPath = $window.FindName('SendBtnPath')
@@ -38811,6 +41455,8 @@ public const int ICON_BIG = 1;
 				} catch {}
 			}.GetNewClosure()
 			$W.SyncMdStretch = $syncMdStretch
+
+
 			if ($W.Log) {
 				try { $W.Log.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled } catch {}
 				$W.Log.add_SizeChanged({
@@ -38921,8 +41567,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					# DWMWA_USE_IMMERSIVE_DARK_MODE: 20 (20H1+), 19 (older)
 					[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 20, [ref]$useDark, 4)
 					[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 19, [ref]$useDark, 4)
-					# DWMWA_WINDOW_CORNER_PREFERENCE (33): 1 = DWMWCP_DONOTROUND
-					# We draw our own CornerRadius border; OS rounding leaves ugly square fill.
+					# DWMWA_WINDOW_CORNER_PREFERENCE (33): 1=DONOTROUND (we paint MainChromeBorder radius).
+					# Keep OS from double-rounding on top of our 8px chrome.
 					try {
 						$noRound = 1
 						[void][MB.Native.Dwm]::DwmSetWindowAttribute($hwnd, 33, [ref]$noRound, 4)
@@ -39811,6 +42457,28 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				}
 			}.GetNewClosure()
 
+			# UI-thread debug lines (same gate as -DebugLog / debug=1). Defined early so WriteQueue handlers can use it.
+			$uiLog = {
+				param($step, $detail)
+				$on = $false
+				try { $on = [bool]$W.DebugLogEnabled } catch { $on = $false }
+				if (-not $on) { return }
+				try {
+					$p = [string]$W.DebugLogPath
+					if (-not $p) { $p = Join-Path $env:USERPROFILE 'Desktop\MiniBot-debug.log' }
+					$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+					$tid = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+					$line = "[{0}] UI tid={1} | {2}" -f $ts, $tid, $step
+					if ($detail) {
+						$d2 = ([string]$detail -replace '[\r\n]+', ' ')
+						if ($d2.Length -gt 500) { $d2 = $d2.Substring(0, 497) + '...' }
+						$line += ' :: ' + $d2
+					}
+					$line += [Environment]::NewLine
+					[System.IO.File]::AppendAllText($p, $line)
+				} catch {}
+			}.GetNewClosure()
+
 			$timer = New-Object System.Windows.Threading.DispatcherTimer
 			$timer.Interval = [TimeSpan]::FromMilliseconds(16)
 			$timer.add_Tick({
@@ -39869,6 +42537,184 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								}
 							} catch {}
 						}
+
+						$convertVizSvgToHtml = {
+							param([string]$SvgMarkup)
+							$svg = [string]$SvgMarkup
+							if ($null -eq $svg) { $svg = '' }
+							$svg = $svg.Trim()
+							if ($svg -notmatch '(?is)<svg\b') {
+								$svg = '<svg xmlns="http://www.w3.org/2000/svg" width="680" height="240" viewBox="0 0 680 240"></svg>'
+							}
+							$sb = New-Object System.Text.StringBuilder
+							[void]$sb.AppendLine('<!DOCTYPE html>')
+							[void]$sb.AppendLine('<html lang="en">')
+							[void]$sb.AppendLine('<head>')
+							[void]$sb.AppendLine('<meta charset="utf-8"/>')
+							[void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1"/>')
+							[void]$sb.AppendLine('<title>MiniBot visualization</title>')
+							[void]$sb.AppendLine('<style>')
+							[void]$sb.AppendLine('  html, body { margin: 0; background: #121216; color: #E5E7EB; min-height: 100%; }')
+							[void]$sb.AppendLine('  .wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 16px; box-sizing: border-box; }')
+							[void]$sb.AppendLine('  svg { max-width: 100%; height: auto; display: block; }')
+							[void]$sb.AppendLine('</style>')
+							[void]$sb.AppendLine('</head>')
+							[void]$sb.AppendLine('<body><div class="wrap">')
+							[void]$sb.AppendLine($svg)
+							[void]$sb.AppendLine('</div></body></html>')
+							return $sb.ToString()
+						}.GetNewClosure()
+
+						$saveVizMarkup = {
+							param($HostBorder, [string]$Markup)
+							try {
+								$svg = [string]$Markup
+								if ([string]::IsNullOrWhiteSpace($svg) -and $HostBorder -and $HostBorder.Tag -is [hashtable]) {
+									try { $svg = [string]$HostBorder.Tag['Markup'] } catch { $svg = '' }
+								}
+								if ([string]::IsNullOrWhiteSpace($svg)) {
+									[System.Windows.MessageBox]::Show(
+										'Nothing to save yet — wait for the visualization to finish rendering.',
+										'Save visualization',
+										[System.Windows.MessageBoxButton]::OK,
+										[System.Windows.MessageBoxImage]::Information
+									) | Out-Null
+									return
+								}
+								$dlg = New-Object Microsoft.Win32.SaveFileDialog
+								$dlg.Title = 'Save visualization'
+								$dlg.Filter = 'SVG image (*.svg)|*.svg|HTML document (*.html)|*.html'
+								$dlg.FilterIndex = 1
+								$dlg.DefaultExt = 'svg'
+								$dlg.AddExtension = $true
+								$dlg.OverwritePrompt = $true
+								$dlg.FileName = ('minibot-viz-{0:yyyyMMdd-HHmmss}' -f (Get-Date))
+								try {
+									$desk = [Environment]::GetFolderPath('Desktop')
+									if ($desk -and (Test-Path -LiteralPath $desk)) { $dlg.InitialDirectory = $desk }
+								} catch {}
+								$ok = $dlg.ShowDialog()
+								if (-not $ok) { return }
+								$path = [string]$dlg.FileName
+								if ([string]::IsNullOrWhiteSpace($path)) { return }
+								$ext = [System.IO.Path]::GetExtension($path)
+								$utf8 = New-Object System.Text.UTF8Encoding $false
+								if ($ext -match '(?i)^\.(html|htm)$') {
+									$html = & $convertVizSvgToHtml $svg
+									[System.IO.File]::WriteAllText($path, $html, $utf8)
+								} else {
+									if ($ext -notmatch '(?i)^\.svg$') {
+										$path = [System.IO.Path]::ChangeExtension($path, '.svg')
+									}
+									$body = $svg.Trim()
+									if ($body -notmatch '(?is)^\s*<svg\b') {
+										$body = '<svg xmlns="http://www.w3.org/2000/svg">' + $body + '</svg>'
+									}
+									[System.IO.File]::WriteAllText($path, $body, $utf8)
+								}
+								try { & $uiLog 'VIZ_UI_SAVE_OK' $path } catch {}
+							} catch {
+								try {
+									[System.Windows.MessageBox]::Show(
+										$_.Exception.Message,
+										'Save visualization failed',
+										[System.Windows.MessageBoxButton]::OK,
+										[System.Windows.MessageBoxImage]::Warning
+									) | Out-Null
+								} catch {}
+								try { & $uiLog 'VIZ_UI_SAVE_ERR' $_.Exception.Message } catch {}
+							}
+						}.GetNewClosure()
+
+						$buildVizHeader = {
+							param(
+								$BrushCache,
+								[string]$TitleMode = 'ready',
+								[string]$Markup = ''
+							)
+							# TitleMode: loading | ready
+							$hdr = New-Object System.Windows.Controls.Border
+							$hdr.Background = $BrushCache['#252530']
+							$hdr.Padding = New-Object System.Windows.Thickness(10, 4, 8, 4)
+							$hdr.CornerRadius = New-Object System.Windows.CornerRadius(6, 6, 0, 0)
+							$grid = New-Object System.Windows.Controls.Grid
+							$col0 = New-Object System.Windows.Controls.ColumnDefinition
+							$col0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+							$col1 = New-Object System.Windows.Controls.ColumnDefinition
+							$col1.Width = [System.Windows.GridLength]::Auto
+							[void]$grid.ColumnDefinitions.Add($col0)
+							[void]$grid.ColumnDefinitions.Add($col1)
+							$hdrTb = New-Object System.Windows.Controls.TextBlock
+							$hdrTb.FontFamily = $W.MonoFont
+							$hdrTb.FontSize = 11
+							$hdrTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+							if ($TitleMode -eq 'loading') {
+								$runRen = New-Object System.Windows.Documents.Run 'rendering'
+								$runRen.Foreground = $BrushCache['#BB9AF7']
+								$runViz = New-Object System.Windows.Documents.Run ' visualization'
+								$runViz.Foreground = $BrushCache['#8A8A96']
+								[void]$hdrTb.Inlines.Add($runRen)
+								[void]$hdrTb.Inlines.Add($runViz)
+							} else {
+								$hdrTb.Text = 'visualization'
+								$hdrTb.Foreground = $BrushCache['#8A8A96']
+							}
+							[System.Windows.Controls.Grid]::SetColumn($hdrTb, 0)
+							[void]$grid.Children.Add($hdrTb)
+							$saveBtn = New-Object System.Windows.Controls.Button
+							$saveBtn.Content = 'save'
+							$saveBtn.FontFamily = $W.MonoFont
+							$saveBtn.FontSize = 11
+							$saveBtn.Foreground = $BrushCache['#8A8A96']
+							$saveBtn.Background = [System.Windows.Media.Brushes]::Transparent
+							$saveBtn.BorderThickness = New-Object System.Windows.Thickness(0)
+							$saveBtn.Padding = New-Object System.Windows.Thickness(8, 2, 4, 2)
+							$saveBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+							$saveBtn.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+							$saveBtn.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+							$saveBtn.Focusable = $false
+							try {
+								$tpl = [System.Windows.Markup.XamlReader]::Parse(
+									'<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
+								)
+								$saveBtn.Template = $tpl
+							} catch {}
+							$saveBtn.Tag = @{ Markup = [string]$Markup; Outer = $null }
+							$saveBtn.IsEnabled = -not [string]::IsNullOrWhiteSpace($Markup)
+							if (-not $saveBtn.IsEnabled) {
+								try { $saveBtn.Opacity = 0.35 } catch {}
+							}
+							$saveBtn.Add_Click({
+								param($s, $e)
+								try {
+									$mk = ''
+									$outerRef = $null
+									if ($s.Tag -is [hashtable]) {
+										try { $mk = [string]$s.Tag['Markup'] } catch {}
+										try { $outerRef = $s.Tag['Outer'] } catch {}
+									}
+									& $saveVizMarkup $outerRef $mk
+								} catch {}
+							}.GetNewClosure())
+							$saveBtn.Add_MouseEnter({
+								param($s, $e)
+								try {
+									if ($s.IsEnabled) { $s.Foreground = $BrushCache['#BB9AF7'] }
+								} catch {}
+							}.GetNewClosure())
+							$saveBtn.Add_MouseLeave({
+								param($s, $e)
+								try { $s.Foreground = $BrushCache['#8A8A96'] } catch {}
+							}.GetNewClosure())
+							[System.Windows.Controls.Grid]::SetColumn($saveBtn, 1)
+							[void]$grid.Children.Add($saveBtn)
+							$hdr.Child = $grid
+							return @{
+								Border   = $hdr
+								Title    = $hdrTb
+								SaveBtn  = $saveBtn
+							}
+						}.GetNewClosure()
 
 						$stretchW = 280.0
 						try {
@@ -40311,6 +43157,427 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								}
 								try { $W.LogLineCharRun = 0 } catch {}
 							} catch {}
+							continue
+						}
+
+						# Viz loading card while SVG streams
+						if ($kind -eq 'md-viz-loading') {
+							try {
+								try { & $uiLog 'VIZ_UI_LOADING_BEGIN' ("stretchW={0}" -f $stretchW) } catch {}
+								& $trimTrailingEmptyParas
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								foreach ($hx in @('#1A1A1E', '#252530', '#3A3A42', '#8B7AB8', '#BB9AF7', '#8A8A96', '#C8C8D0', '#6A6A76', '#121216')) {
+									if (-not $brushCache.ContainsKey($hx)) {
+										try { $brushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+									}
+								}
+								$outer = New-Object System.Windows.Controls.Border
+								$outer.Background = $brushCache['#1A1A1E']
+								$outer.BorderBrush = $brushCache['#3A3A42']
+								$outer.BorderThickness = New-Object System.Windows.Thickness(1)
+								$outer.CornerRadius = New-Object System.Windows.CornerRadius(6)
+								$outer.Margin = New-Object System.Windows.Thickness(0, 8, 0, 8)
+								$outer.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+								$outer.SnapsToDevicePixels = $true
+								$outer.Width = $stretchW
+								$root = New-Object System.Windows.Controls.Grid
+								$rowHdr = New-Object System.Windows.Controls.RowDefinition
+								$rowHdr.Height = [System.Windows.GridLength]::Auto
+								$rowBody = New-Object System.Windows.Controls.RowDefinition
+								$rowBody.Height = [System.Windows.GridLength]::Auto
+								[void]$root.RowDefinitions.Add($rowHdr)
+								[void]$root.RowDefinitions.Add($rowBody)
+								$hdrParts = & $buildVizHeader $brushCache 'loading' ''
+								$hdr = $hdrParts.Border
+								$hdrTb = $hdrParts.Title
+								$saveBtn = $hdrParts.SaveBtn
+								[System.Windows.Controls.Grid]::SetRow($hdr, 0)
+								[void]$root.Children.Add($hdr)
+								$bodyHost = New-Object System.Windows.Controls.Border
+								$bodyHost.Background = $brushCache['#121216']
+								$bodyHost.MinHeight = 140
+								$bodyHost.CornerRadius = New-Object System.Windows.CornerRadius(0, 0, 6, 6)
+								[System.Windows.Controls.Grid]::SetRow($bodyHost, 1)
+								$spinCenter = New-Object System.Windows.Controls.Grid
+								$spinCenter.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+								$spinCenter.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
+								$spinCenter.MinHeight = 140
+								$ring = New-Object System.Windows.Shapes.Ellipse
+								$ring.Width = 36
+								$ring.Height = 36
+								$ring.Stroke = $brushCache['#8B7AB8']
+								$ring.StrokeThickness = 3.0
+								$ring.Fill = [System.Windows.Media.Brushes]::Transparent
+								$dash = New-Object 'System.Windows.Media.DoubleCollection'
+								[void]$dash.Add(2.2)
+								[void]$dash.Add(1.6)
+								$ring.StrokeDashArray = $dash
+								$ring.StrokeDashCap = [System.Windows.Media.PenLineCap]::Round
+								$ring.StrokeStartLineCap = [System.Windows.Media.PenLineCap]::Round
+								$ring.StrokeEndLineCap = [System.Windows.Media.PenLineCap]::Round
+								$ring.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+								$ring.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$ring.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.5)
+								$spinRot = New-Object System.Windows.Media.RotateTransform 0
+								$ring.RenderTransform = $spinRot
+								[void]$spinCenter.Children.Add($ring)
+								$bodyHost.Child = $spinCenter
+								[void]$root.Children.Add($bodyHost)
+								$outer.Child = $root
+								if ($saveBtn -and $saveBtn.Tag -is [hashtable]) {
+									$saveBtn.Tag['Outer'] = $outer
+								}
+								$outer.Tag = @{
+									Kind     = 'md-viz-loading'
+									BodyHost = $bodyHost
+									HdrTitle = $hdrTb
+									SaveBtn  = $saveBtn
+									SpinRing = $ring
+									SpinRot  = $spinRot
+									Markup   = ''
+								}
+								try {
+									$W.ActiveVizBodyHost = $bodyHost
+									$W.ActiveVizOuter = $outer
+									$W.ActiveVizHdrTb = $hdrTb
+									$W.ActiveVizSaveBtn = $saveBtn
+									$W.ActiveVizSpinRot = $spinRot
+									$W.VizSpinActive = $true
+									try {
+										if ($W.VizSpinTimer) {
+											try { $W.VizSpinTimer.Stop() } catch {}
+											$W.VizSpinTimer = $null
+										}
+									} catch {}
+									try {
+										$vTimer = New-Object System.Windows.Threading.DispatcherTimer
+										$vTimer.Interval = [TimeSpan]::FromMilliseconds(16)
+										$vTimer.Add_Tick({
+											param($ts, $te)
+											try {
+												if (-not [bool]$W.VizSpinActive) { return }
+												$rt = $null
+												try { $rt = $W.ActiveVizSpinRot } catch {}
+												if (-not $rt) { return }
+												$a = 0.0
+												try { $a = [double]$rt.Angle } catch { $a = 0.0 }
+												$rt.Angle = ($a + 2.0) % 360.0
+											} catch {}
+										}.GetNewClosure())
+										$W.VizSpinTimer = $vTimer
+										$vTimer.Start()
+									} catch {}
+								} catch {}
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($outer)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+								try { & $uiLog 'VIZ_UI_LOADING_OK' ("hostSet={0}" -f ($null -ne $bodyHost)) } catch {}
+								try {
+									$sl = $null
+									if ($W -is [hashtable]) {
+										if (-not $W.ContainsKey('MdStretchElements') -or $null -eq $W['MdStretchElements']) {
+											$W['MdStretchElements'] = New-Object System.Collections.ArrayList
+										}
+										$sl = $W['MdStretchElements']
+									} else {
+										try { $sl = $W.MdStretchElements } catch { $sl = $null }
+										if ($null -eq $sl) {
+											$sl = New-Object System.Collections.ArrayList
+											try { $W | Add-Member -NotePropertyName MdStretchElements -NotePropertyValue $sl -Force } catch {}
+										}
+									}
+									if ($null -ne $sl) { [void]$sl.Add($outer) }
+								} catch {}
+								$doc.Blocks.Add((& $newPara))
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {
+								try { & $uiLog 'VIZ_UI_LOADING_ERR' $_.Exception.Message } catch {}
+							}
+							continue
+						}
+
+						if ($kind -eq 'md-viz') {
+							try {
+								$svgMarkup = ''
+								try { $svgMarkup = [string]$item.Text } catch { $svgMarkup = '' }
+								$vizLang = 'iv'
+								try { if ($item.Lang) { $vizLang = [string]$item.Lang } } catch {}
+								$prev = $svgMarkup
+								if ($prev.Length -gt 200) { $prev = $prev.Substring(0, 200) + '...' }
+								$prev = ($prev -replace '[\r\n]+', ' ')
+								try {
+									& $uiLog 'VIZ_UI_FILL_BEGIN' ("engine=svg-wpf lang={0} chars={1} preview={2}" -f $vizLang, $svgMarkup.Length, $prev)
+								} catch {}
+
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								foreach ($hx in @('#1A1A1E', '#252530', '#3A3A42', '#7DCFFF', '#8A8A96', '#C8C8D0', '#2A2A30', '#F05C5C', '#E0AF68', '#6A6A76', '#121216', '#BB9AF7')) {
+									if (-not $brushCache.ContainsKey($hx)) {
+										try { $brushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+									}
+								}
+
+								$bodyHost = $null
+								$outer = $null
+								try { $bodyHost = $W.ActiveVizBodyHost } catch {}
+								try { $outer = $W.ActiveVizOuter } catch {}
+								$reuse = ($null -ne $bodyHost)
+								try { & $uiLog 'VIZ_UI_CARD' ("reuse={0} bodyHost={1} outer={2}" -f $reuse, ($null -ne $bodyHost), ($null -ne $outer)) } catch {}
+								if (-not $reuse) {
+									& $trimTrailingEmptyParas
+									$outer = New-Object System.Windows.Controls.Border
+									$outer.Background = $brushCache['#1A1A1E']
+									$outer.BorderBrush = $brushCache['#3A3A42']
+									$outer.BorderThickness = New-Object System.Windows.Thickness(1)
+									$outer.CornerRadius = New-Object System.Windows.CornerRadius(6)
+									$outer.Margin = New-Object System.Windows.Thickness(0, 8, 0, 8)
+									$outer.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+									$outer.SnapsToDevicePixels = $true
+									$outer.Width = $stretchW
+									$root = New-Object System.Windows.Controls.Grid
+									$rowHdr = New-Object System.Windows.Controls.RowDefinition
+									$rowHdr.Height = [System.Windows.GridLength]::Auto
+									$rowBody = New-Object System.Windows.Controls.RowDefinition
+									$rowBody.Height = [System.Windows.GridLength]::Auto
+									[void]$root.RowDefinitions.Add($rowHdr)
+									[void]$root.RowDefinitions.Add($rowBody)
+									$hdrParts = & $buildVizHeader $brushCache 'ready' ''
+									$hdr = $hdrParts.Border
+									$hdrTb = $hdrParts.Title
+									$saveBtnNew = $hdrParts.SaveBtn
+									[System.Windows.Controls.Grid]::SetRow($hdr, 0)
+									[void]$root.Children.Add($hdr)
+									$bodyHost = New-Object System.Windows.Controls.Border
+									$bodyHost.Background = $brushCache['#121216']
+									$bodyHost.Padding = New-Object System.Windows.Thickness(0)
+									$bodyHost.CornerRadius = New-Object System.Windows.CornerRadius(0, 0, 6, 6)
+									$bodyHost.MinHeight = 120
+									[System.Windows.Controls.Grid]::SetRow($bodyHost, 1)
+									[void]$root.Children.Add($bodyHost)
+									$outer.Child = $root
+									if ($saveBtnNew -and $saveBtnNew.Tag -is [hashtable]) {
+										$saveBtnNew.Tag['Outer'] = $outer
+									}
+									$outer.Tag = @{
+										Kind     = 'md-viz'
+										BodyHost = $bodyHost
+										HdrTitle = $hdrTb
+										SaveBtn  = $saveBtnNew
+										Markup   = ''
+									}
+								} else {
+									try { $bodyHost.Padding = New-Object System.Windows.Thickness(0) } catch {}
+								}
+
+								try { $W.VizSpinActive = $false } catch {}
+								try { $W.ActiveVizSpinRot = $null } catch {}
+								try {
+									$ht = $null
+									try { $ht = $W.ActiveVizHdrTb } catch {}
+									if (-not $ht -and $outer -and $outer.Tag -is [hashtable]) {
+										try { $ht = $outer.Tag['HdrTitle'] } catch {}
+									}
+									if ($ht) {
+										try { $ht.Inlines.Clear() } catch {}
+										$ht.Text = 'visualization'
+										try {
+											$bc = $null
+											try { $bc = $W['BrushCache'] } catch { try { $bc = $W.BrushCache } catch {} }
+											if ($bc -and $bc.ContainsKey('#8A8A96')) { $ht.Foreground = $bc['#8A8A96'] }
+										} catch {}
+									}
+								} catch {}
+								try { $W.ActiveVizHdrTb = $null } catch {}
+
+								$vizOk = $false
+								$vizErr = ''
+								$vizH = 380
+								$cardW = [Math]::Max(120.0, [double]$stretchW)
+								try {
+									if ([string]::IsNullOrWhiteSpace($svgMarkup)) {
+										throw 'Visualization markup was empty (nothing between @@@RenderOpen and @@@RenderClose).'
+									}
+
+									if (-not ('MiniBot.Live.SvgView' -as [type])) {
+										try { $null = Initialize-MBVizCaptureType } catch {}
+									}
+									if (-not ('MiniBot.Live.SvgView' -as [type])) {
+										throw 'MiniBot.Live.SvgView type missing (enable -DebugLog for VIZ_CAPTURE_TYPE_ERR).'
+									}
+
+									try { $W.VizLiveSlots = New-Object System.Collections.ArrayList } catch {}
+
+									# Intrinsic SVG size when it fits; only scale DOWN to card (never stretch-fill / upscale).
+									$svgW = 0
+									$svgH = 0
+									if ($svgMarkup -match '(?is)<svg\b[^>]*\bwidth\s*=\s*"(\d+(?:\.\d+)?)"') {
+										try { $svgW = [int][Math]::Round([double]$Matches[1]) } catch {}
+									}
+									if ($svgMarkup -match '(?is)<svg\b[^>]*\bheight\s*=\s*"(\d+(?:\.\d+)?)"') {
+										try { $svgH = [int][Math]::Round([double]$Matches[1]) } catch {}
+									}
+									if (($svgW -lt 1 -or $svgH -lt 1) -and $svgMarkup -match '(?is)\bviewBox\s*=\s*"\s*[0-9.eE+-]+\s+[0-9.eE+-]+\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)') {
+										try {
+											if ($svgW -lt 1) { $svgW = [int][Math]::Round([double]$Matches[1]) }
+											if ($svgH -lt 1) { $svgH = [int][Math]::Round([double]$Matches[2]) }
+										} catch {}
+									}
+									if ($svgW -lt 1) { $svgW = 680 }
+									if ($svgH -lt 1) { $svgH = 320 }
+									$maxW = [Math]::Max(120.0, [double]$cardW)
+									$maxH = 720.0
+									$scale = 1.0
+									if ($svgW -gt $maxW) { $scale = [Math]::Min($scale, $maxW / [double]$svgW) }
+									if ($svgH -gt $maxH) { $scale = [Math]::Min($scale, $maxH / [double]$svgH) }
+									$capW = [int][Math]::Max(40, [Math]::Round($svgW * $scale))
+									$capH = [int][Math]::Max(40, [Math]::Round($svgH * $scale))
+									if ($capW -gt [int]$maxW) { $capW = [int]$maxW }
+									if ($capH -gt [int]$maxH) { $capH = [int]$maxH }
+									$vizH = $capH
+
+									$svg = New-Object MiniBot.Live.SvgView
+									$svg.Configure([double]$capW, [double]$capH)
+									$svg.LoadMarkup([string]$svgMarkup)
+									$svg.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+									$svg.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+									$svg.Margin = New-Object System.Windows.Thickness(0)
+
+									# Full-width body; SVG stays natural/capped size and centers in the card
+									$bodyHost.Child = $svg
+									$bodyHost.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+									try { $bodyHost.ClearValue([System.Windows.FrameworkElement]::WidthProperty) } catch {
+										try { $bodyHost.Width = [double]::NaN } catch {}
+									}
+									$bodyHost.Height = [double]$capH
+									$bodyHost.MinHeight = [double]$capH
+									$bodyHost.MaxHeight = [double]$capH
+									$bodyHost.Padding = New-Object System.Windows.Thickness(0)
+									$bodyHost.Margin = New-Object System.Windows.Thickness(0)
+									try { $bodyHost.ClipToBounds = $true } catch {}
+
+									$slot = @{
+										Host   = $svg
+										Markup = [string]$svgMarkup
+										Lang   = $vizLang
+										CapW   = $capW
+										CapH   = $capH
+										Engine = 'svg-wpf'
+									}
+									if (-not $W.VizLiveSlots) { $W.VizLiveSlots = New-Object System.Collections.ArrayList }
+									[void]$W.VizLiveSlots.Add($slot)
+
+									try { & $uiLog 'VIZ_UI_SVG_CREATE' ("engine=svg-wpf w={0} h={1} chars={2} probe={3}" -f $capW, $capH, $svgMarkup.Length, $svg.LastProbe) } catch {}
+									try { & $uiLog 'VIZ_UI_SVG_PROBE' ("mode=svg-wpf {0} loadedOk={1}" -f $svg.LastProbe, $svg.LoadedOk) } catch {}
+
+									$vizOk = [bool]$svg.LoadedOk
+									if (-not $vizOk) {
+										throw ("SVG render failed: " + $svg.LastProbe)
+									}
+									try {
+										$saveBtn = $null
+										try { $saveBtn = $W.ActiveVizSaveBtn } catch {}
+										if (-not $saveBtn -and $outer -and $outer.Tag -is [hashtable]) {
+											try { $saveBtn = $outer.Tag['SaveBtn'] } catch {}
+										}
+										if ($saveBtn) {
+											if ($saveBtn.Tag -is [hashtable]) {
+												$saveBtn.Tag['Markup'] = [string]$svgMarkup
+												$saveBtn.Tag['Outer'] = $outer
+											} else {
+												$saveBtn.Tag = @{ Markup = [string]$svgMarkup; Outer = $outer }
+											}
+											$saveBtn.IsEnabled = $true
+											try { $saveBtn.Opacity = 1.0 } catch {}
+										}
+										$prevTag = $null
+										try { if ($outer.Tag -is [hashtable]) { $prevTag = $outer.Tag } } catch {}
+										$outer.Tag = @{
+											Kind     = 'md-viz'
+											Lang     = $vizLang
+											Engine   = 'svg-wpf'
+											Slot     = $slot
+											Markup   = [string]$svgMarkup
+											SaveBtn  = $saveBtn
+											BodyHost = $bodyHost
+											HdrTitle = $(if ($prevTag -and $prevTag['HdrTitle']) { $prevTag['HdrTitle'] } else { $null })
+										}
+									} catch {
+										try { $outer.Tag = @{ Kind = 'md-viz'; Lang = $vizLang; Engine = 'svg-wpf'; Slot = $slot; Markup = [string]$svgMarkup } } catch {}
+									}
+									try { & $uiLog 'VIZ_UI_ATTACH_OK' ("engine=svg-wpf w={0} h={1} reuse={2}" -f $capW, $capH, $reuse) } catch {}
+								} catch {
+									$vizErr = $_.Exception.Message
+									if ($_.Exception.InnerException) {
+										try { $vizErr = $vizErr + ' | ' + $_.Exception.InnerException.Message } catch {}
+									}
+									$vizOk = $false
+									try { & $uiLog 'VIZ_UI_SVG_FAIL' $vizErr } catch {}
+								}
+
+								if (-not $vizOk) {
+									$warn = New-Object System.Windows.Controls.TextBlock
+									$warn.TextWrapping = [System.Windows.TextWrapping]::Wrap
+									$warn.FontFamily = $W.MonoFont
+									$warn.FontSize = 12
+									$warn.Margin = New-Object System.Windows.Thickness(12, 10, 12, 12)
+									$warn.Foreground = $brushCache['#E0AF68']
+									$warn.Text = "Inline visualization failed.`n`n" + $vizErr
+									$bodyHost.Child = $warn
+									$bodyHost.MinHeight = 100
+									try { $outer.Tag = @{ Kind = 'md-viz'; Lang = $vizLang; Fallback = $true; Error = $vizErr; Markup = [string]$svgMarkup } } catch {}
+									# Still allow saving source markup if present
+									try {
+										$sb = $null
+										try { $sb = $W.ActiveVizSaveBtn } catch {}
+										if (-not $sb -and $outer -and $outer.Tag -is [hashtable]) { $sb = $outer.Tag['SaveBtn'] }
+										if ($sb -and -not [string]::IsNullOrWhiteSpace($svgMarkup)) {
+											if ($sb.Tag -is [hashtable]) {
+												$sb.Tag['Markup'] = [string]$svgMarkup
+												$sb.Tag['Outer'] = $outer
+											}
+											$sb.IsEnabled = $true
+											try { $sb.Opacity = 1.0 } catch {}
+										}
+									} catch {}
+									try { & $uiLog 'VIZ_UI_FALLBACK' ("err={0}" -f $vizErr) } catch {}
+								}
+
+								try {
+									$W.ActiveVizBodyHost = $null
+									$W.ActiveVizOuter = $null
+									$W.ActiveVizSaveBtn = $null
+								} catch {}
+
+								if (-not $reuse) {
+									$buc = New-Object System.Windows.Documents.BlockUIContainer ($outer)
+									$buc.Margin = New-Object System.Windows.Thickness 0
+									$doc.Blocks.Add($buc)
+									try {
+										$sl = $null
+										if ($W -is [hashtable]) {
+											if (-not $W.ContainsKey('MdStretchElements') -or $null -eq $W['MdStretchElements']) {
+												$W['MdStretchElements'] = New-Object System.Collections.ArrayList
+											}
+											$sl = $W['MdStretchElements']
+										} else {
+											try { $sl = $W.MdStretchElements } catch { $sl = $null }
+											if ($null -eq $sl) {
+												$sl = New-Object System.Collections.ArrayList
+												try { $W | Add-Member -NotePropertyName MdStretchElements -NotePropertyValue $sl -Force } catch {}
+											}
+										}
+										if ($null -ne $sl) { [void]$sl.Add($outer) }
+									} catch {}
+									$doc.Blocks.Add((& $newPara))
+								}
+								try { $W.LogLineCharRun = 0 } catch {}
+								try { & $uiLog 'VIZ_UI_FILL_DONE' ("ok={0} reuse={1} engine=svg-wpf" -f $vizOk, $reuse) } catch {}
+							} catch {
+								try { & $uiLog 'VIZ_UI_FILL_ERR' $_.Exception.Message } catch {}
+							}
 							continue
 						}
 
@@ -43254,6 +46521,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							if ([string]::IsNullOrWhiteSpace($gpoBlockReason)) {
 								$gpoBlockReason = 'This Windows edition does not include Local Group Policy (typically Home/Core; needs Pro or higher).'
 							}
+							$domainBlockedMap = @{}
+							try { $domainBlockedMap = $td.domainBlocked } catch { $domainBlockedMap = @{} }
+							if ($null -eq $domainBlockedMap) { $domainBlockedMap = @{} }
 							$mono = $null
 							try { $mono = $W.MonoFont } catch {}
 							$mkThemedTip = {
@@ -43273,7 +46543,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$ttb = New-Object System.Windows.Controls.TextBlock
 									$ttb.Text = [string]$text
 									$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
-									$ttb.MaxWidth = 340
+									$tipMax = 340
+									if ([string]$text -match '(?i)Remote target:|5985') { $tipMax = 420 }
+									$ttb.MaxWidth = $tipMax
 									$ttb.Foreground = $menuFg
 									$ttb.FontSize = 12
 									$ttb.LineHeight = 16
@@ -43525,7 +46797,22 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												}
 											}
 										} catch { $noGpo = $false }
-										$toolUnavailable = ($noVision -or $noGpo)
+										$noDomain = $false
+										try {
+											if ($domainBlockedMap -is [hashtable]) {
+												if ($domainBlockedMap.ContainsKey($tName)) { $noDomain = $true }
+												elseif ($domainBlockedMap.Contains($tName)) { $noDomain = $true }
+												else {
+													foreach ($dk in @($domainBlockedMap.Keys)) {
+														if ([string]::Equals([string]$dk, $tName, [StringComparison]::OrdinalIgnoreCase)) {
+															$noDomain = $true
+															break
+														}
+													}
+												}
+											}
+										} catch { $noDomain = $false }
+										$toolUnavailable = ($noVision -or $noGpo -or $noDomain)
 										if ($noVision) {
 											if ($tTip -notmatch '(?i)does not support vision|no ''vision'' in Abilities') {
 												$tTip = ("{0}`n`nUnavailable: current model does not support vision (no 'vision' in Abilities)." -f $tTip.TrimEnd())
@@ -43535,6 +46822,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											if ($tTip -notmatch '(?i)Local Group Policy|gpedit|Home/Core|does not include Local Group Policy') {
 												$tTip = ("{0}`n`nUnavailable: {1}" -f $tTip.TrimEnd(), $gpoBlockReason)
 											}
+										}
+										if ($noDomain -and $tTip -notmatch '(?i)Status: unavailable') {
+											$tTip = ("{0}`n`nStatus: unavailable (domain required)" -f $tTip.TrimEnd())
 										}
 										$wasUsed = $false
 										try {
@@ -43554,7 +46844,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										}
 										$toolFg = $itemFg
 										if ($toolUnavailable -and $orangeB) { $toolFg = $orangeB }
-										# Unavailable (vision / GPO edition): orange, never "used" highlight
+										# Unavailable (vision / GPO edition / domain): orange, never "used" highlight
 										[void]$cm.Items.Add((& $addToolItem $tName $toolFg $menuBg $tTip $(if ($toolUnavailable) { $false } else { $wasUsed })))
 									}
 								}
@@ -44124,27 +47414,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				}.GetNewClosure())
 			}
 
-			# UI-thread debug lines (same gate as -DebugLog / debug=1)
-			$uiLog = {
-				param($step, $detail)
-				$on = $false
-				try { $on = [bool]$W.DebugLogEnabled } catch { $on = $false }
-				if (-not $on) { return }
-				try {
-					$p = [string]$W.DebugLogPath
-					if (-not $p) { $p = Join-Path $env:USERPROFILE 'Desktop\MiniBot-debug.log' }
-					$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-					$tid = [System.Threading.Thread]::CurrentThread.ManagedThreadId
-					$line = "[{0}] UI tid={1} | {2}" -f $ts, $tid, $step
-					if ($detail) {
-						$d2 = ([string]$detail -replace '[\r\n]+', ' ')
-						if ($d2.Length -gt 400) { $d2 = $d2.Substring(0, 397) + '...' }
-						$line += ' :: ' + $d2
-					}
-					$line += [Environment]::NewLine
-					[System.IO.File]::AppendAllText($p, $line)
-				} catch {}
-			}.GetNewClosure()
+			# $uiLog defined earlier (before WriteQueue timer) — same Desktop MiniBot-debug.log gate
 
 			$W.Prompt.add_PreviewKeyDown({
 				param($sender, $e)
@@ -44217,6 +47487,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 			$window.add_Closing({
 				param($s, $ev)
 				try { & $uiLog 'WINDOW_CLOSING' ("soft={0}" -f $W.SoftClose) } catch {}
+			try { $W.VizLiveSlots = New-Object System.Collections.ArrayList } catch {}
 				$W.ExitRequested = $true
 				$W.InterruptFlag = $true
 				# Hard-exit; release single-instance lock
@@ -44335,17 +47606,45 @@ function Stop-MBWpfHost {
 		try { [void]$script:MB.Wpf.InputWait.Set() } catch {}
 		try { [void]$script:MB.Wpf.CredWait.Set() } catch {}
 		try { [void]$script:MB.Wpf.ConfirmWait.Set() } catch {}
-		Invoke-MBWpf -Action {
-			if ($script:MB.Wpf.Window) { $script:MB.Wpf.Window.Close() }
+		# Prefer async close: sync Dispatcher.Invoke often throws "A task was canceled"
+		# once Closing has already started BeginInvokeShutdown.
+		$disp = $null
+		try { $disp = $script:MB.Wpf.Dispatcher } catch {}
+		$alreadyDown = $false
+		try {
+			if ($disp -and ($disp.HasShutdownStarted -or $disp.HasShutdownFinished)) { $alreadyDown = $true }
+		} catch {}
+		if (-not $alreadyDown) {
+			try {
+				Invoke-MBWpf -Async -Action {
+					try {
+						if ($script:MB.Wpf.Window) { $script:MB.Wpf.Window.Close() }
+					} catch {}
+				}
+			} catch {
+				$msg = [string]$_.Exception.Message
+				if ($msg -notmatch '(?i)cancel') {
+					Write-MBDebugLog -Step 'WPF_STOP_CLOSE_ERR' -Detail $msg
+				} else {
+					Write-MBDebugLog -Step 'WPF_STOP_CLOSE_SKIP' -Detail 'dispatcher cancel (expected on teardown)'
+				}
+			}
+		} else {
+			Write-MBDebugLog -Step 'WPF_STOP_CLOSE_SKIP' -Detail 'dispatcher already shutting down'
 		}
 	} catch {
-		Write-MBDebugLog -Step 'WPF_STOP_CLOSE_ERR' -Detail $_.Exception.Message
+		$msg = [string]$_.Exception.Message
+		if ($msg -notmatch '(?i)cancel') {
+			Write-MBDebugLog -Step 'WPF_STOP_CLOSE_ERR' -Detail $msg
+		} else {
+			Write-MBDebugLog -Step 'WPF_STOP_CLOSE_SKIP' -Detail $msg
+		}
 	}
 	try {
 		if ($script:MB.Wpf.Ps) { $script:MB.Wpf.Ps.Dispose() }
 		if ($script:MB.Wpf.Runspace) { $script:MB.Wpf.Runspace.Close(); $script:MB.Wpf.Runspace.Dispose() }
 	} catch {}
-	$script:MB.Wpf.Ready = $false
+	try { $script:MB.Wpf.Ready = $false } catch {}
 	Write-MBDebugLog -Step 'WPF_STOP_DONE'
 }
 
@@ -44400,15 +47699,10 @@ function Start-LocalAgent {
 	$script:MB.PreferWpfLogin = $true
 
 	Write-MBDebugLog -Step 'AGENT_AUTH_BEGIN'
-	$auth = Connect-MBModelEndpoint -TimeoutSeconds 8
+	# Fast probe (hard HttpClient timeout). Do not refresh models before WPF host — that blocked the UI.
+	$auth = Connect-MBModelEndpoint -TimeoutSeconds 3
 	$connTest = $auth.ConnTest
 	Write-MBDebugLog -Step 'AGENT_AUTH_DONE' -Detail ("ok={0} exit={1}" -f $auth.Success, $auth.Exit)
-	if ($auth.Success) {
-		try {
-			$null = Refresh-MBRemoteModels -Force
-			Write-MBDebugLog -Step 'AGENT_MODELS' -Detail ("count={0} active={1}" -f @($script:MB.RemoteModels).Count, (Get-MBActiveModel))
-		} catch {}
-	}
 
 	if ($auth.Exit -or -not $auth.Success) {
 		$msg = $null
@@ -45171,8 +48465,17 @@ function Start-LocalAgent {
 					elseif ($fn -eq 'ScanNetwork') {
 						$hint = '  (usually ~30s)'
 					}
-					elseif ($fn -eq 'ProbeShares') {
+					elseif ($fn -eq 'FindShares') {
 						$hint = '  (port filter + map guess)'
+					}
+					elseif ($fn -eq 'PortProbe') {
+						$hint = '  (tcp ports)'
+					}
+					elseif ($fn -eq 'FindWebHosts') {
+						$hint = '  (http/https ports)'
+					}
+					elseif ($fn -eq 'FindRdp') {
+						$hint = '  (3389)'
 					}
 					elseif (Test-MBHasProp $argsObj 'path') { $hint = "  $(Get-MBProp $argsObj 'path')" }
 					elseif (Test-MBHasProp $argsObj 'name') { $hint = "  $(Get-MBProp $argsObj 'name')" }
@@ -45221,7 +48524,7 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 					Write-Host "    ($($script:MB.LastToolMs) ms, $($toolResult.Length) chars)" -ForegroundColor DarkGray
 					try {
 						$toolSec = [double]([math]::Max(0, [int]$script:MB.LastToolMs) / 1000.0)
-						Write-MBWorkedStamp -Seconds $toolSec
+						Write-MBWorkedStamp -Seconds $toolSec -NoSpeed
 					} catch {}
 
 					$tcId = Get-MBProp $tc 'id'
