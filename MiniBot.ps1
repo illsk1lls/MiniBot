@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.40.0 - Mini Repair-Bot
+	MiniBot v2.40.1 - Mini Repair-Bot
 .DESCRIPTION
 	OpenAI-compatible PowerShell 5.1 agent client for local models.
 	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
@@ -40,7 +40,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.40.0",
+	[string]$Version = "2.40.1",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -8928,7 +8928,6 @@ INLINE VISUALS — emit SVG between @@@RenderOpen and @@@RenderClose (own lines)
 <svg width="680" height="240" viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg"><rect width="680" height="240" fill="#1A1A1E"/><rect x="80" y="40" width="40" height="160" fill="#7AA2F7"/><rect x="160" y="80" width="40" height="120" fill="#9ECE6A"/><line x1="60" y1="200" x2="620" y2="200" stroke="#3A3A42" stroke-width="1"/></svg>
 @@@RenderClose
 Do not stream bare SVG outside those markers.
-REPORTS: when summarizing data, comparisons, trends, inventories, disk/RAM/top processes, network findings, or multi-metric status — interleave short markdown with SVG charts/tables where a visual helps (bar/line/sparkline/simple table geometry). Place each viz between narrative sections (not only at the end). Skip empty decoration; one clear chart beats three noisy ones.
 VIZ RULES: SVG only (rect/circle/ellipse/line/path/polyline/polygon/text/g; fill/stroke attr or style=). REQUIRED width="N" height="N" + viewBox + xmlns. No JavaScript, CDNs, or WPF/XAML. No decorative title banner unless relevant. Flyer/poster layouts: be careful with text size and alignment (readable hierarchy, consistent columns, no overlapping labels, text-anchor when centering).
 Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration). If a tool is missing: ERROR may say missing_tool=X group=Y — EnableToolGroup group=Y then call X same turn; do NOT invent COM/shell.
 ROUTER (intent->tool; enable group first if off; do not shell these):
