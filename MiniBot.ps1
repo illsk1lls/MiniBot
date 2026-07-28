@@ -2382,8 +2382,8 @@ function Get-MBActiveModel {
 	try { Sync-MBActiveModelFromWpf } catch {}
 	$m = ''
 	try { $m = [string]$script:MB.ActiveModel } catch { $m = '' }
+	# Path-like ids are valid (llama-server); do not treat them as "no model"
 	if (-not [string]::IsNullOrWhiteSpace($m) -and $m -ne 'Select Model') {
-		if (Test-MBLooksLikeModelPath -S $m) { return '' }
 		return $m
 	}
 	$entries = @()
@@ -2398,13 +2398,10 @@ function Get-MBActiveModel {
 	$remote = @()
 	try { $remote = @($script:MB.RemoteModels) } catch { $remote = @() }
 	if ($remote.Count -eq 1) {
-		$r0 = [string]$remote[0]
-		if (-not (Test-MBLooksLikeModelPath -S $r0)) { return $r0 }
-		return ''
+		return [string]$remote[0]
 	}
 	if ($remote.Count -gt 1) { return '' }
 	try { $m = [string]$Model } catch { $m = '' }
-	if (Test-MBLooksLikeModelPath -S $m) { return '' }
 	return $m
 }
 
@@ -2431,26 +2428,41 @@ function Format-MBByteSize {
 }
 
 function Test-MBLooksLikeModelPath {
-	# True only for filesystem-looking model paths from llama.cpp (not HF/Unsloth ids).
+	# True for filesystem-looking model paths from llama.cpp / llama-server.
 	# Unsloth/HF ids look like: unsloth/Qwen3.5-4B-MTP-GGUF  (slash is org/repo, not a path)
+	# Path-like ids are still VALID API model ids — only display/labeling should shorten them.
 	param([string]$S)
-	if ([string]::IsNullOrWhiteSpace($S)) { return $true }
+	if ([string]::IsNullOrWhiteSpace($S)) { return $false }
 	$t = $S.Trim()
 	# Windows drive / UNC / any backslash path
 	if ($t -match '^[A-Za-z]:[\\/]') { return $true }
 	if ($t -match '^\\\\') { return $true }
 	if ($t -match '\\') { return $true }
-	# Absolute or relative filesystem paths
+	# Absolute or relative filesystem paths (not HF org/name with a single slash)
 	if ($t -match '^/') { return $true }
 	if ($t -match '^\.\.?/') { return $true }
-	# Real .gguf file names (Unsloth ids use -GGUF suffix without a dot)
+	# Real weight file names (Unsloth catalog ids use -GGUF suffix without a dot)
 	if ($t -match '(?i)\.gguf$') { return $true }
 	if ($t -match '(?i)\.(bin|safetensors|ggml|pt|pth|onnx)$') { return $true }
 	return $false
 }
 
+function Get-MBModelDisplayName {
+	# Short label for PoweredBy / banners; keep full id for chat API.
+	param([string]$Id = '')
+	$t = ([string]$Id).Trim()
+	if ([string]::IsNullOrWhiteSpace($t)) { return '' }
+	if (-not (Test-MBLooksLikeModelPath -S $t)) { return $t }
+	try {
+		$leaf = [System.IO.Path]::GetFileName($t.TrimEnd([char[]]@('\', '/')))
+		if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
+	} catch {}
+	if ($t -match '[\\/]([^\\/]+)$') { return $Matches[1] }
+	return $t
+}
+
 function Get-MBPreferredModelAlias {
-	# Prefer intentional API id/alias; never model_path / filesystem names
+	# Prefer clean API id/alias; fall back to path-like id (llama-server /models often is a .gguf path).
 	param($Row, [string]$PropsAlias = '')
 	$cands = New-Object System.Collections.ArrayList
 	if (-not [string]::IsNullOrWhiteSpace($PropsAlias)) { [void]$cands.Add($PropsAlias.Trim()) }
@@ -2464,21 +2476,16 @@ function Get-MBPreferredModelAlias {
 		try { if ($Row.name) { [void]$cands.Add(([string]$Row.name).Trim()) } } catch {}
 		try { if ($Row.model) { [void]$cands.Add(([string]$Row.model).Trim()) } } catch {}
 	}
+	# Prefer non-path labels first
 	foreach ($c in $cands) {
 		if ([string]::IsNullOrWhiteSpace($c)) { continue }
 		if (Test-MBLooksLikeModelPath -S $c) { continue }
 		return $c
 	}
-	# Last resort: if every candidate was filtered, still accept a non-path HF-style id
-	# (org/name) from row.id — Unsloth Studio returns these as the real model id.
-	try {
-		if ($null -ne $Row -and $Row.id) {
-			$fallback = ([string]$Row.id).Trim()
-			if (-not [string]::IsNullOrWhiteSpace($fallback) -and -not (Test-MBLooksLikeModelPath -S $fallback)) {
-				return $fallback
-			}
-		}
-	} catch {}
+	# Accept path / .gguf id — required for local llama.cpp / llama-server
+	foreach ($c in $cands) {
+		if (-not [string]::IsNullOrWhiteSpace($c)) { return $c }
+	}
 	return ''
 }
 
@@ -2538,7 +2545,7 @@ function Get-MBServerPropsFromBase {
 			}
 			$alias = ''
 			try { $alias = [string]$obj.model_alias } catch { $alias = '' }
-			if (Test-MBLooksLikeModelPath -S $alias) { $alias = '' }
+			# Keep path-like aliases (llama-server); display shortens them later
 			$vision = $false
 			$audio = $false
 			try { $vision = [bool]$obj.modalities.vision } catch {}
@@ -3047,7 +3054,7 @@ function Get-MBRemoteModelsFromBase {
 			foreach ($row in $rows) {
 				$id = ''
 				if ($row -is [string]) {
-					if (-not (Test-MBLooksLikeModelPath -S $row)) { $id = $row.Trim() }
+					$id = $row.Trim()
 				} else {
 					$id = Get-MBPreferredModelAlias -Row $row -PropsAlias ''
 					if ([string]::IsNullOrWhiteSpace($id)) {
@@ -3059,7 +3066,7 @@ function Get-MBRemoteModelsFromBase {
 					}
 				}
 				if ([string]::IsNullOrWhiteSpace($id)) { continue }
-				if (Test-MBLooksLikeModelPath -S $id) { continue }
+				# Keep path / .gguf ids — llama-server OpenAI API uses them as the model name
 				if ($ids -contains $id) { continue }
 				[void]$ids.Add($id)
 				$nCtx = 0; $nCtxTrain = 0; $nParams = 0; $sizeB = 0
@@ -3143,17 +3150,23 @@ function Get-MBRemoteModelsFromBase {
 			} catch { $props = $null }
 		}
 	}
-	if ($props -and $props.Ok -and $props.ModelAlias -and -not (Test-MBLooksLikeModelPath -S ([string]$props.ModelAlias))) {
-		$pa = [string]$props.ModelAlias
-		return @{
-			Ok = $true
-			Base = $(if ($props.Base) { [string]$props.Base } else { $raw })
-			Models = @($pa)
-			Entries = @([pscustomobject]@{
-				Id = $pa; NCtx = [int]$props.NCtx; NCtxTrain = 0
-				NParams = 0; Size = 0; Vision = [bool]$props.Vision
-			})
-			Props = $props
+	if ($props -and $props.Ok) {
+		$pa = ''
+		try { $pa = [string]$props.ModelAlias } catch { $pa = '' }
+		if ([string]::IsNullOrWhiteSpace($pa)) {
+			try { $pa = [string]$props.ModelPath } catch { $pa = '' }
+		}
+		if (-not [string]::IsNullOrWhiteSpace($pa)) {
+			return @{
+				Ok = $true
+				Base = $(if ($props.Base) { [string]$props.Base } else { $raw })
+				Models = @($pa)
+				Entries = @([pscustomobject]@{
+					Id = $pa; NCtx = [int]$props.NCtx; NCtxTrain = 0
+					NParams = 0; Size = 0; Vision = [bool]$props.Vision
+				})
+				Props = $props
+			}
 		}
 	}
 	return @{ Ok = $false; Base = $raw; Models = @(); Entries = @(); Props = $props }
@@ -3325,9 +3338,9 @@ function Refresh-MBRemoteModels {
 			foreach ($re in $rich) {
 				$id = [string]$re.Id
 				if ([string]::IsNullOrWhiteSpace($id)) { continue }
-				if (Test-MBLooksLikeModelPath -S $id) { continue }
 				$key = "{0}|{1}" -f $id, $resolved
-				$label = if ($multiEndpoint) { "{0}  @  {1}" -f $id, $hostLab } else { $id }
+				$disp = Get-MBModelDisplayName -Id $id
+				$label = if ($multiEndpoint) { "{0}  @  {1}" -f $disp, $hostLab } else { $disp }
 				$nCtx = 0; $nCtxTrain = 0; $nParams = 0; $sizeB = 0; $vision = $false
 				try { $nCtx = [int]$re.NCtx } catch {}
 				try { $nCtxTrain = [int]$re.NCtxTrain } catch {}
@@ -3377,8 +3390,6 @@ function Refresh-MBRemoteModels {
 		$activeKey = ''
 		try { $active = [string]$script:MB.ActiveModel } catch { $active = '' }
 		try { $activeKey = [string]$script:MB.ActiveModelKey } catch { $activeKey = '' }
-		# Drop stale path-like active model names
-		if ($active -and (Test-MBLooksLikeModelPath -S $active)) { $active = ''; $activeKey = '' }
 		$match = $null
 		if ($activeKey) {
 			$match = @($entries | Where-Object { $_.Key -eq $activeKey } | Select-Object -First 1)
@@ -3389,7 +3400,7 @@ function Refresh-MBRemoteModels {
 		if (-not $match) {
 			$launch = ''
 			try { $launch = [string]$Model } catch { $launch = '' }
-			if ($launch -and -not (Test-MBLooksLikeModelPath -S $launch)) {
+			if ($launch) {
 				$match = @($entries | Where-Object { $_.Id -eq $launch } | Select-Object -First 1)
 			}
 		}
@@ -3398,7 +3409,6 @@ function Refresh-MBRemoteModels {
 			if ($entries[0].NCtx -gt 0) {
 				[void](Apply-MBServerContextWindow -NCtx ([int]$entries[0].NCtx) -Source 'server')
 			}
-			# ServerInfo for the selected endpoint
 			try {
 				$p = Get-MBServerPropsFromBase -BaseUrl ([string]$entries[0].Base)
 				if ($p -and $p.Ok) { $script:MB.ServerInfo = $p }
@@ -3417,12 +3427,11 @@ function Refresh-MBRemoteModels {
 			$pick = $entries[0]
 			try {
 				$launch = [string]$Model
-				if ($launch -and -not (Test-MBLooksLikeModelPath -S $launch)) {
+				if ($launch) {
 					$m2 = @($entries | Where-Object { $_.Id -eq $launch } | Select-Object -First 1)
 					if ($m2) { $pick = $m2 }
 					else {
-						# partial match e.g. Model=grok-4.5 against id grok-4.5-...
-						$m3 = @($entries | Where-Object { $_.Id -like ("*{0}*" -f $launch) } | Select-Object -First 1)
+						$m3 = @($entries | Where-Object { $_.Id -like ("*{0}*" -f $launch) -or (Get-MBModelDisplayName -Id $_.Id) -like ("*{0}*" -f $launch) } | Select-Object -First 1)
 						if ($m3) { $pick = $m3 }
 					}
 				}
@@ -3436,11 +3445,10 @@ function Refresh-MBRemoteModels {
 				if ($p -and $p.Ok) { $script:MB.ServerInfo = $p }
 			} catch {}
 		} elseif ($entries.Count -eq 0) {
-			# leave launch -Model as fallback only if not a path
+			# Keep -Model as active even if /models list was empty (some gateways omit listing)
 			try {
 				$launch = [string]$Model
-				if ($launch -and -not (Test-MBLooksLikeModelPath -S $launch) -and (Test-MBApiKeyUsable -Key ([string]$ApiKey) -or $true)) {
-					# Keep -Model as active even if /models list was empty (some gateways omit listing)
+				if ($launch) {
 					$pb = ''
 					try { $pb = [string]$script:MB.PrimaryApiBase } catch {}
 					if (-not $pb) { try { $pb = [string]$BaseUrl } catch {} }
@@ -3480,14 +3488,14 @@ function Refresh-MBRemoteModels {
 }
 
 function Get-MBDisplayModel {
+	# UI label (basename for path-like llama-server ids); API still uses Get-MBActiveModel full id
 	$active = Get-MBActiveModel
-	if (-not [string]::IsNullOrWhiteSpace($active)) { return $active }
-	# Optional -ModelAlias / -Model only when the user filled them in
+	if (-not [string]::IsNullOrWhiteSpace($active)) { return (Get-MBModelDisplayName -Id $active) }
 	try {
 		if (-not [string]::IsNullOrWhiteSpace([string]$ModelAlias)) { return [string]$ModelAlias }
 	} catch {}
 	try {
-		if (-not [string]::IsNullOrWhiteSpace([string]$Model)) { return [string]$Model }
+		if (-not [string]::IsNullOrWhiteSpace([string]$Model)) { return (Get-MBModelDisplayName -Id ([string]$Model)) }
 	} catch {}
 	return ''
 }
@@ -39361,6 +39369,13 @@ function Start-MBWpfHost {
 				param([string]$Id, [int]$MaxLen = 36)
 				$m = ([string]$Id).Trim()
 				if ([string]::IsNullOrWhiteSpace($m)) { return 'Select Model' }
+				# Basename for llama-server path / .gguf ids
+				try {
+					if ($m -match '^[A-Za-z]:[\\/]' -or $m -match '[\\/]' -or $m -match '(?i)\.gguf$') {
+						$leaf = [System.IO.Path]::GetFileName($m.TrimEnd([char[]]@('\', '/')))
+						if (-not [string]::IsNullOrWhiteSpace($leaf)) { $m = $leaf }
+					}
+				} catch {}
 				if ($m.Length -le $MaxLen) { return $m }
 				$m2 = $m -replace '\.gguf$', ''
 				if ($m2.Length -le $MaxLen) { return $m2 }
