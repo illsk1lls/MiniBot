@@ -4,13 +4,11 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.40.1 - Mini Repair-Bot
+	MiniBot v2.50.0 - Local AI agent host for Windows PowerShell 5.1
 .DESCRIPTION
-	OpenAI-compatible PowerShell 5.1 agent client for local models.
-	Supports irm | iex deployment and a hybrid .CMD/.PS1 launcher.
+	OpenAI-compatible agent client (WPF UI + tools). Hybrid .CMD/.PS1 launcher; irm|iex friendly.
 .NOTES
-	Requires Windows PowerShell 5.1+. GetWindowsUpdateStatus uses native WU COM (optional PSWindowsUpdate fallback).
-	Optional: System.Speech for /speech (Right-Ctrl PTT + TTS).
+	Windows PowerShell 5.1+. Optional System.Speech for /speech (Right-Ctrl PTT + TTS).
 #>
 
 param(
@@ -19,7 +17,7 @@ param(
 	# Port stays in the URL (not a separate param) so multi-endpoint bases, HTTPS, and /v1 paths stay simple.
 	# Localhost placeholder: nothing listening -> Connect recovery popup to enter real endpoint (xAI, LAN, etc.).
 	# Leave empty ("") to open Connect immediately without a probe timeout.
-	[string]$BaseUrl = "http://127.0.0.1:8080/v1",
+	[string]$BaseUrl = "", # e.g. http://127.0.0.1:8080/v1 - Hardcode here for direct connect without login popup
 	# Optional preferred model id. Leave empty to auto-pick from /models (single model)
 	# or the PoweredBy picker (multiple). Only used when set / -Model is passed.
 	# HF/Unsloth-style ids with a slash are OK: unsloth/Qwen3.5-4B-MTP-GGUF
@@ -36,11 +34,11 @@ param(
 	# If you log in with NPM Basic for the primary llama.cpp host, leave this "none" unless the app itself needs Bearer.
 	[string]$ApiKey = "none",
 	[double]$Temperature = 0.15,
-	[int]$MaxTurns = 30,
+	[int]$MaxTurns = 50,
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.40.1",
+	[string]$Version = "2.50.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -516,6 +514,12 @@ $script:MB = @{
 	TurnsLeft          = $(try { [int]$MaxTurns } catch { 30 })
 	TurnsUsed          = 0
 	TurnsInFlight      = $false
+	# Unlimited tool-loop turns (disables MaxTurns cap; UI shows pulsing infinity)
+	UnlimitedTurns     = $false
+	# Remaining turns frozen when ∞ turns ON (not counted down while ∞; restored when ∞ OFF)
+	TurnsLeftFrozen    = $null
+	# After ∞ OFF mid-flight: agent-turn index at resume so left = Frozen - (Turn - ResumeTurn0)
+	TurnsResumeTurn0   = $null
 	VizHostState       = $null
 	VizCaptureReady    = $false
 	MdVizActive        = $false
@@ -548,6 +552,28 @@ $script:MB = @{
 	StickyNotes        = New-Object System.Collections.ArrayList
 	StickyFindings     = New-Object System.Collections.ArrayList
 	StickyExtra        = ''
+	# Multi-step checklist; survives compact via SESSION STATE
+	TaskBoard          = $null
+	# Stop/Esc: sticky collapses to the active task (yellow); full board kept for resume
+	TaskBoardPaused    = $false
+	# path (lower) -> UtcNow.Ticks of last successful ReadFile (soft read-before-edit nudge)
+	RecentFileReads    = @{}
+	# path (lower) -> @{ path; actions=@(read|edit|write); last=ticks }
+	PinnedPaths        = [ordered]@{}
+	# path (lower) -> last error/blocked snippet for compact retention
+	ToolErrorsByPath   = @{}
+	# fingerprint -> count of BLOCKED/NEED_INPUT outcomes this turn
+	FpBadOutcomeHits   = @{}
+	# fingerprint -> force stop (NEED_INPUT) after repeated bad outcomes
+	FpForceStop        = @{}
+	# this-turn tool summary lines for post-tool hygiene footer
+	TurnToolSummary    = New-Object System.Collections.ArrayList
+	# Post-tool turn hint (not rewritten into wire mid-loop).
+	LastTurnHygiene    = ''
+	# Prompt-cache: freeze base system + SESSION STATE for the tool loop.
+	WireStateFrozen    = $false
+	FrozenStickyContent = ''
+	FrozenBaseContent  = ''
 	LastToolFp         = $null
 	LastToolAction     = $null   # 'ran' | 'warned' | 'confirmed_ran'
 	LastToolPreview    = ''
@@ -1442,7 +1468,6 @@ namespace MiniBot.Core {
 				error = "MMDeviceEnumerator unavailable: " + ex.Message;
 				return null;
 			}
-			// multimedia -> console -> communications (dock/HDMI/Bluetooth default-device oddities)
 			int[] roles = new int[] { 1, 0, 2 };
 			Guid iid = typeof(IAudioEndpointVolume).GUID;
 			foreach (int role in roles) {
@@ -1746,7 +1771,6 @@ namespace MiniBot.Core {
 		static bool IsStop(int deadlineTick) {
 			if (CancelRequested) return true;
 			if (deadlineTick != 0) {
-				// TickCount wrap-safe compare
 				int now = Environment.TickCount;
 				if ((now - deadlineTick) > 0) return true;
 			}
@@ -1840,7 +1864,6 @@ namespace MiniBot.Core {
 				list = list.GetRange(0, maxResults);
 			}
 			sw.Stop();
-			// stamp total wall time on first entry for diagnostics
 			if (list.Count > 0) list[0].ElapsedMs = sw.ElapsedMilliseconds;
 			return list.ToArray();
 		}
@@ -1863,7 +1886,6 @@ namespace MiniBot.Core {
 			WIN32_FIND_DATAW data;
 			IntPtr h = FindFirstFileExW(pattern, FindExInfoBasic, out data, FindExSearchNameMatch, IntPtr.Zero, FIND_FIRST_EX_LARGE_FETCH);
 			if (h == INVALID_HANDLE_VALUE) {
-				// fallback for odd roots
 				try {
 					foreach (var d in Directory.EnumerateDirectories(root)) {
 						into.Add(d);
@@ -1970,7 +1992,6 @@ namespace MiniBot.Core {
 		const int SM_CXVIRTUALSCREEN = 78;
 		const int SM_CYVIRTUALSCREEN = 79;
 
-		// PROCESS_DPI_AWARENESS
 		const int PROCESS_DPI_UNAWARE = 0;
 		const int PROCESS_SYSTEM_DPI_AWARE = 1;
 		const int PROCESS_PER_MONITOR_DPI_AWARE = 2;
@@ -2032,7 +2053,6 @@ namespace MiniBot.Core {
 			int h = GetSystemMetrics(SM_CYSCREEN);
 			if (w < 1) w = 1;
 			if (h < 1) h = 1;
-			// Primary origin is always 0,0 in virtual desktop coords for SM_CXSCREEN
 			return new Rectangle(0, 0, w, h);
 		}
 
@@ -2103,6 +2123,7 @@ $script:HasDpiScreen = [bool]("MiniBot.Core.DpiScreen" -as [type])
 
 function Get-MBGlyph {
 	param([string]$Name)
+	# Build non-ASCII at runtime — source literals mojibake under PS 5.1 without BOM
 	switch ($Name) {
 		'tl'     { return [char]0x256D }
 		'tr'     { return [char]0x256E }
@@ -2111,11 +2132,20 @@ function Get-MBGlyph {
 		'h'      { return [char]0x2500 }
 		'v'      { return [char]0x2502 }
 		'dot'    { return [char]0x00B7 }
+		'arrow'  { return [char]0x2192 }  # right arrow for titles (a -> b)
+		'approx' { return [char]0x2248 }  # approx equal
 		'prompt' { return [char]0x276F }
 		'fill'   { return [char]0x2588 }
 		'empty'  { return [char]0x2591 }
 		default  { return '?' }
 	}
+}
+
+function Format-MBTitleSep {
+	# "left  ->  right" with a real arrow (runtime), safe for titles
+	param([string]$Left = '', [string]$Right = '')
+	$arr = try { [string](Get-MBGlyph 'arrow') } catch { '->' }
+	return ('{0}  {1}  {2}' -f [string]$Left, $arr, [string]$Right)
 }
 
 function Get-MBUserDisplayName {
@@ -2634,13 +2664,11 @@ function Write-MBBannerModelLine {
 		$last = ''
 		try { $last = [string]$script:MB.BannerModelLast } catch { $last = '' }
 		if (-not $Force -and $last -eq $track) { return }
-		$hostLab = ''
 		$baseShow = ''
 		try {
 			$b = [string]$script:MB.ActiveModelBase
 			if (-not $b) { $b = Get-MBApiBaseUrl }
 			$baseShow = Normalize-MBApiBase -Url $b
-			$hostLab = Get-MBShortHostLabel -Base $b
 		} catch {}
 		$show = Get-MBShortModel -MaxLen 64
 		$info = $null
@@ -2665,10 +2693,8 @@ function Write-MBBannerModelLine {
 			try { $audio = [bool]$info.Audio } catch {}
 			try { if ([int]$info.TotalSlots -gt 0) { $slots = [int]$info.TotalSlots } } catch {}
 		}
+		# Full endpoint URL only — short host label belongs on the Connected line
 		$hostLine = if ($baseShow) { $baseShow } else { [string]$BaseUrl }
-		if ($hostLab -and $script:MB.RemoteModelEntries -and @($script:MB.RemoteModelEntries).Count -gt 1) {
-			$hostLine = ("{0}  ({1})" -f $hostLine, $hostLab)
-		}
 		# Connection banner text (append Host/Model/Abilities — does not clear the log)
 		Write-MBKV 'Host' $hostLine -ValueColor Gray
 		Write-MBKV 'Model' $show -ValueColor Magenta
@@ -2689,6 +2715,74 @@ function Write-MBBannerModelLine {
 	} catch {}
 }
 
+function Test-MBConversationIsFresh {
+	# True when there is no real chat/tool history yet (banner-only / system-only session).
+	try {
+		foreach ($m in @($script:Messages)) {
+			if ($null -eq $m) { continue }
+			$r = ''
+			try { $r = [string](Get-MBProp $m 'role') } catch { $r = '' }
+			if ($r -notin @('user', 'assistant', 'tool')) { continue }
+			$c = ''
+			try { $c = [string](Get-MBProp $m 'content') } catch { $c = '' }
+			if ($r -eq 'user' -and [string]::IsNullOrWhiteSpace($c)) { continue }
+			if ($r -eq 'assistant') {
+				$hasTc = $false
+				try {
+					$tcs = Get-MBProp $m 'tool_calls'
+					if ($tcs -and @($tcs).Count -gt 0) { $hasTc = $true }
+				} catch {}
+				if (-not $hasTc -and [string]::IsNullOrWhiteSpace($c)) { continue }
+			}
+			if ($r -eq 'tool' -and [string]::IsNullOrWhiteSpace($c)) { continue }
+			return $false
+		}
+	} catch {}
+	return $true
+}
+
+function Clear-MBConsoleView {
+	# Wipe the operator log (WPF document or host console) for a clean banner re-paint.
+	if (Test-MBWpfActive) {
+		try {
+			$script:MB.Wpf.PendingClearLog = $true
+			# Discard any queued paint so stale lines do not reappear after the wipe
+			$q = $null
+			try { $q = $script:MB.Wpf.WriteQueue } catch { $q = $null }
+			if ($q) {
+				$toss = $null
+				while ($q.TryDequeue([ref]$toss)) { }
+			}
+		} catch {}
+		return
+	}
+	try { Clear-Host } catch {}
+}
+
+function Sync-MBWpfModelPicker {
+	# Push model list + active selection into the WPF bag and bump seq so the STA timer rebuilds the titlebar picker.
+	param([switch]$BumpSeq)
+	if (-not $script:MB.Wpf) { return }
+	try {
+		$script:MB.Wpf.ActiveModel = [string]$script:MB.ActiveModel
+		$script:MB.Wpf.ActiveModelBase = [string]$script:MB.ActiveModelBase
+		$script:MB.Wpf.ActiveModelKey = [string]$script:MB.ActiveModelKey
+		$script:MB.Wpf.RemoteModels = @($script:MB.RemoteModels)
+		$script:MB.Wpf.RemoteModelEntries = @($script:MB.RemoteModelEntries)
+		$script:MB.Wpf.ModelDirty = $false
+		try {
+			$script:MB.Wpf.ContextWindow = [int]$script:MB.ContextWindow
+			$script:MB.Wpf.ContextSource = [string]$script:MB.ContextSource
+		} catch {}
+		if ($BumpSeq) {
+			$prevSeq = 0
+			try { $prevSeq = [int64]$script:MB.Wpf.RemoteModelsSeq } catch { $prevSeq = 0 }
+			if ($prevSeq -lt 0) { $prevSeq = 0 }
+			$script:MB.Wpf.RemoteModelsSeq = $prevSeq + 1
+		}
+	} catch {}
+}
+
 function Set-MBActiveModel {
 	param(
 		[string]$Id,
@@ -2697,7 +2791,9 @@ function Set-MBActiveModel {
 		[switch]$Quiet,
 		[switch]$FromUi,
 		# Banner divider verbage: 'added' | 'switched' (empty = auto switched when UI changes)
-		[string]$BannerKind = ''
+		[string]$BannerKind = '',
+		# Optional status line written after a console clear (e.g. "Added N model(s)")
+		[string]$StatusNote = ''
 	)
 	$id = ([string]$Id).Trim()
 	if ([string]::IsNullOrWhiteSpace($id) -or $id -eq 'Select Model') { return }
@@ -2735,10 +2831,11 @@ function Set-MBActiveModel {
 	}
 	$prevKey = ''
 	try { $prevKey = [string]$script:MB.ActiveModelKey } catch { $prevKey = '' }
-	$same = ($prev -eq $id)
-	try {
-		if ($same -and $prevKey -eq $keyN) { return }
-	} catch {}
+	$sameBinding = ($prev -eq $id -and $prevKey -eq $keyN)
+	# Quiet rebind of the same model (Refresh-MBRemoteModels) can no-op. UI-driven
+	# add/switch must still refresh the titlebar picker + connection banner even when
+	# Refresh already auto-selected the same default.
+	if ($sameBinding -and $Quiet -and -not $FromUi) { return }
 	$endpointChanged = ($prevKey -ne $keyN)
 
 	# Never prompt to save session on model/endpoint switch (that re-entered via ModelDirty
@@ -2751,58 +2848,73 @@ function Set-MBActiveModel {
 	try { $script:Model = $id } catch {}
 	try { Set-Variable -Name Model -Scope Script -Value $id -ErrorAction SilentlyContinue } catch {}
 	# Refresh n_ctx / caps + connection info for THIS endpoint (always re-check on select)
-	try {
-		$entN = 0
-		foreach ($e in @($script:MB.RemoteModelEntries)) {
-			if ($e.Key -eq $keyN -or ($e.Id -eq $id -and $e.Base -eq $baseN)) {
-				if ([int]$e.NCtx -gt 0) { $entN = [int]$e.NCtx }
-				break
-			}
-		}
-		if ($entN -gt 0) { [void](Apply-MBServerContextWindow -NCtx $entN -Source 'server') }
-		$p = Get-MBServerPropsFromBase -BaseUrl $baseN
-		if ($p -and $p.Ok) {
-			$script:MB.ServerInfo = $p
-			if ([int]$p.NCtx -gt 0) { [void](Apply-MBServerContextWindow -NCtx ([int]$p.NCtx) -Source 'server') }
-		} else {
-			# Still stamp host from base so banner text has the right endpoint
-			try {
-				$script:MB.ServerInfo = @{
-					Ok = $true
-					Base = $baseN
-					NCtx = $entN
-					Vision = $false
-					Audio = $false
-					TotalSlots = 0
-				}
-			} catch {}
-		}
-	} catch {}
-	if ($script:MB.Wpf) {
+	if (-not $sameBinding) {
 		try {
-			$script:MB.Wpf.ActiveModel = $id
-			$script:MB.Wpf.ActiveModelBase = $baseN
-			$script:MB.Wpf.ActiveModelKey = $keyN
-			$script:MB.Wpf.ModelDirty = $false
-			$script:MB.Wpf.ContextWindow = [int]$script:MB.ContextWindow
-			$script:MB.Wpf.ContextSource = [string]$script:MB.ContextSource
-			# Update picker labels without forcing a full menu rebuild every select
-			# (RemoteModelsSeq rebuild was re-dirtying Model and looping UI handlers).
-			try {
-				$script:MB.Wpf.RemoteModels = @($script:MB.RemoteModels)
-				$script:MB.Wpf.RemoteModelEntries = @($script:MB.RemoteModelEntries)
-			} catch {}
+			$entN = 0
+			foreach ($e in @($script:MB.RemoteModelEntries)) {
+				if ($e.Key -eq $keyN -or ($e.Id -eq $id -and $e.Base -eq $baseN)) {
+					if ([int]$e.NCtx -gt 0) { $entN = [int]$e.NCtx }
+					break
+				}
+			}
+			if ($entN -gt 0) { [void](Apply-MBServerContextWindow -NCtx $entN -Source 'server') }
+			$p = Get-MBServerPropsFromBase -BaseUrl $baseN
+			if ($p -and $p.Ok) {
+				$script:MB.ServerInfo = $p
+				if ([int]$p.NCtx -gt 0) { [void](Apply-MBServerContextWindow -NCtx ([int]$p.NCtx) -Source 'server') }
+			} else {
+				# Still stamp host from base so banner text has the right endpoint
+				try {
+					$script:MB.ServerInfo = @{
+						Ok = $true
+						Base = $baseN
+						NCtx = $entN
+						Vision = $false
+						Audio = $false
+						TotalSlots = 0
+					}
+				} catch {}
+			}
 		} catch {}
 	}
+	# Always mirror active model + list into WPF; bump picker seq on UI/endpoint changes
+	# so the titlebar chip/menu actually repaint after auto-connect / add-endpoint.
+	$bumpPicker = [bool]$FromUi -or $endpointChanged -or -not $sameBinding
+	try { Sync-MBWpfModelPicker -BumpSeq:$bumpPicker } catch {}
 	try { Update-MBWpfWindowTitle } catch {}
-	# Vision ability may change with model - refresh senses tool gating in the UI / active list
-	try { Update-MBWpfToolGroupBar -Force } catch {}
+	# Vision ability may change with model - refresh vision tool gating in the UI / active list
+	if (-not $sameBinding) {
+		try { Update-MBWpfToolGroupBar -Force } catch {}
+	}
 	# Full banner when PoweredBy selection changes (UI switch / endpoint add). Quiet = internal rebind only.
 	if (-not $Quiet -and [bool]$script:MB.BannerShown) {
 		try {
-			if ($FromUi -or $endpointChanged -or -not $script:MB.BannerModelLast) {
-				# Divider always reads "model switched" (Added status is separate when adding)
-				Show-MBActiveEndpointBanner -WithDivider -DividerLabel 'model switched' -IncludeTypeHint
+			if ($FromUi -or $endpointChanged -or -not $script:MB.BannerModelLast -or -not $sameBinding) {
+				$fresh = $false
+				try { $fresh = [bool](Test-MBConversationIsFresh) } catch { $fresh = $false }
+				$kindL = ([string]$BannerKind).Trim().ToLowerInvariant()
+				$note = ([string]$StatusNote).Trim()
+				if ($fresh) {
+					# Banner-only session: wipe old connection chrome, then paint the new one
+					try { Clear-MBConsoleView } catch {}
+					if ($note) {
+						try {
+							Write-MBOk $note
+							Write-Host ''
+						} catch {}
+					}
+					Show-MBActiveEndpointBanner -IncludeTypeHint
+				} else {
+					# Real chat history: keep scrollback, mark the switch/add
+					if ($note) {
+						try {
+							Write-MBOk $note
+							Write-Host ''
+						} catch {}
+					}
+					$lab = if ($kindL -eq 'added') { 'model added' } else { 'model switched' }
+					Show-MBActiveEndpointBanner -WithDivider -DividerLabel $lab -IncludeTypeHint
+				}
 			}
 		} catch {
 			try { Write-MBBannerModelLine -Force } catch {}
@@ -2817,6 +2929,49 @@ function Sync-MBActiveModelFromWpf {
 		try {
 			$script:MB.Wpf.NpmUser = [string]$script:MB.NpmUser
 			$script:MB.Wpf.NpmPass = [string]$script:MB.NpmPass
+		} catch {}
+		# PoweredBy "+ Add endpoint" -> same Connect UI as boot/login (not the old janky dialog)
+		try {
+			if ([bool]$script:MB.Wpf.PendingShowAddEndpoint) {
+				$script:MB.Wpf.PendingShowAddEndpoint = $false
+				$curEp = ''
+				try { $curEp = [string]$script:MB.ActiveModelBase } catch {}
+				if ([string]::IsNullOrWhiteSpace($curEp)) {
+					try { $curEp = [string]$script:MB.ResolvedApiBase } catch {}
+				}
+				if ([string]::IsNullOrWhiteSpace($curEp)) {
+					try { $curEp = [string](Get-Variable -Name BaseUrl -ValueOnly -ErrorAction SilentlyContinue) } catch {}
+				}
+				if ([string]::IsNullOrWhiteSpace($curEp)) { $curEp = 'http://127.0.0.1:8080/v1' }
+				$picked = $null
+				try {
+					$picked = Show-MBEndpointConnectDialog -CurrentUrl $curEp -ConnectMode
+				} catch {
+					$picked = @{ Cancelled = $true }
+					try { Write-MBWarn ("Add endpoint UI failed: {0}" -f $_.Exception.Message) } catch {}
+				}
+				try {
+					if ($picked -and -not [bool]$picked.Cancelled) {
+						Close-MBLoginSession -Success
+					} else {
+						Close-MBLoginSession
+					}
+				} catch {}
+				if ($picked -and -not [bool]$picked.Cancelled -and -not [string]::IsNullOrWhiteSpace([string]$picked.Url)) {
+					try { $script:MB.Wpf.PendingAddBaseUrl = [string]$picked.Url } catch {}
+					try {
+						$am = 'none'
+						if ($picked.AuthMode) { $am = [string]$picked.AuthMode }
+						$script:MB.Wpf.PendingAddBaseAuthMode = $am
+					} catch {}
+					try {
+						$ak = ''
+						if ($picked.ApiKey) { $ak = [string]$picked.ApiKey }
+						$script:MB.Wpf.PendingAddBaseApiKey = $ak
+					} catch {}
+					try { $script:MB.Wpf.PendingAddBaseDirty = $true } catch {}
+				}
+			}
 		} catch {}
 		# Pull per-endpoint API keys + auth modes set from the Add endpoint dialog
 		try {
@@ -2930,30 +3085,36 @@ function Sync-MBActiveModelFromWpf {
 								if ($script:MB.RemoteModels -notcontains $mid) {
 									$script:MB.RemoteModels = @($script:MB.RemoteModels) + @($mid)
 								}
-								if ($script:MB.Wpf) {
-									$script:MB.Wpf.RemoteModelEntries = @($script:MB.RemoteModelEntries)
-									$script:MB.Wpf.RemoteModels = @($script:MB.RemoteModels)
-									$script:MB.Wpf.RemoteModelsSeq = (Get-Date).Ticks
-								}
+								try { Sync-MBWpfModelPicker -BumpSeq } catch {}
 							}
 						} catch {}
 					}
-					# Brief "Added" status (blank line after only); host is on the next banner Host line
-					if ($res.Message) {
-						try {
-							Write-MBOk ([string]$res.Message)
-							Write-Host ''
-						} catch {}
-					}
+					$addNote = ''
+					if ($res.Message) { $addNote = [string]$res.Message }
 					if ($pick) {
-						# Populates PoweredBy + "model switched" divider + banner + Connected
-						Set-MBActiveModel -Id ([string]$pick.Id) -Base ([string]$pick.Base) -Key ([string]$pick.Key) -FromUi -BannerKind 'switched'
+						# FromUi always refreshes titlebar picker; StatusNote survives console clear
+						Set-MBActiveModel -Id ([string]$pick.Id) -Base ([string]$pick.Base) -Key ([string]$pick.Key) `
+							-FromUi -BannerKind 'added' -StatusNote $addNote
 					} else {
 						try {
-							Show-MBActiveEndpointBanner -WithDivider -DividerLabel 'model switched' -IncludeTypeHint
+							$freshAdd = $false
+							try { $freshAdd = [bool](Test-MBConversationIsFresh) } catch { $freshAdd = $false }
+							if ($freshAdd) {
+								try { Clear-MBConsoleView } catch {}
+								if ($addNote) {
+									try { Write-MBOk $addNote; Write-Host '' } catch {}
+								}
+								Show-MBActiveEndpointBanner -IncludeTypeHint
+							} else {
+								if ($addNote) {
+									try { Write-MBOk $addNote; Write-Host '' } catch {}
+								}
+								Show-MBActiveEndpointBanner -WithDivider -DividerLabel 'model added' -IncludeTypeHint
+							}
 						} catch {
 							try { Write-MBBannerModelLine -Force } catch {}
 						}
+						try { Sync-MBWpfModelPicker -BumpSeq } catch {}
 					}
 					try { Update-MBWpfWindowTitle } catch {}
 				} catch {}
@@ -3463,9 +3624,6 @@ function Refresh-MBRemoteModels {
 
 		if ($script:MB.Wpf) {
 			try {
-				$script:MB.Wpf.RemoteModels = @($idsOnly)
-				$script:MB.Wpf.RemoteModelEntries = @($entries)
-				$script:MB.Wpf.RemoteModelsSeq = (Get-Date).Ticks
 				$script:MB.Wpf.ExtraApiBases = @($script:MB.ExtraApiBases)
 				try {
 					if ($script:MB.ExtraApiKeys -is [hashtable]) {
@@ -3477,8 +3635,8 @@ function Refresh-MBRemoteModels {
 						$script:MB.Wpf.ExtraApiAuth = $script:MB.ExtraApiAuth
 					}
 				} catch {}
-				$script:MB.Wpf.ContextWindow = [int]$script:MB.ContextWindow
-				$script:MB.Wpf.ContextSource = [string]$script:MB.ContextSource
+				# Always rebuild titlebar model menu after a forced/list refresh
+				Sync-MBWpfModelPicker -BumpSeq
 			} catch {}
 		}
 		return @($idsOnly)
@@ -3991,6 +4149,9 @@ function Show-MBBanner {
 	} else {
 		'OFF  (modifying actions need Y/N/A)'
 	}
+	try {
+		if (Test-MBUnlimitedTurns) { $autoVal = $autoVal + '  |  turns: Unlimited' }
+	} catch {}
 	# Auto-approve ON=caution orange; OFF=green
 	$autoColor = if ($script:MB.AutoApprove) { [ConsoleColor]::DarkYellow } else { [ConsoleColor]::Green }
 
@@ -4086,8 +4247,26 @@ function Write-MBConnectionTail {
 	}
 	if ([string]::IsNullOrWhiteSpace($authLabel)) { $authLabel = 'Basic' }
 	if ($ms -lt 0) { $ms = 0 }
-	# No host/IP here — Host line already shows the endpoint
-	Write-MBOk ("Connected ({0}, {1} ms)" -f $authLabel, $ms)
+	# Short host before auth type: Connected (x.ai API, 123 ms) — full URL stays on Host line
+	$hostLab = ''
+	try {
+		if (-not [string]::IsNullOrWhiteSpace($base)) {
+			$hostLab = Get-MBShortHostLabel -Base $base
+		}
+	} catch { $hostLab = '' }
+	if ([string]::IsNullOrWhiteSpace($hostLab)) {
+		try {
+			$ab = ''
+			try { $ab = [string]$script:MB.ActiveModelBase } catch { $ab = '' }
+			if (-not $ab) { try { $ab = Get-MBApiBaseUrl } catch { $ab = '' } }
+			if ($ab) { $hostLab = Get-MBShortHostLabel -Base $ab }
+		} catch { $hostLab = '' }
+	}
+	if (-not [string]::IsNullOrWhiteSpace($hostLab)) {
+		Write-MBOk ("Connected ({0} {1}, {2} ms)" -f $hostLab, $authLabel, $ms)
+	} else {
+		Write-MBOk ("Connected ({0}, {1} ms)" -f $authLabel, $ms)
+	}
 
 	if ($IncludeNativeHelpers) {
 		# Capability list (what MiniBot can use), not a runtime-load probe.
@@ -4117,8 +4296,7 @@ function Write-MBConnectionTail {
 
 function Show-MBActiveEndpointBanner {
 	# Full connection banner for the model currently in PoweredBy.
-	# First load: no divider. Later: full-width "model switched" rule
-	# (endpoint "Added" status is a separate console line when applicable).
+	# First load: no divider. Later: full-width rule ("model switched" / "model added").
 	param(
 		[switch]$WithDivider,
 		[string]$DividerLabel = '',
@@ -4128,8 +4306,8 @@ function Show-MBActiveEndpointBanner {
 		[switch]$IncludeTypeHint
 	)
 	if ($WithDivider) {
-		# Always "model switched" — add-endpoint already prints its own Added status
-		$lab = 'model switched'
+		$lab = ([string]$DividerLabel).Trim()
+		if ([string]::IsNullOrWhiteSpace($lab)) { $lab = 'model switched' }
 		try {
 			Write-Host ''
 			Write-MBRule -Label $lab
@@ -4154,11 +4332,11 @@ function Show-MBHelp {
 		@{ c = "/help";            d = "Show this help" },
 		@{ c = "/status";          d = "Session stats + context budget" },
 		@{ c = "/context";         d = "Detailed context breakdown" },
-		@{ c = "/clear";           d = "Clear chat history (keeps sticky notes)" },
+		@{ c = "/clear";           d = "Clear chat history (keeps sticky notes / pins)" },
 		@{ c = "/compact";         d = "Aggressively trim history to free context" },
 		@{ c = "/note <text>";     d = "Pin a sticky note into session state" },
 		@{ c = "/find <text>";     d = "Pin a finding into session state" },
-		@{ c = "/forget";          d = "Clear sticky notes + findings" },
+		@{ c = "/forget";          d = "Clear sticky notes, findings, digest, pins, TaskBoard" },
 		@{ c = "/auto [on|off]";   d = "Toggle auto-approve for modifying actions" },
 		@{ c = "/autocompact";     d = "Toggle automatic context compaction" },
 		@{ c = "/cd <path>";       d = "Change agent working directory" },
@@ -4170,7 +4348,7 @@ function Show-MBHelp {
 		@{ c = "/model";           d = "Show current model id" },
 		@{ c = "/retry";           d = "Re-send the last user message" },
 		@{ c = "exit | quit";      d = "End session" },
-		@{ c = "ESC";              d = "Hard-stop stream now (anytime between user entry)" }
+		@{ c = "ESC";              d = "Hard-stop stream / tool loop (or clear draft when idle)" }
 	)
 	$withSpeech = New-Object System.Collections.ArrayList
 	foreach ($x in $cmds) {
@@ -4188,17 +4366,21 @@ function Show-MBHelp {
 	Write-MBRule -Label "tool groups"
 	Write-Host "  Progressive surface: only active tool schemas + matching prompt playbooks are sent." -ForegroundColor DarkGray
 	Write-Host "  Cold start = core only. EnableToolGroup (or /tools <group>) expands tools + system prompt." -ForegroundColor DarkGray
+	Write-Host "  Header chips: catalog order (core … web); lime = active, gray = off; orange = unavailable (vision/GPO/domain)." -ForegroundColor DarkGray
 	Write-Host ("  Profile: {0}  |  Active: {1}" -f $script:MB.ToolProfile, ((@($script:MB.ActiveToolGroups) -join ', '))) -ForegroundColor DarkGray
 	Write-Host ""
+	$groupOrder = @(Get-MBToolGroupOrder)
 	if ($script:MBToolGroupMeta) {
-		foreach ($key in @($script:MBToolGroupMeta.Keys)) {
+		foreach ($key in $groupOrder) {
+			if (-not $script:MBToolGroupMeta.Contains($key)) { continue }
 			$meta = $script:MBToolGroupMeta[$key]
 			$isOn = @($script:MB.ActiveToolGroups) -contains $key
 			$flag = if ($isOn) { 'ON' } else { 'off' }
 			$flagColor = if ($isOn) { 'Green' } else { 'DarkGray' }
-			$tools = @($script:MBToolCatalog[$key])
-			$toolPreview = ($tools | Select-Object -First 6) -join ', '
-			if ($tools.Count -gt 6) { $toolPreview += ', ...' }
+			$tools = @()
+			try { $tools = @($script:MBToolCatalog[$key]) } catch { $tools = @() }
+			$toolPreview = ($tools | Select-Object -First 8) -join ', '
+			if ($tools.Count -gt 8) { $toolPreview += ', ...' }
 			Write-Host "  [" -NoNewline -ForegroundColor DarkGray
 			Write-Host $flag -NoNewline -ForegroundColor $flagColor
 			Write-Host "] " -NoNewline -ForegroundColor DarkGray
@@ -4209,10 +4391,19 @@ function Show-MBHelp {
 		}
 	}
 	Write-Host ""
+	Write-MBRule -Label "core highlights"
+	Write-Host "  TaskBoard - multi-step checklist (SESSION STATE); action=set|update|status|clear" -ForegroundColor Gray
+	Write-Host "  Edit stack - EditFile / ApplyPatch / WriteFile (unified LCS diffs, path.bak default)" -ForegroundColor Gray
+	Write-Host "  Forensics group - HexView/HexEdit/HexSearch/StringsScan (EnableToolGroup group=forensics)" -ForegroundColor Gray
+	Write-Host "  Web - SearchWeb then BrowsePage; MakeHttpRequest for APIs; GitHub raw helpers" -ForegroundColor Gray
+	Write-Host "  Docs - Microsoft Learn + SS64 (EnableToolGroup group=docs)" -ForegroundColor Gray
+	Write-Host "  Loop hygiene - same tool+args blocked after retest; NEED_INPUT/TOOLS_DONE stops thrash" -ForegroundColor Gray
+	Write-Host "  After tools - short DID / NEXT (or ASK); open errors stay in SESSION STATE" -ForegroundColor Gray
+	Write-Host ""
 	Write-Host "  /tools - list tools; /tools <group|full|core|list>" -ForegroundColor Gray
 	Write-Host "  /sandbox - show root; /sandbox clear | clear all" -ForegroundColor Gray
 	Write-Host "  /speech on|off - voice mode (-SpeechEnabled or speech=1)" -ForegroundColor Gray
-	Write-Host "  Agent can also call ListToolGroups / EnableToolGroup" -ForegroundColor DarkGray
+	Write-Host "  Agent: ListToolGroups / EnableToolGroup / TaskBoard" -ForegroundColor DarkGray
 	Write-Host ""
 	Write-MBRule -Label "prompt keys"
 	Write-Host "  Enter - submit" -ForegroundColor Gray
@@ -4717,6 +4908,9 @@ function Request-MBAbort {
 
 	$n = 0
 	try { $n = Stop-MBBackendTasks } catch { $n = 0 }
+
+	# Collapse TaskBoard sticky to the active (yellow) stop row - keep full list for resume
+	try { Suspend-MBTaskBoardForInterrupt } catch {}
 
 	if (-not $Silent) {
 		if ($script:MB.IsThinking) { try { Write-Host "" } catch {} }
@@ -5257,10 +5451,17 @@ function Start-MBLoginSession {
 		ConnectError = ''
 		ConnectMode  = $false
 		InitialLayer = 'login'   # login | connect
-		CanGoBackToConnect = $false  # true after Connect layer used (manual/recovery path)
+		# Titlebar Back always available on Login (→ endpoint form)
+		CanGoBackToConnect = $true
+		# false = dropped on Login by hardcoded/params BaseUrl (Login secondary = Quit)
+		# true  = operator used Connect form (Login secondary = Cancel → back to Connect)
+		VisitedConnect = $false
 	})
 	try {
-		if ($InitialLayer -eq 'connect') { $bag.InitialLayer = 'connect' }
+		if ($InitialLayer -eq 'connect') {
+			$bag.InitialLayer = 'connect'
+			$bag.VisitedConnect = $true
+		}
 	} catch {}
 
 	$rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
@@ -5366,14 +5567,14 @@ function Start-MBLoginSession {
           CornerRadius="8" ClipToBounds="True" SnapsToDevicePixels="True">
     <Grid>
       <Grid.RowDefinitions>
-        <RowDefinition Height="36"/>
+        <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
       </Grid.RowDefinitions>
-      <!-- Custom titlebar -->
+      <!-- Dark title chrome: brand + Close only (Back lives on body heading row) -->
       <Border x:Name="LoginTitleBar" Grid.Row="0" Background="#2A2A30" BorderBrush="#3A3A42"
               BorderThickness="0,0,0,1" Padding="10,0,0,0" CornerRadius="8,8,0,0"
               SnapsToDevicePixels="True">
-        <Grid>
+        <Grid Height="36">
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*"/>
             <ColumnDefinition Width="Auto"/>
@@ -5466,22 +5667,13 @@ function Start-MBLoginSession {
                          VerticalAlignment="Center"/>
             </Grid>
           </StackPanel>
-          <StackPanel Grid.Column="1" Orientation="Horizontal">
-            <Button x:Name="LoginTitleBack" Width="46" Height="36" Visibility="Collapsed"
-                    Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
-                    Template="{StaticResource NoMouseOverButtonTemplate}">
-              <!-- arrow-left -->
-              <Path Width="12" Height="12" Stretch="Uniform" Fill="#C8C8D0"
-                    Data="M20,11V13H8L13.5,18.5L12.08,19.92L4.16,12L12.08,4.08L13.5,5.5L8,11H20Z"
-                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
-            </Button>
-            <Button x:Name="LoginTitleClose" Width="46" Height="36"
-                    Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
-                    Template="{StaticResource NoMouseOverButtonTemplate}" ToolTip="Close">
-              <Path Width="10" Height="10" Stretch="Uniform" Stroke="#C8C8D0" StrokeThickness="1.15"
-                    Data="M0,0 L10,10 M10,0 L0,10" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-            </Button>
-          </StackPanel>
+          <!-- Close top-right of dark chrome -->
+          <Button x:Name="LoginTitleClose" Grid.Column="1" Width="46" Height="36"
+                  Background="Transparent" BorderThickness="0" Cursor="Hand" Focusable="False"
+                  Template="{StaticResource NoMouseOverButtonTemplate}" ToolTip="Close">
+            <Path Width="10" Height="10" Stretch="Uniform" Stroke="#C8C8D0" StrokeThickness="1.15"
+                  Data="M0,0 L10,10 M10,0 L0,10" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Button>
         </Grid>
       </Border>
       <Border Grid.Row="1" Background="#121216" Padding="22,18,22,14"
@@ -5537,8 +5729,26 @@ function Start-MBLoginSession {
               <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
             <StackPanel Grid.Row="0">
-              <TextBlock Text="Authentication required" Foreground="#E0E0E8"
-                         FontSize="16" FontWeight="Bold" Margin="0,0,0,6"/>
+              <!-- Heading + Change Endpoint arrow on the same line (arrow right-aligned) -->
+              <Grid Margin="0,0,0,6">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Authentication required" Foreground="#E0E0E8"
+                           FontSize="16" FontWeight="Bold" VerticalAlignment="Center"
+                           TextWrapping="Wrap" Margin="0,0,10,0"/>
+                <Button x:Name="LoginTitleBack" Grid.Column="1" Width="32" Height="28"
+                        Visibility="Collapsed" Background="Transparent" BorderThickness="0"
+                        Cursor="Hand" Focusable="False" VerticalAlignment="Center"
+                        HorizontalAlignment="Right"
+                        Template="{StaticResource NoMouseOverButtonTemplate}">
+                  <!-- arrow-right: darker idle; hover lightens fill only -->
+                  <Path x:Name="LoginTitleBackPath" Width="14" Height="14" Stretch="Uniform" Fill="#5C5C66"
+                        Data="M4,11V13H16L10.5,18.5L11.92,19.92L19.84,12L11.92,4.08L10.5,5.5L16,11H4Z"
+                        HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Button>
+              </Grid>
               <TextBlock x:Name="AuthSubtitle" Text="" Foreground="#8A8A96" TextWrapping="Wrap"
                          FontSize="12" Margin="0,0,0,10" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
               <TextBlock Text="Username" Foreground="#A0A0AA" FontSize="11" Margin="0,0,0,4"/>
@@ -5863,19 +6073,64 @@ public const int ICON_BIG = 1;
 				if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
 				try {
 					$bcT = New-Object System.Windows.Media.BrushConverter
+					$tipBg = $bcT.ConvertFromString('#1A1A1E')
+					$tipFg = $bcT.ConvertFromString('#C8C8D0')
+					$tipBd = $bcT.ConvertFromString('#3A3A42')
 					$tip = New-Object System.Windows.Controls.ToolTip
-					$tip.Background = $bcT.ConvertFromString('#1A1A1E')
-					$tip.Foreground = $bcT.ConvertFromString('#C8C8D0')
-					$tip.BorderBrush = $bcT.ConvertFromString('#3A3A42')
+					try { $tip.OverridesDefaultStyle = $true } catch {}
+					$tip.Background = $tipBg
+					$tip.Foreground = $tipFg
+					$tip.BorderBrush = $tipBd
 					$tip.BorderThickness = New-Object System.Windows.Thickness(1)
 					$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
 					$tip.HasDropShadow = $true
 					try { $tip.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Mouse } catch {}
+					# Kill system highlight / control brushes on the popup
+					try {
+						if ($null -eq $tip.Resources) { $tip.Resources = New-Object System.Windows.ResourceDictionary }
+						foreach ($sk in @(
+							[System.Windows.SystemColors]::ControlBrushKey,
+							[System.Windows.SystemColors]::ControlLightBrushKey,
+							[System.Windows.SystemColors]::ControlLightLightBrushKey,
+							[System.Windows.SystemColors]::ControlDarkBrushKey,
+							[System.Windows.SystemColors]::HighlightBrushKey,
+							[System.Windows.SystemColors]::InfoBrushKey,
+							[System.Windows.SystemColors]::WindowBrushKey,
+							[System.Windows.SystemColors]::InactiveSelectionHighlightBrushKey
+						)) {
+							try { $tip.Resources[$sk] = $tipBg } catch {}
+						}
+						foreach ($sk in @(
+							[System.Windows.SystemColors]::ControlTextBrushKey,
+							[System.Windows.SystemColors]::InfoTextBrushKey,
+							[System.Windows.SystemColors]::WindowTextBrushKey,
+							[System.Windows.SystemColors]::HighlightTextBrushKey
+						)) {
+							try { $tip.Resources[$sk] = $tipFg } catch {}
+						}
+					} catch {}
+					try {
+						$tipTplXaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ToolTip">
+  <Border Background="{TemplateBinding Background}"
+          BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}"
+          Padding="{TemplateBinding Padding}"
+          CornerRadius="4" SnapsToDevicePixels="True">
+    <ContentPresenter HorizontalAlignment="Left" VerticalAlignment="Center"
+                      TextElement.Foreground="{TemplateBinding Foreground}"/>
+  </Border>
+</ControlTemplate>
+'@
+						$tipTpl = [Windows.Markup.XamlReader]::Parse($tipTplXaml)
+						if ($null -ne $tipTpl) { $tip.Template = $tipTpl }
+					} catch {}
 					$ttb = New-Object System.Windows.Controls.TextBlock
 					$ttb.Text = [string]$Text
 					$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
 					$ttb.MaxWidth = [double]$MaxWidth
-					$ttb.Foreground = $bcT.ConvertFromString('#C8C8D0')
+					$ttb.Foreground = $tipFg
+					$ttb.Background = [System.Windows.Media.Brushes]::Transparent
 					$ttb.FontSize = 12
 					$ttb.LineHeight = 16
 					try { $ttb.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas, Cascadia Mono, Courier New') } catch {}
@@ -5893,6 +6148,8 @@ public const int ICON_BIG = 1;
 						try {
 							[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($Target, 350)
 							[System.Windows.Controls.ToolTipService]::SetShowDuration($Target, 20000)
+							[System.Windows.Controls.ToolTipService]::SetBetweenShowDelay($Target, 100)
+							[System.Windows.Controls.ToolTipService]::SetShowsToolTipOnKeyboardFocus($Target, $false)
 						} catch {}
 					} else {
 						$Target.ToolTip = [string]$Text
@@ -5904,22 +6161,70 @@ public const int ICON_BIG = 1;
 			try { & $setLoginRobotFace 'default' } catch {}
 			try { & $applyLoginWindowIcon 'default' } catch {}
 			if ($sub) { $sub.Text = ("Sign in to access:`n{0}" -f $Hint) }
+			# Right-pointing chevron (flip of Material arrow-left). Reassert on every show so no flow leaves a left arrow.
+			$loginBackArrowData = 'M4,11V13H16L10.5,18.5L11.92,19.92L19.84,12L11.92,4.08L10.5,5.5L16,11H4Z'
+			$loginBackArrowIdle = '#5C5C66'
+			$loginBackArrowHover = '#A0A0AA'
+			$getLoginBackPath = {
+				try {
+					if (-not $loginTitleBack) { return $null }
+					if ($loginTitleBack.Content -is [System.Windows.Shapes.Path]) {
+						return [System.Windows.Shapes.Path]$loginTitleBack.Content
+					}
+					$named = $null
+					try { $named = $win.FindName('LoginTitleBackPath') } catch { $named = $null }
+					if ($named -is [System.Windows.Shapes.Path]) { return $named }
+				} catch {}
+				return $null
+			}.GetNewClosure()
+			$setLoginBackArrowFill = {
+				param([string]$Hex)
+				try {
+					$path = & $getLoginBackPath
+					if (-not $path) { return }
+					$bc = New-Object System.Windows.Media.BrushConverter
+					$path.Fill = $bc.ConvertFromString($Hex)
+				} catch {}
+			}.GetNewClosure()
 			$setBackVisible = {
 				param([bool]$Show)
 				try {
 					if (-not $loginTitleBack) { return }
-					$loginTitleBack.Visibility = $(if ($Show) {
-						[System.Windows.Visibility]::Visible
+					if ($Show) {
+						try {
+							$path = & $getLoginBackPath
+							if ($path -is [System.Windows.Shapes.Path]) {
+								$path.Data = [System.Windows.Media.Geometry]::Parse($loginBackArrowData)
+								$path.RenderTransform = $null
+								$path.LayoutTransform = $null
+								try { $path.FlowDirection = [System.Windows.FlowDirection]::LeftToRight } catch {}
+							}
+						} catch {}
+						try { $loginTitleBack.Background = [System.Windows.Media.Brushes]::Transparent } catch {}
+						try { & $setLoginBackArrowFill $loginBackArrowIdle } catch {}
+						try {
+							if ($setThemedToolTip) {
+								& $setThemedToolTip $loginTitleBack 'Change Endpoint' 180
+							} else {
+								$loginTitleBack.ToolTip = 'Change Endpoint'
+							}
+						} catch {
+							try { $loginTitleBack.ToolTip = 'Change Endpoint' } catch {}
+						}
+						# Same line as "Authentication required", right-aligned (not in titlebar)
+						$loginTitleBack.Visibility = [System.Windows.Visibility]::Visible
 					} else {
-						[System.Windows.Visibility]::Collapsed
-					})
+						$loginTitleBack.Visibility = [System.Windows.Visibility]::Collapsed
+						try { $loginTitleBack.ToolTip = $null } catch {}
+						try { [System.Windows.Controls.ToolTipService]::SetToolTip($loginTitleBack, $null) } catch {}
+					}
 				} catch {}
 			}.GetNewClosure()
 
 			# Themed tooltips (auth / connect chrome)
 			try {
 				if ($loginTitleClose) { & $setThemedToolTip $loginTitleClose 'Close' 120 }
-				if ($loginTitleBack) { & $setThemedToolTip $loginTitleBack 'Back to endpoint' 200 }
+				if ($loginTitleBack) { & $setThemedToolTip $loginTitleBack 'Change Endpoint' 180 }
 				if ($loginRobotHost) { & $setThemedToolTip $loginRobotHost 'MiniBot' 140 }
 				if ($epAuthNone) { & $setThemedToolTip $epAuthNone 'No Authorization header (open LAN servers)' 280 }
 				if ($epAuthKey) { & $setThemedToolTip $epAuthKey 'Bearer token (Unsloth, vLLM --api-key, OpenAI-compat keys)' 300 }
@@ -5940,7 +6245,6 @@ public const int ICON_BIG = 1;
 					$loginTitleBar.add_MouseLeftButtonDown({
 						param($s, $e)
 						try {
-							if ($loginTitleBack -and $loginTitleBack.IsMouseOver) { return }
 							if ($loginTitleClose -and $loginTitleClose.IsMouseOver) { return }
 							if ($e.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) { $win.DragMove() }
 						} catch {}
@@ -5955,14 +6259,17 @@ public const int ICON_BIG = 1;
 						try { $loginTitleClose.Background = [System.Windows.Media.Brushes]::Transparent } catch {}
 					}.GetNewClosure())
 				}
-				# Back: same grey hover as main-window Maximize
+				# Back on heading row: transparent chrome; only the arrow lightens on hover
 				if ($loginTitleBack) {
-					$bcB = New-Object System.Windows.Media.BrushConverter
+					try { $loginTitleBack.Background = [System.Windows.Media.Brushes]::Transparent } catch {}
+					try { & $setLoginBackArrowFill $loginBackArrowIdle } catch {}
 					$loginTitleBack.add_MouseEnter({
-						try { $loginTitleBack.Background = $bcB.ConvertFromString('#3A3A42') } catch {}
+						try { $loginTitleBack.Background = [System.Windows.Media.Brushes]::Transparent } catch {}
+						try { & $setLoginBackArrowFill $loginBackArrowHover } catch {}
 					}.GetNewClosure())
 					$loginTitleBack.add_MouseLeave({
 						try { $loginTitleBack.Background = [System.Windows.Media.Brushes]::Transparent } catch {}
+						try { & $setLoginBackArrowFill $loginBackArrowIdle } catch {}
 					}.GetNewClosure())
 				}
 			} catch {}
@@ -6006,10 +6313,17 @@ public const int ICON_BIG = 1;
 					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Visible }
 					& $setLoginTitleLabel 'Login'
-					# Back only when user reached Login via Connect (manual empty BaseUrl or recovery)
-					$allowBack = $false
-					try { $allowBack = [bool]$B.CanGoBackToConnect } catch {}
-					& $setBackVisible $allowBack
+					# Title chrome: Back under X → endpoint/API key screen (not a form Cancel button)
+					try { $B.CanGoBackToConnect = $true } catch {}
+					& $setBackVisible $true
+					# Form secondary is always Quit; navigation back is the title chrome arrow under X
+					try {
+						if ($cancel) {
+							$cancel.Content = 'Quit'
+							if ($setThemedToolTip) { & $setThemedToolTip $cancel 'Quit MiniBot' 160 }
+							else { $cancel.ToolTip = 'Quit MiniBot' }
+						}
+					} catch {}
 					try { & $setLoginRobotFace 'default' } catch {}
 					try { & $applyLoginWindowIcon 'default' } catch {}
 					# Refresh host line — ConnectUrl may have changed after a failed first attempt
@@ -6175,8 +6489,9 @@ public const int ICON_BIG = 1;
 					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($confirmLayer) { $confirmLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					if ($connectLayer) { $connectLayer.Visibility = [System.Windows.Visibility]::Visible }
-					# Using Connect layer => Login may offer Back later
+					# Operator is on endpoint form — later Login uses Cancel (not Quit)
 					try { $B.CanGoBackToConnect = $true } catch {}
+					try { $B.VisitedConnect = $true } catch {}
 					& $setBackVisible $false
 					$isConn = $false
 					try { $isConn = [bool]$B.ConnectMode } catch {}
@@ -6435,8 +6750,28 @@ public const int ICON_BIG = 1;
 			}.GetNewClosure()
 
 			$ok.add_Click({ param($s,$e) try { & $submit } catch {} }.GetNewClosure())
+			# Shared: leave Login and open Connect without quitting (title chrome Back under X)
+			$doGoBackToConnect = {
+				try {
+					try { $B.CanGoBackToConnect = $true } catch {}
+					try { $B.VisitedConnect = $true } catch {}
+					$B.CredResult = @{
+						User = $null; Pass = $null
+						Cancelled = $false
+						Back = $true
+						SoftExit = $false
+						HardClose = $false
+					}
+					try { [void]$B.CredWait.Set() } catch {}
+					try { [void]$B.EndpointWait.Reset() } catch {}
+					$B.EndpointResult = $null
+					try { $B.ConnectMode = $true } catch {}
+					& $showConnect
+				} catch {}
+			}.GetNewClosure()
 			$doLoginCancel = {
 				try {
+					# Form Quit / Escape always exit — Back under X is the only return-to-Connect path
 					$B.CredResult = @{
 						User = $null; Pass = $null; Cancelled = $true
 						SoftExit = $true; HardClose = $false
@@ -6457,29 +6792,17 @@ public const int ICON_BIG = 1;
 					try {
 						$onConnect = $false
 						try { $onConnect = ($connectLayer -and $connectLayer.Visibility -eq [System.Windows.Visibility]::Visible) } catch {}
-						if ($onConnect) { & $doConnectCancel } else { & $doLoginCancel }
+						if ($onConnect) {
+							& $doConnectCancel
+						} else {
+							# X on Login: quit (Back under X returns to Connect)
+							& $doLoginCancel
+						}
 					} catch {
 						try { & $finishLoginCancel $true } catch {}
 					}
 				}.GetNewClosure())
 			}
-			# Back: leave Login (waiting for creds) and re-open Connect for another endpoint
-			$doGoBackToConnect = {
-				try {
-					if (-not [bool]$B.CanGoBackToConnect) { return }
-					$B.CredResult = @{
-						User = $null; Pass = $null
-						Cancelled = $false
-						Back = $true
-						SoftExit = $false
-						HardClose = $false
-					}
-					try { [void]$B.CredWait.Set() } catch {}
-					try { [void]$B.EndpointWait.Reset() } catch {}
-					$B.EndpointResult = $null
-					& $showConnect
-				} catch {}
-			}.GetNewClosure()
 			if ($loginTitleBack) {
 				$loginTitleBack.add_Click({
 					param($s, $e)
@@ -6687,7 +7010,10 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					if ($loginLayer) { $loginLayer.Visibility = [System.Windows.Visibility]::Collapsed }
 					& $showConnect
 				} else {
+					# Hardcoded/params BaseUrl path: Login with Back + Quit (not Cancel)
 					if ($connectLayer) { $connectLayer.Visibility = [System.Windows.Visibility]::Collapsed }
+					try { $B.VisitedConnect = $false } catch {}
+					& $showLogin
 				}
 			} catch {}
 
@@ -7442,7 +7768,7 @@ function Connect-MBModelEndpoint {
 				Message  = $_.Exception.Message
 			}
 		}
-		# Back to Connect: re-pick endpoint (only when CanGoBackToConnect path was used)
+		# Back from Login: always open endpoint selection (URL + auth type / API key)
 		try {
 			if ([bool]$entered.Back) {
 				$picked = $null
@@ -7450,18 +7776,8 @@ function Connect-MBModelEndpoint {
 					$curEp = ''
 					try { $curEp = [string]$testParams.BaseUrl } catch {}
 					if ([string]::IsNullOrWhiteSpace($curEp)) { $curEp = 'http://127.0.0.1:8080/v1' }
-					$useConnectMode = $true
-					try {
-						if ($script:MB.LoginSession -and $null -ne $script:MB.LoginSession.ConnectMode) {
-							$useConnectMode = [bool]$script:MB.LoginSession.ConnectMode
-						}
-					} catch { $useConnectMode = $true }
-					if ($useConnectMode) {
-						$picked = Show-MBEndpointConnectDialog -CurrentUrl $curEp -ConnectMode
-					} else {
-						$failHint = if ($connTest -and $connTest.Message) { [string]$connTest.Message } else { '' }
-						$picked = Show-MBEndpointConnectDialog -CurrentUrl $curEp -ErrorMessage $failHint
-					}
+					# Always ConnectMode so the form is for entering/changing endpoint + API key
+					$picked = Show-MBEndpointConnectDialog -CurrentUrl $curEp -ConnectMode
 				} catch {
 					try { Close-MBLoginSession } catch {}
 					return @{
@@ -8270,7 +8586,8 @@ function Repair-MBMessagesEncoding {
 					}
 					$fnArgs = Sanitize-MBText -Text ([string]$fnArgs)
 					$tcId = Get-MBProp $tc 'id'
-					if (-not $tcId) { $tcId = 'call_' + [guid]::NewGuid().ToString('N').Substring(0, 8) }
+					# Stable fallback — never mint a fresh GUID here (breaks tool_call_id pairing on re-encode)
+					if ([string]::IsNullOrWhiteSpace([string]$tcId)) { $tcId = 'call_' + $tcOut.Count }
 					[void]$tcOut.Add(@{
 						id       = Sanitize-MBText -Text ([string]$tcId)
 						type     = 'function'
@@ -8288,6 +8605,174 @@ function Repair-MBMessagesEncoding {
 		[void]$out.Add($msg)
 	}
 	return $out.ToArray()
+}
+
+function Test-MBIsTurnHygieneMessage {
+	# Legacy mid-history system blobs from older post-tool injection; strip on sync.
+	param($Message)
+	$r = Get-MBProp $Message 'role'
+	if ($r -ne 'system') { return $false }
+	$c = [string](Get-MBProp $Message 'content')
+	if ([string]::IsNullOrEmpty($c)) { return $false }
+	return $c.StartsWith('[TURN_HYGIENE')
+}
+
+function Repair-MBToolMessageSequence {
+	# Ensure every assistant tool_calls block has matching tool results (and drop orphans).
+	# Local servers (llama.cpp etc.) 400 on unpaired tool_call_id / orphan tool roles.
+	param([array]$Messages)
+	$msgs = @($Messages)
+	if ($msgs.Count -eq 0) { return @() }
+	$out = New-Object System.Collections.ArrayList
+	$i = 0
+	while ($i -lt $msgs.Count) {
+		$m = $msgs[$i]
+		if ($null -eq $m) { $i++; continue }
+		$role = [string](Get-MBProp $m 'role')
+
+		if ($role -eq 'tool') {
+			# Orphan tool result (no preceding assistant tool_calls consumed it) — drop
+			$i++
+			continue
+		}
+
+		if ($role -eq 'assistant') {
+			$rawTcs = Get-MBProp $m 'tool_calls'
+			$tcs = @()
+			if ($rawTcs) { $tcs = @($rawTcs) }
+			if ($tcs.Count -gt 0) {
+				$fixedTcs = New-Object System.Collections.ArrayList
+				$expectedOrder = New-Object System.Collections.ArrayList
+				$expectedSet = @{}
+				$tcN = 0
+				foreach ($tc in $tcs) {
+					$fn = Get-MBProp $tc 'function'
+					$fnName = [string](Get-MBProp $fn 'name')
+					if ([string]::IsNullOrWhiteSpace($fnName)) { continue }
+					$fnArgs = Get-MBProp $fn 'arguments'
+					if ($null -eq $fnArgs) { $fnArgs = '{}' }
+					elseif (-not ($fnArgs -is [string])) {
+						try { $fnArgs = ConvertTo-MBJson $fnArgs -Depth 10 } catch { $fnArgs = '{}' }
+					}
+					$tcId = [string](Get-MBProp $tc 'id')
+					if ([string]::IsNullOrWhiteSpace($tcId)) { $tcId = 'call_' + $tcN }
+					$tcN++
+					if ($expectedSet.ContainsKey($tcId)) {
+						# duplicate id — uniquify for API safety
+						$tcId = $tcId + '_' + $tcN
+					}
+					$expectedSet[$tcId] = $true
+					[void]$expectedOrder.Add($tcId)
+					[void]$fixedTcs.Add(@{
+						id       = $tcId
+						type     = 'function'
+						function = @{
+							name      = $fnName
+							arguments = [string]$fnArgs
+						}
+					})
+				}
+				if ($fixedTcs.Count -eq 0) {
+					# assistant claimed tools but none valid — emit content-only
+					$content = Get-MBProp $m 'content'
+					if ($null -eq $content) { $content = '' }
+					[void]$out.Add(@{ role = 'assistant'; content = $content })
+					$i++
+					continue
+				}
+
+				# Consume following tool messages (skip legacy mid-history hygiene)
+				$have = @{}
+				$toolById = @{}
+				$j = $i + 1
+				while ($j -lt $msgs.Count) {
+					$rj = [string](Get-MBProp $msgs[$j] 'role')
+					if ($rj -eq 'system' -and (Test-MBIsTurnHygieneMessage $msgs[$j])) {
+						$j++
+						continue
+					}
+					if ($rj -ne 'tool') { break }
+					$tid = [string](Get-MBProp $msgs[$j] 'tool_call_id')
+					if (-not $tid) { $tid = [string](Get-MBProp $msgs[$j] 'id') }
+					if ($tid -and $expectedSet.ContainsKey($tid) -and -not $have.ContainsKey($tid)) {
+						$have[$tid] = $true
+						$toolById[$tid] = $msgs[$j]
+					}
+					# unknown tool_call_id dropped (orphan)
+					$j++
+				}
+
+				$content = Get-MBProp $m 'content'
+				if ($null -eq $content) { $content = '' }
+				[void]$out.Add(@{
+					role       = 'assistant'
+					content    = $content
+					tool_calls = @($fixedTcs.ToArray())
+				})
+				foreach ($id in $expectedOrder) {
+					if ($toolById.ContainsKey($id)) {
+						$tm = $toolById[$id]
+						$tcid = [string](Get-MBProp $tm 'tool_call_id')
+						if (-not $tcid) { $tcid = $id }
+						$tcontent = Get-MBProp $tm 'content'
+						if ($null -eq $tcontent) { $tcontent = '' }
+						$tmsg = @{
+							role         = 'tool'
+							tool_call_id = $id
+							content      = $tcontent
+						}
+						$tname = Get-MBProp $tm 'name'
+						if ($tname) { $tmsg['name'] = $tname }
+						[void]$out.Add($tmsg)
+					} else {
+						[void]$out.Add(@{
+							role         = 'tool'
+							tool_call_id = $id
+							content      = '[tool result missing — repaired for API sequence]'
+						})
+					}
+				}
+				$i = $j
+				continue
+			}
+		}
+
+		[void]$out.Add($m)
+		$i++
+	}
+	return $out.ToArray()
+}
+
+function Get-MBSafeHistoryKeepStart {
+	# Snap a keep-last window so we never start mid tool-result group (orphan tools).
+	param(
+		[array]$Rest,
+		[int]$KeepLast
+	)
+	$n = @($Rest).Count
+	if ($n -eq 0) { return 0 }
+	if ($KeepLast -le 0) { return $n }
+	if ($n -le $KeepLast) { return 0 }
+	$start = $n - $KeepLast
+	# Walk back over tool messages to their assistant parent
+	while ($start -gt 0) {
+		$r = [string](Get-MBProp $Rest[$start] 'role')
+		if ($r -eq 'tool') { $start--; continue }
+		if ($r -eq 'system' -and (Test-MBIsTurnHygieneMessage $Rest[$start])) { $start--; continue }
+		break
+	}
+	# If we landed after an assistant that still has tool_calls, include that assistant
+	if ($start -gt 0) {
+		$prev = $Rest[$start - 1]
+		$pr = [string](Get-MBProp $prev 'role')
+		if ($pr -eq 'assistant') {
+			$pt = Get-MBProp $prev 'tool_calls'
+			if ($pt -and @($pt).Count -gt 0) { $start-- }
+		}
+	}
+	# Still on a tool? keep walking
+	while ($start -gt 0 -and [string](Get-MBProp $Rest[$start] 'role') -eq 'tool') { $start-- }
+	return $start
 }
 
 function Test-MBReplyIncomplete {
@@ -8788,7 +9273,8 @@ function Normalize-MBMessagesForApi {
 					}
 					$fnArgs = Sanitize-MBText -Text ([string]$fnArgs)
 					$tcId = Get-MBProp $tc 'id'
-					if (-not $tcId) { $tcId = 'call_' + [guid]::NewGuid().ToString('N').Substring(0, 8) }
+					# Stable fallback — never mint a fresh GUID here (breaks tool_call_id pairing on re-encode)
+					if ([string]::IsNullOrWhiteSpace([string]$tcId)) { $tcId = 'call_' + $tcOut.Count }
 
 					[void]$tcOut.Add(@{
 						id       = Sanitize-MBText -Text ([string]$tcId)
@@ -8870,8 +9356,19 @@ function New-MBChatRequestBody {
 	)
 
 	$Messages = @(Get-MBMessagesWithPendingVision -Messages $Messages)
+	# Strip legacy TURN_HYGIENE; repair tool_call pairing before encode.
+	try {
+		$wire = New-Object System.Collections.ArrayList
+		foreach ($wm in @($Messages)) {
+			if (Test-MBIsTurnHygieneMessage $wm) { continue }
+			[void]$wire.Add($wm)
+		}
+		$Messages = $wire.ToArray()
+	} catch {}
+	try { $Messages = @(Repair-MBToolMessageSequence -Messages $Messages) } catch {}
 
 	$normMessages = @(Normalize-MBMessagesForApi -Messages $Messages)
+	try { $normMessages = @(Repair-MBToolMessageSequence -Messages $normMessages) } catch {}
 
 	for ($i = 0; $i -lt $normMessages.Count; $i++) {
 		if ($normMessages[$i] -is [hashtable] -and $normMessages[$i].ContainsKey('content')) {
@@ -8916,20 +9413,25 @@ function New-MBChatRequestBody {
 # Cold-start group map. Model enables groups by these names.
 # Short labels for errors / ListToolGroups only (not expanded into every system prompt OFF line)
 $script:MBGroupQuickMap = [ordered]@{
-	senses = 'vision/TTS'
-	system = 'inventory+services+volume+brightness'
+	vision = 'ReadImage/ReadPdf/ViewScreen'
+	sound = 'SpeakText/AudioVolume'
+	forensics = 'hex/PE/disasm/strings'
+	system = 'inventory+services+brightness'
 	network = 'LAN/PortProbe/Find*/RemoteCommand'
 	diag = 'BSOD/disk/events'; repair = 'sfc/dism/chkdsk'
 	setup = 'options/GroupPolicy/restore/uninstall/reboot/NewMachine'
 	identity = 'users/domain'; shares = 'map/share/print'; installers = 'apps'
-	sandbox = 'PS lab'; files = 'dl/zip/cab/iso'; packages = 'PSGallery'
-	registry = 'reg'; clipboard = 'clip'; web = 'HTTP/GitHub'
+	sandbox = 'PS lab'; files = 'dl/zip/cab/iso/rename/dupes'; packages = 'PSGallery'
+	registry = 'reg'; clipboard = 'clip'; docs = 'Learn/SS64'; web = 'HTTP/GitHub'
 }
 
 $script:MBSystemPromptBase = @"
 You are $AgentName v$Version - local Windows tool-first agent (PS 5.1). Evidence only; concise; CWD-relative paths unless absolute; never dump multi-MB/binary/.dmp.
 No delete/destroy unless operator asked for that specific target. Mutate after read when possible; deny = stop + replan (never retry the same blocked approach). Prefer specialized tools; RunCommand is LAST resort.
-Never ReadFile images/video/PDF/binary (crashes servers) — vision: senses ReadImage/ReadPdf; operator display: markdown below.
+TASKBOARD FIRST (priority for multi-step): If the operator ask needs 2+ tool steps, more than one file/host/service, diagnose-then-fix, setup, scan-then-act, or any plan with ordered work - call TaskBoard action=set (goal + items) BEFORE other thrashing. Prefer TaskBoard over chat-only plans. Work ONE in_progress item at a time; TaskBoard update when done/blocked; verify before marking done. Do not abandon open TaskBoard items to fluff. After compact, re-read SESSION STATE Task board and continue. Think: (1) goal (2) facts (3) next tool (4) success check - then tools. Single trivial lookups may skip TaskBoard. STOP/PAUSED board: if SESSION STATE says PAUSED (operator Stop/Esc), DEFAULT is TaskBoard action=clear then action=set a NEW board for a new request. Only RESUME (update from NOW, do not clear) when the operator explicitly asks to resume/continue that plan.
+LOOP HYGIENE: identical tool+args → same result (harness loop-guards). After LOOP GUARD / TOOLS_DONE=1 / NEED_INPUT: STOP tools, tell operator. Do not thrash. When finishing after tools, end with short DID / NEXT (or ASK) — never trail off mid-loop.
+Bad tool twice (same blocked/NEED_INPUT): stop and ASK operator — no third identical retry.
+Never ReadFile images/video/PDF/binary (crashes servers) — images/PDF/screen: vision group; PE/binary/hex: forensics; operator display: markdown below.
 INLINE MEDIA (chat UI) — REQUIRED for play/show/hear: always embed on its own line as ![label](absolute-path). Prefer absolute Windows paths. Images png/jpg/gif/webp/bmp/tif; video mp4/m4v/mov/wmv; audio mp3/wav/flac/m4a/aac/ogg/wma. After DownloadFile / ViewScreen save / FindFiles pick / any "play or show" ask: emit ![...](...) so it plays in-chat. NEVER Start-Process/Invoke-Item/explorer/VLC/default-app first. External player ONLY if format not inline-compatible or operator explicitly asked external. Do not reply with a bare path alone when they should see/hear it.
 INLINE VISUALS — emit SVG between @@@RenderOpen and @@@RenderClose (own lines). Host renders pure WPF SvgView (scrolls/clips like media, centered in the card). Not WPF XAML. No markdown fences. SVG body only. ALWAYS set numeric width AND height on <svg> (pixels). Never width="100%" or height="auto". Include xmlns + viewBox. Colors: #E5E7EB / #9CA3AF text; #121216 / #1A1A1E / #252530 bg; #3A3A42 border; #7AA2F7 / #7DCFFF accent. Optional per-shape <title> for tooltips only. Do NOT put a chart title on the drawing unless the operator asked or labels are needed (axes/legend). Prefer data geometry first. Example:
 @@@RenderOpen
@@ -8939,10 +9441,13 @@ Do not stream bare SVG outside those markers.
 VIZ RULES: SVG only (rect/circle/ellipse/line/path/polyline/polygon/text/g; fill/stroke attr or style=). REQUIRED width="N" height="N" + viewBox + xmlns. No JavaScript, CDNs, or WPF/XAML. No decorative title banner unless relevant. Flyer/poster layouts: be careful with text size and alignment (readable hierarchy, consistent columns, no overlapping labels, text-anchor when centering).
 Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration). If a tool is missing: ERROR may say missing_tool=X group=Y — EnableToolGroup group=Y then call X same turn; do NOT invent COM/shell.
 ROUTER (intent->tool; enable group first if off; do not shell these):
- volume|mute|unmute|speaker -> EnableToolGroup group=system then AudioVolume (action=get|set|mute|unmute; level=0-100)
+ volume|mute|unmute|speaker|sound level -> EnableToolGroup group=sound then AudioVolume (action=get|set|mute|unmute; level=0-100)
+ speak|tts|say aloud -> EnableToolGroup group=sound then SpeakText
  brightness|dim display -> EnableToolGroup group=system then DisplayBrightness (action=get|set; level=0-100)
+ image|screenshot|look at screen|pdf vision -> EnableToolGroup group=vision then ReadImage/ViewScreen/ReadPdf
  service start/stop/restart -> EnableToolGroup group=system then ControlService
  kill process -> EnableToolGroup group=diag then StopProcess
+ pe|exe|dll|hex|disasm|patch jump|iat|entropy|strings binary -> EnableToolGroup group=forensics then HexView/HexEdit/HexSearch/StringsScan
  find shares/LAN -> EnableToolGroup group=network then FindShares/ScanNetwork
  find web servers/http hosts -> network then FindWebHosts (or PortProbe profile=web)
  find rdp/remote desktop hosts -> network then FindRdp (or PortProbe profile=rdp)
@@ -8951,21 +9456,33 @@ ROUTER (intent->tool; enable group first if off; do not shell these):
  sfc|dism|chkdsk -> EnableToolGroup group=repair then RunRepairTool
  reboot/shutdown -> EnableToolGroup group=setup then Reboot
  group policy / gpedit / Policies registry -> EnableToolGroup group=setup then GroupPolicy (list_catalog|get|set|remove|gpupdate)
- NEVER RunCommand for volume/mute/brightness/endpoint COM/AudioEndpointVolume/IAudioEndpointVolume/nircmd volume — use AudioVolume/DisplayBrightness (system group).
+ bulk rename|batch rename|rename many files|mass rename -> EnableToolGroup group=files then BulkRename (dry_run first; RunCommand only if BulkRename fails)
+ find duplicates|duplicate files|hash dupes|same content copies -> EnableToolGroup group=files then FindDuplicates (RunCommand only if FindDuplicates fails)
+ official docs|microsoft learn|ms learn|ss64|cmd reference|powershell syntax doc -> EnableToolGroup group=docs then SearchMicrosoftLearn/ReadMicrosoftLearn or SearchSs64/ReadSs64
+ NEVER RunCommand for volume/mute/speech COM — use sound group (AudioVolume/SpeakText). Brightness: system DisplayBrightness.
  NEVER raw reg.exe for policy keys if GroupPolicy tool available (setup group).
-MAP: senses=vision/TTS | system=inventory+services+AudioVolume+DisplayBrightness | network=LAN+PortProbe+FindShares+FindWebHosts+FindRdp+RemoteCommand | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=options+GroupPolicy+restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso | packages=PSGallery | registry | clipboard | web=HTTP/GitHub
+ NEVER shell bulk rename / dupe-scan first (Rename-Item loops, Get-FileHash|Group-Object, robocopy/fdupes style) — files BulkRename / FindDuplicates; RunCommand only after those tools error/fail.
+MAP: vision=ReadImage/ReadPdf/ViewScreen | sound=SpeakText/AudioVolume | forensics=HexView/HexEdit/HexSearch/StringsScan | system=inventory+services+DisplayBrightness | network=LAN+PortProbe+FindShares+FindWebHosts+FindRdp+RemoteCommand | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=options/GroupPolicy/restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso/BulkRename/FindDuplicates | packages=PSGallery | registry | clipboard | docs=SearchMicrosoftLearn/ReadMicrosoftLearn/SearchSs64/ReadSs64 | web=HTTP/SearchWeb/BrowsePage
+DOCS (group=docs): official Windows/PowerShell/cmd references when unsure of API/policy/syntax. Prefer SearchMicrosoftLearn + ReadMicrosoftLearn for MS docs; SearchSs64 + ReadSs64 for cmd/PowerShell/bash cheat sheets. EnableToolGroup group=docs first. Not for general web (use web group). Local Get-Help is version-accurate when available — still use Learn for product docs.
 FindFiles: multi-ext one call; truncated=normal (use rows); specific ask->narrow; vague play/show->pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice->tell operator. User text = results only.
+FINAL REPLY after tools (when no more tools): short DID: (what worked) and NEXT: (follow-up) or ASK: (operator input). Keep it tight for local models.
 "@
 
 $script:MBGroupPrompt = [ordered]@{
 	core = @"
-CORE: text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; HexView/HexEdit; RunCommand (last resort); CWD/env; EnableToolGroup. Prefer specialized tools. MEDIA: ![label](absolute-path) inline for play/show. Volume/mute/brightness are system group (AudioVolume/DisplayBrightness) — not RunCommand.
+CORE: TaskBoard FIRST for multi-step work (action=set goal+items before tool thrash; update one in_progress at a time). Then text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; DiffText (unified LCS); RunCommand (last resort); CWD/env; EnableToolGroup. Prefer specialized tools. ReadFile before Edit/ApplyPatch (soft nudge if skipped). Mutating file tools write path.bak by default (backup=false to skip). ApplyPatch can create files (--- /dev/null or *** Add File). PE/binary: group=forensics. Images/PDF/screen: group=vision. Volume/speak: group=sound. Brightness: system DisplayBrightness. MEDIA: ![label](absolute-path) inline for play/show.
 "@
-	senses = @"
-SENSES: ReadImage (vision, auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true -> show with ![label](path) inline, not external open); SpeakText. No ReadFile on images/PDF.
+	vision = @"
+VISION: ReadImage (auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true -> show with ![label](path) inline, not external open). No ReadFile on images/PDF. SpeakText is sound group.
+"@
+	sound = @"
+SOUND: SpeakText (SAPI TTS); AudioVolume (get/set/mute/unmute, level=0-100). Prefer over shell COM / nircmd volume. Display brightness is system group.
+"@
+	forensics = @"
+FORENSICS: HexView (disasm + IAT/export labels, entropy, carve, hash, functions, rva/section/at_entry); HexEdit (preset=force_jcc|nop_range|ret0, path.bak); HexSearch (?? wildcards); StringsScan (filter=url|path|interesting). Prefer over ReadAllBytes/Format-Hex. Not for text source (use EditFile).
 "@
 	system = @"
-SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime; AudioVolume (volume/mute); DisplayBrightness. Prefer over Get-ComputerInfo / shell COM. Services: ControlService not shell.
+SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime; DisplayBrightness. Prefer over Get-ComputerInfo / shell COM. Services: ControlService not shell. Volume/mute: sound group AudioVolume.
 "@
 	network = @"
 NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; PortProbe (TCP open/closed); FindShares (REQUIRED for shares — never net view loops); FindWebHosts; FindRdp; GetLocalShares/MappedDrives/Printers; RemoteCommand (domain-admin: domain-joined + domain user only; PortProbe first; orange off-domain). If remote_command_unavailable=1 or remote_port_closed=1 / TOOLS_DONE=1: STOP tools and tell operator. Do not RunCommand/Test-NetConnection thrash. NEED_INPUT when ports open but auth failed — DOMAIN\\DomainAdmin + password. Search=omit hosts; targeted=computer=/hosts=.
@@ -8992,7 +9509,7 @@ INSTALLERS: ListInstallers / InstallPackage (prompt; silent).
 SANDBOX: SandBoxWrite->SandBox piece/pieces+assert; compose to ship. Claim pass only if ok=true.
 "@
 	files = @"
-FILES: DownloadFile; zip Expand/Compress; MakeCab/ExpandCab; MakeIso/MountIso/UnmountIso (prompt on mutate). After download/save of media, show with ![label](path) inline.
+FILES: DownloadFile; zip Expand/Compress; MakeCab/ExpandCab; MakeIso/MountIso/UnmountIso; BulkRename (dry_run default; prompt on apply); FindDuplicates (size then hash, read-only). Bulk rename / duplicate hunt: ALWAYS BulkRename or FindDuplicates first — RunCommand only if that tool errors/fails (not as the opening move). After download/save of media, show with ![label](path) inline.
 "@
 	packages = @"
 PACKAGES: Find/Get/Install/Update PS modules (mutate prompts).
@@ -9003,12 +9520,15 @@ REGISTRY: ReadRegistry; SetRegistry (prompt).
 	clipboard = @"
 CLIPBOARD: read|write (prompt).
 "@
+	docs = @"
+DOCS: SearchMicrosoftLearn / ReadMicrosoftLearn (learn.microsoft.com only); SearchSs64 / ReadSs64 (ss64.com only — Windows CMD, PowerShell, bash). Search then Read best URL. Cap pages; quote official syntax/flags. Prefer over guessing cmdlets or inventing registry paths. General web = web group.
+"@
 	web = @"
-WEB: MakeHttpRequest/BrowsePage/GitHub raw+list. File downloads->files DownloadFile.
+WEB: SearchWeb (query→title/url/snippet) then BrowsePage on best URLs. MakeHttpRequest for APIs. BrowsePage returns readable text + links + needs_render if JS shell. GitHub: ConvertGitHubUrl/GetGitHubRawFile/ListGitHubDirectory. Downloads→files DownloadFile. Official MS Learn / SS64 = docs group.
 "@
 }
 
-function Get-MBSystemPrompt {
+function Build-MBSystemPromptLive {
 	$parts = New-Object System.Collections.ArrayList
 	[void]$parts.Add([string]$script:MBSystemPromptBase)
 
@@ -9024,7 +9544,7 @@ function Get-MBSystemPrompt {
 	}
 	if (-not $activeSet.ContainsKey('core')) { $activeSet['core'] = $true }
 
-	$order = @('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web')
+	$order = @('core','vision','sound','forensics','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','docs','web')
 	$onList = New-Object System.Collections.ArrayList
 	$offBits = New-Object System.Collections.ArrayList
 	foreach ($g in $order) {
@@ -9046,20 +9566,32 @@ function Get-MBSystemPrompt {
 	return (($parts | Where-Object { $_ -and "$_".Trim() }) -join "`n")
 }
 
+function Get-MBSystemPrompt {
+	# Base system prompt; frozen mid tool-loop for prompt-cache stability.
+	try {
+		if ([bool]$script:MB.WireStateFrozen -and -not [string]::IsNullOrEmpty([string]$script:MB.FrozenBaseContent)) {
+			return [string]$script:MB.FrozenBaseContent
+		}
+	} catch {}
+	return (Build-MBSystemPromptLive)
+}
+
 $SystemPrompt = Get-MBSystemPrompt
 
 $Tools = @(
-	@{ type = "function"; function = @{ name = "ReadFile"; description = "Read text files (head/tail/offset+length). NEVER images/video/PDF/binary — use senses or ![path]."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; head = @{ type = "integer" }; tail = @{ type = "integer" }; offset = @{ type = "integer" }; length = @{ type = "integer" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "WriteFile"; description = "Create/overwrite whole file. Prefer EditFile/ApplyPatch for edits. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" } }; required = @("path","content") } } },
-	@{ type = "function"; function = @{ name = "EditFile"; description = "Search/replace (unique match default). replaceAll / occurrence / edits[] supported. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" }; edits = @{ type = "array"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply unified diff / *** Update File patch. ALWAYS prompts."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string" }; path = @{ type = "string" } }; required = @("patch") } } },
+	@{ type = "function"; function = @{ name = "ReadFile"; description = "Read text files (head/tail/offset+length). NEVER images/video/PDF/binary — use vision tools or ![path]."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; head = @{ type = "integer" }; tail = @{ type = "integer" }; offset = @{ type = "integer" }; length = @{ type = "integer" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "WriteFile"; description = "Create/overwrite whole file. Prefer EditFile/ApplyPatch for edits. ALWAYS prompts. Default backup=true writes path.bak before overwrite."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" }; backup = @{ type = "boolean"; description = "Write path.bak before overwrite (default true; ignored on create)" } }; required = @("path","content") } } },
+	@{ type = "function"; function = @{ name = "EditFile"; description = "Search/replace (unique match default). replaceAll / occurrence / edits[] supported. ALWAYS prompts. Default backup=true writes path.bak first. Prefer ReadFile first."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" }; backup = @{ type = "boolean"; description = "Write path.bak before apply (default true)" }; edits = @{ type = "array"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply unified diff / *** Update File patch. Creates files when --- /dev/null or *** Add File. ALWAYS prompts. Default backup=true for existing targets."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string" }; path = @{ type = "string" }; backup = @{ type = "boolean"; description = "Write path.bak before patching existing files (default true)" } }; required = @("patch") } } },
 	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell (default) or cmd. Pass exact command text. Mutating/multi-statement/redirects need approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string" }; shell = @{ type = "string"; enum = @("powershell","cmd") }; timeout_sec = @{ type = "integer" } }; required = @("command") } } },
 	@{ type = "function"; function = @{ name = "RemoteCommand"; description = "Domain-administrator remoting tool (WinRM only). REQUIRES this host domain-joined with a signed-in domain user (orange/unavailable on workgroup or local-user sessions). Run a command on a REMOTE host (not this PC). ALWAYS approval. Native WinRM/PowerShell remoting. host= + command= required. shell=powershell|cmd|pwsh. Prefer username=DOMAIN\\DomainAdmin + password. Empty password only if account is truly blank. Optional port, use_ssl, timeout_sec. transport=winrm only. On auth failure NEED_INPUT for domain admin credentials. Do not use local RunCommand for remote hosts."; parameters = @{ type = "object"; properties = @{ host = @{ type = "string"; description = "Remote IP or hostname (also accepts user@host or host:port)" }; computer = @{ type = "string"; description = "Alias for host" }; command = @{ type = "string"; description = "Command/script to run on the remote host" }; transport = @{ type = "string"; description = "winrm only (default)" }; shell = @{ type = "string"; description = "powershell (default), cmd, or pwsh" }; username = @{ type = "string"; description = "Domain account preferred: DOMAIN\\DomainAdmin (domain admin tool)" }; password = @{ type = "string"; description = "Domain account password (WinRM). Empty only if truly blank" }; port = @{ type = "integer"; description = "WinRM port (default 5985 / 5986 with use_ssl)" }; use_ssl = @{ type = "boolean"; description = "WinRM over HTTPS" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default harness CommandTimeout)" } }; required = @("host","command") } } },
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents under path."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" } }; required = @("path","pattern") } } },
-	@{ type = "function"; function = @{ name = "DiffText"; description = "Line diff of two strings or files."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" } }; required = @("left","right") } } },
-	@{ type = "function"; function = @{ name = "HexView"; description = "Binary inspect for PE/abandonware: hex dump + labels; disasm=true for x86/x64 listing (jmp/je/jne/jnz/jcc/call/ret with FILE offsets); trace=true walks control flow; at_entry=true starts at PE entry. Follow targets via offset=0x... disasm=true. Prefer HexView over [IO.File]::ReadAllBytes. DIFF: path2/next_diff. Patch jumps with HexEdit (JNE 75->EB force, or 90 90 nop)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default true)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" }; disasm = @{ type = "boolean"; description = "x86/x64 disassembly listing; resolves jmp/jcc/call relative targets to file offsets" }; trace = @{ type = "boolean"; description = "Walk control flow from offset (follow JMP; list JE/JNE both paths)" }; at_entry = @{ type = "boolean"; description = "Start at PE entry point file offset" }; max_insns = @{ type = "integer"; description = "Disasm instruction count (default 48, max 200)" }; max_steps = @{ type = "integer"; description = "Trace steps (default 32, max 80)" }; follow_calls = @{ type = "boolean"; description = "trace: step into CALL targets" }; prefer_branch = @{ type = "string"; description = "trace: fallthrough (default) or taken at Jcc" }; arch = @{ type = "string"; description = "auto|x86|x64 (default auto from PE)" }; dump_hex = @{ type = "boolean"; description = "Include hex dump (default true)" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes at offset (hex= or bytes[]). ALWAYS prompts. For jumps: HexView disasm first; common patches JE/JNE short 74/75 -> EB (always) or 90 90 (nop). Prefer HexView path2 to verify."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; extend = @{ type = "boolean" }; backup = @{ type = "boolean" } }; required = @("path","offset") } } },
+	@{ type = "function"; function = @{ name = "DiffText"; description = "Unified line diff (LCS-based) of two strings or files. Shows @@ hunks with context."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" }; context = @{ type = "integer"; description = "Context lines around changes (default 3)" }; maxLines = @{ type = "integer"; description = "Max output lines (default 200)" } }; required = @("left","right") } } },
+	@{ type = "function"; function = @{ name = "HexView"; description = "Binary/PE forensics: hex dump + PE labels; disasm=true x86/x64 with IAT/delay/export labels + uncertain resync; hash=true SHA256 file+sections; functions=true prologue scan; entropy/carve; at_entry/rva/section. Flags .NET managed. DIFF path2. Prefer over ReadAllBytes. HexEdit presets; HexSearch; StringsScan."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default true)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" }; disasm = @{ type = "boolean"; description = "x86/x64 disassembly; IAT/export labels on indirect calls" }; trace = @{ type = "boolean"; description = "Walk control flow from offset (follow JMP; list JE/JNE both paths)" }; at_entry = @{ type = "boolean"; description = "Start at PE entry point file offset" }; rva = @{ type = "string"; description = "PE RVA (decimal/0x) -> map to file offset" }; section = @{ type = "string"; description = "PE section name (e.g. .text) -> start raw offset" }; max_insns = @{ type = "integer"; description = "Disasm instruction count (default 48, max 200)" }; max_steps = @{ type = "integer"; description = "Trace steps (default 32, max 80)" }; follow_calls = @{ type = "boolean"; description = "trace: step into CALL targets" }; prefer_branch = @{ type = "string"; description = "trace: fallthrough (default) or taken at Jcc" }; arch = @{ type = "string"; description = "auto|x86|x64 (default auto from PE)" }; dump_hex = @{ type = "boolean"; description = "Include hex dump (default true)" }; entropy = @{ type = "boolean"; description = "Shannon entropy map (high = packed/encrypted)" }; entropy_blocks = @{ type = "integer"; description = "Entropy windows (default 64)" }; carve = @{ type = "boolean"; description = "Find embedded MZ/PE images" }; hash = @{ type = "boolean"; description = "SHA256 of file + each PE section" }; functions = @{ type = "boolean"; description = "Heuristic function prologue scan in .text" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes at offset. hex= or bytes[] OR preset=force_jcc|nop_range|ret0|ret|int3 (length= for nop/int3 count). ALWAYS prompts with disasm before/after. Default backup=true path.bak."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; preset = @{ type = "string"; description = "force_jcc|nop_range|ret0|ret|int3" }; length = @{ type = "integer"; description = "Byte count for nop_range/int3 presets" }; extend = @{ type = "boolean" }; backup = @{ type = "boolean"; description = "Write path.bak before patch (default true)" } }; required = @("path","offset") } } },
+	@{ type = "function"; function = @{ name = "HexSearch"; description = "Search file for hex byte pattern with ?? wildcards (e.g. pattern='E8 ?? ?? ?? ??' or '4D 5A'). Returns file offsets. Follow with HexView offset=..."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string"; description = "Hex bytes with optional ?? wildcards" }; hex = @{ type = "string"; description = "Alias for pattern" }; offset = @{ type = "string"; description = "Start offset" }; maxResults = @{ type = "integer"; description = "Max hits (default 32)" }; max_scan = @{ type = "integer"; description = "Max bytes to scan from offset (0=to EOF)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "StringsScan"; description = "Full-file ASCII/UTF-16LE string extraction. filter=path|url|ip|registry|email|interesting or substring. Prefer over dumping whole binary with ReadFile."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; minLen = @{ type = "integer"; description = "Minimum string length (default 4)" }; maxHits = @{ type = "integer"; description = "Max strings (default 80)" }; offset = @{ type = "string" }; max_scan = @{ type = "integer"; description = "Max bytes to scan (0=full file)" }; encoding = @{ type = "string"; description = "ascii|utf16|both (default both)" }; filter = @{ type = "string"; description = "path|url|ip|registry|email|interesting or free text" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "GetWorkingDirectory"; description = "Agent CWD."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "SetWorkingDirectory"; description = "Set agent CWD."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "GetEnvironment"; description = "Env vars / PATH summary."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" } } } } },
@@ -9096,12 +9628,17 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "RunQuickDiagnostics"; description = "Bundle: BSOD, events (24h collapsed), disk health, one-level disk space, memory. Embeds objects not nested JSON strings."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "RunRepairTool"; description = "sfc, dism, or chkdsk. ALWAYS prompts for approval."; parameters = @{ type = "object"; properties = @{ tool = @{ type = "string"; enum = @("sfc","dism","chkdsk") }; driveLetter = @{ type = "string" }; arguments = @{ type = "string" } }; required = @("tool") } } },
 	@{ type = "function"; function = @{ name = "GetServiceStatus"; description = "Service status. Omit name to list services (optional status filter, max cap). With name = one service."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Service name; omit to list many" }; status = @{ type = "string"; description = "When listing: Running|Stopped|..." }; max = @{ type = "integer"; description = "Max when listing (default 250)" } } } } },
-	@{ type = "function"; function = @{ name = "ReadRegistry"; description = "Read registry key values."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "SetRegistry"; description = "Create/set a registry value (creates key if missing). ALWAYS prompts. type: String|ExpandString|MultiString|DWord|QWord|Binary."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "e.g. HKCU:\\Software\\MyApp" }; name = @{ type = "string"; description = "Value name; (default) for default value" }; value = @{ type = "string"; description = "Value (hex for Binary; MultiString newline/semicolon separated)" }; type = @{ type = "string"; description = "String (default) | ExpandString | MultiString | DWord | QWord | Binary" } }; required = @("path","name","value") } } },
+	@{ type = "function"; function = @{ name = "ReadRegistry"; description = "Read registry key values. path: HKLM:\\SOFTWARE\\... or HKCU:\\... (also HKEY_LOCAL_MACHINE\\...)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "e.g. HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "SetRegistry"; description = "Create/set a registry value (creates key if missing). ALWAYS prompts. path accepts HKLM:\\SOFTWARE\\... (same as ReadRegistry). type: String|ExpandString|MultiString|DWord|QWord|Binary (also REG_DWORD/REG_SZ/int)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "e.g. HKCU:\\Software\\MyApp or HKLM:\\SOFTWARE\\..." }; name = @{ type = "string"; description = "Value name; (default) for default value" }; value = @{ type = "string"; description = "Value (hex for Binary; MultiString newline/semicolon separated; 0xHEX ok for DWord)" }; type = @{ type = "string"; description = "String (default) | ExpandString | MultiString | DWord | QWord | Binary | REG_DWORD | REG_SZ | int" } }; required = @("path","name","value") } } },
 	@{ type = "function"; function = @{ name = "GetPowerInfo"; description = "Battery/power health summary as single clean JSON (ok/has_battery/fields). Soft errors as ok=false."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetScheduledTasks"; description = "Scheduled tasks for diagnostics/persistence hunting. Default max=30, includeSystem=false (excludes Microsoft\\Windows + SYSTEM). filter=system|enabled|recent|user or name substring."; parameters = @{ type = "object"; properties = @{ days = @{ type = "integer" }; filter = @{ type = "string" }; includeDisabled = @{ type = "boolean" }; includeSystem = @{ type = "boolean"; description = "Include Microsoft\\Windows / SYSTEM tasks (default false)" }; max = @{ type = "integer"; description = "Max tasks returned (default 30)" }; exportPath = @{ type = "string" } } } } },
 	@{ type = "function"; function = @{ name = "MakeHttpRequest"; description = "HTTP client GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS with auth, headers, JSON/form/raw body. Default verify_ssl=false (bad/self-signed HTTPS via system curl -k). verify_ssl=true uses strict Invoke-WebRequest. Returns status_code, headers, body, final_url."; parameters = @{ type = "object"; properties = @{ method = @{ type = "string"; enum = @("GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS") }; url = @{ type = "string" }; headers = @{ type = "object" }; params = @{ type = "object" }; json_body = @{ type = "object" }; form_data = @{ type = "object" }; raw_data = @{ type = "string" }; bearer_token = @{ type = "string" }; basic_auth_username = @{ type = "string" }; basic_auth_password = @{ type = "string" }; cookies = @{ type = "object" }; content_type = @{ type = "string" }; verify_ssl = @{ type = "boolean"; description = "default false = curl -k for HTTPS; true = strict cert check" }; user_agent = @{ type = "string" }; timeout = @{ type = "integer"; description = "seconds (default 30, max 600)" } }; required = @("method","url") } } },
-	@{ type = "function"; function = @{ name = "BrowsePage"; description = "Fetch webpage as clean readable text. Default verify_ssl=false (bad HTTPS via system curl -k)."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string" }; max_length = @{ type = "integer" }; verify_ssl = @{ type = "boolean"; description = "default false = curl -k for HTTPS" }; user_agent = @{ type = "string" }; extract_links = @{ type = "boolean" } }; required = @("url") } } },
+	@{ type = "function"; function = @{ name = "BrowsePage"; description = "Fetch a URL and return readable text (title, text, absolute links, final_url, content_kind). Detects JS shells (needs_render=true). Default verify_ssl=false (curl -k). Prefer SearchWeb first when discovering pages. Not for binary/PDF (use DownloadFile/ReadPdf)."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string" }; max_length = @{ type = "integer"; description = "Max text chars (default 12000)" }; verify_ssl = @{ type = "boolean"; description = "default false = curl -k for HTTPS" }; user_agent = @{ type = "string" }; extract_links = @{ type = "boolean"; description = "Include links[] (default true)" }; max_links = @{ type = "integer"; description = "Max links (default 24)" } }; required = @("url") } } },
+	@{ type = "function"; function = @{ name = "SearchWeb"; description = "Web search → {title,url,snippet}[]. Engines: DuckDuckGo (unwraps uddg redirects) + Bing + Brave when blocked. Prefer engine=bing if DDG bot-blocks. Then BrowsePage best URLs. MS docs: use SearchMicrosoftLearn instead."; parameters = @{ type = "object"; properties = @{ query = @{ type = "string"; description = "Search query" }; max_results = @{ type = "integer"; description = "Max results (default 8, max 20)" }; engine = @{ type = "string"; description = "auto (default) | duckduckgo | bing | brave" }; verify_ssl = @{ type = "boolean"; description = "default true for search endpoints" }; user_agent = @{ type = "string" } }; required = @("query") } } },
+	@{ type = "function"; function = @{ name = "SearchMicrosoftLearn"; description = "Search Microsoft Learn / docs (learn.microsoft.com). Prefer for official Windows, PowerShell, .NET, Azure, and product docs. Returns {title,url,snippet}[]. Then ReadMicrosoftLearn on the best URL. Not general web (use SearchWeb)."; parameters = @{ type = "object"; properties = @{ query = @{ type = "string"; description = "Search query e.g. Get-SmbShare, Group Policy no auto update" }; max_results = @{ type = "integer"; description = "Max results (default 8, max 15)" }; locale = @{ type = "string"; description = "Locale e.g. en-us (default en-us)" } }; required = @("query") } } },
+	@{ type = "function"; function = @{ name = "ReadMicrosoftLearn"; description = "Fetch and extract readable text from a Microsoft Learn / docs.microsoft.com page. url= must be learn.microsoft.com (or docs.microsoft.com). Prefer after SearchMicrosoftLearn. Caps text length."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string"; description = "Full https://learn.microsoft.com/... URL" }; max_length = @{ type = "integer"; description = "Max text chars (default 10000)" } }; required = @("url") } } },
+	@{ type = "function"; function = @{ name = "SearchSs64"; description = "Search SS64 command references (ss64.com): Windows CMD, PowerShell, bash. Returns {title,url,snippet}[]. Then ReadSs64. scope=auto|ps|nt|bash biases the search."; parameters = @{ type = "object"; properties = @{ query = @{ type = "string"; description = "Command or topic e.g. robocopy, Get-ChildItem, find" }; max_results = @{ type = "integer"; description = "Max results (default 8, max 15)" }; scope = @{ type = "string"; description = "auto (default) | ps | nt | bash — PowerShell, Windows CMD, or Linux/bash" } }; required = @("query") } } },
+	@{ type = "function"; function = @{ name = "ReadSs64"; description = "Fetch readable text from an ss64.com page. url= full ss64 URL, OR command= name (e.g. robocopy, dir) with optional scope=ps|nt|bash to resolve a direct page. Prefer after SearchSs64."; parameters = @{ type = "object"; properties = @{ url = @{ type = "string"; description = "Full https://ss64.com/... URL" }; command = @{ type = "string"; description = "Command name to resolve if url omitted e.g. robocopy" }; scope = @{ type = "string"; description = "When using command=: auto|ps|nt|bash (default auto tries ps then nt)" }; max_length = @{ type = "integer"; description = "Max text chars (default 10000)" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "ConvertGitHubUrl"; description = "Convert github.com URLs to raw.githubusercontent.com form."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string" } }; required = @("github_url") } } },
 	@{ type = "function"; function = @{ name = "GetGitHubRawFile"; description = "Fetch raw file content from a GitHub URL."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string" }; max_length = @{ type = "integer" } }; required = @("github_url") } } },
 	@{ type = "function"; function = @{ name = "ListGitHubDirectory"; description = "List files/folders in a GitHub repo (repo URL or tree/blob URL; optional ref)."; parameters = @{ type = "object"; properties = @{ github_url = @{ type = "string"; description = "github.com owner/repo or tree/blob URL" }; ref = @{ type = "string"; description = "Branch/tag/commit if not in URL (default main)" } }; required = @("github_url") } } },
@@ -9119,6 +9656,8 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "UnmountIso"; description = "Dismount a mounted .iso (Dismount-DiskImage). ALWAYS prompts. Pass path= to the .iso and/or letter= drive (e.g. E). Prefer over shell Dismount-DiskImage."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Path to the .iso that is mounted" }; iso_path = @{ type = "string"; description = "Alias for path" }; letter = @{ type = "string"; description = "Drive letter e.g. E or E:" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "MakeCab"; description = "Build a .cab with makecab.exe (LZX by default) and live progress in the UI. ALWAYS prompts. source= folder (pack files inside) and/or files=[paths]. force=true overwrites. Prefer over raw makecab directive scripts."; parameters = @{ type = "object"; properties = @{ source = @{ type = "string"; description = "Folder whose files are packed (non-recursive by default)" }; path = @{ type = "string"; description = "Alias for source folder" }; files = @{ type = "array"; items = @{ type = "string" }; description = "Explicit file paths to pack" }; destination = @{ type = "string"; description = "Output .cab path" }; cab_path = @{ type = "string"; description = "Alias for destination" }; force = @{ type = "boolean"; description = "Overwrite existing .cab (default false)" }; recursive = @{ type = "boolean"; description = "When source is a folder, include subfolders (default false)" }; compression = @{ type = "string"; description = "LZX (default) | MSZIP | none" }; compression_level = @{ type = "integer"; description = "LZX level 1-7 (default 7)" }; compression_memory = @{ type = "integer"; description = "LZX memory 15-21 (default 21)" } }; required = @("destination") } } },
 	@{ type = "function"; function = @{ name = "ExpandCab"; description = "Extract a .cab with expand.exe. ALWAYS prompts. path= .cab, destination= output folder. force=true allows non-empty dest."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Source .cab path" }; cab_path = @{ type = "string"; description = "Alias for path" }; destination = @{ type = "string"; description = "Output folder" }; force = @{ type = "boolean"; description = "Allow extract into existing non-empty folder (default false)" } }; required = @("path","destination") } } },
+	@{ type = "function"; function = @{ name = "BulkRename"; description = "REQUIRED for bulk/batch/mass rename of many files. Prefer over Rename-Item/ren loops in RunCommand — use RunCommand only if BulkRename errors/fails. path= directory. glob= filter (default *). Mode A: find= + replace= (substring; use_regex=true for .NET regex with `$1). Mode B: template= e.g. photo_{n:03}{ext} tokens {name}{stem}{ext}{n}{n:00}{parent}. dry_run=true DEFAULT (plan only). dry_run=false applies and ALWAYS prompts. recursive=false default. max=200. Prefer dry_run first then apply."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Folder containing files to rename" }; directory = @{ type = "string"; description = "Alias for path" }; glob = @{ type = "string"; description = "Name filter e.g. *.jpg (default *)" }; recursive = @{ type = "boolean"; description = "Include subfolders (default false)" }; find = @{ type = "string"; description = "Text or regex to match in the file name" }; replace = @{ type = "string"; description = "Replacement (use `$1 groups when use_regex=true)" }; use_regex = @{ type = "boolean"; description = "Treat find as .NET regex (default false)" }; template = @{ type = "string"; description = "New-name template: {name} {stem} {ext} {n} {n:00} {parent}" }; start_index = @{ type = "integer"; description = "Counter start for {n} (default 1)" }; dry_run = @{ type = "boolean"; description = "true=preview only (default true); false=apply with approval" }; max = @{ type = "integer"; description = "Max files to process (default 200, hard 1000)" }; force = @{ type = "boolean"; description = "Allow overwrite if target name exists (default false)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "FindDuplicates"; description = "REQUIRED for finding duplicate files by content. Prefer over Get-FileHash|Group-Object shells in RunCommand — use RunCommand only if FindDuplicates errors/fails. Size buckets then SHA256. path= root. recursive=true default. min_bytes skips tiny files (default 1). max_scan caps walk (default 10000). max_groups caps result groups (default 40). No approval."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Root folder to scan" }; directory = @{ type = "string"; description = "Alias for path" }; recursive = @{ type = "boolean"; description = "Recurse subfolders (default true)" }; glob = @{ type = "string"; description = "Optional name filter e.g. *.pdf" }; min_bytes = @{ type = "integer"; description = "Ignore files smaller than this (default 1)" }; max_scan = @{ type = "integer"; description = "Max files to enumerate (default 10000)" }; max_groups = @{ type = "integer"; description = "Max duplicate groups returned (default 40)" }; max_per_group = @{ type = "integer"; description = "Max paths listed per group (default 12)" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "FindPSModule"; description = "Search PowerShell Gallery modules (read-only). Isolated process with timeout (default 60s); Esc/Stop aborts."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Module name or wildcard" }; max_results = @{ type = "integer"; description = "Max results (default 15)" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default 60)" } }; required = @("name") } } },
 	@{ type = "function"; function = @{ name = "GetInstalledPSModule"; description = "List installed PowerShell modules (optional name filter)."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Optional module name filter" } } } } },
 	@{ type = "function"; function = @{ name = "InstallPSModule"; description = "Install a PowerShell module (default CurrentUser scope). ALWAYS prompts. Isolated process with timeout (default 180s); Esc/Stop aborts — will not freeze MiniBot."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" }; version = @{ type = "string"; description = "Optional exact version" }; scope = @{ type = "string"; description = "CurrentUser (default) or AllUsers" }; allow_prerelease = @{ type = "boolean" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default 180)" } }; required = @("name") } } },
@@ -9146,25 +9685,31 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "ListInstallers"; description = "List silent installer catalog (id, name, notes). Read-only. Catalog: 7zip, chrome, adobe_reader, adwcleaner, vlc."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "InstallPackage"; description = "Silent download+install from the installers catalog. package=id or packages=[ids]. Follows redirects (dynamic URLs). ALWAYS prompts. Temp downloads cleaned after each package. Ids: 7zip, chrome, adobe_reader, adwcleaner (will run a scan), vlc."; parameters = @{ type = "object"; properties = @{ package = @{ type = "string"; description = "Single package id" }; packages = @{ type = "array"; items = @{ type = "string" }; description = "Multiple package ids" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "EnableToolGroup"; description = "Silently enable group(s): group=network,shares or groups=[diag,repair]. See MAP. Then call tools same turn; never narrate."; parameters = @{ type = "object"; properties = @{ group = @{ type = "string" }; groups = @{ type = "array"; items = @{ type = "string" } } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "ListToolGroups"; description = "List groups/tools. Prefer EnableToolGroup + MAP."; parameters = @{ type = "object"; properties = @{} } } }
+	@{ type = "function"; function = @{ name = "ListToolGroups"; description = "List groups/tools. Prefer EnableToolGroup + MAP."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "TaskBoard"; description = "PRIORITY for multi-step work: call action=set (goal + items) BEFORE thrashing other tools when the ask needs 2+ steps, multi-file/host/service, diagnose+fix, setup, or ordered plans. Sticky under chips; update one in_progress at a time (done/blocked). action=set|update|status|clear. PAUSED after Stop/Esc: DEFAULT clear then set NEW; RESUME only if operator asked (update from NOW). status=show. clear=wipe."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; description = "set | update | status | clear" }; goal = @{ type = "string"; description = "Overall goal (action=set)" }; items = @{ type = "array"; description = "Checklist for action=set (strings or objects with id/title/status)" }; id = @{ type = "string"; description = "Item id for update" }; status = @{ type = "string"; description = "pending|in_progress|done|blocked" }; title = @{ type = "string"; description = "Rename item or new title on update" }; note = @{ type = "string"; description = "Short note on update" } }; required = @("action") } } }
 )
 
 # Progressive tool catalog (core lean; optional groups on demand)
 $script:MBToolCatalog = [ordered]@{
 	core = @(
+		# TaskBoard first in core so multi-step planning is always visible and preferred
+		'TaskBoard','EnableToolGroup','ListToolGroups',
 		'ReadFile','WriteFile','EditFile','ApplyPatch','ListDirectory','SearchFiles','FindFiles','DiffText',
-		'HexView','HexEdit',
-		'RunCommand','GetWorkingDirectory','SetWorkingDirectory','GetEnvironment','SetEnvironment',
-		'EnableToolGroup','ListToolGroups'
+		'RunCommand','GetWorkingDirectory','SetWorkingDirectory','GetEnvironment','SetEnvironment'
 	)
-	senses = @(
-		'ReadImage','ReadPdf','ViewScreen','SpeakText'
+	vision = @(
+		'ReadImage','ReadPdf','ViewScreen'
+	)
+	sound = @(
+		'SpeakText','AudioVolume'
+	)
+	forensics = @(
+		'HexView','HexEdit','HexSearch','StringsScan'
 	)
 	system = @(
 		'GetSystemInfo','GetProcessList','GetProcessTree','GetMemoryInfo','GetPowerInfo',
 		'GetServiceStatus','ControlService','GetInstalledSoftware','GetWindowsUpdateStatus','GetSystemUptime',
-		# Endpoint UX: not setup (reboot/NewMachine) and not core — enable system when needed
-		'AudioVolume','DisplayBrightness'
+		'DisplayBrightness'
 	)
 	network = @(
 		'GetNetworkInfo','GetNetConnections','ScanNetwork','PortProbe','FindShares','FindWebHosts','FindRdp',
@@ -9189,30 +9734,40 @@ $script:MBToolCatalog = [ordered]@{
 		'ListInstallers','InstallPackage'
 	)
 	sandbox   = @('SandBoxWrite','SandBox','SandBoxList','GetSandBoxInfo','ClearSandBox')
-	files     = @('DownloadFile','ExpandArchive','CompressArchive','MakeCab','ExpandCab','MakeIso','MountIso','UnmountIso')
+	files     = @('DownloadFile','ExpandArchive','CompressArchive','MakeCab','ExpandCab','MakeIso','MountIso','UnmountIso','BulkRename','FindDuplicates')
 	packages  = @('FindPSModule','GetInstalledPSModule','InstallPSModule','UpdatePSModule')
 	registry  = @('ReadRegistry','SetRegistry')
 	clipboard = @('Clipboard')
-	web       = @('MakeHttpRequest','BrowsePage','ConvertGitHubUrl','GetGitHubRawFile','ListGitHubDirectory')
+	docs      = @('SearchMicrosoftLearn','ReadMicrosoftLearn','SearchSs64','ReadSs64')
+	web       = @('MakeHttpRequest','BrowsePage','SearchWeb','ConvertGitHubUrl','GetGitHubRawFile','ListGitHubDirectory')
 
 }
 
+# Group chip tooltips (operator-facing). Model routing lives in MAP / group prompts / tool schemas.
 $script:MBToolGroupMeta = [ordered]@{
 	core = @{
 		Label       = 'Core'
-		Description = 'Always available: read/write files, edit code, run commands, and manage the working folder.'
+		Description = 'Always on: read and edit files, search the disk, run commands when needed, working folder, and task checklist.'
 	}
-	senses = @{
-		Label       = 'Senses'
-		Description = 'See the screen, read images/PDFs, and speak replies aloud.'
+	vision = @{
+		Label       = 'Vision'
+		Description = 'Let the agent look at images, PDFs, and the screen. Shows orange if the connected model cannot do vision.'
+	}
+	sound = @{
+		Label       = 'Sound'
+		Description = 'Speak text aloud and control system volume or mute.'
+	}
+	forensics = @{
+		Label       = 'Forensics'
+		Description = 'Inspect programs and binaries: hex view, search, strings, and careful byte edits.'
 	}
 	system = @{
 		Label       = 'System'
-		Description = 'This PC: hardware, processes, memory, services, software, uptime, plus volume/mute (AudioVolume) and display brightness.'
+		Description = 'This PC: hardware, processes, memory, services, installed software, uptime, and display brightness.'
 	}
 	network = @{
 		Label       = 'Network'
-		Description = 'LAN scan, PortProbe, FindShares/WebHosts/Rdp, mapped drives/printers, RemoteCommand (domain-admin WinRM; orange off-domain).'
+		Description = 'Scan the LAN, probe ports, find shares or remote desktops, list maps/printers, and remote commands (domain).'
 	}
 	diag = @{
 		Label       = 'Diag'
@@ -9220,31 +9775,31 @@ $script:MBToolGroupMeta = [ordered]@{
 	}
 	repair = @{
 		Label       = 'Repair'
-		Description = 'Run repair tools (sfc, DISM, chkdsk). Approval is required before changes.'
+		Description = 'Run Windows repair tools (System File Checker, DISM, Check Disk). You will be asked before changes.'
 	}
 	setup = @{
 		Label       = 'Setup / Tune'
-		Description = 'Windows options, local Group Policy (Policies registry), restore points, uninstall, reboot, new-machine setup. Volume/brightness under System.'
+		Description = 'Windows options, local Group Policy, restore points, uninstall, reboot, and new-machine setup.'
 	}
 	identity = @{
 		Label       = 'Identity'
-		Description = 'Manage local users and join or leave an Active Directory domain.'
+		Description = 'Local user accounts and join or leave an Active Directory domain.'
 	}
 	shares = @{
 		Label       = 'Shares'
-		Description = 'Map/unmap drives, create or remove folder shares, and add/remove network printers.'
+		Description = 'Map or unmap drives, create or remove folder shares, and add or remove network printers.'
 	}
 	installers = @{
 		Label       = 'Installers'
-		Description = 'Download and silently install common apps (7-Zip, Chrome, Reader, VLC, and more).'
+		Description = 'Download and quietly install common apps (7-Zip, Chrome, Reader, VLC, and more).'
 	}
 	sandbox = @{
 		Label       = 'SandBox'
-		Description = 'Build and test PowerShell scripts in a safe incremental lab before applying them.'
+		Description = 'Build and test PowerShell scripts in a safe scratch lab before applying them for real.'
 	}
 	files = @{
 		Label       = 'Files'
-		Description = 'Download files, zip/cab archives, and make/mount/unmount ISO images.'
+		Description = 'Downloads, zip/cab/ISO, bulk rename, and find duplicate files.'
 	}
 	packages = @{
 		Label       = 'Packages'
@@ -9252,17 +9807,169 @@ $script:MBToolGroupMeta = [ordered]@{
 	}
 	registry = @{
 		Label       = 'Registry'
-		Description = 'Read and change Windows registry values (writes require approval).'
+		Description = 'Read and change Windows registry values (writes ask for approval).'
 	}
 	clipboard = @{
 		Label       = 'Clipboard'
-		Description = 'Read or set the Windows clipboard text.'
+		Description = 'Read or set Windows clipboard text.'
+	}
+	docs = @{
+		Label       = 'Docs'
+		Description = 'Official docs: Microsoft Learn (Windows/PowerShell) and SS64 command references.'
 	}
 	web = @{
 		Label       = 'Web / HTTP'
-		Description = 'Call HTTP APIs, fetch web pages, and pull files from GitHub.'
+		Description = 'Search the web, open pages, call HTTP APIs, and pull files from GitHub.'
 	}
 
+}
+
+# Tool chip / menu tooltips for the operator (not model schema text).
+# Keys must match tool function names. Keep short, plain language; no agent routing.
+$script:MBToolUserTips = [ordered]@{
+	# core
+	ReadFile              = 'Read a text file (optionally head, tail, or a slice). Not for images, video, or PDFs.'
+	WriteFile             = 'Create or overwrite a whole text file. You will be asked to approve.'
+	EditFile              = 'Search-and-replace edit in a file (diff shown in chat). You will be asked to approve.'
+	ApplyPatch            = 'Apply a unified diff / patch to files. You will be asked to approve.'
+	ListDirectory         = 'List files and folders in a directory.'
+	SearchFiles           = 'Search inside file contents under a folder (regex).'
+	FindFiles             = 'Find files by name, extension, size, or how recently they changed.'
+	DiffText              = 'Compare two texts or files and show a line-by-line diff (also drawn in chat).'
+	RunCommand            = 'Run a PowerShell or cmd command on this PC. Prefer dedicated tools when one exists; approval for risky commands.'
+	GetWorkingDirectory   = 'Show the agent''s current working folder.'
+	SetWorkingDirectory   = 'Change the agent''s working folder.'
+	GetEnvironment        = 'Show environment variables / PATH summary.'
+	SetEnvironment        = 'Set an environment variable for this session.'
+	TaskBoard             = 'PRIORITY multi-step checklist (set goal+items first; update as you go; sticky under chips).'
+	EnableToolGroup       = 'Turn on extra tool groups so more capabilities become available.'
+	ListToolGroups        = 'Show which tool groups exist and what they contain.'
+
+	# vision
+	ReadImage             = 'Load an image so the agent can look at it (needs a vision-capable model).'
+	ReadPdf               = 'Read text from a PDF page for the agent.'
+	ViewScreen            = 'Capture the desktop so the agent can see what is on screen.'
+
+	# sound
+	SpeakText             = 'Speak text aloud with built-in Windows speech.'
+	AudioVolume           = 'Get or set system volume, or mute / unmute. Changes ask for approval.'
+
+	# forensics
+	HexView               = 'Inspect a binary or program: hex dump, PE layout, optional disassembly, hashes, and more.'
+	HexEdit               = 'Patch bytes at an offset (before/after shown in chat). You will be asked to approve.'
+	HexSearch             = 'Search a file for a hex pattern (supports ?? wildcards).'
+	StringsScan           = 'Extract readable strings from a binary (paths, URLs, registry keys, etc.).'
+
+	# system
+	GetSystemInfo         = 'Basic PC info: OS, CPU, RAM, and network addresses.'
+	GetProcessList        = 'List running processes (often sorted by CPU use).'
+	GetProcessTree        = 'Show processes as a parent/child tree.'
+	GetMemoryInfo         = 'Memory usage and top memory consumers.'
+	GetPowerInfo          = 'Battery and power status (laptops and similar).'
+	GetServiceStatus      = 'List Windows services or check one by name.'
+	ControlService        = 'Start, stop, restart a service, or set startup type. You will be asked to approve.'
+	GetInstalledSoftware  = 'List installed programs from the Uninstall registry.'
+	GetWindowsUpdateStatus = 'Show pending Windows updates.'
+	GetSystemUptime       = 'How long the PC has been up and last boot time.'
+	DisplayBrightness     = 'Get or set built-in display brightness (usually laptops). Set asks for approval.'
+
+	# network
+	GetNetworkInfo        = 'Network adapters and a simple connectivity check.'
+	GetNetConnections     = 'Open TCP connections and listeners (addresses, ports, process).'
+	ScanNetwork           = 'Discover machines on the local network (IP, MAC, hostname when available).'
+	PortProbe             = 'Test whether specific TCP ports are open on one or more hosts.'
+	FindShares            = 'Find network folder shares on the LAN or on hosts you specify (not create/map).'
+	FindWebHosts          = 'Find machines on the LAN that answer on common web ports.'
+	FindRdp               = 'Find machines on the LAN with Remote Desktop (port 3389) open.'
+	GetLocalShares        = 'List folder shares published by this PC.'
+	GetMappedDrives       = 'List network drives mapped on this PC (letter → path).'
+	GetPrinters           = 'List printers set up on this PC.'
+	RemoteCommand         = 'Run a command on another Windows PC over WinRM (ports 5985/5986). Target must already allow remote management. Needs this PC domain-joined with a domain user; you approve each run.'
+
+	# diag
+	GetBSODInfo           = 'Recent blue-screen / crash dump info and related events.'
+	GetEventLogs          = 'Recent error and warning events (and related disk I/O noise).'
+	GetDiskHealth         = 'Physical disk health and SMART-style counters.'
+	GetDiskSpace          = 'Free space on drives and large folders under a path.'
+	GetStartupItems       = 'Programs and services that start with Windows.'
+	GetScheduledTasks     = 'Scheduled tasks (useful for diagnostics).'
+	GetDriverInfo         = 'Installed drivers with optional filters.'
+	StopProcess           = 'End one or more processes. You will be asked to approve.'
+	RunQuickDiagnostics   = 'One-shot health bundle: crashes, events, disk, space, memory.'
+
+	# repair
+	RunRepairTool         = 'Run sfc, DISM, or chkdsk. You will be asked to approve.'
+
+	# setup
+	SetWindowsOption      = 'Apply a named Windows tweak (Explorer, power, network discovery, and more). Approval required.'
+	ListWindowsOptions    = 'List available Windows option keys and allowed values.'
+	GroupPolicy           = 'Edit local Group Policy–style settings (Policies registry). Not available on Home editions.'
+	SystemRestore         = 'System Restore status, enable/disable, create points, or list points.'
+	UninstallSoftware     = 'Uninstall a program by name. You will be asked to approve.'
+	Reboot                = 'Schedule reboot or shutdown, or cancel a pending timer. You will be asked to approve.'
+	NewMachineSetup       = 'Guided new-PC setup (settings plus common apps). You will be asked to approve.'
+
+	# identity
+	AddLocalUser          = 'Create a local Windows user account. You will be asked to approve.'
+	RemoveLocalUser       = 'Delete a local Windows user account. You will be asked to approve.'
+	JoinDomain            = 'Join this PC to an Active Directory domain. You will be asked to approve.'
+	LeaveDomain           = 'Leave the domain and join a workgroup. Needs a local admin password; approval required.'
+
+	# shares
+	MapNetworkDrive       = 'Map a network share to a drive letter. You will be asked to approve.'
+	RemoveMappedDrive     = 'Disconnect a mapped network drive letter on this PC. You will be asked to approve.'
+	CreateShare           = 'Share a local folder over the network (SMB). You will be asked to approve.'
+	RemoveShare           = 'Stop sharing a local folder (does not delete the files). You will be asked to approve.'
+	AddNetworkPrinter     = 'Connect a network or shared printer. You will be asked to approve.'
+	RemoveNetworkPrinter  = 'Remove a printer from this PC. You will be asked to approve.'
+
+	# installers
+	ListInstallers        = 'Show the silent installer catalog (7-Zip, Chrome, Reader, VLC, and more).'
+	InstallPackage        = 'Download and silently install from the catalog. You will be asked to approve.'
+
+	# sandbox
+	SandBoxWrite          = 'Save a named PowerShell snippet in the lab (does not run it yet).'
+	SandBox               = 'Run and check lab code with optional assertions.'
+	SandBoxList           = 'List saved lab pieces and last pass/fail status.'
+	GetSandBoxInfo        = 'Show the lab folder layout and last run info.'
+	ClearSandBox          = 'Delete SandBox scratch files for this session (or all sessions if asked).'
+
+	# files
+	DownloadFile          = 'Download a file from a URL to a path (size-capped). You will be asked to approve.'
+	ExpandArchive         = 'Extract a .zip archive to a folder. You will be asked to approve.'
+	CompressArchive       = 'Create a .zip from a file or folder. You will be asked to approve.'
+	MakeCab               = 'Build a .cab archive. You will be asked to approve.'
+	ExpandCab             = 'Extract a .cab archive. You will be asked to approve.'
+	MakeIso               = 'Build an .iso image from a folder. You will be asked to approve.'
+	MountIso              = 'Mount an .iso as a virtual drive. You will be asked to approve.'
+	UnmountIso            = 'Eject / dismount a mounted .iso. You will be asked to approve.'
+	BulkRename            = 'Rename many files at once (preview first, then apply with approval).'
+	FindDuplicates        = 'Find duplicate files under a folder by size, then content hash (read-only).'
+
+	# packages
+	FindPSModule          = 'Search the PowerShell Gallery for modules.'
+	GetInstalledPSModule  = 'List PowerShell modules installed on this PC.'
+	InstallPSModule       = 'Install a PowerShell module (usually for the current user). You will be asked to approve.'
+	UpdatePSModule        = 'Update an installed PowerShell module. You will be asked to approve.'
+
+	# registry
+	ReadRegistry          = 'Read values under a registry key.'
+	SetRegistry           = 'Create or set a registry value. You will be asked to approve.'
+
+	# clipboard
+	Clipboard             = 'Read or write Windows clipboard text (writes ask for approval).'
+
+	# web
+	MakeHttpRequest       = 'Call an HTTP API (GET/POST/etc.) with optional headers and body.'
+	BrowsePage            = 'Fetch a web page and return readable text and links.'
+	SearchWeb             = 'Search the web and return top titles, URLs, and snippets.'
+	SearchMicrosoftLearn  = 'Search Microsoft Learn (official Windows, PowerShell, product docs).'
+	ReadMicrosoftLearn    = 'Read a Microsoft Learn page into text (learn.microsoft.com only).'
+	SearchSs64            = 'Search SS64 command references (CMD, PowerShell, bash).'
+	ReadSs64              = 'Read an SS64 page by URL or command name (ss64.com only).'
+	ConvertGitHubUrl      = 'Convert a github.com link to a raw content URL.'
+	GetGitHubRawFile      = 'Download raw file content from a GitHub URL.'
+	ListGitHubDirectory   = 'List files and folders in a GitHub repository path.'
 }
 
 function Initialize-MBToolGroups {
@@ -9274,7 +9981,7 @@ function Initialize-MBToolGroups {
 	$profile = [string]$script:MB.ToolProfile
 	if ([string]::IsNullOrWhiteSpace($profile)) { $profile = [string]$ToolProfile }
 	if ($profile -match '^(?i)full|all$') {
-		foreach ($g in @('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web')) {
+		foreach ($g in @(Get-MBToolGroupOrder)) {
 			if (-not ($script:MB.ActiveToolGroups -contains $g)) {
 				[void]$script:MB.ActiveToolGroups.Add($g)
 			}
@@ -9294,7 +10001,7 @@ function Sync-MBPromptAfterToolGroups {
 }
 
 function Get-MBToolGroupOrder {
-	@('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web')
+	@('core','vision','sound','forensics','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','docs','web')
 }
 
 function Add-MBUsedToolName {
@@ -9311,19 +10018,46 @@ function Add-MBUsedToolName {
 	} catch {}
 }
 
+function Get-MBToolUserTipBody {
+	# Operator-facing body only (no tool name prefix). Prefer MBToolUserTips map.
+	param([string]$Name, [string]$Description = '')
+	$n = ([string]$Name).Trim()
+	if ([string]::IsNullOrWhiteSpace($n)) { return '' }
+
+	if ($script:MBToolUserTips) {
+		if ($script:MBToolUserTips.Contains($n)) {
+			return [string]$script:MBToolUserTips[$n]
+		}
+		foreach ($k in @($script:MBToolUserTips.Keys)) {
+			if ([string]::Equals([string]$k, $n, [StringComparison]::OrdinalIgnoreCase)) {
+				return [string]$script:MBToolUserTips[$k]
+			}
+		}
+	}
+
+	# Fallback: first sentence of schema, stripped of agent-routing noise (should rarely hit).
+	$d = ([string]$Description).Trim()
+	if ([string]::IsNullOrWhiteSpace($d)) { return '' }
+	$d = $d -replace '(?i)\bREQUIRED\b[^.]*\.\s*', ''
+	$d = $d -replace '(?i)\bALWAYS prompts?[^.]*\.\s*', ''
+	$d = $d -replace '(?i)\bPrefer over[^.]*\.\s*', ''
+	$d = $d -replace '(?i)\bDo not use[^.]*\.\s*', ''
+	$d = $d -replace '(?i)\bNEVER[^.]*\.\s*', ''
+	$d = $d -replace '(?i)\bmissing_tool[^.]*\.\s*', ''
+	$d = $d -replace '(?i)\bEnableToolGroup[^.]*\.\s*', ''
+	$d = $d.Trim()
+	if ($d -match '^(.+?[.!?])(\s|$)') { $d = $Matches[1].Trim() }
+	if ($d.Length -gt 180) { $d = $d.Substring(0, 177).Trim() + '...' }
+	return $d
+}
+
 function Get-MBToolUserTipText {
 	param([string]$Name, [string]$Description = '')
 	$n = ([string]$Name).Trim()
-	$d = ([string]$Description).Trim()
-	if ([string]::IsNullOrWhiteSpace($d)) {
-		if ($n) { return $n }
-		return ''
-	}
-	$cut = $d
-	if ($cut -match '^(.+?[.!?])(\s|$)') { $cut = $Matches[1].Trim() }
-	if ($cut.Length -gt 180) { $cut = $cut.Substring(0, 177).Trim() + '...' }
-	if ($n) { return ("{0}`n{1}" -f $n, $cut) }
-	return $cut
+	if ([string]::IsNullOrWhiteSpace($n)) { return '' }
+	$body = Get-MBToolUserTipBody -Name $n -Description $Description
+	if ([string]::IsNullOrWhiteSpace($body)) { return $n }
+	return ("{0}`n{1}" -f $n, $body)
 }
 
 function Get-MBToolUiTips {
@@ -9359,23 +10093,33 @@ function Get-MBToolUiTips {
 		}
 	} catch {}
 
-	# Always-present meta tools
-	if (-not $toolTips.ContainsKey('EnableToolGroup')) {
-		$toolTips['EnableToolGroup'] = "EnableToolGroup`nUnlock extra tool groups so the agent can use more capabilities."
-	}
-	if (-not $toolTips.ContainsKey('ListToolGroups')) {
-		$toolTips['ListToolGroups'] = "ListToolGroups`nShow which tool groups are available and what they contain."
+	# Seed map-only tools even if schema list is empty at call time
+	if ($script:MBToolUserTips) {
+		foreach ($k in @($script:MBToolUserTips.Keys)) {
+			if (-not $toolTips.ContainsKey([string]$k)) {
+				$toolTips[[string]$k] = Get-MBToolUserTipText -Name ([string]$k)
+			}
+		}
 	}
 
-	# Vision-gated senses tools: orange UI when Abilities lacks lowercase "vision"
+	# Always-present meta tools
+	if (-not $toolTips.ContainsKey('EnableToolGroup')) {
+		$toolTips['EnableToolGroup'] = Get-MBToolUserTipText -Name 'EnableToolGroup'
+	}
+	if (-not $toolTips.ContainsKey('ListToolGroups')) {
+		$toolTips['ListToolGroups'] = Get-MBToolUserTipText -Name 'ListToolGroups'
+	}
+
+	# Vision-gated tools: orange UI when Abilities lacks lowercase "vision"
 	$hasVision = $false
 	try { $hasVision = [bool](Test-MBModelHasVision) } catch { $hasVision = $false }
 	if (-not $hasVision) {
 		foreach ($vt in @(Get-MBVisionToolNames)) {
 			$base = ''
 			if ($toolTips.ContainsKey($vt)) { $base = [string]$toolTips[$vt] }
+			if ([string]::IsNullOrWhiteSpace($base)) { $base = Get-MBToolUserTipText -Name $vt }
 			if ([string]::IsNullOrWhiteSpace($base)) { $base = $vt }
-			$toolTips[$vt] = ("{0}`n`nUnavailable: current model does not support vision (no 'vision' in Abilities)." -f $base.TrimEnd())
+			$toolTips[$vt] = ("{0}`n`nUnavailable: the connected model cannot view images or the screen." -f $base.TrimEnd())
 		}
 	}
 
@@ -9387,23 +10131,27 @@ function Get-MBToolUiTips {
 		foreach ($gt in @(Get-MBGroupPolicyToolNames)) {
 			$base = ''
 			if ($toolTips.ContainsKey($gt)) { $base = [string]$toolTips[$gt] }
+			if ([string]::IsNullOrWhiteSpace($base)) { $base = Get-MBToolUserTipText -Name $gt }
 			if ([string]::IsNullOrWhiteSpace($base)) { $base = $gt }
 			$toolTips[$gt] = ("{0}`n`nUnavailable: {1}" -f $base.TrimEnd(), $why)
 		}
 	}
 
-	# RemoteCommand tooltip: name + WinRM how-to
-	$howTo = ''
-	try { $howTo = Get-MBRemoteCommandHowToText } catch { $howTo = '' }
+	# RemoteCommand: operator tip from map; append domain gate when off-domain
+	$onDomain = $true
+	try { $onDomain = [bool](Test-MBHostOnDomain) } catch { $onDomain = $true }
+	$domainWhy = ''
+	if (-not $onDomain) {
+		try { $domainWhy = Get-MBRemoteCommandUnavailableReason } catch { $domainWhy = 'This PC or user is not on a domain.' }
+	}
 	foreach ($rt in @(Get-MBRemoteCommandToolNames)) {
-		$base = $rt
-		try {
-			if ($toolTips.ContainsKey($rt)) {
-				$first = ([string]$toolTips[$rt] -split "`r?`n", 2)[0].Trim()
-				if ($first) { $base = $first }
-			}
-		} catch {}
-		$toolTips[$rt] = if ($howTo) { ("{0}`n`n{1}" -f $base, $howTo.TrimEnd()) } else { $base }
+		$base = Get-MBToolUserTipText -Name $rt
+		if ([string]::IsNullOrWhiteSpace($base)) { $base = $rt }
+		if (-not $onDomain -and $domainWhy) {
+			$toolTips[$rt] = ("{0}`n`nUnavailable: {1}" -f $base.TrimEnd(), $domainWhy.TrimEnd())
+		} else {
+			$toolTips[$rt] = $base
+		}
 	}
 
 	return @{
@@ -9481,14 +10229,17 @@ function Update-MBWpfToolGroupBar {
 		foreach ($rt in @(Get-MBRemoteCommandToolNames)) { $domainBlocked[$rt] = $true }
 	}
 
-	# Active chips first so they stay visible on the first wrap line
+	# Stable catalog order (core…web) so chips wrap evenly; active state is lime, not reordering
 	$displayOrder = New-Object System.Collections.ArrayList
 	foreach ($g in $order) {
-		if ($activeList -contains [string]$g) { [void]$displayOrder.Add([string]$g) }
-	}
-	foreach ($g in $order) {
 		$gs = [string]$g
-		if (-not ($displayOrder -contains $gs)) { [void]$displayOrder.Add($gs) }
+		if ($gs -and -not ($displayOrder -contains $gs)) { [void]$displayOrder.Add($gs) }
+	}
+	foreach ($g in @($activeList)) {
+		$gs = [string]$g
+		if ($gs -and -not ($displayOrder -contains $gs) -and $script:MBToolCatalog -and $script:MBToolCatalog.Contains($gs)) {
+			[void]$displayOrder.Add($gs)
+		}
 	}
 
 	# Installers chip: tools, then divider, then catalog package names
@@ -9557,27 +10308,33 @@ function Resolve-MBToolGroupName {
 	if ($script:MBToolCatalog -and $script:MBToolCatalog.Contains($g)) { return $g }
 
 	$aliases = @{
-		'vision' = 'senses'; 'image' = 'senses'; 'images' = 'senses'; 'img' = 'senses'
-		'pdf' = 'senses'; 'pdfs' = 'senses'; 'screen' = 'senses'; 'screenshot' = 'senses'
-		'viewscreen' = 'senses'; 'readimage' = 'senses'; 'readpdf' = 'senses'
-		'speech' = 'senses'; 'tts' = 'senses'; 'voice' = 'senses'; 'speak' = 'senses'; 'sapi' = 'senses'
-		'see' = 'senses'; 'hear' = 'senses'; 'sense' = 'senses'
+		'senses' = 'vision'; 'vision' = 'vision'; 'image' = 'vision'; 'images' = 'vision'; 'img' = 'vision'
+		'pdf' = 'vision'; 'pdfs' = 'vision'; 'screen' = 'vision'; 'screenshot' = 'vision'
+		'viewscreen' = 'vision'; 'readimage' = 'vision'; 'readpdf' = 'vision'
+		'see' = 'vision'; 'sense' = 'vision'
+		'sound' = 'sound'; 'audio' = 'sound'; 'speech' = 'sound'; 'tts' = 'sound'; 'voice' = 'sound'
+		'speak' = 'sound'; 'sapi' = 'sound'; 'hear' = 'sound'; 'volume' = 'sound'; 'mute' = 'sound'
+		'speaker' = 'sound'; 'speakers' = 'sound'
 		'sys' = 'system'; 'os' = 'system'; 'process' = 'system'; 'processes' = 'system'
 		'service' = 'system'; 'services' = 'system'; 'software' = 'system'; 'uptime' = 'system'
 		'inventory' = 'system'; 'memory' = 'system'; 'ram' = 'system'
+		'brightness' = 'system'; 'dim' = 'system'
 		'network' = 'network'; 'lan' = 'network'; 'scannetwork' = 'network'; 'ipscan' = 'network'; 'arpscan' = 'network'
 		'probeshares' = 'network'; 'findshares' = 'network'; 'smbscan' = 'network'
 		'findshare' = 'network'; 'find_share' = 'network'; 'locateshare' = 'network'
 		'port' = 'network'; 'ports' = 'network'; 'netstat' = 'network'
 		'localshares' = 'network'; 'mappeddrives' = 'network'; 'printers' = 'network'
 		'diag' = 'diag'; 'diagnostic' = 'diag'; 'diagnostics' = 'diag'; 'diagnose' = 'diag'
-		'forensic' = 'diag'; 'forensics' = 'diag'; 'investigate' = 'diag'
+		'forensic' = 'forensics'; 'forensics' = 'forensics'; 'binary' = 'forensics'; 'hex' = 'forensics'
+		'pe' = 'forensics'; 'disasm' = 'forensics'; 'hexview' = 'forensics'; 'hexedit' = 'forensics'
+		'hexsearch' = 'forensics'; 'strings' = 'forensics'; 'stringsscan' = 'forensics'
+		'investigate' = 'diag'
 		'bsod' = 'diag'; 'event' = 'diag'; 'events' = 'diag'; 'disk' = 'diag'
 		'startup' = 'diag'; 'scheduledtasks' = 'diag'; 'tasks' = 'diag'; 'driver' = 'diag'; 'drivers' = 'diag'
 		'stopprocess' = 'diag'; 'kill' = 'diag'; 'killprocess' = 'diag'; 'taskkill' = 'diag'
 		'fix' = 'repair'; 'dism' = 'repair'; 'sfc' = 'repair'; 'chkdsk' = 'repair'
 		'tune' = 'setup'; 'tuning' = 'setup'; 'newmachine' = 'setup'; 'newpc' = 'setup'
-		'desktop' = 'setup'; 'brightness' = 'setup'; 'volume' = 'setup'; 'audio' = 'setup'
+		'desktop' = 'setup'
 		'power' = 'setup'; 'uac' = 'setup'; 'restore' = 'setup'; 'uninstall' = 'setup'
 		'boot' = 'setup'; 'f8' = 'setup'; 'explorer' = 'setup'; 'reboot' = 'setup'; 'shutdown' = 'setup'
 		'domain' = 'identity'; 'joindomain' = 'identity'; 'leavedomain' = 'identity'; 'disjoin' = 'identity'; 'unjoin' = 'identity'
@@ -9596,6 +10353,9 @@ function Resolve-MBToolGroupName {
 		'psgallery' = 'packages'; 'psmodule' = 'packages'; 'psmodules' = 'packages'
 		'reg' = 'registry'; 'regs' = 'registry'
 		'clip' = 'clipboard'; 'paste' = 'clipboard'
+		'docs' = 'docs'; 'doc' = 'docs'; 'documentation' = 'docs'
+		'learn' = 'docs'; 'mslearn' = 'docs'; 'microsoft_learn' = 'docs'
+		'ss64' = 'docs'; 'ss_64' = 'docs'; 'cmdref' = 'docs'
 		'http' = 'web'; 'https' = 'web'; 'browse' = 'web'; 'browser' = 'web'
 		'github' = 'web'; 'url' = 'web'; 'www' = 'web'; 'fetch' = 'web'
 	}
@@ -9631,10 +10391,22 @@ function Resolve-MBToolName {
 		'search' = 'SearchFiles'; 'grep' = 'SearchFiles'; 'find' = 'FindFiles'
 		'hex' = 'HexView'; 'hexview' = 'HexView'; 'hex_view' = 'HexView'; 'hexdump' = 'HexView'
 		'hexedit' = 'HexEdit'; 'hex_edit' = 'HexEdit'; 'hexpatch' = 'HexEdit'
+		'hexsearch' = 'HexSearch'; 'hex_search' = 'HexSearch'; 'findhex' = 'HexSearch'; 'find_hex' = 'HexSearch'
+		'strings' = 'StringsScan'; 'strings_scan' = 'StringsScan'; 'stringscan' = 'StringsScan'
 		'screenshot' = 'ViewScreen'; 'screen' = 'ViewScreen'; 'capture' = 'ViewScreen'
 		'image' = 'ReadImage'; 'pdf' = 'ReadPdf'; 'read_pdf' = 'ReadPdf'; 'read_image' = 'ReadImage'
 		'http' = 'MakeHttpRequest'; 'fetch' = 'BrowsePage'; 'browse' = 'BrowsePage'
+		'search_web' = 'SearchWeb'; 'web_search' = 'SearchWeb'; 'searchweb' = 'SearchWeb'; 'duckduckgo' = 'SearchWeb'
+		'search_learn' = 'SearchMicrosoftLearn'; 'search_microsoft_learn' = 'SearchMicrosoftLearn'
+		'microsoft_learn' = 'SearchMicrosoftLearn'; 'ms_learn' = 'SearchMicrosoftLearn'
+		'read_learn' = 'ReadMicrosoftLearn'; 'read_microsoft_learn' = 'ReadMicrosoftLearn'
+		'search_ss64' = 'SearchSs64'; 'ss64_search' = 'SearchSs64'
+		'read_ss64' = 'ReadSs64'; 'ss64' = 'ReadSs64'
 		'download' = 'DownloadFile'; 'wget' = 'DownloadFile'; 'curl' = 'MakeHttpRequest'
+		'bulk_rename' = 'BulkRename'; 'bulkrename' = 'BulkRename'; 'rename_bulk' = 'BulkRename'
+		'rename_files' = 'BulkRename'; 'mass_rename' = 'BulkRename'; 'batch_rename' = 'BulkRename'
+		'find_duplicates' = 'FindDuplicates'; 'findduplicates' = 'FindDuplicates'; 'duplicates' = 'FindDuplicates'
+		'dupes' = 'FindDuplicates'; 'find_dupes' = 'FindDuplicates'; 'duplicate_files' = 'FindDuplicates'
 		'clipboard' = 'Clipboard'; 'clip' = 'Clipboard'
 		'registry' = 'ReadRegistry'; 'reg' = 'ReadRegistry'
 		'process' = 'GetProcessList'; 'processes' = 'GetProcessList'; 'ps' = 'GetProcessList'
@@ -9655,6 +10427,9 @@ function Resolve-MBToolName {
 		'list_maps' = 'GetMappedDrives'; 'get_mapped_drives' = 'GetMappedDrives'
 		'enable_tools' = 'EnableToolGroup'; 'enable_group' = 'EnableToolGroup'
 		'tools' = 'ListToolGroups'; 'list_tools' = 'ListToolGroups'
+		'taskboard' = 'TaskBoard'; 'task_board' = 'TaskBoard'; 'todo' = 'TaskBoard'
+		'todos' = 'TaskBoard'; 'todo_write' = 'TaskBoard'; 'task_plan' = 'TaskBoard'
+		'plan_tasks' = 'TaskBoard'; 'checklist' = 'TaskBoard'
 		'volume' = 'AudioVolume'; 'mute' = 'AudioVolume'; 'unmute' = 'AudioVolume'
 		'set_volume' = 'AudioVolume'; 'setvolume' = 'AudioVolume'; 'audio_volume' = 'AudioVolume'
 		'speaker' = 'AudioVolume'; 'speakers' = 'AudioVolume'; 'sound_level' = 'AudioVolume'
@@ -9726,7 +10501,7 @@ function Get-MBToolEnableHint {
 	if ($grp -eq 'core') {
 		return "missing_tool=$resolved group=core (should already be available). Call $resolved directly - do not use RunCommand."
 	}
-	return "Call EnableToolGroup using MAP (senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web) then the real tool name."
+	return "Call EnableToolGroup using MAP (vision|sound|forensics|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web) then the real tool name."
 }
 
 function Get-MBAbilityParts {
@@ -9850,7 +10625,7 @@ function Get-MBWindowsEditionSnapshot {
 
 function Test-MBWindowsHasLocalGroupPolicy {
 	# Pro and above (and Server) ship Local Group Policy / gpedit; Home/Core do not.
-	# UI paints GroupPolicy orange when this is false (same pattern as vision-blocked senses tools).
+	# UI paints GroupPolicy orange when this is false (same pattern as vision-blocked vision tools).
 	if ($null -ne $script:MB.HasLocalGroupPolicy) {
 		return [bool]$script:MB.HasLocalGroupPolicy
 	}
@@ -9910,11 +10685,13 @@ function Get-MBRemoteCommandToolNames {
 }
 
 function Get-MBRemoteCommandHowToText {
-	@(
-		'Remote target: Windows Remote Management must already be enabled and reachable (typical ports 5985 / 5986).'
-		'If ports are closed, enable remote management on that PC via Windows settings / domain policy / IT standard process, then allow the firewall for remote management. Do not use this tool to push remoting onto unmanaged machines.'
-		'Probe ports first; if closed, stop and tell the operator — do not thrash alternate probes.'
-	) -join "`n"
+	# Operator-facing summary (tool chip uses MBToolUserTips; kept for any external callers).
+	$body = ''
+	try { $body = Get-MBToolUserTipBody -Name 'RemoteCommand' } catch { $body = '' }
+	if ([string]::IsNullOrWhiteSpace($body)) {
+		$body = 'Run a command on another Windows PC over WinRM (ports 5985/5986). Needs domain PC + domain user.'
+	}
+	return $body
 }
 
 function Test-MBToolNeedsDomainMembership {
@@ -10043,14 +10820,14 @@ function Get-MBActiveToolNames {
 	}
 	[void]$toAdd.Add('EnableToolGroup')
 	[void]$toAdd.Add('ListToolGroups')
-	# When senses is enabled, always push vision tools into the LIVE API schema so the model
+	# When vision group is enabled, always push vision tools into the LIVE API schema so the model
 	# can call them same-turn. Runtime still soft-fails if the model lacks vision ability.
-	$sensesOn = ($groups -contains 'senses' -or $groups -contains 'full' -or $groups -contains 'all')
+	$visionOn = ($groups -contains 'vision' -or $groups -contains 'senses' -or $groups -contains 'full' -or $groups -contains 'all')
 	$hasVision = $false
 	try { $hasVision = [bool](Test-MBModelHasVision) } catch { $hasVision = $false }
 	foreach ($n in @($toAdd)) {
 		if ([string]::IsNullOrWhiteSpace($n)) { continue }
-		if (-not $hasVision -and -not $sensesOn -and (Test-MBToolNeedsVision -Name $n)) { continue }
+		if (-not $hasVision -and -not $visionOn -and (Test-MBToolNeedsVision -Name $n)) { continue }
 		$map[$n.ToLowerInvariant()] = $n
 	}
 	return @($map.Values)
@@ -10140,7 +10917,7 @@ function Enable-MBToolGroup {
 	$tokens = @(Get-MBEnableToolGroupTokens -Group $Group -groups $groups)
 	if ($tokens.Count -eq 0) {
 		$map = ($script:MBGroupQuickMap.Keys | ForEach-Object { "$_=$($script:MBGroupQuickMap[$_])" }) -join '; '
-		return "ERROR: group or groups required. One or many: group=network,shares or groups=[network,shares]. Known: senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full. MAP: $map"
+		return "ERROR: group or groups required. One or many: group=network,shares or groups=[network,shares]. Known: vision|sound|forensics|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full. MAP: $map"
 	}
 
 	# Resolve each token -> group name (or tool-name alias)
@@ -10175,7 +10952,7 @@ function Enable-MBToolGroup {
 		}
 		$known = @($script:MBToolCatalog.Keys) -join ', '
 		$bad = if ($unknown.Count -gt 0) { $unknown -join ', ' } else { ($tokens -join ', ') }
-		return "ERROR: Unknown group(s) '$bad'. Known: $known, full. Or pass a tool name (e.g. ReadPdf -> senses)."
+		return "ERROR: Unknown group(s) '$bad'. Known: $known, full. Or pass a tool name (e.g. ReadPdf -> vision)."
 	}
 
 	# full/all wins
@@ -10184,7 +10961,7 @@ function Enable-MBToolGroup {
 		if ($g -in @('all', 'full')) { $wantFull = $true; break }
 	}
 	if ($wantFull) {
-		foreach ($name in @('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web')) {
+		foreach ($name in @(Get-MBToolGroupOrder)) {
 			if (-not ($script:MB.ActiveToolGroups -contains $name)) {
 				[void]$script:MB.ActiveToolGroups.Add($name)
 			}
@@ -10291,7 +11068,7 @@ function Get-MBToolGroupsStatus {
 		activeToolCount = $nActive
 		activeTools   = @((Get-MBActiveToolNames | Sort-Object))
 		groups        = $groups
-		hint          = "EnableToolGroup group=network,shares or groups=[diag,repair] (multi ok) | senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full - enable all needed in one call"
+		hint          = "EnableToolGroup group=network,shares or groups=[diag,repair] (multi ok) | vision|sound|forensics|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full - enable all needed in one call"
 	}) -Depth 6
 }
 
@@ -10342,10 +11119,10 @@ function Get-MBReadFileMediaBlockMessage {
 	$k = ([string]$Kind).ToLowerInvariant()
 	$e = ([string]$Ext).ToLowerInvariant()
 	if ($k -eq 'image' -or $e -in @('.png','.jpg','.jpeg','.gif','.bmp','.ico','.webp','.tif','.tiff','.heic','.heif','.jfif')) {
-		return "BLOCKED: Never use ReadFile on images (crashes / corrupts context). For model vision: EnableToolGroup group=senses then ReadImage path=... . To show the operator the file in chat: ![label](path). Do not dump binary as text."
+		return "BLOCKED: Never use ReadFile on images (crashes / corrupts context). For model vision: EnableToolGroup group=vision then ReadImage path=... . To show the operator the file in chat: ![label](path). Do not dump binary as text."
 	}
 	if ($k -eq 'pdf' -or $e -eq '.pdf') {
-		return "BLOCKED: Never use ReadFile on PDFs. EnableToolGroup group=senses then ReadPdf path=... (page=1 first). Do not dump binary as text."
+		return "BLOCKED: Never use ReadFile on PDFs. EnableToolGroup group=vision then ReadPdf path=... (page=1 first). Do not dump binary as text."
 	}
 	if ($k -eq 'video' -or $e -in @('.mp4','.m4v','.mov','.avi','.mkv','.wmv','.webm')) {
 		return "BLOCKED: Never use ReadFile on video. Show/play INLINE with ![label](absolute-path) in chat (required). Default app only if format is not inline-compatible. Do not dump binary as text."
@@ -10407,18 +11184,21 @@ function Invoke-ReadFile {
 
 	try {
 		# prefer UTF-8 over ANSI when high-bit characters present
+		$result = $null
 		if ($tail -gt 0) {
-			return Limit-MBResult ((Get-Content -LiteralPath $path -Tail $tail -Encoding UTF8 -ErrorAction Stop | Out-String))
+			$result = Limit-MBResult ((Get-Content -LiteralPath $path -Tail $tail -Encoding UTF8 -ErrorAction Stop | Out-String))
 		}
 		elseif ($head -gt 0) {
-			return Limit-MBResult ((Get-Content -LiteralPath $path -TotalCount $head -Encoding UTF8 -ErrorAction Stop | Out-String))
+			$result = Limit-MBResult ((Get-Content -LiteralPath $path -TotalCount $head -Encoding UTF8 -ErrorAction Stop | Out-String))
 		}
 		elseif (($offset -gt 0) -and ($length -gt 0)) {
-			return Limit-MBResult ((Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | Select-Object -Skip ($offset - 1) -First $length | Out-String))
+			$result = Limit-MBResult ((Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | Select-Object -Skip ($offset - 1) -First $length | Out-String))
 		}
 		else {
-			return Limit-MBResult ((Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop))
+			$result = Limit-MBResult ((Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop))
 		}
+		try { Register-MBFileRead -Path $path } catch {}
+		return $result
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -10510,42 +11290,624 @@ function Write-MBTextFile {
 	[System.IO.File]::WriteAllText($Path, $payload, $enc)
 }
 
+function Backup-MBFile {
+	# Copy existing file to path.bak (overwrite). Returns bak path or $null if skipped/missing.
+	param(
+		[Parameter(Mandatory)][string]$Path,
+		[bool]$Enabled = $true
+	)
+	if (-not $Enabled) { return $null }
+	if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+	$bak = $Path + '.bak'
+	try {
+		[System.IO.File]::Copy($Path, $bak, $true)
+		return $bak
+	} catch {
+		throw "Backup failed ($bak): $($_.Exception.Message)"
+	}
+}
+
+function Register-MBFileRead {
+	param([string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return }
+	try {
+		$full = $Path
+		try { $full = [System.IO.Path]::GetFullPath($Path) } catch { $full = $Path }
+		$key = $full.ToLowerInvariant()
+		if ($null -eq $script:MB.RecentFileReads) {
+			$script:MB.RecentFileReads = @{}
+		}
+		$script:MB.RecentFileReads[$key] = [datetime]::UtcNow.Ticks
+		try { Register-MBPathPin -Path $full -Action 'read' } catch {}
+		# Cap map size (keep newest 48)
+		if ($script:MB.RecentFileReads.Count -gt 64) {
+			$ordered = @($script:MB.RecentFileReads.GetEnumerator() | Sort-Object { $_.Value } -Descending)
+			$keep = @{}
+			$n = 0
+			foreach ($e in $ordered) {
+				if ($n -ge 48) { break }
+				$keep[$e.Key] = $e.Value
+				$n++
+			}
+			$script:MB.RecentFileReads = $keep
+		}
+	} catch {}
+}
+
+function Test-MBFileRecentlyRead {
+	param(
+		[string]$Path,
+		[int]$WithinMinutes = 45
+	)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+	try {
+		if ($null -eq $script:MB.RecentFileReads -or $script:MB.RecentFileReads.Count -eq 0) { return $false }
+		$full = $Path
+		try { $full = [System.IO.Path]::GetFullPath($Path) } catch { $full = $Path }
+		$key = $full.ToLowerInvariant()
+		if (-not $script:MB.RecentFileReads.ContainsKey($key)) { return $false }
+		$ticks = [int64]$script:MB.RecentFileReads[$key]
+		$age = [datetime]::UtcNow - [datetime]::new($ticks, [System.DateTimeKind]::Utc)
+		return ($age.TotalMinutes -le [math]::Max(1, $WithinMinutes))
+	} catch {
+		return $false
+	}
+}
+
+function Get-MBReadBeforeEditNudge {
+	param([string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+	if (Test-MBFileRecentlyRead -Path $Path) { return '' }
+	return "NOTE: File not ReadFile'd recently this session — prefer ReadFile first to ground the edit. (Soft nudge; not blocked.)"
+}
+
+function Format-MBDiffLineClip {
+	param([string]$Line, [int]$MaxLen = 200)
+	$s = [string]$Line
+	if ($null -eq $s) { $s = '' }
+	if ($s.Length -gt $MaxLen) { return $s.Substring(0, $MaxLen - 3) + '...' }
+	return $s
+}
+
+function Get-MBLineDiffOpsIndexAligned {
+	# Fast fallback when LCS would be too expensive
+	param([string[]]$OldLines, [string[]]$NewLines)
+	$ops = New-Object System.Collections.Generic.List[object]
+	$max = [math]::Max($OldLines.Count, $NewLines.Count)
+	$oi = 0; $ni = 0
+	for ($i = 0; $i -lt $max; $i++) {
+		$l = if ($i -lt $OldLines.Count) { $OldLines[$i] } else { $null }
+		$r = if ($i -lt $NewLines.Count) { $NewLines[$i] } else { $null }
+		if ($null -ne $l -and $null -ne $r -and ($l -ceq $r)) {
+			[void]$ops.Add([pscustomobject]@{ Op = 'eq'; Text = $l; OldNo = ($i + 1); NewNo = ($i + 1) })
+		} else {
+			if ($null -ne $l) {
+				[void]$ops.Add([pscustomobject]@{ Op = 'del'; Text = $l; OldNo = ($i + 1); NewNo = 0 })
+			}
+			if ($null -ne $r) {
+				[void]$ops.Add([pscustomobject]@{ Op = 'ins'; Text = $r; OldNo = 0; NewNo = ($i + 1) })
+			}
+		}
+	}
+	return $ops
+}
+
+function Get-MBLineDiffOpsLcs {
+	# Classic LCS DP + backtrack. Caller must cap sizes.
+	param([string[]]$OldLines, [string[]]$NewLines)
+	$n = $OldLines.Count
+	$m = $NewLines.Count
+	if ($n -eq 0 -and $m -eq 0) {
+		return (New-Object System.Collections.Generic.List[object])
+	}
+	if ($n -eq 0) {
+		$ops = New-Object System.Collections.Generic.List[object]
+		for ($j = 0; $j -lt $m; $j++) {
+			[void]$ops.Add([pscustomobject]@{ Op = 'ins'; Text = $NewLines[$j]; OldNo = 0; NewNo = ($j + 1) })
+		}
+		return $ops
+	}
+	if ($m -eq 0) {
+		$ops = New-Object System.Collections.Generic.List[object]
+		for ($i = 0; $i -lt $n; $i++) {
+			[void]$ops.Add([pscustomobject]@{ Op = 'del'; Text = $OldLines[$i]; OldNo = ($i + 1); NewNo = 0 })
+		}
+		return $ops
+	}
+
+	$dp = New-Object 'int[,]' ($n + 1), ($m + 1)
+	for ($i = 1; $i -le $n; $i++) {
+		$oi = $OldLines[$i - 1]
+		for ($j = 1; $j -le $m; $j++) {
+			if ($oi -ceq $NewLines[$j - 1]) {
+				$dp[$i, $j] = $dp[($i - 1), ($j - 1)] + 1
+			} else {
+				$up = $dp[($i - 1), $j]
+				$left = $dp[$i, ($j - 1)]
+				$dp[$i, $j] = if ($up -ge $left) { $up } else { $left }
+			}
+		}
+	}
+
+	$rev = New-Object System.Collections.Generic.List[object]
+	$i = $n; $j = $m
+	while ($i -gt 0 -or $j -gt 0) {
+		if ($i -gt 0 -and $j -gt 0 -and ($OldLines[$i - 1] -ceq $NewLines[$j - 1])) {
+			[void]$rev.Add([pscustomobject]@{ Op = 'eq'; Text = $OldLines[$i - 1]; OldNo = $i; NewNo = $j })
+			$i--; $j--
+		}
+		elseif ($j -gt 0 -and ($i -eq 0 -or $dp[$i, ($j - 1)] -ge $dp[($i - 1), $j])) {
+			[void]$rev.Add([pscustomobject]@{ Op = 'ins'; Text = $NewLines[$j - 1]; OldNo = 0; NewNo = $j })
+			$j--
+		}
+		else {
+			[void]$rev.Add([pscustomobject]@{ Op = 'del'; Text = $OldLines[$i - 1]; OldNo = $i; NewNo = 0 })
+			$i--
+		}
+	}
+	$ops = New-Object System.Collections.Generic.List[object]
+	for ($k = $rev.Count - 1; $k -ge 0; $k--) {
+		[void]$ops.Add($rev[$k])
+	}
+	return $ops
+}
+
+function Get-MBLineDiffOps {
+	param(
+		[string[]]$OldLines,
+		[string[]]$NewLines,
+		[int]$MaxLcsLines = 700,
+		[long]$MaxLcsCells = 250000
+	)
+	$n = $OldLines.Count
+	$m = $NewLines.Count
+	# Strip common prefix/suffix to shrink LCS window
+	$pre = 0
+	while ($pre -lt $n -and $pre -lt $m -and ($OldLines[$pre] -ceq $NewLines[$pre])) { $pre++ }
+	$suf = 0
+	while ($suf -lt ($n - $pre) -and $suf -lt ($m - $pre) -and ($OldLines[$n - 1 - $suf] -ceq $NewLines[$m - 1 - $suf])) { $suf++ }
+
+	$ops = New-Object System.Collections.Generic.List[object]
+	for ($i = 0; $i -lt $pre; $i++) {
+		[void]$ops.Add([pscustomobject]@{ Op = 'eq'; Text = $OldLines[$i]; OldNo = ($i + 1); NewNo = ($i + 1) })
+	}
+
+	$midOldN = $n - $pre - $suf
+	$midNewN = $m - $pre - $suf
+	if ($midOldN -gt 0 -or $midNewN -gt 0) {
+		$midOld = if ($midOldN -gt 0) { $OldLines[$pre..($pre + $midOldN - 1)] } else { @() }
+		$midNew = if ($midNewN -gt 0) { $NewLines[$pre..($pre + $midNewN - 1)] } else { @() }
+		$useLcs = ($midOldN -le $MaxLcsLines) -and ($midNewN -le $MaxLcsLines) -and (([long]$midOldN * [long]$midNewN) -le $MaxLcsCells)
+		$midOps = if ($useLcs) {
+			Get-MBLineDiffOpsLcs -OldLines @($midOld) -NewLines @($midNew)
+		} else {
+			Get-MBLineDiffOpsIndexAligned -OldLines @($midOld) -NewLines @($midNew)
+		}
+		# Mid ops use 1-based indices within the mid slice; shift to full-file line numbers
+		foreach ($op in $midOps) {
+			if ($op.Op -eq 'eq') {
+				$oNo = $pre + [int]$op.OldNo
+				$nNo = $pre + [int]$op.NewNo
+			} elseif ($op.Op -eq 'del') {
+				$oNo = $pre + [int]$op.OldNo
+				$nNo = 0
+			} else {
+				$oNo = 0
+				$nNo = $pre + [int]$op.NewNo
+			}
+			[void]$ops.Add([pscustomobject]@{ Op = $op.Op; Text = $op.Text; OldNo = $oNo; NewNo = $nNo })
+		}
+		$script:__mbDiffUsedLcs = [bool]$useLcs
+	} else {
+		$script:__mbDiffUsedLcs = $true
+	}
+
+	for ($s = 0; $s -lt $suf; $s++) {
+		$oi = $n - $suf + $s
+		$ni = $m - $suf + $s
+		[void]$ops.Add([pscustomobject]@{ Op = 'eq'; Text = $OldLines[$oi]; OldNo = ($oi + 1); NewNo = ($ni + 1) })
+	}
+	return $ops
+}
+
 function Get-MBLineDiffPreview {
+	# Unified LCS (or capped fallback) line diff for previews and DiffText.
 	param(
 		[string]$OldText,
 		[string]$NewText,
-		[int]$MaxLines = 28
+		[int]$MaxLines = 28,
+		[int]$Context = 3,
+		[int]$LineClip = 200
 	)
+	if ($null -eq $OldText) { $OldText = '' }
+	if ($null -eq $NewText) { $NewText = '' }
 	$oldLines = @([string]$OldText -split "`r?`n", -1)
 	$newLines = @([string]$NewText -split "`r?`n", -1)
-	$max = [math]::Max($oldLines.Count, $newLines.Count)
-	$out = New-Object System.Collections.Generic.List[string]
-	$diffs = 0
-	for ($i = 0; $i -lt $max; $i++) {
-		$l = if ($i -lt $oldLines.Count) { $oldLines[$i] } else { $null }
-		$r = if ($i -lt $newLines.Count) { $newLines[$i] } else { $null }
-		if ($l -ceq $r) { continue }
-		$diffs++
-		$n = $i + 1
-		if ($null -ne $l) {
-			$ls = [string]$l
-			if ($ls.Length -gt 160) { $ls = $ls.Substring(0, 157) + '...' }
-			[void]$out.Add("- ${n}: $ls")
+	# Empty-string split yields one empty element — treat pure empty as zero lines when both empty
+	if ($OldText -eq '' -and $oldLines.Count -eq 1 -and $oldLines[0] -eq '') { $oldLines = @() }
+	if ($NewText -eq '' -and $newLines.Count -eq 1 -and $newLines[0] -eq '') { $newLines = @() }
+
+	$script:__mbDiffUsedLcs = $true
+	$ops = @(Get-MBLineDiffOps -OldLines $oldLines -NewLines $newLines)
+	$added = 0; $removed = 0; $same = 0
+	foreach ($op in $ops) {
+		switch ($op.Op) {
+			'ins' { $added++ }
+			'del' { $removed++ }
+			default { $same++ }
 		}
-		if ($null -ne $r) {
-			$rs = [string]$r
-			if ($rs.Length -gt 160) { $rs = $rs.Substring(0, 157) + '...' }
-			[void]$out.Add("+ ${n}: $rs")
+	}
+	$lineDiffs = $added + $removed
+	if ($lineDiffs -eq 0 -and $OldText -ceq $NewText) {
+		return @{
+			Preview   = '(identical)'
+			LineDiffs = 0
+			Added     = 0
+			Removed   = 0
+			Mode      = 'lcs'
+			Unified   = '(identical)'
+			DiffRows  = @()
+			Summary   = '+0 -0'
 		}
+	}
+
+	# Build change-index mask for hunk grouping
+	$isChange = New-Object bool[] $ops.Count
+	for ($i = 0; $i -lt $ops.Count; $i++) {
+		$isChange[$i] = ($ops[$i].Op -ne 'eq')
+	}
+	$ctx = [math]::Max(0, [math]::Min(12, $Context))
+	# Use ArrayList (not List[T]) — PS 5.1 sometimes throws "Argument types do not match"
+	# when packing Generic.List[object] of PSCustomObjects into a returned hashtable.
+	$out = New-Object System.Collections.ArrayList
+	$rows = New-Object System.Collections.ArrayList
+	$truncated = $false
+	$i = 0
+	while ($i -lt $ops.Count) {
+		if (-not $isChange[$i]) { $i++; continue }
+		# expand hunk with context
+		$start = [math]::Max(0, $i - $ctx)
+		$end = $i
+		while ($end -lt $ops.Count) {
+			if ($isChange[$end]) {
+				$end++
+				continue
+			}
+			# look ahead for next change within 2*ctx
+			$nextCh = -1
+			$lookTo = [math]::Min($ops.Count - 1, $end + (2 * $ctx))
+			for ($k = $end; $k -le $lookTo; $k++) {
+				if ($isChange[$k]) { $nextCh = $k; break }
+			}
+			if ($nextCh -ge 0) {
+				$end = $nextCh + 1
+			} else {
+				$end = [math]::Min($ops.Count, $end + $ctx)
+				break
+			}
+		}
+		# hunk header from first non-eq in range for line numbers
+		$oldStart = 0; $newStart = 0
+		$oldCount = 0; $newCount = 0
+		for ($k = $start; $k -lt $end; $k++) {
+			$op = $ops[$k]
+			if ($op.Op -eq 'eq') {
+				if ($oldStart -eq 0 -and $op.OldNo -gt 0) { $oldStart = [int]$op.OldNo }
+				if ($newStart -eq 0 -and $op.NewNo -gt 0) { $newStart = [int]$op.NewNo }
+				$oldCount++; $newCount++
+			} elseif ($op.Op -eq 'del') {
+				if ($oldStart -eq 0) { $oldStart = [int]$op.OldNo }
+				$oldCount++
+			} else {
+				if ($newStart -eq 0) { $newStart = [int]$op.NewNo }
+				$newCount++
+			}
+		}
+		if ($oldStart -eq 0) { $oldStart = 1 }
+		if ($newStart -eq 0) { $newStart = 1 }
 		if ($out.Count -ge $MaxLines) {
-			[void]$out.Add('... preview truncated ...')
+			$truncated = $true
 			break
 		}
+		$hunkTxt = ('@@ -{0},{1} +{2},{3} @@' -f $oldStart, $oldCount, $newStart, $newCount)
+		[void]$out.Add($hunkTxt)
+		try {
+			[void]$rows.Add(@{
+				Tag = 'hunk'
+				OldNo = [int]$oldStart
+				NewNo = [int]$newStart
+				Text = [string]$hunkTxt
+			})
+		} catch {}
+		for ($k = $start; $k -lt $end; $k++) {
+			if ($out.Count -ge $MaxLines) {
+				$truncated = $true
+				break
+			}
+			$op = $ops[$k]
+			$txt = Format-MBDiffLineClip -Line ([string]$op.Text) -MaxLen $LineClip
+			$tag = 'eq'
+			switch ($op.Op) {
+				'eq'  { [void]$out.Add(' ' + $txt); $tag = 'eq' }
+				'del' { [void]$out.Add('-' + $txt); $tag = 'del' }
+				'ins' { [void]$out.Add('+' + $txt); $tag = 'ins' }
+			}
+			$oNo = 0
+			$nNo = 0
+			try { if ($null -ne $op.OldNo) { $oNo = [int]$op.OldNo } } catch { $oNo = 0 }
+			try { if ($null -ne $op.NewNo) { $nNo = [int]$op.NewNo } } catch { $nNo = 0 }
+			try {
+				[void]$rows.Add(@{
+					Tag = [string]$tag
+					OldNo = $oNo
+					NewNo = $nNo
+					Text = [string]$txt
+				})
+			} catch {}
+		}
+		if ($truncated) { break }
+		$i = $end
 	}
-	return @{
-		Preview   = $(if ($out.Count -gt 0) { $out -join "`n" } else { '(no line-level diff; content length changed only)' })
-		LineDiffs = $diffs
+
+	if ($out.Count -eq 0) {
+		# Content differs only by newline style or empty edge cases
+		[void]$out.Add('(no line-level op stream; lengths or EOL may differ)')
+		[void]$out.Add(('- old chars: {0}' -f $OldText.Length))
+		[void]$out.Add(('+ new chars: {0}' -f $NewText.Length))
+		try {
+			[void]$rows.Add(@{ Tag = 'meta'; OldNo = 0; NewNo = 0; Text = '(no line-level op stream; lengths or EOL may differ)' })
+			[void]$rows.Add(@{ Tag = 'del'; OldNo = 0; NewNo = 0; Text = ('old chars: {0}' -f $OldText.Length) })
+			[void]$rows.Add(@{ Tag = 'ins'; OldNo = 0; NewNo = 0; Text = ('new chars: {0}' -f $NewText.Length) })
+		} catch {}
 	}
+	if ($truncated) {
+		[void]$out.Add('... diff truncated ...')
+		try { [void]$rows.Add(@{ Tag = 'meta'; OldNo = 0; NewNo = 0; Text = '... diff truncated ...' }) } catch {}
+	}
+	$mode = if ($script:__mbDiffUsedLcs) { 'lcs' } else { 'aligned-fallback' }
+	$summary = "+$added -$removed (mode=$mode)"
+	$unified = ($out.ToArray() -join "`n")
+	# Build result as plain Hashtable with only simple types (PS 5.1 safe across splat/return)
+	$result = New-Object System.Collections.Hashtable
+	$result['Preview'] = [string]$unified
+	$result['Unified'] = [string]$unified
+	$result['LineDiffs'] = [int]$lineDiffs
+	$result['Added'] = [int]$added
+	$result['Removed'] = [int]$removed
+	$result['Mode'] = [string]$mode
+	$result['Summary'] = [string]$summary
+	# Copy rows to Object[] of Hashtables — avoid Generic.List / PSCustomObject packing issues
+	try {
+		$rowArr = New-Object System.Collections.ArrayList
+		foreach ($r in @($rows)) {
+			if ($null -eq $r) { continue }
+			if ($r -is [hashtable]) {
+				[void]$rowArr.Add($r)
+			} else {
+				[void]$rowArr.Add(@{
+					Tag = [string](Get-MBProp $r 'Tag' 'eq')
+					OldNo = [int](Get-MBProp $r 'OldNo' 0)
+					NewNo = [int](Get-MBProp $r 'NewNo' 0)
+					Text = [string](Get-MBProp $r 'Text' '')
+				})
+			}
+		}
+		$result['DiffRows'] = @($rowArr.ToArray())
+	} catch {
+		$result['DiffRows'] = @()
+	}
+	return $result
+}
+
+function Write-MBDiffInline {
+	# Operator chat: Grok Build–style diff card (line nums + red/green band bg). Model still gets plain tool return.
+	param(
+		[string]$Title = '',
+		[string]$DiffText = '',
+		[string]$Summary = '',
+		[int]$MaxLines = 120,
+		$Rows = $null
+	)
+	$rowList = New-Object System.Collections.ArrayList
+	if ($null -ne $Rows) {
+		foreach ($r in @($Rows)) {
+			if ($null -eq $r) { continue }
+			# Normalize to plain hashtable (WPF queue + PS 5.1 safe)
+			try {
+				if ($r -is [hashtable]) {
+					[void]$rowList.Add(@{
+						Tag = [string]$(if ($r['Tag']) { $r['Tag'] } else { 'eq' })
+						OldNo = [int]$(if ($null -ne $r['OldNo']) { $r['OldNo'] } else { 0 })
+						NewNo = [int]$(if ($null -ne $r['NewNo']) { $r['NewNo'] } else { 0 })
+						Text = [string]$(if ($null -ne $r['Text']) { $r['Text'] } else { '' })
+					})
+				} else {
+					[void]$rowList.Add(@{
+						Tag = [string](Get-MBProp $r 'Tag' 'eq')
+						OldNo = [int](Get-MBProp $r 'OldNo' 0)
+						NewNo = [int](Get-MBProp $r 'NewNo' 0)
+						Text = [string](Get-MBProp $r 'Text' '')
+					})
+				}
+			} catch {
+				try { [void]$rowList.Add(@{ Tag = 'eq'; OldNo = 0; NewNo = 0; Text = [string]$r }) } catch {}
+			}
+		}
+	}
+	# Fallback: parse unified text into rows (no reliable line numbers)
+	if ($rowList.Count -eq 0) {
+		if ([string]::IsNullOrWhiteSpace($DiffText)) { return }
+		$raw = ([string]$DiffText) -replace "`r`n", "`n" -replace "`r", "`n"
+		if ($raw -match '^\(identical\)$') { return }
+		foreach ($ln in @($raw -split "`n", -1)) {
+			$s = [string]$ln
+			if ($s.StartsWith('+++') -or $s.StartsWith('---')) {
+				[void]$rowList.Add([pscustomobject]@{ Tag = 'meta'; OldNo = 0; NewNo = 0; Text = $s })
+			} elseif ($s.StartsWith('@@')) {
+				[void]$rowList.Add([pscustomobject]@{ Tag = 'hunk'; OldNo = 0; NewNo = 0; Text = $s })
+			} elseif ($s.StartsWith('+')) {
+				$t = if ($s.Length -gt 1) { $s.Substring(1) } else { '' }
+				[void]$rowList.Add([pscustomobject]@{ Tag = 'ins'; OldNo = 0; NewNo = 0; Text = $t })
+			} elseif ($s.StartsWith('-')) {
+				$t = if ($s.Length -gt 1) { $s.Substring(1) } else { '' }
+				[void]$rowList.Add([pscustomobject]@{ Tag = 'del'; OldNo = 0; NewNo = 0; Text = $t })
+			} elseif ($s.StartsWith('...')) {
+				[void]$rowList.Add([pscustomobject]@{ Tag = 'meta'; OldNo = 0; NewNo = 0; Text = $s })
+			} elseif ($s.StartsWith(' ')) {
+				$t = if ($s.Length -gt 1) { $s.Substring(1) } else { '' }
+				[void]$rowList.Add([pscustomobject]@{ Tag = 'eq'; OldNo = 0; NewNo = 0; Text = $t })
+			} else {
+				[void]$rowList.Add([pscustomobject]@{ Tag = 'eq'; OldNo = 0; NewNo = 0; Text = $s })
+			}
+		}
+	}
+	if ($rowList.Count -eq 0) { return }
+	if ($MaxLines -le 0) { $MaxLines = 120 }
+	if ($MaxLines -gt 400) { $MaxLines = 400 }
+	$trunc = $false
+	if ($rowList.Count -gt $MaxLines) {
+		$tmpRows = New-Object System.Collections.ArrayList
+		$take = 0
+		foreach ($x in @($rowList)) {
+			if ($take -ge $MaxLines) { break }
+			[void]$tmpRows.Add($x)
+			$take++
+		}
+		$rowList = $tmpRows
+		$trunc = $true
+		[void]$rowList.Add([pscustomobject]@{ Tag = 'meta'; OldNo = 0; NewNo = 0; Text = '... diff truncated ...' })
+	}
+
+	# TokyoNight-aligned bands from Grok Build (xai-grok-pager tokyonight theme)
+	# diff_delete_bg rgb(85,15,20)  diff_insert_bg rgb(15,65,20)
+	try {
+		if (Test-MBWpfActive) {
+			if (-not $script:MB.Wpf.WriteQueue) {
+				$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+			}
+			# Serialize rows as simple hashtables for the STA bag
+			$payloadRows = New-Object System.Collections.ArrayList
+			foreach ($r in @($rowList)) {
+				$tag = 'eq'
+				$txt = ''
+				$o = 0
+				$n = 0
+				try {
+					if ($r -is [hashtable]) {
+						if ($r.ContainsKey('Tag') -and $r['Tag']) { $tag = [string]$r['Tag'] }
+						if ($r.ContainsKey('Text') -and $null -ne $r['Text']) { $txt = [string]$r['Text'] }
+						if ($r.ContainsKey('OldNo') -and $null -ne $r['OldNo']) { $o = [int]$r['OldNo'] }
+						if ($r.ContainsKey('NewNo') -and $null -ne $r['NewNo']) { $n = [int]$r['NewNo'] }
+					} else {
+						$tag = [string](Get-MBProp $r 'Tag' 'eq')
+						$txt = [string](Get-MBProp $r 'Text' '')
+						$o = [int](Get-MBProp $r 'OldNo' 0)
+						$n = [int](Get-MBProp $r 'NewNo' 0)
+					}
+				} catch {}
+				try { $txt = ConvertTo-MBWpfSafeText -Text $txt } catch {}
+				if ($txt.Length -gt 500) { $txt = $txt.Substring(0, 497) + '...' }
+				[void]$payloadRows.Add(@{
+					Tag = [string]$tag
+					Text = [string]$txt
+					OldNo = [int]$o
+					NewNo = [int]$n
+				})
+			}
+			# Use plain Hashtable payload (not PSCustomObject) for STA queue compatibility
+			$safeTitle = [string]$Title
+			$safeSum = [string]$Summary
+			try { $safeTitle = ConvertTo-MBWpfSafeText -Text $safeTitle } catch {}
+			try { $safeSum = ConvertTo-MBWpfSafeText -Text $safeSum } catch {}
+			$payload = New-Object System.Collections.Hashtable
+			$payload['Kind'] = 'diff-block'
+			$payload['Title'] = $safeTitle
+			$payload['Summary'] = $safeSum
+			$payload['Rows'] = @($payloadRows.ToArray())
+			$payload['Brand'] = $(try { [string]$AgentName } catch { 'MiniBot' })
+			$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]$payload)
+			return
+		}
+	} catch {}
+
+	# Console fallback (ANSI-ish via colors; no true bg on classic host)
+	try {
+		Write-Host ''
+		if (-not [string]::IsNullOrWhiteSpace($Title)) {
+			$tShow = [string]$Title
+			try { $tShow = ConvertTo-MBWpfSafeText -Text $tShow } catch {}
+			Write-Host ("  {0}" -f $tShow) -ForegroundColor Cyan
+		}
+		if (-not [string]::IsNullOrWhiteSpace($Summary)) {
+			$sShow = [string]$Summary.Trim()
+			try { $sShow = ConvertTo-MBWpfSafeText -Text $sShow } catch {}
+			Write-Host ("  {0}" -f $sShow) -ForegroundColor DarkGray
+		}
+		foreach ($r in @($rowList)) {
+			$tag = 'eq'
+			$txt = ''
+			$oN = 0
+			$nN = 0
+			try {
+				if ($r -is [hashtable]) {
+					$tag = [string]$(if ($r['Tag']) { $r['Tag'] } else { 'eq' })
+					$txt = [string]$(if ($null -ne $r['Text']) { $r['Text'] } else { '' })
+					if ($null -ne $r['OldNo']) { $oN = [int]$r['OldNo'] }
+					if ($null -ne $r['NewNo']) { $nN = [int]$r['NewNo'] }
+				} else {
+					$tag = [string](Get-MBProp $r 'Tag' 'eq')
+					$txt = [string](Get-MBProp $r 'Text' '')
+					$oN = [int](Get-MBProp $r 'OldNo' 0)
+					$nN = [int](Get-MBProp $r 'NewNo' 0)
+				}
+			} catch {}
+			if ($txt.Length -gt 500) { $txt = $txt.Substring(0, 497) + '...' }
+			$num = ''
+			if ($tag -eq 'del') { $num = if ($oN -gt 0) { '{0,4}' -f $oN } else { '    ' } }
+			elseif ($tag -eq 'ins') { $num = if ($nN -gt 0) { '{0,4}' -f $nN } else { '    ' } }
+			elseif ($tag -eq 'eq') {
+				$nn = if ($nN -gt 0) { $nN } elseif ($oN -gt 0) { $oN } else { 0 }
+				$num = if ($nn -gt 0) { '{0,4}' -f $nn } else { '    ' }
+			} else { $num = '    ' }
+			$col = [ConsoleColor]::DarkGray
+			$mark = ' '
+			if ($tag -eq 'del') { $col = [ConsoleColor]::Red; $mark = '-' }
+			elseif ($tag -eq 'ins') { $col = [ConsoleColor]::Green; $mark = '+' }
+			elseif ($tag -eq 'hunk' -or $tag -eq 'meta') { $col = [ConsoleColor]::DarkYellow; $mark = ' ' }
+			Write-Host ("  {0} {1} {2}" -f $num, $mark, $txt) -ForegroundColor $col
+		}
+		if ($trunc) { Write-Host '  ... diff truncated ...' -ForegroundColor DarkGray }
+		Write-Host ''
+	} catch {}
+}
+
+function Write-MBHexDiffInline {
+	# Before/after hex (or disasm) as Grok-style red/green band rows for HexEdit.
+	param(
+		[string]$Title = 'HexEdit',
+		[string]$Before = '',
+		[string]$After = '',
+		[string]$Summary = '',
+		[int]$MaxLines = 40
+	)
+	$bb = ([string]$Before) -replace "`r`n", "`n" -replace "`r", "`n"
+	$aa = ([string]$After) -replace "`r`n", "`n" -replace "`r", "`n"
+	if ([string]::IsNullOrWhiteSpace($bb) -and [string]::IsNullOrWhiteSpace($aa)) { return }
+	$rows = New-Object System.Collections.ArrayList
+	if (-not [string]::IsNullOrWhiteSpace($bb)) {
+		[void]$rows.Add([pscustomobject]@{ Tag = 'meta'; OldNo = 0; NewNo = 0; Text = '--- before' })
+		foreach ($ln in @($bb -split "`n", -1)) {
+			[void]$rows.Add([pscustomobject]@{ Tag = 'del'; OldNo = 0; NewNo = 0; Text = $ln })
+		}
+	}
+	if (-not [string]::IsNullOrWhiteSpace($aa)) {
+		[void]$rows.Add([pscustomobject]@{ Tag = 'meta'; OldNo = 0; NewNo = 0; Text = '+++ after' })
+		foreach ($ln in @($aa -split "`n", -1)) {
+			[void]$rows.Add([pscustomobject]@{ Tag = 'ins'; OldNo = 0; NewNo = 0; Text = $ln })
+		}
+	}
+	Write-MBDiffInline -Title $Title -Summary $Summary -Rows @($rows) -MaxLines $MaxLines
 }
 
 function Find-MBSearchNearMiss {
@@ -10784,37 +12146,93 @@ function Get-MBEditPreview {
 	$result.Mode = $op.Mode
 	if ($result.Error) { return $result }
 
-	$diff = Get-MBLineDiffPreview -OldText $Content -NewText $result.NewContent
-	$result.Preview = $diff.Preview
-	$result.LineDiffs = $diff.LineDiffs
+	try {
+		$diff = Get-MBLineDiffPreview -OldText $Content -NewText $result.NewContent
+		$result.Preview = [string](Get-MBProp $diff 'Preview' '')
+		$result.LineDiffs = [int](Get-MBProp $diff 'LineDiffs' 0)
+	} catch {
+		$result.Preview = '(diff preview unavailable)'
+		$result.LineDiffs = 0
+	}
 	return $result
 }
 
 function Invoke-WriteFile {
-	param([string]$path, [string]$content)
+	param(
+		[string]$path,
+		[string]$content,
+		[bool]$backup = $true
+	)
 	$path = Resolve-MBPath $path
 	$bytes = [System.Text.Encoding]::UTF8.GetByteCount([string]$content)
 	$exists = Test-Path -LiteralPath $path
 	$action = if ($exists) { 'OVERWRITE' } else { 'CREATE' }
-	if (-not (Request-Confirmation -Title "WriteFile requires approval" -Details "${action}:`n`n  $path`n`nBytes: $bytes")) {
+	$nudge = if ($exists) { Get-MBReadBeforeEditNudge -Path $path } else { '' }
+	$diffNote = ''
+	if ($exists) {
+		try {
+			$prevPeek = Read-MBTextFile -Path $path
+			$pd = Get-MBLineDiffPreview -OldText ([string]$prevPeek.Text) -NewText ([string]$content) -MaxLines 24 -Context 2
+			$diffNote = "`nDiff ($($pd.Summary)):`n$($pd.Preview)"
+		} catch { $diffNote = '' }
+	}
+	$details = "${action}:  $path`nBytes: $bytes  |  Backup (.bak): $(if ($exists) { $backup } else { 'n/a (create)' })"
+	if ($nudge) { $details += "`n$nudge" }
+	# Content / diff go in the code box (not grey console dump)
+	$codeBody = [string]$content
+	$codeLang = 'text'
+	try {
+		if ($path -match '\.(ps1|psd1|psm1)$') { $codeLang = 'ps' }
+		elseif ($path -match '\.(js|ts|jsx|tsx)$') { $codeLang = 'js' }
+		elseif ($path -match '\.(py)$') { $codeLang = 'py' }
+		elseif ($path -match '\.(json)$') { $codeLang = 'json' }
+		elseif ($path -match '\.(xml|xaml|html|htm|csproj|config)$') { $codeLang = 'xml' }
+		elseif ($path -match '\.(cs)$') { $codeLang = 'cs' }
+		elseif ($path -match '\.(bat|cmd)$') { $codeLang = 'bat' }
+		elseif ($path -match '\.(md|markdown)$') { $codeLang = 'md' }
+	} catch {}
+	if ($diffNote -and $exists) {
+		# Prefer unified diff in the box when overwriting (meta only above)
+		try {
+			$codeBody = ([string]$diffNote).TrimStart("`n")
+			if ($codeBody -match '(?s)^Diff \(([^)]+)\):\s*(.*)$') {
+				$details += ("`nDiff: {0}" -f [string]$Matches[1])
+				$codeBody = [string]$Matches[2]
+			}
+			$codeLang = 'diff'
+		} catch {}
+	} else {
+		# Cap huge writes for the approval preview
+		if ($codeBody.Length -gt 12000) {
+			$codeBody = $codeBody.Substring(0, 11997) + '...'
+		}
+	}
+	if (-not (Request-Confirmation -Title "WriteFile requires approval" -Details $details -Code $codeBody -CodeLang $codeLang)) {
 		return "BLOCKED BY USER: File write denied by operator."
 	}
 	try {
 		$enc = 'utf8'
 		$nl = 'LF'
+		$bakPath = $null
 		if ($exists) {
 			try {
 				$prev = Read-MBTextFile -Path $path
 				$enc = $prev.Encoding
 				$nl = $prev.Newline
 			} catch {}
+			if ($backup) {
+				$bakPath = Backup-MBFile -Path $path -Enabled $true
+			}
 		} else {
 			# New files: UTF-8 no BOM; Windows newlines for scripts
 			if ($path -match '\.(ps1|bat|cmd|vbs|reg|ini|psd1|psm1)$') { $nl = 'CRLF' }
 		}
 		Write-MBTextFile -Path $path -Text ([string]$content) -Encoding $enc -Newline $nl
-		if ($script:MB.AutoApprove) { return "SUCCESS (auto-approved): Written $path ($action, enc=$enc, nl=$nl)" }
-		return "SUCCESS: Written $path ($action, enc=$enc, nl=$nl)"
+		try { Register-MBFileRead -Path $path } catch {}
+		$bakNote = if ($bakPath) { ", bak=$bakPath" } else { '' }
+		$nudgeNote = if ($nudge) { " [$nudge]" } else { '' }
+		if ($script:MB.AutoApprove) { return "SUCCESS (auto-approved): Written $path ($action, enc=$enc, nl=$nl$bakNote)$nudgeNote" }
+		return "SUCCESS: Written $path ($action, enc=$enc, nl=$nl$bakNote)$nudgeNote"
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -10828,6 +12246,7 @@ function Invoke-EditFile {
 		[bool]$useRegex = $false,
 		[bool]$replaceAll = $false,
 		[int]$occurrence = 0,
+		[bool]$backup = $true,
 		$edits = $null
 	)
 	$path = Resolve-MBPath $path
@@ -10838,6 +12257,7 @@ function Invoke-EditFile {
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
+	$nudge = Get-MBReadBeforeEditNudge -Path $path
 
 	$editList = New-Object System.Collections.Generic.List[object]
 	if ($null -ne $edits) {
@@ -10894,7 +12314,7 @@ function Invoke-EditFile {
 		$sShow = $sLF; if ($sShow.Length -gt 220) { $sShow = $sShow.Substring(0, 217) + '...' }
 		$rShow = $rLF; if ($rShow.Length -gt 220) { $rShow = $rShow.Substring(0, 217) + '...' }
 		[void]$previews.Add(@"
---- edit #$step ($($preview.Mode), matches=$($preview.Count), line deltas≈$($preview.LineDiffs)) ---
+--- edit #$step ($($preview.Mode), matches=$($preview.Count), line deltas~$($preview.LineDiffs)) ---
 Search:
 $sShow
 Replace:
@@ -10908,25 +12328,48 @@ $($preview.Preview)
 		return "ERROR: Edit produced no content change (search matched but replacement is identical)."
 	}
 
-	$overall = Get-MBLineDiffPreview -OldText $contentLF -NewText $working -MaxLines 36
+	$overall = Get-MBLineDiffPreview -OldText $contentLF -NewText $working -MaxLines 48 -Context 3
+	$nudgeBlock = if ($nudge) { "`n$nudge`n" } else { '' }
 	$details = @"
 File: $path
 Encoding: $($file.Encoding)  |  Newlines: $($file.Newline)  |  Hunks: $($editList.Count)
-Total matches applied: $totalMatches  |  Modes: $($modes -join ', ')
-Line deltas (approx): $($overall.LineDiffs)
-
+Total matches: $totalMatches  |  Modes: $($modes -join ', ')  |  Diff: $($overall.Summary)  |  Backup (.bak): $backup
+$nudgeBlock
+"@.Trim()
+	$codeBody = @"
 $($previews -join "`n`n")
 
-Overall diff sample:
+Overall unified diff:
 $($overall.Preview)
-"@
-	if (-not (Request-Confirmation -Title "EditFile requires approval" -Details $details)) {
+"@.Trim()
+	if (-not (Request-Confirmation -Title "EditFile requires approval" -Details $details -Code $codeBody -CodeLang 'diff')) {
 		return "BLOCKED BY USER: Edit denied by operator."
 	}
 	try {
+		$bakPath = $null
+		if ($backup) {
+			$bakPath = Backup-MBFile -Path $path -Enabled $true
+		}
 		Write-MBTextFile -Path $path -Text $working -Encoding $file.Encoding -Newline $file.Newline
+		try { Register-MBFileRead -Path $path } catch {}
 		$auto = if ($script:MB.AutoApprove) { ' (auto-approved)' } else { '' }
-		return "SUCCESS${auto}: Edit applied to $path (hunks=$($editList.Count), matches=$totalMatches, enc=$($file.Encoding), nl=$($file.Newline))"
+		$bakNote = if ($bakPath) { ", bak=$bakPath" } else { '' }
+		$nudgeNote = if ($nudge) { " [$nudge]" } else { '' }
+		try {
+			$diffBody = @"
+--- a/$path
++++ b/$path
+$(Get-MBProp $overall 'Preview' '')
+"@
+			$dr = $null
+			try { $dr = Get-MBProp $overall 'DiffRows' $null } catch { $dr = $null }
+			$editTitle = ('EditFile  {0}' -f $path)
+			try { $editTitle = ConvertTo-MBWpfSafeText -Text $editTitle } catch {}
+			Write-MBDiffInline -Title $editTitle -DiffText $diffBody `
+				-Summary ([string](Get-MBProp $overall 'Summary' '')) -Rows $dr -MaxLines 100
+		} catch {}
+		$sumNote = [string](Get-MBProp $overall 'Summary' '')
+		return "SUCCESS${auto}: Edit applied to $path (hunks=$($editList.Count), matches=$totalMatches, enc=$($file.Encoding), nl=$($file.Newline), $sumNote$bakNote)$nudgeNote"
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -10935,7 +12378,8 @@ $($overall.Preview)
 function Invoke-ApplyPatch {
 	param(
 		[Parameter(Mandatory)][string]$patch,
-		[string]$path = ''
+		[string]$path = '',
+		[bool]$backup = $true
 	)
 	if ([string]::IsNullOrWhiteSpace($patch)) {
 		return "ERROR: Empty patch"
@@ -10947,6 +12391,7 @@ function Invoke-ApplyPatch {
 	$files = New-Object System.Collections.Generic.List[object]
 	$curPath = if ($path) { Resolve-MBPath $path } else { $null }
 	$curHunks = New-Object System.Collections.Generic.List[object]
+	$curIsNew = $false
 	$oldBuf = $null
 	$newBuf = $null
 	$inHunk = $false
@@ -10959,12 +12404,13 @@ function Invoke-ApplyPatch {
 		[void]$Hunks.Add([pscustomobject]@{ Old = $o; New = $n })
 	}
 	$flushFile = {
-		param($Files, [string]$P, $Hunks)
+		param($Files, [string]$P, $Hunks, [bool]$IsNew)
 		if ([string]::IsNullOrWhiteSpace($P)) { return }
 		if ($Hunks.Count -eq 0) { return }
 		[void]$Files.Add([pscustomobject]@{
 			Path  = $P
 			Hunks = @($Hunks.ToArray())
+			IsNew = [bool]$IsNew
 		})
 		$Hunks.Clear()
 	}
@@ -10972,13 +12418,14 @@ function Invoke-ApplyPatch {
 	foreach ($raw in $lines) {
 		$line = [string]$raw
 
-		if ($line -match '^\*\*\*\s+Update File:\s*(.+)\s*$') {
+		if ($line -match '^\*\*\*\s+(?:Update|Add)\s+File:\s*(.+)\s*$') {
 			if ($inHunk) {
 				& $flushHunk $curHunks $oldBuf $newBuf
 				$inHunk = $false; $oldBuf = $null; $newBuf = $null
 			}
-			& $flushFile $files $curPath $curHunks
+			& $flushFile $files $curPath $curHunks $curIsNew
 			$curPath = Resolve-MBPath $matches[1].Trim()
+			$curIsNew = ($line -match '^\*\*\*\s+Add\s+File:')
 			continue
 		}
 		if ($line -match '^\*\*\*\s+Begin Patch' -or $line -match '^\*\*\*\s+End Patch') { continue }
@@ -10990,7 +12437,9 @@ function Invoke-ApplyPatch {
 			}
 			$p = ($line.Substring(3)).Trim() -replace '\t.*$',''
 			if ($p.StartsWith('a/') -or $p.StartsWith('b/')) { $p = $p.Substring(2) }
-			if ($p -ne '/dev/null' -and $p -ne 'nul' -and -not [string]::IsNullOrWhiteSpace($p)) {
+			if ($p -eq '/dev/null' -or $p -eq 'nul' -or $p -eq 'NUL') {
+				$curIsNew = $true
+			} elseif (-not [string]::IsNullOrWhiteSpace($p)) {
 				if (-not $curPath) { $curPath = Resolve-MBPath $p }
 			}
 			continue
@@ -10998,14 +12447,17 @@ function Invoke-ApplyPatch {
 		if ($line -match '^\+\+\+\s+') {
 			$p = ($line.Substring(3)).Trim() -replace '\t.*$',''
 			if ($p.StartsWith('a/') -or $p.StartsWith('b/')) { $p = $p.Substring(2) }
-			if ($p -ne '/dev/null' -and $p -ne 'nul' -and -not [string]::IsNullOrWhiteSpace($p)) {
+			if ($p -eq '/dev/null' -or $p -eq 'nul' -or $p -eq 'NUL') {
+				# delete-file patches not supported; leave path as-is
+			} elseif (-not [string]::IsNullOrWhiteSpace($p)) {
 				if ($inHunk) {
 					& $flushHunk $curHunks $oldBuf $newBuf
 					$inHunk = $false; $oldBuf = $null; $newBuf = $null
 				}
 				$resolved = Resolve-MBPath $p
 				if ($curPath -and $curHunks.Count -gt 0 -and ($resolved -ne $curPath)) {
-					& $flushFile $files $curPath $curHunks
+					& $flushFile $files $curPath $curHunks $curIsNew
+					$curIsNew = $false
 				}
 				$curPath = $resolved
 			}
@@ -11054,7 +12506,7 @@ function Invoke-ApplyPatch {
 		}
 	}
 	if ($inHunk) { & $flushHunk $curHunks $oldBuf $newBuf }
-	& $flushFile $files $curPath $curHunks
+	& $flushFile $files $curPath $curHunks $curIsNew
 
 	if ($files.Count -eq 0) {
 		return @"
@@ -11066,8 +12518,15 @@ Use unified diff:
    context
   -old
   +new
+Create new file:
+  --- /dev/null
+  +++ b/path
+  @@
+  +line1
+  +line2
 Or:
   *** Update File: path
+  *** Add File: path
   @@
    context
   -old
@@ -11079,31 +12538,85 @@ Or:
 	$previewBlocks = New-Object System.Collections.Generic.List[string]
 	foreach ($f in $files) {
 		$fp = [string]$f.Path
-		if (-not (Test-Path -LiteralPath $fp)) {
-			return "ERROR: Patch target not found: $fp (ApplyPatch updates existing files; use WriteFile to create)."
+		$exists = Test-Path -LiteralPath $fp -PathType Leaf
+		$wantCreate = [bool]$f.IsNew -or (-not $exists)
+
+		if (-not $exists) {
+			# New-file path: every hunk must be pure addition (empty old side)
+			$work = ''
+			$hNum = 0
+			foreach ($h in @($f.Hunks)) {
+				$hNum++
+				$oldArr = @($h.Old)
+				$newArr = @($h.New)
+				# Allow empty old (create); reject if old-side text present
+				$oldText = ($oldArr -join "`n")
+				if ($oldText.Length -gt 0) {
+					return "ERROR: $fp does not exist and hunk #$hNum has old-side text. Use --- /dev/null or *** Add File for create, or WriteFile. Old side must be empty for new files."
+				}
+				$chunk = ($newArr -join "`n")
+				if ($work.Length -gt 0 -and $chunk.Length -gt 0) {
+					$work = $work + "`n" + $chunk
+				} else {
+					$work = $work + $chunk
+				}
+			}
+			$enc = 'utf8'
+			$nl = 'LF'
+			if ($fp -match '\.(ps1|bat|cmd|vbs|reg|ini|psd1|psm1)$') { $nl = 'CRLF' }
+			$diff = Get-MBLineDiffPreview -OldText '' -NewText $work -MaxLines 40 -Context 2
+			$nudge = ''
+			[void]$plan.Add([pscustomobject]@{
+				Path      = $fp
+				Encoding  = $enc
+				Newline   = $nl
+				NewText   = $work
+				Hunks     = $hNum
+				Preview   = $diff.Preview
+				LineDiffs = $diff.LineDiffs
+				Summary   = $diff.Summary
+				IsNew     = $true
+				Nudge     = $nudge
+			})
+			[void]$previewBlocks.Add("CREATE: $fp (hunks=$hNum, $($diff.Summary), enc=$enc)`n$($diff.Preview)")
+			continue
 		}
+
+		if ($wantCreate -and $exists) {
+			# Marked as add but file exists — treat as update if old sides present; else refuse clobber
+			$allEmptyOld = $true
+			foreach ($h in @($f.Hunks)) {
+				$ot = (@($h.Old) -join "`n")
+				if ($ot.Length -gt 0) { $allEmptyOld = $false; break }
+			}
+			if ($allEmptyOld) {
+				return "ERROR: $fp already exists; refuse pure-create patch clobber. Use EditFile/Update File hunks with context, or WriteFile to overwrite."
+			}
+		}
+
 		try {
 			$st = Read-MBTextFile -Path $fp
 		} catch {
 			return "ERROR: Cannot read $fp : $($_.Exception.Message)"
 		}
+		$nudge = Get-MBReadBeforeEditNudge -Path $fp
 		$work = ([string]$st.Text) -replace "`r`n", "`n" -replace "`r", "`n"
 		$hNum = 0
 		foreach ($h in @($f.Hunks)) {
 			$hNum++
 			$oldText = (@($h.Old) -join "`n")
 			$newText = (@($h.New) -join "`n")
+			if ($oldText.Length -eq 0) {
+				return "ERROR: $fp hunk #$hNum has empty old side (include context lines). For new files use --- /dev/null or *** Add File."
+			}
 			$positions = @(Find-MBLiteralMatches -Content $work -Search $oldText)
-			if ($positions.Count -eq 0 -and $oldText.Length -gt 0) {
+			if ($positions.Count -eq 0) {
 				$oldTrim = $oldText -replace "`n$", ''
 				$positions = @(Find-MBLiteralMatches -Content $work -Search $oldTrim)
 				if ($positions.Count -gt 0) {
 					$oldText = $oldTrim
 					$newText = $newText -replace "`n$", ''
 				}
-			}
-			if ($oldText.Length -eq 0) {
-				return "ERROR: $fp hunk #$hNum has empty old side (include context lines)."
 			}
 			if ($positions.Count -eq 0) {
 				$hint = Find-MBSearchNearMiss -Content $work -Search $oldText
@@ -11117,7 +12630,7 @@ Or:
 			$work = $work.Remove($pos, $oldText.Length).Insert($pos, $newText)
 		}
 		$origLF = ([string]$st.Text) -replace "`r`n", "`n" -replace "`r", "`n"
-		$diff = Get-MBLineDiffPreview -OldText $origLF -NewText $work
+		$diff = Get-MBLineDiffPreview -OldText $origLF -NewText $work -MaxLines 40 -Context 3
 		[void]$plan.Add([pscustomobject]@{
 			Path      = $fp
 			Encoding  = $st.Encoding
@@ -11126,20 +12639,32 @@ Or:
 			Hunks     = $hNum
 			Preview   = $diff.Preview
 			LineDiffs = $diff.LineDiffs
+			Summary   = $diff.Summary
+			IsNew     = $false
+			Nudge     = $nudge
 		})
-		[void]$previewBlocks.Add("File: $fp (hunks=$hNum, line deltas≈$($diff.LineDiffs), enc=$($st.Encoding))`n$($diff.Preview)")
+		$nudgeLine = if ($nudge) { "`n$nudge" } else { '' }
+		[void]$previewBlocks.Add("UPDATE: $fp (hunks=$hNum, $($diff.Summary), enc=$($st.Encoding), bak=$backup)$nudgeLine`n$($diff.Preview)")
 	}
 
-	$details = "ApplyPatch - $($plan.Count) file(s)`n`n" + ($previewBlocks -join "`n`n")
-	if (-not (Request-Confirmation -Title "ApplyPatch requires approval" -Details $details)) {
+	$details = "ApplyPatch - $($plan.Count) file(s)  |  Backup (.bak) on existing: $backup"
+	$codeBody = ($previewBlocks -join "`n`n")
+	if (-not (Request-Confirmation -Title "ApplyPatch requires approval" -Details $details -Code $codeBody -CodeLang 'diff')) {
 		return "BLOCKED BY USER: Patch denied by operator."
 	}
 
 	$ok = New-Object System.Collections.Generic.List[string]
 	foreach ($p in $plan) {
 		try {
+			$bakPath = $null
+			if (-not $p.IsNew -and $backup) {
+				$bakPath = Backup-MBFile -Path $p.Path -Enabled $true
+			}
 			Write-MBTextFile -Path $p.Path -Text $p.NewText -Encoding $p.Encoding -Newline $p.Newline
-			[void]$ok.Add("$($p.Path) (hunks=$($p.Hunks))")
+			try { Register-MBFileRead -Path $p.Path } catch {}
+			$tag = if ($p.IsNew) { 'CREATE' } else { 'UPDATE' }
+			$bakNote = if ($bakPath) { ", bak=$bakPath" } else { '' }
+			[void]$ok.Add("$tag $($p.Path) (hunks=$($p.Hunks)$bakNote)")
 		} catch {
 			return "ERROR: Failed writing $($p.Path): $($_.Exception.Message). Already wrote: $($ok -join '; ')"
 		}
@@ -12720,12 +14245,12 @@ function Invoke-RunCommand {
 	$timeoutMs = if ($timeout_sec -gt 0) { $timeout_sec * 1000 } else { $CommandTimeoutSec * 1000 }
 	$wd = $script:MB.WorkingDir
 
-	# OS UX knobs: never shell/COM — specialized tools are always preferred (volume is CORE).
+	# OS UX knobs: never shell/COM — specialized tools preferred.
 	$cmdStr = [string]$command
 	if ($cmdStr -match '(?i)(AudioEndpointVolume|IAudioEndpointVolume|MMDeviceEnumerator|EndpointVolume|nircmd.*(mute|volume)|Set-AudioDevice|AudioDeviceCmdlets|\(New-Object\s+-[Mm]om\s+WScript\.Shell\).*(SendKeys|\{VOLUME)|keybd_event.*VOLUME)') {
 		return (
 			"REDIRECTED: Do not use RunCommand for volume/mute (COM/WASAPI/nircmd/SendKeys).`n" +
-			"missing_tool=AudioVolume group=system. Call EnableToolGroup group=system then AudioVolume (same turn).`n" +
+			"missing_tool=AudioVolume group=sound. Call EnableToolGroup group=sound then AudioVolume (same turn).`n" +
 			"AudioVolume action=get|set|mute|unmute; level=0-100 for set. Example: action=set level=40"
 		)
 	}
@@ -12766,6 +14291,45 @@ function Invoke-RunCommand {
 				"Play/show: ![label](absolute-path) INLINE. Default app only as last resort (incompatible format or explicit external player)."
 			)
 		}
+	}
+
+	# Bulk rename shells: steer to BulkRename (RunCommand only after that tool fails).
+	$bulkRenameShell = $false
+	if ($cmdStr -match '(?i)\bRename-Item\b') {
+		if ($cmdStr -match '(?i)(ForEach-Object|foreach\s*\(|% \{|\|\s*%|Get-ChildItem|\bgci\b|\bdir\b|-NewName\s*\{|-replace\b)') {
+			$bulkRenameShell = $true
+		}
+	}
+	if ($cmdStr -match '(?i)\bren\b.+\*' -or $cmdStr -match '(?i)\bren\s+".*\*"' -or $cmdStr -match '(?i)Move-Item.+\|\s*(ForEach|%)') {
+		$bulkRenameShell = $true
+	}
+	if ($bulkRenameShell) {
+		return (
+			"REDIRECTED: Do not bulk-rename via RunCommand first.`n" +
+			"missing_tool=BulkRename group=files. Call EnableToolGroup group=files then BulkRename (same turn).`n" +
+			"BulkRename path= folder; glob= optional; find=+replace= or template= (e.g. photo_{n:03}{ext}); dry_run=true first then dry_run=false to apply.`n" +
+			"Use RunCommand for rename only if BulkRename errors/fails after you tried it."
+		)
+	}
+
+	# Duplicate-file shells: steer to FindDuplicates (RunCommand only after that tool fails).
+	$dupeShell = $false
+	if ($cmdStr -match '(?i)\bGet-FileHash\b' -and $cmdStr -match '(?i)(Group-Object|GroupBy|duplicate|hashtable|\.Hash)') {
+		$dupeShell = $true
+	}
+	if ($cmdStr -match '(?i)Group-Object\s+(-Property\s+)?(Length|Hash|HashString)' -and $cmdStr -match '(?i)(Get-ChildItem|gci|Get-FileHash|FullName)') {
+		$dupeShell = $true
+	}
+	if ($cmdStr -match '(?i)(fdupes|jdupes|dupeGuru|find.*duplicate|duplicate.*file)') {
+		$dupeShell = $true
+	}
+	if ($dupeShell) {
+		return (
+			"REDIRECTED: Do not scan for content duplicates via RunCommand first.`n" +
+			"missing_tool=FindDuplicates group=files. Call EnableToolGroup group=files then FindDuplicates (same turn).`n" +
+			"FindDuplicates path= root; optional glob=/min_bytes=/recursive=. Size then SHA256; read-only.`n" +
+			"Use RunCommand for dupe hunt only if FindDuplicates errors/fails after you tried it."
+		)
 	}
 
 	# Never interpolate $command into expandable strings (eats $_, $$, `" , etc. in the parent).
@@ -13566,43 +15130,78 @@ function Invoke-DiffText {
 		[string]$left,
 		[string]$right,
 		[bool]$leftIsFile = $false,
-		[bool]$rightIsFile = $false
+		[bool]$rightIsFile = $false,
+		[int]$context = 3,
+		[int]$maxLines = 200
 	)
 	try {
+		$leftLabel = 'left'
+		$rightLabel = 'right'
+		$leftLeaf = 'left'
+		$rightLeaf = 'right'
 		if ($leftIsFile) {
 			$lp = Resolve-MBPath $left
+			$leftLabel = $lp
+			try { $leftLeaf = [System.IO.Path]::GetFileName($lp) } catch { $leftLeaf = $lp }
+			if ([string]::IsNullOrWhiteSpace($leftLeaf)) { $leftLeaf = $lp }
 			$left = [System.IO.File]::ReadAllText($lp)
+			try { Register-MBFileRead -Path $lp } catch {}
+		} else {
+			# Inline text — short preview for the card title
+			$snip = ([string]$left) -replace '[\r\n]+', ' '
+			if ($snip.Length -gt 28) { $snip = $snip.Substring(0, 25) + '...' }
+			if ([string]::IsNullOrWhiteSpace($snip)) { $snip = '(empty)' }
+			$leftLeaf = ('"{0}"' -f $snip)
+			$leftLabel = 'left (text)'
 		}
 		if ($rightIsFile) {
 			$rp = Resolve-MBPath $right
+			$rightLabel = $rp
+			try { $rightLeaf = [System.IO.Path]::GetFileName($rp) } catch { $rightLeaf = $rp }
+			if ([string]::IsNullOrWhiteSpace($rightLeaf)) { $rightLeaf = $rp }
 			$right = [System.IO.File]::ReadAllText($rp)
+			try { Register-MBFileRead -Path $rp } catch {}
+		} else {
+			$snip = ([string]$right) -replace '[\r\n]+', ' '
+			if ($snip.Length -gt 28) { $snip = $snip.Substring(0, 25) + '...' }
+			if ([string]::IsNullOrWhiteSpace($snip)) { $snip = '(empty)' }
+			$rightLeaf = ('"{0}"' -f $snip)
+			$rightLabel = 'right (text)'
 		}
-		$lLines = ($left -split "`r?`n", -1)
-		$rLines = ($right -split "`r?`n", -1)
-		$max = [math]::Max($lLines.Count, $rLines.Count)
-		$out = New-Object System.Collections.Generic.List[string]
-		$diffs = 0
-		for ($i = 0; $i -lt $max; $i++) {
-			$l = if ($i -lt $lLines.Count) { $lLines[$i] } else { $null }
-			$r = if ($i -lt $rLines.Count) { $rLines[$i] } else { $null }
-			$n = $i + 1
-			if ($l -ceq $r) { continue }
-			$diffs++
-			if ($null -ne $l -and $null -ne $r) {
-				$out.Add("- ${n}: $l")
-				$out.Add("+ ${n}: $r")
-			} elseif ($null -ne $l) {
-				$out.Add("- ${n}: $l")
-			} else {
-				$out.Add("+ ${n}: $r")
-			}
-			if ($out.Count -ge 200) {
-				$out.Add("... diff truncated ...")
-				break
-			}
+		if ($maxLines -le 0) { $maxLines = 200 }
+		if ($maxLines -gt 2000) { $maxLines = 2000 }
+		if ($context -lt 0) { $context = 0 }
+		if ($context -gt 12) { $context = 12 }
+		$diff = Get-MBLineDiffPreview -OldText ([string]$left) -NewText ([string]$right) -MaxLines $maxLines -Context $context -LineClip 240
+		if ([int]$diff.LineDiffs -eq 0 -and [string]$diff.Preview -eq '(identical)') {
+			return "No differences."
 		}
-		if ($diffs -eq 0) { return "No differences." }
-		return Limit-MBResult (("Diff lines changed (approx): $diffs`n" + ($out -join "`n")))
+		$header = @"
+--- $leftLabel
++++ $rightLabel
+Summary: $($diff.Summary)
+"@
+		$body = $header + "`n" + [string]$diff.Preview
+		# Card title: file names (or short text previews) — runtime arrow (no source-literal mojibake)
+		$cardTitle = ('DiffText  {0}' -f (Format-MBTitleSep -Left $leftLeaf -Right $rightLeaf))
+		$sumBits = New-Object System.Collections.ArrayList
+		try {
+			$ds = [string](Get-MBProp $diff 'Summary' '')
+			if (-not [string]::IsNullOrWhiteSpace($ds)) { [void]$sumBits.Add($ds.Trim()) }
+		} catch {}
+		# Full paths under the title when either side is a file (leaf already in title)
+		if ($leftIsFile -or $rightIsFile) {
+			[void]$sumBits.Add((Format-MBTitleSep -Left $leftLabel -Right $rightLabel))
+		}
+		$dot = try { [string](Get-MBGlyph 'dot') } catch { '|' }
+		$cardSum = ($sumBits -join ("  {0}  " -f $dot))
+		try {
+			$dr = $null
+			try { $dr = Get-MBProp $diff 'DiffRows' $null } catch { $dr = $null }
+			Write-MBDiffInline -Title $cardTitle -DiffText $body -Summary $cardSum `
+				-Rows $dr -MaxLines ([Math]::Min(160, [Math]::Max(40, $maxLines)))
+		} catch {}
+		return Limit-MBResult $body
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -18767,6 +20366,444 @@ function Invoke-ExpandCab {
 	}
 }
 
+function Invoke-BulkRename {
+	param(
+		[string]$path,
+		[string]$directory = '',
+		[string]$glob = '*',
+		[bool]$recursive = $false,
+		[string]$find = '',
+		[string]$replace = '',
+		[bool]$use_regex = $false,
+		[string]$template = '',
+		[int]$start_index = 1,
+		[bool]$dry_run = $true,
+		[int]$max = 200,
+		[bool]$force = $false
+	)
+	if ([string]::IsNullOrWhiteSpace($path) -and -not [string]::IsNullOrWhiteSpace($directory)) {
+		$path = $directory
+	}
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required (folder to rename inside)." }
+
+	$root = Resolve-MBPath $path
+	if (-not (Test-Path -LiteralPath $root)) { return "ERROR: path not found: $root" }
+	if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+		return "ERROR: path must be a folder: $root"
+	}
+
+	if ($max -le 0) { $max = 200 }
+	if ($max -gt 1000) { $max = 1000 }
+	if ($start_index -lt 0) { $start_index = 0 }
+	if ([string]::IsNullOrWhiteSpace($glob)) { $glob = '*' }
+
+	$hasFind = -not [string]::IsNullOrEmpty($find)
+	$hasTemplate = -not [string]::IsNullOrWhiteSpace($template)
+	if (-not $hasFind -and -not $hasTemplate) {
+		return "ERROR: provide find=+replace= (optional use_regex) or template= (e.g. photo_{n:03}{ext})."
+	}
+	if ($hasFind -and $hasTemplate) {
+		return "ERROR: use either find/replace or template, not both."
+	}
+	if ($null -eq $replace) { $replace = '' }
+
+	$patterns = @(Convert-MBFindFilePatterns -glob $glob)
+	if ($patterns.Count -eq 0) { $patterns = @('*') }
+
+	try {
+		$gci = @{
+			LiteralPath = $root
+			File        = $true
+			ErrorAction = 'SilentlyContinue'
+			Force       = $true
+		}
+		if ($recursive) { $gci['Recurse'] = $true }
+		$useNativeFilter = ($patterns.Count -eq 1 -and $patterns[0] -ne '*' -and $patterns[0] -notmatch '[\\/]')
+		if ($useNativeFilter) { $gci['Filter'] = $patterns[0] }
+		$files = @(Get-ChildItem @gci | Sort-Object FullName)
+		if (-not $useNativeFilter -or $patterns[0] -eq '*') {
+			if ($patterns.Count -gt 1 -or $patterns[0] -ne '*') {
+				$files = @($files | Where-Object {
+					$n = $_.Name
+					$ok = $false
+					foreach ($p in $patterns) {
+						if ($p -eq '*' -or $n -like $p) { $ok = $true; break }
+					}
+					$ok
+				})
+			}
+		}
+	} catch {
+		return "ERROR: failed to list files: $($_.Exception.Message)"
+	}
+
+	$totalMatched = $files.Count
+	if ($totalMatched -eq 0) {
+		return ConvertTo-MBJson @{
+			success = $true
+			dry_run = $dry_run
+			path    = $root
+			message = "No files matched glob '$glob' under $root"
+			count   = 0
+			renames = @()
+		}
+	}
+
+	$files = @($files | Select-Object -First $max)
+	$rx = $null
+	if ($hasFind -and $use_regex) {
+		try {
+			$rx = New-Object System.Text.RegularExpressions.Regex($find, [System.Text.RegularExpressions.RegexOptions]::None)
+		} catch {
+			return "ERROR: invalid regex in find=: $($_.Exception.Message)"
+		}
+	}
+
+	$planned = New-Object System.Collections.ArrayList
+	$skipped = New-Object System.Collections.ArrayList
+	$targetSeen = @{}
+	$idx = $start_index
+
+	foreach ($f in $files) {
+		$oldName = [string]$f.Name
+		$stem = [System.IO.Path]::GetFileNameWithoutExtension($oldName)
+		$ext = [System.IO.Path]::GetExtension($oldName)
+		$parentName = ''
+		try { $parentName = [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($f.FullName)) } catch { $parentName = '' }
+		$newName = $null
+
+		if ($hasTemplate) {
+			$newName = [string]$template
+			# padded counters first: {n:00} {n:000}
+			while ($newName -match '\{n:(\d+)\}') {
+				$w = 1
+				try { $w = [int]$Matches[1] } catch { $w = 1 }
+				if ($w -lt 1) { $w = 1 }
+				if ($w -gt 12) { $w = 12 }
+				$pad = $idx.ToString().PadLeft($w, '0')
+				$tok = [string]$Matches[0]
+				$at = $newName.IndexOf($tok)
+				if ($at -lt 0) { break }
+				$newName = $newName.Remove($at, $tok.Length).Insert($at, $pad)
+			}
+			$newName = $newName.Replace('{n}', "$idx")
+			$newName = $newName.Replace('{name}', $oldName)
+			$newName = $newName.Replace('{stem}', $stem)
+			$newName = $newName.Replace('{base}', $stem)
+			$newName = $newName.Replace('{ext}', $ext)
+			$newName = $newName.Replace('{parent}', $parentName)
+			$idx++
+		} else {
+			if ($use_regex -and $null -ne $rx) {
+				if (-not $rx.IsMatch($oldName)) {
+					[void]$skipped.Add([ordered]@{ from = $oldName; reason = 'no_regex_match' })
+					continue
+				}
+				$newName = $rx.Replace($oldName, [string]$replace)
+			} else {
+				if ($oldName.IndexOf([string]$find, [System.StringComparison]::Ordinal) -lt 0) {
+					[void]$skipped.Add([ordered]@{ from = $oldName; reason = 'no_substring_match' })
+					continue
+				}
+				$newName = $oldName.Replace([string]$find, [string]$replace)
+			}
+		}
+
+		if ([string]::IsNullOrWhiteSpace($newName)) {
+			[void]$skipped.Add([ordered]@{ from = $oldName; reason = 'empty_new_name' })
+			continue
+		}
+		# strip path separators / illegal name chars
+		$newName = $newName -replace '[\\/:\*\?"<>\|]', '_'
+		$newName = $newName.Trim().TrimEnd('.')
+		if ([string]::IsNullOrWhiteSpace($newName)) {
+			[void]$skipped.Add([ordered]@{ from = $oldName; reason = 'empty_after_sanitize' })
+			continue
+		}
+		if ($newName -eq $oldName) {
+			[void]$skipped.Add([ordered]@{ from = $oldName; reason = 'unchanged' })
+			continue
+		}
+
+		$dir = [System.IO.Path]::GetDirectoryName($f.FullName)
+		$dest = Join-Path $dir $newName
+		$key = $dest.ToLowerInvariant()
+		$conflict = $false
+		$conflictReason = ''
+		if ($targetSeen.ContainsKey($key)) {
+			$conflict = $true
+			$conflictReason = 'duplicate_target_in_batch'
+		} elseif ((Test-Path -LiteralPath $dest) -and -not $force) {
+			$conflict = $true
+			$conflictReason = 'target_exists'
+		}
+		$targetSeen[$key] = $true
+
+		$row = [ordered]@{
+			from = $f.FullName
+			to   = $dest
+			from_name = $oldName
+			to_name   = $newName
+		}
+		if ($conflict) {
+			$row['conflict'] = $true
+			$row['reason'] = $conflictReason
+			[void]$skipped.Add($row)
+			continue
+		}
+		[void]$planned.Add($row)
+	}
+
+	$preview = @($planned | Select-Object -First 40)
+	$payload = [ordered]@{
+		success       = $true
+		dry_run       = $dry_run
+		path          = $root
+		glob          = $(if ($patterns.Count -eq 1) { $patterns[0] } else { ($patterns -join ';') })
+		recursive     = $recursive
+		matched       = $totalMatched
+		capped        = ($totalMatched -gt $files.Count)
+		planned_count = $planned.Count
+		skipped_count = $skipped.Count
+		renames       = $preview
+		skipped_sample = @($skipped | Select-Object -First 20)
+	}
+	if ($hasTemplate) {
+		$payload['mode'] = 'template'
+		$payload['template'] = $template
+		$payload['start_index'] = $start_index
+	} else {
+		$payload['mode'] = $(if ($use_regex) { 'regex' } else { 'substring' })
+		$payload['find'] = $find
+		$payload['replace'] = $replace
+	}
+
+	if ($planned.Count -eq 0) {
+		$payload['message'] = "No renames to apply (matched=$totalMatched, skipped=$($skipped.Count))."
+		return ConvertTo-MBJson $payload -Depth 6
+	}
+
+	if ($dry_run) {
+		$payload['message'] = "DRY RUN: $($planned.Count) rename(s) planned (showing up to 40). Re-call with dry_run=false to apply (will prompt)."
+		$payload['hint'] = 'Review renames[]. Set dry_run=false to apply after operator approval.'
+		return ConvertTo-MBJson $payload -Depth 6
+	}
+
+	# Apply: approval required
+	$sampleLines = @($planned | Select-Object -First 12 | ForEach-Object { "  $($_.from_name)  ->  $($_.to_name)" })
+	$more = if ($planned.Count -gt 12) { "`n  ... +$($planned.Count - 12) more" } else { '' }
+	$details = "Bulk rename $($planned.Count) file(s) under:`n  $root`n`n" + ($sampleLines -join "`n") + $more + "`n`nforce=$force"
+	if (-not (Request-Confirmation -Title "BulkRename requires approval" -Details $details)) {
+		return "BLOCKED BY USER: BulkRename denied by operator."
+	}
+
+	$ok = 0
+	$fail = New-Object System.Collections.ArrayList
+	$done = New-Object System.Collections.ArrayList
+	foreach ($r in $planned) {
+		try {
+			if ((Test-Path -LiteralPath $r.to) -and $force) {
+				Remove-Item -LiteralPath $r.to -Force -ErrorAction Stop
+			}
+			Rename-Item -LiteralPath $r.from -NewName $r.to_name -ErrorAction Stop
+			$ok++
+			if ($done.Count -lt 40) {
+				[void]$done.Add([ordered]@{ from = $r.from; to = $r.to; from_name = $r.from_name; to_name = $r.to_name })
+			}
+		} catch {
+			[void]$fail.Add([ordered]@{ from = $r.from; to = $r.to; error = $_.Exception.Message })
+		}
+	}
+
+	$prefix = if ($script:MB.AutoApprove) { "SUCCESS (auto-approved)" } else { "SUCCESS" }
+	return ConvertTo-MBJson ([ordered]@{
+		success       = ($fail.Count -eq 0)
+		dry_run       = $false
+		message       = "$prefix`: renamed $ok / $($planned.Count) file(s); failed=$($fail.Count)"
+		path          = $root
+		renamed_count = $ok
+		failed_count  = $fail.Count
+		renames       = @($done)
+		failures      = @($fail | Select-Object -First 20)
+		skipped_count = $skipped.Count
+	}) -Depth 6
+}
+
+function Invoke-FindDuplicates {
+	param(
+		[string]$path,
+		[string]$directory = '',
+		[bool]$recursive = $true,
+		[string]$glob = '*',
+		[long]$min_bytes = 1,
+		[int]$max_scan = 10000,
+		[int]$max_groups = 40,
+		[int]$max_per_group = 12
+	)
+	if ([string]::IsNullOrWhiteSpace($path) -and -not [string]::IsNullOrWhiteSpace($directory)) {
+		$path = $directory
+	}
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required." }
+
+	$root = Resolve-MBPath $path
+	if (-not (Test-Path -LiteralPath $root)) { return "ERROR: path not found: $root" }
+	if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+		return "ERROR: path must be a folder: $root"
+	}
+
+	if ($min_bytes -lt 0) { $min_bytes = 0 }
+	if ($max_scan -le 0) { $max_scan = 10000 }
+	if ($max_scan -gt 50000) { $max_scan = 50000 }
+	if ($max_groups -le 0) { $max_groups = 40 }
+	if ($max_groups -gt 200) { $max_groups = 200 }
+	if ($max_per_group -le 0) { $max_per_group = 12 }
+	if ($max_per_group -gt 50) { $max_per_group = 50 }
+	if ([string]::IsNullOrWhiteSpace($glob)) { $glob = '*' }
+
+	$patterns = @(Convert-MBFindFilePatterns -glob $glob)
+	if ($patterns.Count -eq 0) { $patterns = @('*') }
+
+	try {
+		$gci = @{
+			LiteralPath = $root
+			File        = $true
+			ErrorAction = 'SilentlyContinue'
+			Force       = $true
+		}
+		if ($recursive) { $gci['Recurse'] = $true }
+		$useNativeFilter = ($patterns.Count -eq 1 -and $patterns[0] -ne '*' -and $patterns[0] -notmatch '[\\/]')
+		if ($useNativeFilter) { $gci['Filter'] = $patterns[0] }
+		# Stream-ish: take max_scan+1 to know truncation
+		$all = @(Get-ChildItem @gci | Select-Object -First ($max_scan + 1))
+		$truncated = ($all.Count -gt $max_scan)
+		if ($truncated) { $all = @($all | Select-Object -First $max_scan) }
+		if (-not $useNativeFilter -or ($patterns.Count -gt 1) -or ($patterns[0] -ne '*' -and -not $useNativeFilter)) {
+			if (-not $useNativeFilter) {
+				$all = @($all | Where-Object {
+					$n = $_.Name
+					$ok = $false
+					foreach ($p in $patterns) {
+						if ($p -eq '*' -or $n -like $p) { $ok = $true; break }
+					}
+					$ok
+				})
+			}
+		}
+		if ($min_bytes -gt 0) {
+			$all = @($all | Where-Object { [int64]$_.Length -ge $min_bytes })
+		}
+	} catch {
+		return "ERROR: scan failed: $($_.Exception.Message)"
+	}
+
+	$scanned = $all.Count
+	if ($scanned -eq 0) {
+		return ConvertTo-MBJson @{
+			success = $true
+			path    = $root
+			message = "No files to scan under $root"
+			scanned = 0
+			groups  = @()
+			duplicate_groups = 0
+		}
+	}
+
+	# Group by size
+	$bySize = @{}
+	foreach ($f in $all) {
+		$sz = [int64]$f.Length
+		if (-not $bySize.ContainsKey($sz)) {
+			$bySize[$sz] = New-Object System.Collections.ArrayList
+		}
+		[void]$bySize[$sz].Add($f)
+	}
+
+	$candidateFiles = New-Object System.Collections.ArrayList
+	$sizeBuckets = 0
+	foreach ($sz in @($bySize.Keys)) {
+		$bucket = $bySize[$sz]
+		if ($bucket.Count -gt 1) {
+			$sizeBuckets++
+			foreach ($f in $bucket) { [void]$candidateFiles.Add($f) }
+		}
+	}
+
+	# Hash candidates
+	$hashMap = @{}
+	$hashErrors = 0
+	foreach ($f in $candidateFiles) {
+		try {
+			$h = Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop
+			$hex = [string]$h.Hash
+			if (-not $hashMap.ContainsKey($hex)) {
+				$hashMap[$hex] = New-Object System.Collections.ArrayList
+			}
+			[void]$hashMap[$hex].Add([ordered]@{
+				path  = $f.FullName
+				name  = $f.Name
+				bytes = [int64]$f.Length
+			})
+		} catch {
+			$hashErrors++
+		}
+	}
+
+	$groups = New-Object System.Collections.ArrayList
+	$dupFileCount = 0
+	$wasted = [int64]0
+	foreach ($hex in @($hashMap.Keys | Sort-Object)) {
+		$items = $hashMap[$hex]
+		if ($items.Count -lt 2) { continue }
+		$bytes = [int64]$items[0].bytes
+		$extra = $items.Count - 1
+		$dupFileCount += $items.Count
+		$wasted += ($bytes * $extra)
+		$shown = @($items | Select-Object -First $max_per_group)
+		[void]$groups.Add([ordered]@{
+			hash       = $hex
+			bytes      = $bytes
+			count      = $items.Count
+			paths      = @($shown | ForEach-Object { $_.path })
+			files      = $shown
+			truncated  = ($items.Count -gt $max_per_group)
+			wasted_bytes = ($bytes * $extra)
+		})
+	}
+
+	# Largest waste first
+	$groups = @($groups | Sort-Object { -$_.wasted_bytes }, { -$_.count })
+	$totalGroups = $groups.Count
+	$groupsOut = @($groups | Select-Object -First $max_groups)
+
+	return ConvertTo-MBJson ([ordered]@{
+		success           = $true
+		path              = $root
+		recursive         = $recursive
+		glob              = $(if ($patterns.Count -eq 1) { $patterns[0] } else { ($patterns -join ';') })
+		min_bytes         = $min_bytes
+		scanned           = $scanned
+		scan_truncated    = $truncated
+		size_buckets      = $sizeBuckets
+		hashed            = $candidateFiles.Count
+		hash_errors       = $hashErrors
+		duplicate_groups  = $totalGroups
+		groups_returned   = $groupsOut.Count
+		duplicate_files   = $dupFileCount
+		wasted_bytes      = $wasted
+		groups            = $groupsOut
+		message           = $(if ($totalGroups -eq 0) {
+			"No content duplicates found among $scanned file(s) (size-prefilter then SHA256)."
+		} else {
+			"Found $totalGroups duplicate group(s); ~$wasted wasted bytes (keeping one copy per group)."
+		})
+		hint = $(if ($truncated) {
+			"Scan capped at max_scan=$max_scan. Narrow path/glob or raise max_scan to cover more."
+		} elseif ($totalGroups -gt $groupsOut.Count) {
+			"Returning top $max_groups groups by wasted space. Raise max_groups for more."
+		} else { $null })
+	}) -Depth 6
+}
+
 
 function Invoke-MBPSGalleryOp {
 	# Isolate Find/Install/Update-Module in a child powershell.exe with timeout + Esc kill.
@@ -19228,9 +21265,90 @@ function Invoke-UpdatePSModule {
 	}
 }
 
+function Convert-MBRegistryPath {
+	# Normalize model-friendly paths to PS registry provider paths (HKLM:\...).
+	# Accepts: HKLM:\x, HKLM\x, HKEY_LOCAL_MACHINE\x, HKLM:/x, Computer\HKEY_...
+	param([string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+	$p = ([string]$Path).Trim().Trim('"').Trim("'")
+	$p = $p -replace '^(?i)\\\\\.\\', ''
+	$p = $p -replace '^(?i)Computer\\', ''
+	$p = $p -replace '/', '\'
+	$hiveMap = [ordered]@{
+		'HKEY_LOCAL_MACHINE'  = 'HKLM'
+		'HKEY_CURRENT_USER'   = 'HKCU'
+		'HKEY_CLASSES_ROOT'   = 'HKCR'
+		'HKEY_USERS'          = 'HKU'
+		'HKEY_CURRENT_CONFIG' = 'HKCC'
+	}
+	foreach ($full in @($hiveMap.Keys)) {
+		if ($p.Length -ge $full.Length -and $p.Substring(0, $full.Length).Equals($full, [StringComparison]::OrdinalIgnoreCase)) {
+			$rest = $p.Substring($full.Length)
+			$p = $hiveMap[$full] + $rest
+			break
+		}
+	}
+	if ($p -match '^(?i)(HKLM|HKCU|HKCR|HKCC|HKU)(.*)$') {
+		$hive = $Matches[1].ToUpperInvariant()
+		$rest = [string]$Matches[2]
+		$rest = $rest -replace '^:', ''
+		if ([string]::IsNullOrEmpty($rest)) {
+			$p = "${hive}:\"
+		} else {
+			$rest = $rest.TrimStart('\')
+			$p = "${hive}:\$rest"
+		}
+	}
+	$p = $p -replace '(\\+)', '\'
+	return $p
+}
+
+function Resolve-MBRegistryValueType {
+	# Map model type strings → Set-ItemProperty -Type names (RegistryValueKind).
+	param([string]$TypeName)
+	$raw = if ($null -eq $TypeName) { 'String' } else { [string]$TypeName }
+	# REG_DWORD / reg-dword / "REG DWORD" → dword
+	$tKey = ($raw.Trim() -replace '[\s\-_]', '').ToLowerInvariant()
+	if ($tKey.StartsWith('reg') -and $tKey.Length -gt 3) {
+		$tKey = $tKey.Substring(3)
+	}
+	$typeMap = @{
+		''             = 'String'
+		'sz'           = 'String'
+		'string'       = 'String'
+		'str'          = 'String'
+		'text'         = 'String'
+		'expandstring' = 'ExpandString'
+		'expand'       = 'ExpandString'
+		'expandsz'     = 'ExpandString'
+		'multistring'  = 'MultiString'
+		'multi'        = 'MultiString'
+		'multisz'      = 'MultiString'
+		'dword'        = 'DWord'
+		'dwordle'      = 'DWord'
+		'int'          = 'DWord'
+		'int32'        = 'DWord'
+		'uint32'       = 'DWord'
+		'long'         = 'DWord'
+		'qword'        = 'QWord'
+		'qwordle'      = 'QWord'
+		'int64'        = 'QWord'
+		'uint64'       = 'QWord'
+		'binary'       = 'Binary'
+		'bin'          = 'Binary'
+		'bytes'        = 'Binary'
+		'hex'          = 'Binary'
+		'none'         = 'String'
+	}
+	if ($typeMap.ContainsKey($tKey)) { return $typeMap[$tKey] }
+	return $null
+}
+
 function Invoke-ReadRegistry {
 	param([string]$path)
 	try {
+		$path = Convert-MBRegistryPath -Path $path
+		if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required (e.g. HKLM:\\Software\\...)." }
 		if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Registry path not found: $path" }
 		Get-ItemProperty -LiteralPath $path -ErrorAction Stop |
 			Select-Object * -ExcludeProperty PSPath, PSParentPath, PSChildName, PSDrive, PSProvider |
@@ -19241,32 +21359,45 @@ function Invoke-ReadRegistry {
 }
 
 function Invoke-SetRegistry {
+	# ValueType param (aliases: type) — avoids -Type splat quirks.
 	param(
 		[string]$path,
 		[string]$name,
 		[string]$value,
-		[string]$type = 'String'
+		[Alias('type', 'Type', 'reg_type', 'value_type', 'ValueType', 'kind')]
+		[string]$ValueType = 'String'
 	)
-	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required (e.g. HKCU:\\Software\\...)." }
+	$path = Convert-MBRegistryPath -Path $path
+	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required (e.g. HKCU:\\Software\\... or HKLM:\\SOFTWARE\\...)." }
 	if ([string]::IsNullOrWhiteSpace($name)) { return "ERROR: name (value name) is required. Use (default) for default value." }
-	$typeMap = @{
-		'string' = 'String'; 'expandstring' = 'ExpandString'; 'expand' = 'ExpandString'
-		'multistring' = 'MultiString'; 'multi' = 'MultiString'
-		'dword' = 'DWord'; 'int' = 'DWord'; 'qword' = 'QWord'; 'binary' = 'Binary'
+	$propType = Resolve-MBRegistryValueType -TypeName $ValueType
+	if (-not $propType) {
+		return "ERROR: type/ValueType '$ValueType' not recognized. Use String|ExpandString|MultiString|DWord|QWord|Binary (also REG_DWORD, REG_SZ, int, etc.)."
 	}
-	$tKey = ($type -replace '[\s_-]', '').ToLowerInvariant()
-	if (-not $typeMap.ContainsKey($tKey)) {
-		return "ERROR: type must be String, ExpandString, MultiString, DWord, QWord, or Binary."
-	}
-	$propType = $typeMap[$tKey]
 	$val = $value
 	if ($propType -eq 'DWord' -or $propType -eq 'QWord') {
-		try { $val = [long]$value } catch { return "ERROR: value must be numeric for $propType." }
+		try {
+			$vs = ([string]$value).Trim()
+			if ($vs -match '^(?i)0x([0-9a-f]+)$') {
+				$val = [Convert]::ToInt64($Matches[1], 16)
+			} else {
+				$val = [long]$vs
+			}
+			if ($propType -eq 'DWord') {
+				# Registry DWord is UInt32 range; allow signed cast via unchecked int
+				if ($val -gt [int]::MaxValue -and $val -le [uint32]::MaxValue) {
+					$val = [int]([uint32]$val)
+				} else {
+					$val = [int]$val
+				}
+			}
+		} catch { return "ERROR: value must be numeric (or 0xHEX) for $propType." }
 	} elseif ($propType -eq 'MultiString') {
 		$val = @([string]$value -split "`n|;" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 	} elseif ($propType -eq 'Binary') {
 		try {
-			$hex = ([string]$value) -replace '\s', ''
+			$hex = ([string]$value) -replace '\s', '' -replace '^0x', ''
+			if ($hex.Length % 2 -ne 0) { return "ERROR: Binary hex string must have even length." }
 			$val = New-Object byte[] ($hex.Length / 2)
 			for ($i = 0; $i -lt $val.Length; $i++) {
 				$val[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
@@ -19284,8 +21415,10 @@ function Invoke-SetRegistry {
 			New-Item -Path $path -Force -ErrorAction Stop | Out-Null
 		}
 		$n = $name
-		if ($n -eq '(default)' -or $n -eq '(Default)' -or $n -eq '@') { $n = '(default)' }
-		Set-ItemProperty -LiteralPath $path -Name $n -Value $val -Type $propType -Force -ErrorAction Stop
+		if ($n -eq '(default)' -or $n -eq '(Default)' -or $n -eq '@' -or $n -eq '') { $n = '(default)' }
+		# Use RegistryValueKind enum so -Type is always accepted by the Registry provider
+		$kind = [Microsoft.Win32.RegistryValueKind]::$propType
+		Set-ItemProperty -LiteralPath $path -Name $n -Value $val -Type $kind -Force -ErrorAction Stop
 		return ConvertTo-MBJson @{
 			ok    = $true
 			path  = $path
@@ -19809,6 +21942,1168 @@ function Convert-MBPeRvaToOffset {
 		} catch {}
 	}
 	return $null
+}
+
+function Convert-MBPeOffsetToRva {
+	param(
+		[System.Collections.IEnumerable]$Sections,
+		[long]$FileOffset
+	)
+	if ($null -eq $Sections -or $FileOffset -lt 0) { return $null }
+	foreach ($s in @($Sections)) {
+		try {
+			$rptr = [uint32]$s.raw_ptr
+			$rsz = [uint32]$s.raw_size
+			if ($rsz -eq 0) { continue }
+			if ($FileOffset -ge $rptr -and $FileOffset -lt ([long]$rptr + [long]$rsz)) {
+				return [uint32]([uint32]$s.virt_rva + [uint32]($FileOffset - $rptr))
+			}
+		} catch {}
+	}
+	return $null
+}
+
+function Read-MBPeAsciiZ {
+	param(
+		[System.IO.Stream]$Stream,
+		[long]$Offset,
+		[int]$MaxLen = 256
+	)
+	if ($null -eq $Stream -or $Offset -lt 0 -or $Offset -ge $Stream.Length) { return '' }
+	if ($MaxLen -lt 1) { $MaxLen = 64 }
+	if ($MaxLen -gt 512) { $MaxLen = 512 }
+	[void]$Stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+	$buf = New-Object byte[] $MaxLen
+	$n = $Stream.Read($buf, 0, $MaxLen)
+	if ($n -le 0) { return '' }
+	$end = 0
+	while ($end -lt $n -and $buf[$end] -ne 0) { $end++ }
+	if ($end -le 0) { return '' }
+	return [System.Text.Encoding]::ASCII.GetString($buf, 0, $end)
+}
+
+function Get-MBPeSymbolMap {
+	# IAT slot file offsets -> dll!func ; export function file offsets / RVAs -> names.
+	# Used to label call/jmp [rip+disp] and direct calls into exports.
+	param(
+		[string]$Path,
+		[int]$MaxDlls = 48,
+		[int]$MaxFuncsPerDll = 256,
+		[int]$MaxExports = 512
+	)
+	$map = [ordered]@{
+		Ok                 = $false
+		Is64               = $false
+		ImageBase          = [uint64]0
+		Sections           = @()
+		ImportDllCount     = 0
+		IatSlotCount       = 0
+		ExportCount        = 0
+		ExportModule       = ''
+		IatByFileOffset    = @{}   # string key of long fo -> label
+		ExportByFileOffset = @{}
+		ExportByRva        = @{}
+		DelayDllCount      = 0
+		DelayDlls          = @()
+		BoundImportNote    = $null
+		IsDotNet           = $false
+		ClrRva             = 0
+		Error              = $null
+	}
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		if ($fs.Length -lt 64) { $map.Error = 'too_small'; return $map }
+		$hdr = New-Object byte[] 64
+		[void]$fs.Read($hdr, 0, 64)
+		if ($hdr[0] -ne 0x4D -or $hdr[1] -ne 0x5A) { $map.Error = 'not_mz'; return $map }
+		$e_lfanew = [BitConverter]::ToInt32($hdr, 0x3C)
+		if ($e_lfanew -le 0 -or ($e_lfanew + 24) -gt $fs.Length) { $map.Error = 'bad_lfanew'; return $map }
+		[void]$fs.Seek([long]$e_lfanew, [System.IO.SeekOrigin]::Begin)
+		$peSig = New-Object byte[] 4
+		[void]$fs.Read($peSig, 0, 4)
+		if ($peSig[0] -ne 0x50 -or $peSig[1] -ne 0x45) { $map.Error = 'not_pe'; return $map }
+		$coff = New-Object byte[] 20
+		[void]$fs.Read($coff, 0, 20)
+		$numSec = [BitConverter]::ToUInt16($coff, 2)
+		$optSize = [BitConverter]::ToUInt16($coff, 16)
+		$optOff = $e_lfanew + 24
+		$is64 = $false
+		$imgBase = [uint64]0
+		$dataDirOff = 0
+		$numRvaSizes = 0
+		if ($optSize -ge 2 -and ($optOff + $optSize) -le $fs.Length) {
+			[void]$fs.Seek([long]$optOff, [System.IO.SeekOrigin]::Begin)
+			$opt = New-Object byte[] ([Math]::Min([int]$optSize, 384))
+			[void]$fs.Read($opt, 0, $opt.Length)
+			$magic = [BitConverter]::ToUInt16($opt, 0)
+			$is64 = ($magic -eq 0x20B)
+			$map.Is64 = $is64
+			if ($magic -eq 0x20B -and $opt.Length -ge 32) {
+				$imgBase = [BitConverter]::ToUInt64($opt, 24)
+				$dataDirOff = $optOff + 112
+				if ($opt.Length -ge 110) { $numRvaSizes = [BitConverter]::ToInt32($opt, 108) }
+			} elseif ($magic -eq 0x10B -and $opt.Length -ge 32) {
+				$imgBase = [uint64][BitConverter]::ToUInt32($opt, 28)
+				$dataDirOff = $optOff + 96
+				if ($opt.Length -ge 96) { $numRvaSizes = [BitConverter]::ToInt32($opt, 92) }
+			} else {
+				$map.Error = 'bad_optional'
+				return $map
+			}
+		}
+		$map.ImageBase = $imgBase
+		$secOff = $e_lfanew + 24 + $optSize
+		$secs = New-Object System.Collections.ArrayList
+		$maxSec = [Math]::Min([int]$numSec, 48)
+		for ($s = 0; $s -lt $maxSec; $s++) {
+			$so = $secOff + ($s * 40)
+			if (($so + 40) -gt $fs.Length) { break }
+			[void]$fs.Seek([long]$so, [System.IO.SeekOrigin]::Begin)
+			$sec = New-Object byte[] 40
+			[void]$fs.Read($sec, 0, 40)
+			$nb = New-Object byte[] 8
+			[Array]::Copy($sec, 0, $nb, 0, 8)
+			$name = [System.Text.Encoding]::ASCII.GetString($nb).TrimEnd([char]0)
+			[void]$secs.Add([ordered]@{
+				name      = $name
+				virt_rva  = [BitConverter]::ToUInt32($sec, 12)
+				virt_size = [BitConverter]::ToUInt32($sec, 8)
+				raw_ptr   = [BitConverter]::ToUInt32($sec, 20)
+				raw_size  = [BitConverter]::ToUInt32($sec, 16)
+			})
+		}
+		$map.Sections = @($secs)
+		if ($numRvaSizes -le 0) { $numRvaSizes = 16 }
+		if ($numRvaSizes -gt 16) { $numRvaSizes = 16 }
+		$readDir = {
+			param([int]$Index)
+			if ($dataDirOff -le 0) { return $null }
+			$do = $dataDirOff + ($Index * 8)
+			if (($do + 8) -gt $fs.Length) { return $null }
+			[void]$fs.Seek([long]$do, [System.IO.SeekOrigin]::Begin)
+			$db = New-Object byte[] 8
+			[void]$fs.Read($db, 0, 8)
+			$rva = [BitConverter]::ToUInt32($db, 0)
+			$sz = [BitConverter]::ToUInt32($db, 4)
+			if ($rva -eq 0) { return $null }
+			return @{ Rva = $rva; Size = $sz }
+		}
+		# --- Imports / IAT ---
+		$impDir = & $readDir 1
+		if ($impDir) {
+			$impFile = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva ([uint32]$impDir.Rva)
+			if ($null -ne $impFile) {
+				$dllCount = 0
+				$descOff = [long]$impFile
+				$thunkSize = if ($is64) { 8 } else { 4 }
+				$ordMask = if ($is64) { [uint64]0x8000000000000000 } else { [uint64]0x80000000 }
+				while ($dllCount -lt $MaxDlls) {
+					if (($descOff + 20) -gt $fs.Length) { break }
+					[void]$fs.Seek($descOff, [System.IO.SeekOrigin]::Begin)
+					$desc = New-Object byte[] 20
+					[void]$fs.Read($desc, 0, 20)
+					$oft = [BitConverter]::ToUInt32($desc, 0)
+					$nameRva = [BitConverter]::ToUInt32($desc, 12)
+					$ft = [BitConverter]::ToUInt32($desc, 16)
+					if ($oft -eq 0 -and $nameRva -eq 0 -and $ft -eq 0) { break }
+					$dllName = ''
+					$nameOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $nameRva
+					if ($null -ne $nameOff) {
+						$dllName = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$nameOff) -MaxLen 128
+					}
+					if (-not $dllName) { $dllName = ('dll_{0}' -f $dllCount) }
+					$intRva = if ($oft -ne 0) { $oft } else { $ft }
+					$iatRva = $ft
+					if ($intRva -eq 0 -or $iatRva -eq 0) {
+						$dllCount++
+						$descOff += 20
+						continue
+					}
+					$intOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $intRva
+					$iatOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $iatRva
+					if ($null -eq $intOff -or $null -eq $iatOff) {
+						$dllCount++
+						$descOff += 20
+						continue
+					}
+					$fi = 0
+					while ($fi -lt $MaxFuncsPerDll) {
+						$slotInt = [long]$intOff + ($fi * $thunkSize)
+						$slotIat = [long]$iatOff + ($fi * $thunkSize)
+						if (($slotInt + $thunkSize) -gt $fs.Length) { break }
+						[void]$fs.Seek($slotInt, [System.IO.SeekOrigin]::Begin)
+						$tb = New-Object byte[] $thunkSize
+						[void]$fs.Read($tb, 0, $thunkSize)
+						$thunkVal = [uint64]0
+						if ($is64) {
+							$thunkVal = [BitConverter]::ToUInt64($tb, 0)
+						} else {
+							$thunkVal = [uint64][BitConverter]::ToUInt32($tb, 0)
+						}
+						if ($thunkVal -eq 0) { break }
+						$label = ''
+						if (($thunkVal -band $ordMask) -ne 0) {
+							$ord = [int]($thunkVal -band 0xFFFF)
+							$label = ('{0}!#{1}' -f $dllName, $ord)
+						} else {
+							# Hint/Name RVA (lower 31/32 bits; PE RVAs fit in 32-bit)
+							$ibnRva = [uint32]($thunkVal -band [uint64]0x7FFFFFFF)
+							$ibnOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $ibnRva
+							if ($null -ne $ibnOff) {
+								$fn = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$ibnOff + 2) -MaxLen 192
+								if ($fn) { $label = ('{0}!{1}' -f $dllName, $fn) }
+							}
+						}
+						if (-not $label) { $label = ('{0}!?' -f $dllName) }
+						$key = [string]$slotIat
+						$map.IatByFileOffset[$key] = $label
+						# Also map INT slot for completeness
+						$map.IatByFileOffset[[string]$slotInt] = $label
+						$fi++
+					}
+					$map.IatSlotCount += $fi
+					$dllCount++
+					$descOff += 20
+				}
+				$map.ImportDllCount = $dllCount
+			}
+		}
+		# --- Exports ---
+		$expDir = & $readDir 0
+		if ($expDir -and [uint32]$expDir.Size -ge 40) {
+			$expFile = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva ([uint32]$expDir.Rva)
+			if ($null -ne $expFile) {
+				[void]$fs.Seek([long]$expFile, [System.IO.SeekOrigin]::Begin)
+				$ed = New-Object byte[] 40
+				[void]$fs.Read($ed, 0, 40)
+				$nameRvaE = [BitConverter]::ToUInt32($ed, 12)
+				$ordBase = [BitConverter]::ToUInt32($ed, 16)
+				$numFuncs = [BitConverter]::ToUInt32($ed, 20)
+				$numNames = [BitConverter]::ToUInt32($ed, 24)
+				$funcsRva = [BitConverter]::ToUInt32($ed, 28)
+				$namesRva = [BitConverter]::ToUInt32($ed, 32)
+				$ordsRva = [BitConverter]::ToUInt32($ed, 36)
+				$modName = ''
+				$modOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $nameRvaE
+				if ($null -ne $modOff) {
+					$modName = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$modOff) -MaxLen 128
+				}
+				$map.ExportModule = $modName
+				$funcsOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $funcsRva
+				$namesOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $namesRva
+				$ordsOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $ordsRva
+				# Build ordinal -> name
+				$nameByOrdIndex = @{}
+				if ($null -ne $namesOff -and $null -ne $ordsOff -and $numNames -gt 0) {
+					$takeN = [Math]::Min([int]$numNames, $MaxExports)
+					for ($ni = 0; $ni -lt $takeN; $ni++) {
+						[void]$fs.Seek([long]($namesOff + ($ni * 4)), [System.IO.SeekOrigin]::Begin)
+						$nb4 = New-Object byte[] 4
+						[void]$fs.Read($nb4, 0, 4)
+						$nrva = [BitConverter]::ToUInt32($nb4, 0)
+						[void]$fs.Seek([long]($ordsOff + ($ni * 2)), [System.IO.SeekOrigin]::Begin)
+						$ob = New-Object byte[] 2
+						[void]$fs.Read($ob, 0, 2)
+						$ordIdx = [int][BitConverter]::ToUInt16($ob, 0)
+						$nOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $nrva
+						$en = if ($null -ne $nOff) { Read-MBPeAsciiZ -Stream $fs -Offset ([long]$nOff) -MaxLen 128 } else { '' }
+						if ($en) { $nameByOrdIndex[$ordIdx] = $en }
+					}
+				}
+				if ($null -ne $funcsOff -and $numFuncs -gt 0) {
+					$takeF = [Math]::Min([int]$numFuncs, $MaxExports)
+					for ($fi = 0; $fi -lt $takeF; $fi++) {
+						[void]$fs.Seek([long]($funcsOff + ($fi * 4)), [System.IO.SeekOrigin]::Begin)
+						$fb = New-Object byte[] 4
+						[void]$fs.Read($fb, 0, 4)
+						$frva = [BitConverter]::ToUInt32($fb, 0)
+						if ($frva -eq 0) { continue }
+						# Skip forwarders (RVA inside export dir)
+						if ($frva -ge [uint32]$expDir.Rva -and $frva -lt ([uint32]$expDir.Rva + [uint32]$expDir.Size)) { continue }
+						$en = if ($nameByOrdIndex.ContainsKey($fi)) { [string]$nameByOrdIndex[$fi] } else { ('ord_{0}' -f ($ordBase + $fi)) }
+						$label = if ($modName) { ('{0}!{1}' -f $modName, $en) } else { $en }
+						$map.ExportByRva[[string]$frva] = $label
+						$fOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $frva
+						if ($null -ne $fOff) {
+							$map.ExportByFileOffset[[string][long]$fOff] = $label
+						}
+						$map.ExportCount++
+					}
+				}
+			}
+		}
+		# --- Bound import (dir 11): presence note only ---
+		try {
+			$boundDir = & $readDir 11
+			if ($boundDir) {
+				$bOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva ([uint32]$boundDir.Rva)
+				$map.BoundImportNote = [ordered]@{
+					rva        = [uint32]$boundDir.Rva
+					size       = [uint32]$boundDir.Size
+					file       = $bOff
+					file_hex   = $(if ($null -ne $bOff) { ('0x{0:X}' -f [long]$bOff) } else { $null })
+					hint       = 'Bound imports present (pre-bound IAT). Runtime may skip normal loader walk; labels still use INT/IAT names when available.'
+				}
+			}
+		} catch {}
+		# --- Delay-load imports (dir 13) ---
+		try {
+			$delayDir = & $readDir 13
+			if ($delayDir) {
+				$dFile = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva ([uint32]$delayDir.Rva)
+				if ($null -ne $dFile) {
+					$delayList = New-Object System.Collections.ArrayList
+					$descOff = [long]$dFile
+					$dCount = 0
+					$thunkSize = if ($is64) { 8 } else { 4 }
+					$ordMask = if ($is64) { [uint64]0x8000000000000000 } else { [uint64]0x80000000 }
+					while ($dCount -lt $MaxDlls) {
+						if (($descOff + 32) -gt $fs.Length) { break }
+						[void]$fs.Seek($descOff, [System.IO.SeekOrigin]::Begin)
+						$dd = New-Object byte[] 32
+						[void]$fs.Read($dd, 0, 32)
+						# IMAGE_DELAYLOAD_DESCRIPTOR (all zero = end)
+						$attrs = [BitConverter]::ToUInt32($dd, 0)
+						$nameRvaD = [BitConverter]::ToUInt32($dd, 4)
+						$iatRvaD = [BitConverter]::ToUInt32($dd, 12)
+						$intRvaD = [BitConverter]::ToUInt32($dd, 16)
+						if ($attrs -eq 0 -and $nameRvaD -eq 0 -and $iatRvaD -eq 0 -and $intRvaD -eq 0) { break }
+						$dllName = ''
+						$nOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $nameRvaD
+						if ($null -ne $nOff) {
+							$dllName = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$nOff) -MaxLen 128
+						}
+						if (-not $dllName) { $dllName = ('delay_dll_{0}' -f $dCount) }
+						$funcs = New-Object System.Collections.ArrayList
+						$nameTableRva = if ($intRvaD -ne 0) { $intRvaD } else { $iatRvaD }
+						$iatTableRva = $iatRvaD
+						if ($nameTableRva -ne 0 -and $iatTableRva -ne 0) {
+							$ntOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $nameTableRva
+							$iatOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $iatTableRva
+							if ($null -ne $ntOff -and $null -ne $iatOff) {
+								$fi = 0
+								while ($fi -lt $MaxFuncsPerDll) {
+									$slotN = [long]$ntOff + ($fi * $thunkSize)
+									$slotI = [long]$iatOff + ($fi * $thunkSize)
+									if (($slotN + $thunkSize) -gt $fs.Length) { break }
+									[void]$fs.Seek($slotN, [System.IO.SeekOrigin]::Begin)
+									$tb = New-Object byte[] $thunkSize
+									[void]$fs.Read($tb, 0, $thunkSize)
+									$thunkVal = if ($is64) { [BitConverter]::ToUInt64($tb, 0) } else { [uint64][BitConverter]::ToUInt32($tb, 0) }
+									if ($thunkVal -eq 0) { break }
+									$label = ''
+									if (($thunkVal -band $ordMask) -ne 0) {
+										$label = ('{0}!#{1} (delay)' -f $dllName, [int]($thunkVal -band 0xFFFF))
+									} else {
+										$ibnRva = [uint32]($thunkVal -band [uint64]0x7FFFFFFF)
+										$ibnOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $ibnRva
+										if ($null -ne $ibnOff) {
+											$fn = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$ibnOff + 2) -MaxLen 192
+											if ($fn) { $label = ('{0}!{1} (delay)' -f $dllName, $fn) }
+										}
+									}
+									if (-not $label) { $label = ('{0}!? (delay)' -f $dllName) }
+									$map.IatByFileOffset[[string]$slotI] = $label
+									$map.IatByFileOffset[[string]$slotN] = $label
+									[void]$funcs.Add($label)
+									$fi++
+								}
+								$map.IatSlotCount += $fi
+							}
+						}
+						[void]$delayList.Add([ordered]@{
+							dll   = $dllName
+							funcs = @($funcs | Select-Object -First 24)
+							func_count = $funcs.Count
+						})
+						$dCount++
+						$descOff += 32
+					}
+					$map.DelayDllCount = $dCount
+					$map.DelayDlls = @($delayList)
+				}
+			}
+		} catch {}
+		# --- CLR / .NET (dir 14) ---
+		try {
+			$clrDir = & $readDir 14
+			if ($clrDir -and [uint32]$clrDir.Rva -gt 0) {
+				$map.IsDotNet = $true
+				$map.ClrRva = [uint32]$clrDir.Rva
+			}
+			# Also flag mscoree import as managed hint
+			if (-not $map.IsDotNet) {
+				foreach ($k in @($map.IatByFileOffset.Keys)) {
+					$lab = [string]$map.IatByFileOffset[$k]
+					if ($lab -match '(?i)mscoree\.dll') { $map.IsDotNet = $true; break }
+				}
+			}
+		} catch {}
+		$map.Ok = $true
+	} catch {
+		$map.Error = $_.Exception.Message
+		$map.Ok = $false
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	return $map
+}
+
+function Get-MBFileSha256Hex {
+	param(
+		[Parameter(Mandatory)][string]$Path,
+		[long]$Offset = 0,
+		[long]$Length = 0
+	)
+	$fs = $null
+	$sha = $null
+	try {
+		$sha = [System.Security.Cryptography.SHA256]::Create()
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		if ($Offset -lt 0) { $Offset = 0 }
+		if ($Offset -ge $fs.Length) {
+			$hash = $sha.ComputeHash([byte[]]@())
+			return ([BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+		}
+		if ($Length -le 0) { $Length = $fs.Length - $Offset }
+		$Length = [Math]::Min($Length, $fs.Length - $Offset)
+		[void]$fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+		$buf = New-Object byte[] 65536
+		$left = $Length
+		while ($left -gt 0) {
+			$want = [int][Math]::Min([long]$buf.Length, $left)
+			$n = $fs.Read($buf, 0, $want)
+			if ($n -le 0) { break }
+			[void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+			$left -= $n
+		}
+		[void]$sha.TransformFinalBlock([byte[]]@(), 0, 0)
+		return ([BitConverter]::ToString($sha.Hash) -replace '-', '').ToLowerInvariant()
+	} catch {
+		return $null
+	} finally {
+		if ($sha) { try { $sha.Dispose() } catch {} }
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+}
+
+function Get-MBPeIdentity {
+	# SHA256 whole file + per-section; .NET / delay / bound hints for triage.
+	param(
+		[string]$Path,
+		[bool]$SectionHashes = $true,
+		$SymbolMap = $null
+	)
+	$out = [ordered]@{
+		Ok = $false
+		path = $Path
+		file_size = 0L
+		sha256 = $null
+		sections = @()
+		is_dotnet = $false
+		dotnet_hint = $null
+		delay_load = $null
+		bound_import = $null
+		Error = $null
+	}
+	try {
+		if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+			$out.Error = 'not_found'; return $out
+		}
+		$fi = Get-Item -LiteralPath $Path
+		$out.file_size = [long]$fi.Length
+		$out.sha256 = Get-MBFileSha256Hex -Path $Path
+		if ($null -eq $SymbolMap) {
+			try { $SymbolMap = Get-MBPeSymbolMap -Path $Path } catch { $SymbolMap = $null }
+		}
+		if ($SymbolMap -and $SymbolMap.Ok) {
+			$out.is_dotnet = [bool]$SymbolMap.IsDotNet
+			if ($out.is_dotnet) {
+				$out.dotnet_hint = 'Managed (.NET) binary — native x86 disasm at entry is often a thunk to _CorExeMain; prefer metadata/IL tools offline. HexView still useful for PE layout / native stubs.'
+			}
+			if ($SymbolMap.DelayDllCount -gt 0) {
+				$out.delay_load = [ordered]@{
+					dll_count = [int]$SymbolMap.DelayDllCount
+					dlls = @($SymbolMap.DelayDlls | Select-Object -First 16)
+					hint = 'Delay-load DLLs resolve at first call; IAT slots labeled with (delay).'
+				}
+			}
+			if ($SymbolMap.BoundImportNote) {
+				$out.bound_import = $SymbolMap.BoundImportNote
+			}
+			if ($SectionHashes -and $SymbolMap.Sections) {
+				$secOut = New-Object System.Collections.ArrayList
+				foreach ($s in @($SymbolMap.Sections)) {
+					$rptr = [long][uint32]$s.raw_ptr
+					$rsz = [long][uint32]$s.raw_size
+					$h = $null
+					if ($rsz -gt 0 -and $rptr -ge 0) {
+						# Cap huge sections for responsiveness
+						$take = $rsz
+						if ($take -gt 64MB) { $take = 64MB }
+						$h = Get-MBFileSha256Hex -Path $Path -Offset $rptr -Length $take
+					}
+					[void]$secOut.Add([ordered]@{
+						name       = [string]$s.name
+						raw_ptr    = $rptr
+						raw_ptr_hex = ('0x{0:X}' -f $rptr)
+						raw_size   = $rsz
+						sha256     = $h
+						sha256_truncated = ($rsz -gt 64MB)
+					})
+				}
+				$out.sections = @($secOut)
+			}
+		} elseif ($SectionHashes) {
+			# Non-PE: still have whole-file hash
+			$out.sections = @()
+		}
+		$out.Ok = ($null -ne $out.sha256)
+		if (-not $out.Ok -and -not $out.Error) { $out.Error = 'hash_failed' }
+	} catch {
+		$out.Error = $_.Exception.Message
+	}
+	return $out
+}
+
+function Find-MBX86Functions {
+	# Heuristic function starts in a PE code section (prologues + INT3 padding).
+	param(
+		[string]$Path,
+		[int]$MaxHits = 48,
+		[string]$Section = '.text'
+	)
+	$hits = New-Object System.Collections.ArrayList
+	$pe = $null
+	try { $pe = Get-MBPeDisasmContext -Path $Path } catch { $pe = $null }
+	if (-not $pe -or -not $pe.Ok) {
+		return @{ Ok = $false; Error = 'not_pe'; functions = @() }
+	}
+	$is64 = [bool]$pe.Is64
+	$sec = $null
+	foreach ($s in @($pe.Sections)) {
+		$sn = [string]$s.name
+		if ([string]::Equals($sn, $Section, [StringComparison]::OrdinalIgnoreCase)) { $sec = $s; break }
+		if ($sn.TrimStart('.') -eq $Section.TrimStart('.')) { $sec = $s; break }
+	}
+	if (-not $sec) {
+		# pick first executable-looking: .text or first with EXEC-ish name
+		foreach ($s in @($pe.Sections)) {
+			if ([string]$s.name -match '(?i)text|code') { $sec = $s; break }
+		}
+		if (-not $sec -and $pe.Sections.Count -gt 0) { $sec = $pe.Sections[0] }
+	}
+	if (-not $sec -or [uint32]$sec.raw_size -eq 0) {
+		return @{ Ok = $false; Error = 'no_code_section'; functions = @() }
+	}
+	$rptr = [long][uint32]$sec.raw_ptr
+	$rsz = [long][uint32]$sec.raw_size
+	if ($rsz -gt 4MB) { $rsz = 4MB } # scan cap
+	$r = Read-MBFileBytes -Path $Path -Offset $rptr -Length ([int]$rsz)
+	if (-not $r.Ok) { return @{ Ok = $false; Error = $r.Error; functions = @() } }
+	$b = $r.Bytes
+	$n = $b.Length
+	if ($MaxHits -le 0) { $MaxHits = 48 }
+	if ($MaxHits -gt 200) { $MaxHits = 200 }
+
+	$patterns = New-Object System.Collections.ArrayList
+	# x86
+	[void]$patterns.Add(@{ bytes = [byte[]](0x55, 0x8B, 0xEC); name = 'push ebp; mov ebp,esp' })
+	[void]$patterns.Add(@{ bytes = [byte[]](0x55, 0x89, 0xE5); name = 'push ebp; mov ebp,esp' })
+	[void]$patterns.Add(@{ bytes = [byte[]](0x55, 0x8B, 0xE5); name = 'push ebp; mov ebp,esp?' })
+	# x64
+	[void]$patterns.Add(@{ bytes = [byte[]](0x48, 0x89, 0x5C, 0x24); name = 'mov [rsp+..],rbx' })
+	[void]$patterns.Add(@{ bytes = [byte[]](0x48, 0x83, 0xEC); name = 'sub rsp, imm8' })
+	[void]$patterns.Add(@{ bytes = [byte[]](0x48, 0x81, 0xEC); name = 'sub rsp, imm32' })
+	[void]$patterns.Add(@{ bytes = [byte[]](0x40, 0x53); name = 'push rbx (rex)' })
+	[void]$patterns.Add(@{ bytes = [byte[]](0x40, 0x55); name = 'push rbp (rex)' })
+	[void]$patterns.Add(@{ bytes = [byte[]](0x55, 0x48, 0x8B, 0xEC); name = 'push rbp; mov rbp,rsp' })
+	[void]$patterns.Add(@{ bytes = [byte[]](0x55, 0x48, 0x89, 0xE5); name = 'push rbp; mov rbp,rsp' })
+
+	$seen = @{}
+	$i = 0
+	while ($i -lt $n -and $hits.Count -lt $MaxHits) {
+		$matched = $false
+		# INT3/NOP padding then code
+		if ($b[$i] -eq 0xCC -or $b[$i] -eq 0x90) {
+			$j = $i
+			while ($j -lt $n -and ($b[$j] -eq 0xCC -or $b[$j] -eq 0x90)) { $j++ }
+			if ($j -gt $i -and $j -lt $n -and $b[$j] -ne 0xCC) {
+				# start after pad
+				$abs = $rptr + $j
+				$key = [string]$abs
+				if (-not $seen.ContainsKey($key)) {
+					$seen[$key] = $true
+					[void]$hits.Add([ordered]@{
+						offset = $abs
+						offset_hex = ('0x{0:X}' -f $abs)
+						kind = 'after_pad'
+						pattern = $(if ($b[$i] -eq 0xCC) { 'int3_pad' } else { 'nop_pad' })
+						section = [string]$sec.name
+					})
+					$matched = $true
+				}
+				$i = $j
+				continue
+			}
+		}
+		foreach ($p in $patterns) {
+			$pb = $p.bytes
+			if (($i + $pb.Length) -gt $n) { continue }
+			$ok = $true
+			for ($k = 0; $k -lt $pb.Length; $k++) {
+				if ($b[$i + $k] -ne $pb[$k]) { $ok = $false; break }
+			}
+			if (-not $ok) { continue }
+			$abs = $rptr + $i
+			$key = [string]$abs
+			if (-not $seen.ContainsKey($key)) {
+				$seen[$key] = $true
+				[void]$hits.Add([ordered]@{
+					offset = $abs
+					offset_hex = ('0x{0:X}' -f $abs)
+					kind = 'prologue'
+					pattern = [string]$p.name
+					section = [string]$sec.name
+				})
+			}
+			$matched = $true
+			break
+		}
+		$i++
+	}
+	# Include entry if mapped
+	if ($null -ne $pe.EntryFile) {
+		$ek = [string][long]$pe.EntryFile
+		if (-not $seen.ContainsKey($ek)) {
+			$hits.Insert(0, [ordered]@{
+				offset = [long]$pe.EntryFile
+				offset_hex = ('0x{0:X}' -f [long]$pe.EntryFile)
+				kind = 'entry'
+				pattern = 'AddressOfEntryPoint'
+				section = ''
+			})
+		}
+	}
+	return @{
+		Ok = $true
+		section = [string]$sec.name
+		is64 = $is64
+		count = $hits.Count
+		functions = @($hits | Select-Object -First $MaxHits)
+		hint = 'Heuristic only. HexView offset=<offset_hex> disasm=true to inspect.'
+	}
+}
+
+function Get-MBFileEntropyMap {
+	# Sliding-window Shannon entropy for packed/encrypted island detection.
+	param(
+		[string]$Path,
+		[int]$BlockSize = 0,
+		[int]$MaxBlocks = 256,
+		[double]$HighThreshold = 7.0
+	)
+	$result = [ordered]@{
+		Ok            = $false
+		file_size     = 0L
+		block_size    = 0
+		blocks        = @()
+		high_entropy  = @()
+		mean_entropy  = 0.0
+		max_entropy   = 0.0
+		min_entropy   = 0.0
+		Error         = $null
+	}
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$len = $fs.Length
+		$result.file_size = $len
+		if ($len -le 0) { $result.Error = 'empty'; return $result }
+		if ($BlockSize -le 0) {
+			# Adaptive: aim for ~MaxBlocks windows
+			$bs = [int][Math]::Ceiling([double]$len / [double][Math]::Max(1, $MaxBlocks))
+			if ($bs -lt 256) { $bs = 256 }
+			if ($bs -gt 65536) { $bs = 65536 }
+			# Prefer power-of-two-ish sizes
+			if ($bs -le 512) { $bs = 512 }
+			elseif ($bs -le 1024) { $bs = 1024 }
+			elseif ($bs -le 4096) { $bs = 4096 }
+			elseif ($bs -le 16384) { $bs = 16384 }
+			else { $bs = 65536 }
+			$BlockSize = $bs
+		}
+		if ($BlockSize -lt 64) { $BlockSize = 64 }
+		if ($BlockSize -gt 262144) { $BlockSize = 262144 }
+		if ($MaxBlocks -le 0) { $MaxBlocks = 256 }
+		if ($MaxBlocks -gt 1024) { $MaxBlocks = 1024 }
+		$result.block_size = $BlockSize
+		$buf = New-Object byte[] $BlockSize
+		$hist = New-Object int[] 256
+		$blocks = New-Object System.Collections.ArrayList
+		$high = New-Object System.Collections.ArrayList
+		$sumE = 0.0
+		$maxE = 0.0
+		$minE = 8.0
+		$pos = 0L
+		$bi = 0
+		$log2 = [Math]::Log(2.0)
+		while ($pos -lt $len -and $bi -lt $MaxBlocks) {
+			$want = [int][Math]::Min([long]$BlockSize, $len - $pos)
+			[void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+			$n = $fs.Read($buf, 0, $want)
+			if ($n -le 0) { break }
+			for ($h = 0; $h -lt 256; $h++) { $hist[$h] = 0 }
+			for ($i = 0; $i -lt $n; $i++) { $hist[$buf[$i]]++ }
+			$ent = 0.0
+			$inv = 1.0 / [double]$n
+			for ($h = 0; $h -lt 256; $h++) {
+				$c = $hist[$h]
+				if ($c -le 0) { continue }
+				$p = $c * $inv
+				$ent -= $p * ([Math]::Log($p) / $log2)
+			}
+			$rec = [ordered]@{
+				offset     = $pos
+				offset_hex = ('0x{0:X}' -f $pos)
+				length     = $n
+				entropy    = [Math]::Round($ent, 3)
+			}
+			[void]$blocks.Add($rec)
+			$sumE += $ent
+			if ($ent -gt $maxE) { $maxE = $ent }
+			if ($ent -lt $minE) { $minE = $ent }
+			if ($ent -ge $HighThreshold) {
+				[void]$high.Add($rec)
+			}
+			$pos += $want
+			$bi++
+			# If file larger than MaxBlocks * BlockSize, sample remaining with stride
+			if ($bi -ge $MaxBlocks) { break }
+			if ($pos -lt $len -and (($len - $pos) / $BlockSize) -gt ($MaxBlocks - $bi)) {
+				# jump ahead to cover file tail
+				$remainBlocks = $MaxBlocks - $bi
+				if ($remainBlocks -gt 1) {
+					$stride = [long][Math]::Max($BlockSize, [long](($len - $pos) / $remainBlocks))
+					# keep sequential for first portion; only stride when needed
+				}
+			}
+		}
+		$result.blocks = @($blocks)
+		$result.high_entropy = @($high)
+		$result.mean_entropy = if ($blocks.Count -gt 0) { [Math]::Round($sumE / $blocks.Count, 3) } else { 0.0 }
+		$result.max_entropy = [Math]::Round($maxE, 3)
+		$result.min_entropy = if ($blocks.Count -gt 0) { [Math]::Round($minE, 3) } else { 0.0 }
+		$result.Ok = $true
+		$result['hint'] = 'entropy near 8.0 suggests encrypted/compressed; low (~1-5) code/text. Use HexView offset= on high blocks or StringsScan.'
+	} catch {
+		$result.Error = $_.Exception.Message
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	return $result
+}
+
+function Find-MBEmbeddedMz {
+	# Find nested MZ/PE images (overlay / dropped / appended PEs). Skips primary PE at offset 0.
+	param(
+		[string]$Path,
+		[long]$StartOffset = 0,
+		[int]$MaxHits = 16,
+		[long]$MaxScan = 0
+	)
+	$hits = New-Object System.Collections.ArrayList
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$len = $fs.Length
+		if ($MaxScan -le 0 -or $MaxScan -gt $len) { $MaxScan = $len }
+		if ($StartOffset -lt 0) { $StartOffset = 0 }
+		$end = [Math]::Min($len, $StartOffset + $MaxScan)
+		$chunk = 1024 * 1024
+		$buf = New-Object byte[] ($chunk + 4)
+		$pos = $StartOffset
+		while ($pos -lt $end -and $hits.Count -lt $MaxHits) {
+			$want = [int][Math]::Min([long]$chunk + 1, $end - $pos)
+			if ($want -lt 2) { break }
+			[void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+			$n = $fs.Read($buf, 0, $want)
+			if ($n -lt 2) { break }
+			$i = 0
+			while ($i -lt ($n - 1) -and $hits.Count -lt $MaxHits) {
+				if ($buf[$i] -eq 0x4D -and $buf[$i + 1] -eq 0x5A) {
+					$abs = $pos + $i
+					# Skip trivial DOS header at 0 unless StartOffset forces it
+					$valid = $false
+					$peOff = $null
+					$machine = ''
+					$is64 = $false
+					try {
+						if (($abs + 0x40) -le $len) {
+							[void]$fs.Seek($abs + 0x3C, [System.IO.SeekOrigin]::Begin)
+							$lb = New-Object byte[] 4
+							[void]$fs.Read($lb, 0, 4)
+							$lf = [BitConverter]::ToInt32($lb, 0)
+							if ($lf -ge 0x40 -and $lf -lt 0x1000 -and ($abs + $lf + 24) -le $len) {
+								[void]$fs.Seek($abs + $lf, [System.IO.SeekOrigin]::Begin)
+								$ps = New-Object byte[] 4
+								[void]$fs.Read($ps, 0, 4)
+								if ($ps[0] -eq 0x50 -and $ps[1] -eq 0x45 -and $ps[2] -eq 0 -and $ps[3] -eq 0) {
+									$valid = $true
+									$peOff = $abs + $lf
+									$coff = New-Object byte[] 22
+									[void]$fs.Read($coff, 0, 22)
+									$mach = [BitConverter]::ToUInt16($coff, 0)
+									$optMagic = [BitConverter]::ToUInt16($coff, 20)
+									$is64 = ($optMagic -eq 0x20B)
+									$machine = switch ($mach) {
+										0x14c { 'i386' }
+										0x8664 { 'AMD64' }
+										0xAA64 { 'ARM64' }
+										default { ('0x{0:X}' -f $mach) }
+									}
+								}
+							}
+						}
+					} catch { $valid = $false }
+					if ($valid) {
+						if ($abs -eq 0 -and $StartOffset -eq 0) {
+							# primary image — note but prefer nested
+							[void]$hits.Add([ordered]@{
+								offset      = 0L
+								offset_hex  = '0x0'
+								kind        = 'primary_pe'
+								pe_offset   = $peOff
+								machine     = $machine
+								is64        = $is64
+							})
+						} else {
+							[void]$hits.Add([ordered]@{
+								offset      = $abs
+								offset_hex  = ('0x{0:X}' -f $abs)
+								kind        = 'embedded_pe'
+								pe_offset   = $peOff
+								pe_offset_hex = ('0x{0:X}' -f $peOff)
+								machine     = $machine
+								is64        = $is64
+								hint        = 'HexView path= offset=this disasm/annotate; or extract with ReadFileBytes slice / copy'
+							})
+						}
+					}
+					$i += 2
+					continue
+				}
+				$i++
+			}
+			# overlap 1 byte for MZ spanning chunks
+			$pos += [Math]::Max(1, $n - 1)
+		}
+	} catch {
+		return @{ Ok = $false; Error = $_.Exception.Message; hits = @() }
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	$embedded = @($hits | Where-Object { $_.kind -eq 'embedded_pe' })
+	return @{
+		Ok = $true
+		hits = @($hits)
+		embedded_count = $embedded.Count
+		embedded = $embedded
+	}
+}
+
+function Convert-MBHexPatternToBytesAndMask {
+	# "4D 5A ?? 00" or "4D5A??00" -> byte[] pattern + bool[] mask (true=must match)
+	param([string]$Pattern)
+	$p = ([string]$Pattern).Trim()
+	if ([string]::IsNullOrWhiteSpace($p)) { throw 'Empty hex pattern' }
+	$p = $p -replace '[,\-:]', ' '
+	$p = $p -replace '\s+', ' '
+	$tokens = @()
+	if ($p -match '\s' -or $p -match '\?') {
+		# split by space; also split contiguous hex into pairs when no spaces
+		foreach ($t in ($p -split ' ')) {
+			if ([string]::IsNullOrWhiteSpace($t)) { continue }
+			if ($t -eq '??' -or $t -eq '?') { $tokens += '??'; continue }
+			if ($t -match '^[0-9A-Fa-f]{2}$') { $tokens += $t.ToUpperInvariant(); continue }
+			if ($t -match '^[0-9A-Fa-f?]+$') {
+				$s = $t
+				if (($s.Length % 2) -ne 0) { throw "Odd-length hex token: $t" }
+				for ($i = 0; $i -lt $s.Length; $i += 2) {
+					$pair = $s.Substring($i, 2)
+					if ($pair -eq '??' -or $pair -match '\?') { $tokens += '??' }
+					else { $tokens += $pair.ToUpperInvariant() }
+				}
+				continue
+			}
+			throw "Invalid hex token: $t"
+		}
+	} else {
+		$s = $p
+		if (($s.Length % 2) -ne 0) { throw 'Odd-length hex pattern' }
+		for ($i = 0; $i -lt $s.Length; $i += 2) {
+			$pair = $s.Substring($i, 2)
+			if ($pair -eq '??') { $tokens += '??' }
+			else { $tokens += $pair.ToUpperInvariant() }
+		}
+	}
+	if ($tokens.Count -eq 0) { throw 'No pattern bytes' }
+	if ($tokens.Count -gt 4096) { throw 'Pattern too long (max 4096 bytes)' }
+	$bytes = New-Object byte[] $tokens.Count
+	$mask = New-Object bool[] $tokens.Count
+	for ($i = 0; $i -lt $tokens.Count; $i++) {
+		if ($tokens[$i] -eq '??') {
+			$bytes[$i] = 0
+			$mask[$i] = $false
+		} else {
+			$bytes[$i] = [Convert]::ToByte($tokens[$i], 16)
+			$mask[$i] = $true
+		}
+	}
+	return @{ Bytes = $bytes; Mask = $mask; Length = $tokens.Count }
+}
+
+function Find-MBHexPattern {
+	param(
+		[string]$Path,
+		[string]$Pattern,
+		[long]$Offset = 0,
+		[int]$MaxResults = 32,
+		[long]$MaxScan = 0
+	)
+	$pm = Convert-MBHexPatternToBytesAndMask -Pattern $Pattern
+	$pat = $pm.Bytes
+	$mask = $pm.Mask
+	$patLen = $pm.Length
+	$hits = New-Object System.Collections.ArrayList
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$len = $fs.Length
+		if ($Offset -lt 0) { $Offset = 0 }
+		if ($Offset -ge $len) {
+			return @{ Ok = $true; hits = @(); pattern_len = $patLen; scanned = 0; note = 'offset past EOF' }
+		}
+		$scanEnd = $len
+		if ($MaxScan -gt 0) { $scanEnd = [Math]::Min($len, $Offset + $MaxScan) }
+		if ($MaxResults -le 0) { $MaxResults = 32 }
+		if ($MaxResults -gt 500) { $MaxResults = 500 }
+		# Stream with overlap
+		$chunk = 1024 * 1024
+		$overlap = $patLen - 1
+		if ($overlap -lt 0) { $overlap = 0 }
+		$buf = New-Object byte[] ($chunk + $overlap + $patLen)
+		$pos = $Offset
+		$scanned = 0L
+		while ($pos -lt $scanEnd -and $hits.Count -lt $MaxResults) {
+			$want = [int][Math]::Min([long]$chunk + $overlap, $scanEnd - $pos)
+			if ($want -lt $patLen) { break }
+			[void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+			$n = $fs.Read($buf, 0, $want)
+			if ($n -lt $patLen) { break }
+			$scanned += $n
+			$limit = $n - $patLen
+			for ($i = 0; $i -le $limit -and $hits.Count -lt $MaxResults; $i++) {
+				$ok = $true
+				for ($j = 0; $j -lt $patLen; $j++) {
+					if ($mask[$j] -and $buf[$i + $j] -ne $pat[$j]) { $ok = $false; break }
+				}
+				if (-not $ok) { continue }
+				$abs = $pos + $i
+				$ctxLen = [Math]::Min(16, $patLen + 8)
+				$ctx = New-Object System.Collections.Generic.List[string]
+				for ($k = 0; $k -lt $ctxLen -and ($i + $k) -lt $n; $k++) {
+					[void]$ctx.Add(('{0:X2}' -f $buf[$i + $k]))
+				}
+				[void]$hits.Add([ordered]@{
+					offset     = $abs
+					offset_hex = ('0x{0:X}' -f $abs)
+					bytes      = ($ctx -join ' ')
+				})
+				# skip ahead by 1 to find overlapping matches
+			}
+			$step = $n - $overlap
+			if ($step -lt 1) { $step = 1 }
+			$pos += $step
+		}
+		return @{
+			Ok          = $true
+			path        = $Path
+			pattern_len = $patLen
+			hits        = @($hits)
+			count       = $hits.Count
+			scanned     = $scanned
+			truncated   = ($hits.Count -ge $MaxResults)
+		}
+	} catch {
+		return @{ Ok = $false; Error = $_.Exception.Message; hits = @() }
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+}
+
+function Get-MBFileStrings {
+	# Full-file ASCII / UTF-16LE string extraction with optional filters.
+	param(
+		[string]$Path,
+		[int]$MinLen = 4,
+		[int]$MaxHits = 80,
+		[long]$Offset = 0,
+		[long]$MaxScan = 0,
+		[string]$Encoding = 'both', # ascii | utf16 | both
+		[string]$Filter = ''        # path|url|ip|registry|email|all or free substring
+	)
+	if ($MinLen -lt 3) { $MinLen = 3 }
+	if ($MinLen -gt 64) { $MinLen = 64 }
+	if ($MaxHits -le 0) { $MaxHits = 80 }
+	if ($MaxHits -gt 500) { $MaxHits = 500 }
+	$encMode = ([string]$Encoding).ToLowerInvariant()
+	if ($encMode -notin @('ascii', 'utf16', 'utf16le', 'both', 'all')) { $encMode = 'both' }
+	if ($encMode -eq 'all') { $encMode = 'both' }
+	if ($encMode -eq 'utf16le') { $encMode = 'utf16' }
+	$filt = ([string]$Filter).Trim().ToLowerInvariant()
+	$useClass = $filt -in @('path', 'url', 'ip', 'registry', 'email', 'all', 'interesting')
+	$testInteresting = {
+		param([string]$S)
+		if ([string]::IsNullOrEmpty($S)) { return $false }
+		if ($filt -eq '' -or $filt -eq 'all' -or $filt -eq 'interesting') {
+			if ($S -match '(?i)https?://|\\\\[a-z0-9]|[A-Za-z]:\\|/bin/|cmd\.exe|powershell|CreateFile|VirtualAlloc|LoadLibrary|GetProcAddress|HKEY_|SOFTWARE\\') { return $true }
+			if ($S -match '\b\d{1,3}(\.\d{1,3}){3}\b') { return $true }
+			if ($S -match '(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}') { return $true }
+			return $false
+		}
+		switch ($filt) {
+			'path' { return ($S -match '(?i)[A-Za-z]:\\|\\\\|/usr/|/etc/|\.dll|\.exe|\.sys') }
+			'url' { return ($S -match '(?i)https?://|ftp://|www\.') }
+			'ip' { return ($S -match '\b\d{1,3}(\.\d{1,3}){3}\b') }
+			'registry' { return ($S -match '(?i)HKEY_|HKLM|HKCU|SOFTWARE\\|SYSTEM\\') }
+			'email' { return ($S -match '(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}') }
+			default { return ($S.ToLowerInvariant().Contains($filt)) }
+		}
+	}
+	$hits = New-Object System.Collections.ArrayList
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$len = $fs.Length
+		if ($Offset -lt 0) { $Offset = 0 }
+		$scanEnd = $len
+		if ($MaxScan -gt 0) { $scanEnd = [Math]::Min($len, $Offset + $MaxScan) }
+		$chunk = 512 * 1024
+		# ASCII
+		if ($encMode -in @('ascii', 'both')) {
+			$buf = New-Object byte[] $chunk
+			$pos = $Offset
+			$run = New-Object System.Collections.Generic.List[byte]
+			$runStart = -1L
+			while ($pos -lt $scanEnd -and $hits.Count -lt $MaxHits) {
+				$want = [int][Math]::Min([long]$chunk, $scanEnd - $pos)
+				[void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+				$n = $fs.Read($buf, 0, $want)
+				if ($n -le 0) { break }
+				for ($i = 0; $i -lt $n -and $hits.Count -lt $MaxHits; $i++) {
+					$b = $buf[$i]
+					if ($b -ge 32 -and $b -le 126) {
+						if ($run.Count -eq 0) { $runStart = $pos + $i }
+						[void]$run.Add($b)
+					} else {
+						if ($run.Count -ge $MinLen) {
+							$s = [System.Text.Encoding]::ASCII.GetString($run.ToArray())
+							$pass = if ($filt) { & $testInteresting $s } else { $true }
+							if ($pass) {
+								$show = $s
+								if ($show.Length -gt 160) { $show = $show.Substring(0, 157) + '...' }
+								[void]$hits.Add([ordered]@{
+									offset = $runStart
+									offset_hex = ('0x{0:X}' -f $runStart)
+									encoding = 'ascii'
+									length = $run.Count
+									text = $show
+								})
+							}
+						}
+						$run.Clear()
+						$runStart = -1L
+					}
+				}
+				$pos += $n
+			}
+			if ($run.Count -ge $MinLen -and $hits.Count -lt $MaxHits) {
+				$s = [System.Text.Encoding]::ASCII.GetString($run.ToArray())
+				$pass = if ($filt) { & $testInteresting $s } else { $true }
+				if ($pass) {
+					$show = $s
+					if ($show.Length -gt 160) { $show = $show.Substring(0, 157) + '...' }
+					[void]$hits.Add([ordered]@{
+						offset = $runStart
+						offset_hex = ('0x{0:X}' -f $runStart)
+						encoding = 'ascii'
+						length = $run.Count
+						text = $show
+					})
+				}
+			}
+		}
+		# UTF-16LE
+		if ($encMode -in @('utf16', 'both') -and $hits.Count -lt $MaxHits) {
+			$buf = New-Object byte[] $chunk
+			$pos = $Offset
+			if (($pos % 2) -ne 0) { $pos++ }
+			$chars = New-Object System.Collections.Generic.List[char]
+			$runStart = -1L
+			while ($pos -lt $scanEnd -and $hits.Count -lt $MaxHits) {
+				$want = [int][Math]::Min([long]$chunk, $scanEnd - $pos)
+				if (($want % 2) -ne 0) { $want-- }
+				if ($want -lt 2) { break }
+				[void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+				$n = $fs.Read($buf, 0, $want)
+				if ($n -lt 2) { break }
+				if (($n % 2) -ne 0) { $n-- }
+				for ($i = 0; $i -lt $n -and $hits.Count -lt $MaxHits; $i += 2) {
+					$ch = [int]$buf[$i] -bor ([int]$buf[$i + 1] -shl 8)
+					$isPrint = ($ch -ge 32 -and $ch -le 126)
+					if ($isPrint) {
+						if ($chars.Count -eq 0) { $runStart = $pos + $i }
+						[void]$chars.Add([char]$ch)
+					} else {
+						if ($chars.Count -ge $MinLen) {
+							$s = -join $chars
+							$pass = if ($filt) { & $testInteresting $s } else { $true }
+							if ($pass) {
+								$show = $s
+								if ($show.Length -gt 160) { $show = $show.Substring(0, 157) + '...' }
+								[void]$hits.Add([ordered]@{
+									offset = $runStart
+									offset_hex = ('0x{0:X}' -f $runStart)
+									encoding = 'utf16le'
+									length = $chars.Count
+									text = $show
+								})
+							}
+						}
+						$chars.Clear()
+						$runStart = -1L
+					}
+				}
+				$pos += $n
+			}
+		}
+		return @{
+			Ok = $true
+			path = $Path
+			min_len = $MinLen
+			filter = $(if ($filt) { $filt } else { $null })
+			encoding = $encMode
+			count = $hits.Count
+			hits = @($hits)
+			truncated = ($hits.Count -ge $MaxHits)
+		}
+	} catch {
+		return @{ Ok = $false; Error = $_.Exception.Message; hits = @() }
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
 }
 
 function Get-MBFileMagicAnnotations {
@@ -20573,6 +23868,9 @@ function Read-MBX86Instruction {
 	$target = $null
 	$fallthrough = $null
 	$immHex = ''
+	$usesRipRel = $false
+	$ripRelDisp = 0
+	$isIndirectCf = $false
 
 	$jcc8 = @{
 		'70'='jo'; '71'='jno'; '72'='jb/jc'; '73'='jae/jnc'; '74'='je/jz'; '75'='jne/jnz'
@@ -20587,12 +23885,7 @@ function Read-MBX86Instruction {
 		[Array]::Copy($Bytes, $start, $raw, 0, $len)
 		$hx = ($raw | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
 		$fo = $FileOffset + $start
-		$ft = $null
-		if ($null -ne $target) {
-			$fallthrough = $FileOffset + $endI
-		} else {
-			$fallthrough = $FileOffset + $endI
-		}
+		$fallthrough = $FileOffset + $endI
 		return @{
 			Ok = $true
 			offset = [long]$fo
@@ -20606,6 +23899,9 @@ function Read-MBX86Instruction {
 			is_conditional_jump = $isCond
 			is_call = $isCall
 			is_ret = $isRet
+			is_indirect = $isIndirectCf
+			uses_rip_rel = $usesRipRel
+			rip_rel_disp = $(if ($usesRipRel) { [int]$ripRelDisp } else { $null })
 			target = $target
 			target_hex = $(if ($null -ne $target) { ('0x{0:X}' -f [long]$target) } else { $null })
 			fallthrough = [long]$fallthrough
@@ -20726,20 +24022,33 @@ function Read-MBX86Instruction {
 		$opstr = ''
 		return & $finish $i
 	}
-	# FF /2 CALL, /4 JMP r/m
+	# FF /2 CALL, /4 JMP r/m (often call [rip+disp] -> IAT)
 	if ($op -eq 0xFF) {
 		if ($i -ge $n) { return @{ Ok = $false; Error = 'truncated' } }
 		$modrm = [int]$Bytes[$i]
+		$mod = ($modrm -shr 6) -band 3
 		$reg = ($modrm -shr 3) -band 7
+		$rm = $modrm -band 7
 		$extra = Get-MBX86ModRMExtraLen -Bytes $Bytes -ModRmIndex $i -Addr16 $addr16
 		if ($extra -lt 0) { return @{ Ok = $false; Error = 'truncated' } }
+		# x64: mod=00 r/m=101 => [RIP+disp32]; x86: absolute [disp32]
+		if ($mod -eq 0 -and $rm -eq 5 -and $extra -ge 4) {
+			$dispOff = $i + 1
+			if (-not $addr16 -and ($dispOff + 3) -lt $n) {
+				$ripRelDisp = [BitConverter]::ToInt32($Bytes, $dispOff)
+				$usesRipRel = $true  # on x86 this is abs disp; resolver treats per arch
+			}
+		}
 		$i = $i + 1 + $extra
 		if ($reg -eq 2) {
-			$mnem = 'call'; $opstr = 'r/m'; $isCF = $true; $isCall = $true
+			$mnem = 'call'; $opstr = 'r/m'; $isCF = $true; $isCall = $true; $isIndirectCf = $true
+			if ($usesRipRel) { $opstr = if ($Is64) { ('[rip+0x{0:X}]' -f $ripRelDisp) } else { ('[0x{0:X}]' -f $ripRelDisp) } }
 		} elseif ($reg -eq 4) {
-			$mnem = 'jmp'; $opstr = 'r/m'; $isCF = $true; $isUncond = $true
+			$mnem = 'jmp'; $opstr = 'r/m'; $isCF = $true; $isUncond = $true; $isIndirectCf = $true
+			if ($usesRipRel) { $opstr = if ($Is64) { ('[rip+0x{0:X}]' -f $ripRelDisp) } else { ('[0x{0:X}]' -f $ripRelDisp) } }
 		} elseif ($reg -eq 6) {
 			$mnem = 'push'; $opstr = 'r/m'
+			if ($usesRipRel) { $opstr = if ($Is64) { ('[rip+0x{0:X}]' -f $ripRelDisp) } else { ('[0x{0:X}]' -f $ripRelDisp) } }
 		} else {
 			$mnem = 'ff'; $opstr = ('/{0}' -f $reg)
 		}
@@ -20855,31 +24164,188 @@ function Read-MBX86Instruction {
 	return & $finish $i
 }
 
+function Resolve-MBDisasmSymbols {
+	# Attach IAT/export labels and mem_file for RIP-relative / abs indirect ops.
+	param(
+		$Instruction,
+		$SymbolMap,
+		[bool]$Is64 = $false
+	)
+	if ($null -eq $Instruction -or -not $Instruction.Ok) { return $Instruction }
+	if ($null -eq $SymbolMap -or -not $SymbolMap.Ok) { return $Instruction }
+	$secs = $SymbolMap.Sections
+	# Direct call/jmp target -> export
+	if ($null -ne $Instruction.target) {
+		$tKey = [string][long]$Instruction.target
+		if ($SymbolMap.ExportByFileOffset.ContainsKey($tKey)) {
+			$Instruction['symbol'] = [string]$SymbolMap.ExportByFileOffset[$tKey]
+			$Instruction['operands'] = ('{0}  ; {1}' -f $Instruction.operands, $Instruction.symbol)
+		} else {
+			$trva = Convert-MBPeOffsetToRva -Sections $secs -FileOffset ([long]$Instruction.target)
+			if ($null -ne $trva) {
+				$rk = [string][uint32]$trva
+				if ($SymbolMap.ExportByRva.ContainsKey($rk)) {
+					$Instruction['symbol'] = [string]$SymbolMap.ExportByRva[$rk]
+					$Instruction['operands'] = ('{0}  ; {1}' -f $Instruction.operands, $Instruction.symbol)
+				}
+			}
+		}
+	}
+	# RIP-relative or abs [disp32] mem operand (call/jmp/push [m])
+	if ($Instruction.uses_rip_rel -and $null -ne $Instruction.rip_rel_disp) {
+		$disp = [int]$Instruction.rip_rel_disp
+		$nextFo = [long]$Instruction.offset + [int]$Instruction.length
+		$memFo = $null
+		if ($Is64) {
+			$nextRva = Convert-MBPeOffsetToRva -Sections $secs -FileOffset $nextFo
+			if ($null -ne $nextRva) {
+				$memRvaLong = [int64][uint32]$nextRva + [int64]$disp
+				if ($memRvaLong -ge 0 -and $memRvaLong -le [uint32]::MaxValue) {
+					$memFo = Convert-MBPeRvaToOffset -Sections $secs -Rva ([uint32]$memRvaLong)
+				}
+			}
+		} else {
+			# x86: [disp32] is absolute VA; convert VA -> RVA -> file when ImageBase known
+			$va = [uint64][uint32]$disp
+			$img = [uint64]$SymbolMap.ImageBase
+			if ($img -gt 0 -and $va -ge $img) {
+				$memRva = [uint32]($va - $img)
+				$memFo = Convert-MBPeRvaToOffset -Sections $secs -Rva $memRva
+			} else {
+				# sometimes encoded as raw VA equal to file-ish; try as file offset
+				if ($disp -ge 0) { $memFo = [long]$disp }
+			}
+		}
+		if ($null -ne $memFo) {
+			$Instruction['mem_file'] = [long]$memFo
+			$Instruction['mem_file_hex'] = ('0x{0:X}' -f [long]$memFo)
+			$mk = [string][long]$memFo
+			if ($SymbolMap.IatByFileOffset.ContainsKey($mk)) {
+				$sym = [string]$SymbolMap.IatByFileOffset[$mk]
+				$Instruction['symbol'] = $sym
+				$Instruction['iat_file'] = [long]$memFo
+				$Instruction['operands'] = ('[{0}]' -f $sym)
+			} else {
+				$Instruction['operands'] = ('{0}  ; mem_file=0x{1:X}' -f $Instruction.operands, $memFo)
+			}
+		}
+	}
+	return $Instruction
+}
+
 function Get-MBX86Disasm {
 	# Linear disassembly listing from a file offset.
+	# Marks uncertain (db) runs and attempts resync on INT3/NOP/common prologues after desync.
 	param(
 		[string]$Path,
 		[long]$Offset = 0,
 		[int]$MaxInsns = 48,
 		[bool]$Is64 = $false,
-		[int]$ReadBytes = 0
+		[int]$ReadBytes = 0,
+		$SymbolMap = $null
 	)
 	if ($MaxInsns -le 0) { $MaxInsns = 48 }
 	if ($MaxInsns -gt 200) { $MaxInsns = 200 }
 	if ($ReadBytes -le 0) { $ReadBytes = [Math]::Min(4096, $MaxInsns * 16) }
 	if ($ReadBytes -gt 8192) { $ReadBytes = 8192 }
+	if ($null -eq $SymbolMap) {
+		try { $SymbolMap = Get-MBPeSymbolMap -Path $Path } catch { $SymbolMap = $null }
+	}
 	$r = Read-MBFileBytes -Path $Path -Offset $Offset -Length $ReadBytes
 	if (-not $r.Ok) { return @{ Ok = $false; Error = $r.Error; instructions = @() } }
 	$ins = New-Object System.Collections.ArrayList
 	$idx = 0
 	$count = 0
-	while ($count -lt $MaxInsns -and $idx -lt $r.Bytes.Length) {
-		$dec = Read-MBX86Instruction -Bytes $r.Bytes -Index $idx -FileOffset $Offset -Is64 $Is64
-		if (-not $dec.Ok) { break }
-		[void]$ins.Add($dec)
-		$idx = [int]$dec.next_index
-		$count++
-		if ($dec.is_ret) { break }
+	$symHits = 0
+	$uncertain = 0
+	$resyncs = 0
+	$dbRun = 0
+	$bytes = $r.Bytes
+	while ($count -lt $MaxInsns -and $idx -lt $bytes.Length) {
+		$dec = Read-MBX86Instruction -Bytes $bytes -Index $idx -FileOffset $Offset -Is64 $Is64
+		if (-not $dec.Ok) {
+			# hard fail: skip one byte and mark
+			if ($idx -lt $bytes.Length) {
+				$fo = $Offset + $idx
+				[void]$ins.Add(@{
+					Ok = $true
+					offset = [long]$fo
+					offset_hex = ('0x{0:X}' -f $fo)
+					length = 1
+					bytes = ('{0:X2}' -f $bytes[$idx])
+					mnemonic = 'db'
+					operands = ('0x{0:X2}' -f $bytes[$idx])
+					uncertain = $true
+					is_control_flow = $false
+					is_ret = $false
+					next_index = $idx + 1
+				})
+				$uncertain++
+				$dbRun++
+				$idx++
+				$count++
+			} else { break }
+		} else {
+			$isDb = ([string]$dec.mnemonic -eq 'db')
+			if ($isDb) {
+				$dec['uncertain'] = $true
+				$uncertain++
+				$dbRun++
+			} else {
+				$dbRun = 0
+				$dec['uncertain'] = $false
+			}
+			try {
+				$dec = Resolve-MBDisasmSymbols -Instruction $dec -SymbolMap $SymbolMap -Is64 $Is64
+				if ($dec.symbol) { $symHits++ }
+			} catch {}
+			[void]$ins.Add($dec)
+			$idx = [int]$dec.next_index
+			$count++
+			if ($dec.is_ret -and -not $isDb) { break }
+		}
+		# After a short db run, try resync to alignment/prologue
+		if ($dbRun -ge 2 -and $idx -lt $bytes.Length -and $count -lt $MaxInsns) {
+			$best = -1
+			$look = [Math]::Min($bytes.Length - 1, $idx + 12)
+			for ($s = $idx; $s -le $look; $s++) {
+				$bb = [int]$bytes[$s]
+				# INT3 / NOP pad end, or classic prologues
+				if ($bb -eq 0xCC -or $bb -eq 0x90) { $best = $s; break }
+				if ($bb -eq 0x55) { $best = $s; break } # push ebp/rbp
+				if ($bb -eq 0xC3) { $best = $s; break } # ret (end of garbage)
+				if ($Is64 -and $bb -eq 0x48 -and ($s + 1) -lt $bytes.Length) {
+					$n1 = [int]$bytes[$s + 1]
+					if ($n1 -in 0x89, 0x83, 0x81, 0x8B) { $best = $s; break }
+				}
+			}
+			if ($best -gt $idx) {
+				$skipN = $best - $idx
+				$fo = $Offset + $idx
+				[void]$ins.Add(@{
+					Ok = $true
+					offset = [long]$fo
+					offset_hex = ('0x{0:X}' -f $fo)
+					length = $skipN
+					bytes = '..'
+					mnemonic = 'resync'
+					operands = ('skip {0} uncertain byte(s) -> 0x{1:X}' -f $skipN, ($Offset + $best))
+					uncertain = $true
+					resync = $true
+					is_control_flow = $false
+					is_ret = $false
+					next_index = $best
+				})
+				$idx = $best
+				$resyncs++
+				$dbRun = 0
+				$count++
+			}
+		}
+	}
+	$dotnetWarn = $null
+	if ($SymbolMap -and $SymbolMap.IsDotNet) {
+		$dotnetWarn = 'PE looks managed (.NET). Native listing may be a bootstrap thunk — treat with caution.'
 	}
 	return @{
 		Ok = $true
@@ -20887,6 +24353,14 @@ function Get-MBX86Disasm {
 		offset_hex = ('0x{0:X}' -f $Offset)
 		is64 = $Is64
 		count = $ins.Count
+		symbols_resolved = $symHits
+		uncertain_count = $uncertain
+		resync_count = $resyncs
+		imports_mapped = $(if ($SymbolMap -and $SymbolMap.Ok) { [int]$SymbolMap.IatSlotCount } else { 0 })
+		exports_mapped = $(if ($SymbolMap -and $SymbolMap.Ok) { [int]$SymbolMap.ExportCount } else { 0 })
+		delay_dlls = $(if ($SymbolMap -and $SymbolMap.Ok) { [int]$SymbolMap.DelayDllCount } else { 0 })
+		is_dotnet = $(if ($SymbolMap) { [bool]$SymbolMap.IsDotNet } else { $false })
+		dotnet_warning = $dotnetWarn
 		instructions = @($ins)
 	}
 }
@@ -21025,7 +24499,15 @@ function Invoke-HexView {
 		[bool]$follow_calls = $false,
 		[string]$prefer_branch = 'fallthrough', # fallthrough | taken
 		[string]$arch = 'auto', # auto | x86 | x64
-		[bool]$dump_hex = $true
+		[bool]$dump_hex = $true,
+		# Forensics
+		[bool]$entropy = $false,
+		[bool]$carve = $false,
+		[bool]$hash = $false,
+		[bool]$functions = $false,
+		$rva = $null,
+		[string]$section = '',
+		[int]$entropy_blocks = 64
 	)
 	$path = Resolve-MBPath -Path $path -MustExist
 	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
@@ -21043,10 +24525,53 @@ function Invoke-HexView {
 	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
 	$peCtx = $null
 	try { $peCtx = Get-MBPeDisasmContext -Path $path } catch { $peCtx = $null }
+	$symMap = $null
 	$is64 = $false
 	if ($arch -eq 'x64') { $is64 = $true }
 	elseif ($arch -eq 'x86') { $is64 = $false }
 	elseif ($peCtx -and $peCtx.Ok) { $is64 = [bool]$peCtx.Is64 }
+
+	# section= name -> start of raw data
+	if (-not [string]::IsNullOrWhiteSpace($section)) {
+		if ($peCtx -and $peCtx.Ok -and $peCtx.Sections) {
+			$want = $section.Trim()
+			$foundSec = $null
+			foreach ($s in @($peCtx.Sections)) {
+				if ([string]::Equals([string]$s.name, $want, [StringComparison]::OrdinalIgnoreCase)) {
+					$foundSec = $s; break
+				}
+			}
+			if (-not $foundSec) {
+				# allow .text without dot etc
+				foreach ($s in @($peCtx.Sections)) {
+					$sn = [string]$s.name
+					if ($sn.TrimStart('.') -eq $want.TrimStart('.')) { $foundSec = $s; break }
+				}
+			}
+			if ($foundSec -and [uint32]$foundSec.raw_ptr -gt 0) {
+				$off = [long][uint32]$foundSec.raw_ptr
+			} else {
+				return "ERROR: section '$section' not found or has no raw data"
+			}
+		} else {
+			return 'ERROR: section= requires a PE with section table'
+		}
+	}
+
+	# rva= -> file offset
+	if ($null -ne $rva -and [string]$rva -ne '') {
+		$rvaVal = Convert-MBOffsetToInt64 -Value $rva -Default -1
+		if ($rvaVal -lt 0) { return 'ERROR: invalid rva (use decimal or 0xHEX)' }
+		if ($peCtx -and $peCtx.Ok -and $peCtx.Sections) {
+			$fo = Convert-MBPeRvaToOffset -Sections $peCtx.Sections -Rva ([uint32]$rvaVal)
+			if ($null -eq $fo) {
+				return ("ERROR: RVA 0x{0:X} not mapped to a section" -f $rvaVal)
+			}
+			$off = [long]$fo
+		} else {
+			return 'ERROR: rva= requires a PE with section table'
+		}
+	}
 
 	if ($at_entry) {
 		if ($peCtx -and $peCtx.Ok -and $null -ne $peCtx.EntryFile) {
@@ -21223,7 +24748,7 @@ function Invoke-HexView {
 		disasm = $disasm
 		trace = $trace
 		arch = $(if ($is64) { 'x64' } else { 'x86' })
-		legend = 'Use disasm=true for x86/x64 listing with jmp/jcc/call targets as file offsets. trace=true walks control flow (follow JMP; list both sides of JE/JNE/...). at_entry=true starts at PE entry. Large/system binaries use annotate light mode (PE structure only). Prefer HexView over ReadAllBytes. Patch jumps with HexEdit (e.g. 75->EB force jump, 75->90 90 nop).'
+		legend = 'disasm=true: x86/x64 + IAT/delay/export labels; uncertain db runs resync. hash=true SHA256 file+sections. functions=true prologue scan. entropy/carve/rva/section/at_entry. HexSearch ?? patterns; StringsScan; HexEdit preset=force_jcc|nop_range|ret0.'
 	}
 	if ($dump) { $payload['dump'] = $dump }
 	try { $payload['byte_classes'] = Get-MBByteClassSummary -Bytes $ra.Bytes } catch {}
@@ -21239,19 +24764,93 @@ function Invoke-HexView {
 			entry_file_hex = $(if ($null -ne $peCtx.EntryFile) { ('0x{0:X}' -f [long]$peCtx.EntryFile) } else { $null })
 			image_base = ('0x{0:X}' -f [uint64]$peCtx.ImageBase)
 		}
+		# file offset -> RVA for current window start
+		try {
+			$curRva = Convert-MBPeOffsetToRva -Sections $peCtx.Sections -FileOffset $off
+			if ($null -ne $curRva) {
+				$payload['pe']['view_rva'] = $curRva
+				$payload['pe']['view_rva_hex'] = ('0x{0:X}' -f [uint32]$curRva)
+				$payload['pe']['view_va_hex'] = ('0x{0:X}' -f ([uint64]$peCtx.ImageBase + [uint32]$curRva))
+			}
+		} catch {}
+	}
+
+	# Symbol map for disasm/hash/dotnet (load once when needed)
+	if ($disasm -or $trace -or $hash) {
+		try { $symMap = Get-MBPeSymbolMap -Path $path } catch { $symMap = $null }
+		if ($symMap -and $symMap.Ok) {
+			$payload['symbols'] = [ordered]@{
+				import_dlls   = [int]$symMap.ImportDllCount
+				iat_slots     = [int]$symMap.IatSlotCount
+				exports       = [int]$symMap.ExportCount
+				export_module = [string]$symMap.ExportModule
+				delay_dlls    = [int]$symMap.DelayDllCount
+				delay_list    = $(if ($symMap.DelayDllCount -gt 0) { @($symMap.DelayDlls | Select-Object -First 12) } else { @() })
+				bound_import  = $symMap.BoundImportNote
+				is_dotnet     = [bool]$symMap.IsDotNet
+			}
+			if ($symMap.IsDotNet) {
+				$payload['dotnet_warning'] = 'Managed (.NET) binary detected (CLR dir and/or mscoree). Native disasm at entry is often a bootstrap — do not treat as app logic.'
+			}
+		}
+	}
+
+	if ($hash) {
+		try {
+			$id = Get-MBPeIdentity -Path $path -SectionHashes $true -SymbolMap $symMap
+			if ($id.Ok) {
+				$payload['identity'] = [ordered]@{
+					sha256      = $id.sha256
+					file_size   = $id.file_size
+					is_dotnet   = $id.is_dotnet
+					dotnet_hint = $id.dotnet_hint
+					delay_load  = $id.delay_load
+					bound_import = $id.bound_import
+					sections    = @($id.sections | Select-Object -First 24)
+				}
+			} else {
+				$payload['identity_error'] = [string]$id.Error
+			}
+		} catch {
+			$payload['identity_error'] = $_.Exception.Message
+		}
+	}
+
+	if ($functions) {
+		try {
+			$fnSec = if ($section) { $section } else { '.text' }
+			$fn = Find-MBX86Functions -Path $path -MaxHits 48 -Section $fnSec
+			if ($fn.Ok) {
+				$payload['functions'] = [ordered]@{
+					section = $fn.section
+					count   = $fn.count
+					is64    = $fn.is64
+					list    = $fn.functions
+					hint    = $fn.hint
+				}
+			} else {
+				$payload['functions_error'] = [string]$fn.Error
+			}
+		} catch {
+			$payload['functions_error'] = $_.Exception.Message
+		}
 	}
 
 	if ($disasm) {
 		try {
-			$d = Get-MBX86Disasm -Path $path -Offset $off -MaxInsns $max_insns -Is64 $is64
+			$d = Get-MBX86Disasm -Path $path -Offset $off -MaxInsns $max_insns -Is64 $is64 -SymbolMap $symMap
 			if ($d.Ok) {
 				# compact listing string for model readability
 				$lines = New-Object System.Collections.ArrayList
 				foreach ($ins in @($d.instructions)) {
-					$tline = ('{0}  {1,-20}  {2,-12} {3}' -f $ins.offset_hex, $ins.bytes, $ins.mnemonic, $ins.operands)
+					$mark = if ($ins.uncertain) { '?' } else { ' ' }
+					$tline = ('{0}{1} {2,-20}  {3,-12} {4}' -f $mark, $ins.offset_hex, $ins.bytes, $ins.mnemonic, $ins.operands)
 					if ($ins.is_control_flow -and $ins.target_hex) {
 						$tline += ('  -> {0}' -f $ins.target_hex)
 						if ($ins.is_conditional_jump) { $tline += (' | else {0}' -f $ins.fallthrough_hex) }
+					}
+					if ($ins.symbol -and ($tline -notmatch [regex]::Escape([string]$ins.symbol))) {
+						$tline += ('  ; {0}' -f $ins.symbol)
 					}
 					[void]$lines.Add($tline)
 				}
@@ -21260,9 +24859,17 @@ function Invoke-HexView {
 					offset_hex = $d.offset_hex
 					count = $d.count
 					is64 = $d.is64
+					symbols_resolved = $d.symbols_resolved
+					uncertain_count = $d.uncertain_count
+					resync_count = $d.resync_count
+					imports_mapped = $d.imports_mapped
+					exports_mapped = $d.exports_mapped
+					delay_dlls = $d.delay_dlls
+					is_dotnet = $d.is_dotnet
+					dotnet_warning = $d.dotnet_warning
 					listing = ($lines -join "`n")
 					instructions = @($d.instructions)
-					how_to_follow = 'Each JMP/Jcc/CALL with a resolved relative target shows -> file_offset. Call HexView again with offset=<target_hex> disasm=true. For path exploration use trace=true.'
+					how_to_follow = 'Lines starting with ? are uncertain (db) or resync skips. JMP/Jcc/CALL -> file_offset; [dll!func] via IAT/delay. functions=true for prologue list.'
 				}
 			} else {
 				$payload['disassembly_error'] = [string]$d.Error
@@ -21275,10 +24882,60 @@ function Invoke-HexView {
 	if ($trace) {
 		try {
 			$tr = Get-MBX86Trace -Path $path -Offset $off -MaxSteps $max_steps -Is64 $is64 -FollowCalls $follow_calls -PreferBranch $pref
+			# decorate branch targets with symbols when possible
+			if ($symMap -and $symMap.Ok -and $tr.branches) {
+				foreach ($br in @($tr.branches)) {
+					try {
+						if ($br.taken) {
+							$tk = [string][long]$br.taken
+							if ($symMap.ExportByFileOffset.ContainsKey($tk)) { $br['taken_symbol'] = $symMap.ExportByFileOffset[$tk] }
+						}
+					} catch {}
+				}
+			}
 			$payload['trace'] = $tr
 			$payload['hint'] = 'trace.branches lists JE/JNE/Jcc alternatives. Set offset to taken_hex or not_taken_hex and disasm/trace again. Prefer HexView over manual ReadAllBytes.'
 		} catch {
 			$payload['trace_error'] = $_.Exception.Message
+		}
+	}
+
+	if ($entropy) {
+		try {
+			$em = Get-MBFileEntropyMap -Path $path -MaxBlocks $entropy_blocks
+			if ($em.Ok) {
+				$payload['entropy'] = [ordered]@{
+					block_size   = $em.block_size
+					mean         = $em.mean_entropy
+					min          = $em.min_entropy
+					max          = $em.max_entropy
+					high_count   = @($em.high_entropy).Count
+					high_entropy = @($em.high_entropy | Select-Object -First 24)
+					sample_blocks = @($em.blocks | Select-Object -First 12)
+					hint         = $em.hint
+				}
+			} else {
+				$payload['entropy_error'] = [string]$em.Error
+			}
+		} catch {
+			$payload['entropy_error'] = $_.Exception.Message
+		}
+	}
+
+	if ($carve) {
+		try {
+			$cv = Find-MBEmbeddedMz -Path $path -MaxHits 16
+			if ($cv.Ok) {
+				$payload['carve'] = [ordered]@{
+					embedded_count = $cv.embedded_count
+					embedded       = @($cv.embedded)
+					all_hits       = @($cv.hits | Select-Object -First 20)
+				}
+			} else {
+				$payload['carve_error'] = [string]$cv.Error
+			}
+		} catch {
+			$payload['carve_error'] = $_.Exception.Message
 		}
 	}
 
@@ -21310,6 +24967,169 @@ function Invoke-HexView {
 	return ConvertTo-MBJson $payload -Depth 12
 }
 
+function Invoke-HexSearch {
+	param(
+		[string]$path,
+		[string]$pattern = '',
+		[string]$hex = '',
+		$offset = 0,
+		[int]$maxResults = 32,
+		$max_scan = 0
+	)
+	$path = Resolve-MBPath -Path $path
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+	$pat = $pattern
+	if ([string]::IsNullOrWhiteSpace($pat)) { $pat = $hex }
+	if ([string]::IsNullOrWhiteSpace($pat)) {
+		return 'ERROR: Provide pattern= or hex= (e.g. "4D 5A ?? 00" or "E8 ?? ?? ?? ??")'
+	}
+	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
+	$ms = 0L
+	if ($null -ne $max_scan -and [string]$max_scan -ne '') {
+		try { $ms = [long]$max_scan } catch { $ms = 0 }
+	}
+	try {
+		$r = Find-MBHexPattern -Path $path -Pattern $pat -Offset $off -MaxResults $maxResults -MaxScan $ms
+		if (-not $r.Ok) { return "ERROR: $($r.Error)" }
+		return ConvertTo-MBJson ([ordered]@{
+			status      = 'ok'
+			path        = $path
+			pattern     = $pat
+			pattern_len = $r.pattern_len
+			count       = $r.count
+			truncated   = $r.truncated
+			hits        = $r.hits
+			hint        = 'Use HexView offset=<hit.offset_hex> disasm=true or dump. ?? = wildcard byte.'
+		}) -Depth 8
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-StringsScan {
+	param(
+		[string]$path,
+		[int]$minLen = 4,
+		[int]$maxHits = 80,
+		$offset = 0,
+		$max_scan = 0,
+		[string]$encoding = 'both',
+		[string]$filter = ''
+	)
+	$path = Resolve-MBPath -Path $path
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
+	$ms = 0L
+	if ($null -ne $max_scan -and [string]$max_scan -ne '') {
+		try { $ms = [long]$max_scan } catch { $ms = 0 }
+	}
+	try {
+		$r = Get-MBFileStrings -Path $path -MinLen $minLen -MaxHits $maxHits -Offset $off -MaxScan $ms -Encoding $encoding -Filter $filter
+		if (-not $r.Ok) { return "ERROR: $($r.Error)" }
+		return ConvertTo-MBJson ([ordered]@{
+			status    = 'ok'
+			path      = $path
+			min_len   = $r.min_len
+			encoding  = $r.encoding
+			filter    = $r.filter
+			count     = $r.count
+			truncated = $r.truncated
+			hits      = $r.hits
+			hint      = 'filter=path|url|ip|registry|email|interesting or free text. encoding=ascii|utf16|both. HexView offset=hit.offset_hex to inspect.'
+		}) -Depth 8
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Resolve-MBHexEditPreset {
+	# Build patch bytes for named forensic patches. Returns @{ Ok; Patch; Note; Error }
+	param(
+		[string]$Preset,
+		[string]$Path,
+		[long]$Offset,
+		[int]$Length = 0
+	)
+	$p = ([string]$Preset).Trim().ToLowerInvariant() -replace '[-\s]', '_'
+	if ([string]::IsNullOrWhiteSpace($p)) {
+		return @{ Ok = $false; Error = 'empty preset' }
+	}
+	# aliases
+	switch ($p) {
+		'force_jmp' { $p = 'force_jcc' }
+		'force' { $p = 'force_jcc' }
+		'always_jump' { $p = 'force_jcc' }
+		'nop' { $p = 'nop_range' }
+		'nops' { $p = 'nop_range' }
+		'ret_0' { $p = 'ret0' }
+		'return0' { $p = 'ret0' }
+		'xor_ret' { $p = 'ret0' }
+	}
+	try {
+		switch ($p) {
+			'force_jcc' {
+				# Short Jcc 7x xx -> EB xx (unconditional short jmp, same size)
+				# Near Jcc 0F 8x rel32 -> 90 E9 rel32 (nop + near jmp; rel already relative to end of jcc which is same as end of e9+nop? 
+				# 0F 8x dd dd dd dd is 6 bytes; E9 rel32 is 5 bytes — use EB with computed 8-bit if in range else 90 E9 with adjusted disp
+				$br = Read-MBFileBytes -Path $Path -Offset $Offset -Length 6
+				if (-not $br.Ok -or $br.Bytes.Length -lt 2) {
+					return @{ Ok = $false; Error = 'cannot read bytes at offset for force_jcc' }
+				}
+				$b0 = [int]$br.Bytes[0]
+				if ($b0 -ge 0x70 -and $b0 -le 0x7F) {
+					$patch = [byte[]](0xEB, $br.Bytes[1])
+					return @{ Ok = $true; Patch = $patch; Note = ('force_jcc: short {0:X2}->{1:X2} EB (always jmp short)' -f $b0, $b0) }
+				}
+				if ($b0 -eq 0x0F -and $br.Bytes.Length -ge 6) {
+					$b1 = [int]$br.Bytes[1]
+					if ($b1 -ge 0x80 -and $b1 -le 0x8F) {
+						$rel = [BitConverter]::ToInt32($br.Bytes, 2)
+						# Original: next = off+6, target = next+rel
+						# New: 90 E9 rel' where next' = off+5, need next'+rel' = target => rel' = rel+1
+						$newRel = $rel + 1
+						$rb = [BitConverter]::GetBytes([int]$newRel)
+						$patch = [byte[]](0x90, 0xE9, $rb[0], $rb[1], $rb[2], $rb[3])
+						return @{ Ok = $true; Patch = $patch; Note = ('force_jcc: near 0F {0:X2} -> 90 E9 (nop+jmp near, rel adjusted +1)' -f $b1) }
+					}
+				}
+				return @{ Ok = $false; Error = ('force_jcc: byte at offset is 0x{0:X2} (need 7x short Jcc or 0F 8x near Jcc)' -f $b0) }
+			}
+			'nop_range' {
+				$len = $Length
+				if ($len -le 0) { $len = 1 }
+				if ($len -gt 4096) { $len = 4096 }
+				$patch = New-Object byte[] $len
+				for ($i = 0; $i -lt $len; $i++) { $patch[$i] = 0x90 }
+				return @{ Ok = $true; Patch = $patch; Note = ("nop_range: {0} x NOP (0x90)" -f $len) }
+			}
+			'ret0' {
+				# xor eax,eax ; ret  — works x86 and zero-extends to rax on x64 for 32-bit zeroing
+				$patch = [byte[]](0x31, 0xC0, 0xC3)
+				return @{ Ok = $true; Patch = $patch; Note = 'ret0: 31 C0 C3  (xor eax,eax; ret)' }
+			}
+			'ret' {
+				$patch = [byte[]](0xC3)
+				return @{ Ok = $true; Patch = $patch; Note = 'ret: C3' }
+			}
+			'int3' {
+				$len = $Length
+				if ($len -le 0) { $len = 1 }
+				if ($len -gt 4096) { $len = 4096 }
+				$patch = New-Object byte[] $len
+				for ($i = 0; $i -lt $len; $i++) { $patch[$i] = 0xCC }
+				return @{ Ok = $true; Patch = $patch; Note = ("int3: {0} x CC" -f $len) }
+			}
+			default {
+				return @{ Ok = $false; Error = "unknown preset '$Preset' (use force_jcc|nop_range|ret0|ret|int3)" }
+			}
+		}
+	} catch {
+		return @{ Ok = $false; Error = $_.Exception.Message }
+	}
+}
+
 function Invoke-HexEdit {
 	param(
 		[string]$path,
@@ -21317,7 +25137,9 @@ function Invoke-HexEdit {
 		[string]$hex = '',
 		$bytes = $null,
 		[bool]$extend = $true,
-		[bool]$backup = $true
+		[bool]$backup = $true,
+		[string]$preset = '',
+		[int]$length = 0
 	)
 	$path = Resolve-MBPath -Path $path
 	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
@@ -21325,9 +25147,19 @@ function Invoke-HexEdit {
 	$off = Convert-MBOffsetToInt64 -Value $offset -Default -1
 	if ($off -lt 0) { return 'ERROR: invalid offset (use decimal or 0xHEX)' }
 
+	$presetNote = ''
 	$patch = $null
 	try {
-		if ($null -ne $bytes) {
+		if (-not [string]::IsNullOrWhiteSpace($preset)) {
+			$exists0 = Test-Path -LiteralPath $path -PathType Leaf
+			if (-not $exists0 -and $preset -match '(?i)force') {
+				return 'ERROR: preset=force_jcc requires an existing file at path'
+			}
+			$pr = Resolve-MBHexEditPreset -Preset $preset -Path $path -Offset $off -Length $length
+			if (-not $pr.Ok) { return "ERROR: $($pr.Error)" }
+			$patch = $pr.Patch
+			$presetNote = [string]$pr.Note
+		} elseif ($null -ne $bytes) {
 			$list = New-Object System.Collections.Generic.List[byte]
 			foreach ($b in @(Convert-MBForceArray $bytes)) {
 				$n = 0
@@ -21341,7 +25173,7 @@ function Invoke-HexEdit {
 		} elseif (-not [string]::IsNullOrWhiteSpace($hex)) {
 			$patch = Convert-MBHexStringToBytes -Hex $hex
 		} else {
-			return 'ERROR: provide hex= or bytes=[]'
+			return 'ERROR: provide hex=, bytes=[], or preset=force_jcc|nop_range|ret0|ret|int3'
 		}
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
@@ -21357,21 +25189,57 @@ function Invoke-HexEdit {
 	}
 	$previewDump = Format-MBHexDump -Bytes $patch -BaseOffset $off -Width 16 -ShowAscii $true
 	$beforeDump = ''
+	$beforeBytes = $null
 	if ($exists -and $curSize -gt $off) {
 		try {
 			$beforeLen = [int][Math]::Min([long]$patch.Length, $curSize - $off)
 			if ($beforeLen -gt 0) {
 				$br = Read-MBFileBytes -Path $path -Offset $off -Length $beforeLen
 				if ($br.Ok -and $br.Bytes.Length -gt 0) {
+					$beforeBytes = $br.Bytes
 					$beforeDump = Format-MBHexDump -Bytes $br.Bytes -BaseOffset $off -Width 16 -ShowAscii $true
 				}
 			}
 		} catch { $beforeDump = '' }
 	}
+	# Disasm before/after preview (best-effort)
+	$disasmBefore = ''
+	$disasmAfter = ''
+	try {
+		$peCtx = $null
+		try { $peCtx = Get-MBPeDisasmContext -Path $path } catch {}
+		$is64 = $false
+		if ($peCtx -and $peCtx.Ok) { $is64 = [bool]$peCtx.Is64 }
+		if ($exists -and $null -ne $beforeBytes -and $beforeBytes.Length -gt 0) {
+			$linesB = New-Object System.Collections.ArrayList
+			$ix = 0; $nIns = 0
+			while ($ix -lt $beforeBytes.Length -and $nIns -lt 6) {
+				$dec = Read-MBX86Instruction -Bytes $beforeBytes -Index $ix -FileOffset $off -Is64 $is64
+				if (-not $dec.Ok) { break }
+				[void]$linesB.Add(('{0}  {1,-16}  {2} {3}' -f $dec.offset_hex, $dec.bytes, $dec.mnemonic, $dec.operands))
+				$ix = [int]$dec.next_index
+				$nIns++
+			}
+			if ($linesB.Count -gt 0) { $disasmBefore = $linesB -join "`n" }
+		}
+		# after: patch bytes as if written
+		$linesA = New-Object System.Collections.ArrayList
+		$ix = 0; $nIns = 0
+		while ($ix -lt $patch.Length -and $nIns -lt 6) {
+			$dec = Read-MBX86Instruction -Bytes $patch -Index $ix -FileOffset $off -Is64 $is64
+			if (-not $dec.Ok) { break }
+			[void]$linesA.Add(('{0}  {1,-16}  {2} {3}' -f $dec.offset_hex, $dec.bytes, $dec.mnemonic, $dec.operands))
+			$ix = [int]$dec.next_index
+			$nIns++
+		}
+		if ($linesA.Count -gt 0) { $disasmAfter = $linesA -join "`n" }
+	} catch {}
+
 	$details = @"
 Path: $path
 Offset: $off (0x$('{0:X}' -f $off))
 Bytes: $($patch.Length)
+Preset: $(if ($presetNote) { $presetNote } elseif ($preset) { $preset } else { '(raw hex/bytes)' })
 Extend past EOF: $extend
 Backup (.bak): $backup
 Exists: $exists (current size $curSize)
@@ -21379,19 +25247,22 @@ End after write: $end
 
 $(if ($beforeDump) { "Before (existing bytes):`n$beforeDump`n`n" } else { '' })After (patch to write):
 $previewDump
+$(if ($disasmBefore) { "`nDisasm BEFORE:`n$disasmBefore`n" } else { '' })$(if ($disasmAfter) { "`nDisasm AFTER:`n$disasmAfter`n" } else { '' })
 "@
-	$codeShow = if ($beforeDump) { "BEFORE:`n$beforeDump`n`nAFTER:`n$previewDump" } else { $previewDump }
+	$codeShow = if ($disasmBefore -or $disasmAfter) {
+		"$(if ($disasmBefore) { "BEFORE:`n$disasmBefore`n`n" } else { '' })AFTER:`n$disasmAfter`n`nHEX AFTER:`n$previewDump"
+	} elseif ($beforeDump) {
+		"BEFORE:`n$beforeDump`n`nAFTER:`n$previewDump"
+	} else { $previewDump }
 	if (-not (Request-Confirmation -Title 'HexEdit requires approval' -Details $details -Code $codeShow -CodeLang 'text')) {
 		return 'BLOCKED BY USER: HexEdit denied by operator.'
 	}
 
 	$fs = $null
 	try {
+		$bakPath = $null
 		if ($exists -and $backup) {
-			$bak = $path + '.bak'
-			if (-not (Test-Path -LiteralPath $bak)) {
-				[System.IO.File]::Copy($path, $bak, $false)
-			}
+			$bakPath = Backup-MBFile -Path $path -Enabled $true
 		}
 		$parent = [System.IO.Path]::GetDirectoryName($path)
 		if ($parent -and -not (Test-Path -LiteralPath $parent)) {
@@ -21411,6 +25282,14 @@ $previewDump
 		$fs.Flush()
 		$newSize = $fs.Length
 		$tag = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+		try {
+			$beforeShow = if ($disasmBefore) { $disasmBefore } elseif ($beforeDump) { $beforeDump } else { '' }
+			$afterShow = if ($disasmAfter) { $disasmAfter } else { $previewDump }
+			$sum = ('offset 0x{0:X}  wrote {1} byte(s)' -f $off, $patch.Length)
+			if ($presetNote) { $sum = $sum + "  |  $presetNote" }
+			elseif ($preset) { $sum = $sum + "  |  preset=$preset" }
+			Write-MBHexDiffInline -Title ("HexEdit  {0}" -f $path) -Before $beforeShow -After $afterShow -Summary $sum -MaxLines 48
+		} catch {}
 		return ConvertTo-MBJson @{
 			status     = $tag
 			path       = $path
@@ -21418,7 +25297,11 @@ $previewDump
 			offset_hex = ('0x{0:X}' -f $off)
 			written    = $patch.Length
 			file_size  = $newSize
-			backup     = $(if ($backup) { $path + '.bak' } else { $null })
+			backup     = $bakPath
+			preset     = $(if ($preset) { $preset } else { $null })
+			preset_note = $(if ($presetNote) { $presetNote } else { $null })
+			disasm_before = $(if ($disasmBefore) { $disasmBefore } else { $null })
+			disasm_after  = $(if ($disasmAfter) { $disasmAfter } else { $null })
 			dump       = $previewDump
 		}
 	} catch {
@@ -21743,8 +25626,9 @@ function Invoke-MBCurlHttp {
 		[void]$argList.Add($hdrFile)
 		[void]$argList.Add('-o')
 		[void]$argList.Add($bodyFile)
+		# Trailer: status | final URL after -L | content-type (parsed below)
 		[void]$argList.Add('-w')
-		[void]$argList.Add('%{http_code}')
+		[void]$argList.Add("`n__MBCURL__%{http_code}|%{url_effective}|%{content_type}")
 
 		if ($Headers) {
 			foreach ($k in @($Headers.Keys)) {
@@ -21773,8 +25657,17 @@ function Invoke-MBCurlHttp {
 		$r = Invoke-MBSetupNative -File $CurlPath -ArgumentList @($argList.ToArray()) -TimeoutSec $nativeTimeout
 		$codeStr = (([string]$r.out) + '').Trim()
 		$status = 0
-		if ($codeStr -match '(\d{3})\s*$') { $status = [int]$Matches[1] }
-		elseif ($codeStr -match '^\d{3}$') { $status = [int]$codeStr }
+		$finalUrl = [string]$Url
+		$contentType = ''
+		if ($codeStr -match '__MBCURL__(\d{3})\|([^\r\n|]*)\|([^\r\n]*)\s*$') {
+			$status = [int]$Matches[1]
+			if ($Matches[2]) { $finalUrl = [string]$Matches[2].Trim() }
+			if ($Matches[3]) { $contentType = [string]$Matches[3].Trim() }
+		} elseif ($codeStr -match '(\d{3})\s*$') {
+			$status = [int]$Matches[1]
+		} elseif ($codeStr -match '^\d{3}$') {
+			$status = [int]$codeStr
+		}
 
 		$respHeaders = @{}
 		if ($hdrFile -and (Test-Path -LiteralPath $hdrFile)) {
@@ -21799,6 +25692,18 @@ function Invoke-MBCurlHttp {
 				}
 			} catch {}
 		}
+		if ($contentType -and -not $respHeaders.ContainsKey('Content-Type') -and -not $respHeaders.ContainsKey('content-type')) {
+			$respHeaders['Content-Type'] = $contentType
+		} elseif (-not $contentType) {
+			try {
+				foreach ($hk in @($respHeaders.Keys)) {
+					if ([string]::Equals([string]$hk, 'Content-Type', [StringComparison]::OrdinalIgnoreCase)) {
+						$contentType = [string]$respHeaders[$hk]
+						break
+					}
+				}
+			} catch {}
+		}
 
 		$bodyText = ''
 		if ($bodyFile -and (Test-Path -LiteralPath $bodyFile)) {
@@ -21810,24 +25715,26 @@ function Invoke-MBCurlHttp {
 			$err = (([string]$r.err) + ' ' + ([string]$r.out)).Trim()
 			if (-not $err) { $err = "curl exit $($r.exit)" }
 			return @{
-				ok          = $false
-				error       = $err
-				status_code = $(if ($status -gt 0) { $status } else { $null })
-				headers     = $respHeaders
-				body_text   = $bodyText
-				final_url   = $Url
-				method      = 'curl'
+				ok           = $false
+				error        = $err
+				status_code  = $(if ($status -gt 0) { $status } else { $null })
+				headers      = $respHeaders
+				body_text    = $bodyText
+				final_url    = $finalUrl
+				content_type = $contentType
+				method       = 'curl'
 			}
 		}
 
 		return @{
-			ok          = $true
-			status_code = $status
-			headers     = $respHeaders
-			body_text   = $bodyText
-			final_url   = $Url
-			method      = 'curl'
-			exit        = $r.exit
+			ok           = $true
+			status_code  = $status
+			headers      = $respHeaders
+			body_text    = $bodyText
+			final_url    = $finalUrl
+			content_type = $contentType
+			method       = 'curl'
+			exit         = $r.exit
 		}
 	} catch {
 		return @{ ok = $false; error = $_.Exception.Message; method = 'curl' }
@@ -22056,6 +25963,7 @@ function Invoke-MakeHttpRequest {
 		}
 		$bodyPack = ConvertFrom-MBHttpBodyPreferJson -BodyText ([string]$cr.body_text)
 		$okHttp = ($cr.status_code -ge 200 -and $cr.status_code -lt 400)
+		$ctOut = $(if ($cr.content_type) { $cr.content_type } else { Get-MBHttpHeaderValueInsensitive -Headers $cr.headers -Name 'Content-Type' })
 		return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
 			success         = [bool]$okHttp
 			status_code     = [int]$cr.status_code
@@ -22063,6 +25971,7 @@ function Invoke-MakeHttpRequest {
 			body            = $bodyPack.body
 			body_truncated  = [bool]$bodyPack.truncated
 			final_url       = $(if ($cr.final_url) { $cr.final_url } else { $url })
+			content_type    = $ctOut
 			content_length  = $(try { [int64]([string]$cr.body_text).Length } catch { $null })
 			method          = $methodU
 			verify_ssl      = $false
@@ -22097,6 +26006,7 @@ function Invoke-MakeHttpRequest {
 		try { $clen = [int64]$resp.RawContentLength } catch {
 			try { $clen = [int64]([string]$resp.Content).Length } catch {}
 		}
+		$ctIwr = Get-MBHttpHeaderValueInsensitive -Headers $respHeaders -Name 'Content-Type'
 		return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
 			success         = $true
 			status_code     = [int]$resp.StatusCode
@@ -22104,6 +26014,7 @@ function Invoke-MakeHttpRequest {
 			body            = $bodyPack.body
 			body_truncated  = [bool]$bodyPack.truncated
 			final_url       = $finalUrl
+			content_type    = $ctIwr
 			content_length  = $clen
 			method          = $methodU
 			verify_ssl      = [bool]$doVerify
@@ -22143,93 +26054,1189 @@ function Invoke-MakeHttpRequest {
 	}
 }
 
+function Get-MBDefaultBrowserUserAgent {
+	return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+}
+
+function Convert-MBResolveAbsoluteUrl {
+	param(
+		[string]$BaseUrl,
+		[string]$Href
+	)
+	if ([string]::IsNullOrWhiteSpace($Href)) { return $null }
+	$h = $Href.Trim()
+	if ($h.Length -eq 0) { return $null }
+	if ($h.StartsWith('#')) { return $null }
+	if ($h -match '^(?i)(javascript|mailto|tel|data):') { return $null }
+	# Unwrap DDG/Bing redirect wrappers (uddg= / bing ck).
+	$unwrapOnce = {
+		param([string]$U)
+		if ([string]::IsNullOrWhiteSpace($U)) { return $U }
+		$x = $U
+		if ($x -match '(?i)[?&]uddg=([^&]+)') {
+			try { $x = [uri]::UnescapeDataString($Matches[1]) } catch {}
+		} elseif ($x -match '(?i)[?&]uddg%3D([^&]+)') {
+			try { $x = [uri]::UnescapeDataString([uri]::UnescapeDataString($Matches[1])) } catch {}
+		}
+		if ($x -match '(?i)bing\.com/ck/' -and $x -match '(?i)[?&]u=([^&]+)') {
+			try { $x = [uri]::UnescapeDataString($Matches[1]) } catch {}
+		}
+		if ($x -match '(?i)^https?://[^/]+/.*[?&]url=(https?%3A[^&]+)') {
+			try { $x = [uri]::UnescapeDataString($Matches[1]) } catch {}
+		}
+		return $x
+	}
+	try { $h = & $unwrapOnce $h } catch {}
+	try { $h = & $unwrapOnce $h } catch {}  # second pass for double-wrap
+	try {
+		if ($h -match '^(?i)https?://') { return $h }
+		if ($h.StartsWith('//')) {
+			return ('https:{0}' -f $h)
+		}
+		if ([string]::IsNullOrWhiteSpace($BaseUrl)) { return $null }
+		$base = New-Object System.Uri($BaseUrl)
+		return (New-Object System.Uri($base, $h)).AbsoluteUri
+	} catch {
+		return $null
+	}
+}
+
+function Get-MBHttpHeaderValueInsensitive {
+	param($Headers, [string]$Name)
+	if ($null -eq $Headers -or [string]::IsNullOrWhiteSpace($Name)) { return $null }
+	try {
+		if ($Headers -is [hashtable] -or $Headers -is [System.Collections.IDictionary]) {
+			foreach ($k in @($Headers.Keys)) {
+				if ([string]::Equals([string]$k, $Name, [StringComparison]::OrdinalIgnoreCase)) {
+					return [string]$Headers[$k]
+				}
+			}
+		}
+	} catch {}
+	return $null
+}
+
+function Convert-MBHtmlStripToText {
+	param([string]$HtmlChunk)
+	if ([string]::IsNullOrEmpty($HtmlChunk)) { return '' }
+	$t = [string]$HtmlChunk
+	$t = [regex]::Replace($t, '(?is)<script[^>]*>.*?</script>', ' ')
+	$t = [regex]::Replace($t, '(?is)<style[^>]*>.*?</style>', ' ')
+	$t = [regex]::Replace($t, '(?is)<noscript[^>]*>.*?</noscript>', ' ')
+	$t = [regex]::Replace($t, '(?is)<!--.*?-->', ' ')
+	$t = [regex]::Replace($t, '(?is)</?(p|div|li|tr|h[1-6]|section|article|header|footer|br|hr|blockquote|pre)[^>]*>', "`n")
+	$t = [regex]::Replace($t, '(?i)<br\s*/?>', "`n")
+	$t = [regex]::Replace($t, '<[^>]+>', ' ')
+	$t = [System.Net.WebUtility]::HtmlDecode($t)
+	$t = $t -replace "`r`n", "`n" -replace "`r", "`n"
+	$t = [regex]::Replace($t, '[ \t\f\v]+', ' ')
+	$t = [regex]::Replace($t, '\n{3,}', "`n`n")
+	return $t.Trim()
+}
+
+function Convert-MBHtmlToReadable {
+	# Agent-oriented extract: title, main text, absolute links, JS-shell detection.
+	param(
+		[string]$Html,
+		[string]$BaseUrl = '',
+		[int]$MaxLength = 12000,
+		[int]$MaxLinks = 24,
+		[bool]$ExtractLinks = $true
+	)
+	if ($null -eq $Html) { $Html = '' }
+	if ($MaxLength -le 0) { $MaxLength = 12000 }
+	if ($MaxLength -gt 100000) { $MaxLength = 100000 }
+	if ($MaxLinks -le 0) { $MaxLinks = 24 }
+	if ($MaxLinks -gt 80) { $MaxLinks = 80 }
+
+	$title = ''
+	if ($Html -match '(?is)<title[^>]*>(.*?)</title>') {
+		$title = Convert-MBHtmlStripToText -HtmlChunk $Matches[1]
+		$title = ($title -replace '\s+', ' ').Trim()
+	}
+	if (-not $title -and $Html -match '(?is)<meta[^>]+property=["'']og:title["''][^>]+content=["'']([^"'']+)["'']') {
+		$title = [System.Net.WebUtility]::HtmlDecode($Matches[1]).Trim()
+	}
+	if (-not $title) { $title = 'No title' }
+
+	# Prefer main/article/role=main; drop chrome
+	$work = $Html
+	$main = $null
+	foreach ($pat in @(
+		'(?is)<main\b[^>]*>(.*?)</main>',
+		'(?is)<article\b[^>]*>(.*?)</article>',
+		'(?is)<div[^>]+role=["'']main["''][^>]*>(.*?)</div>',
+		'(?is)<div[^>]+id=["''](content|main|main-content|article|post|primary)["''][^>]*>(.*?)</div>'
+	)) {
+		$m = [regex]::Match($work, $pat)
+		if ($m.Success) {
+			$main = if ($m.Groups.Count -gt 2 -and $m.Groups[2].Success) { $m.Groups[2].Value } else { $m.Groups[1].Value }
+			if ((Convert-MBHtmlStripToText -HtmlChunk $main).Length -ge 80) { break }
+			$main = $null
+		}
+	}
+	if (-not $main -and $work -match '(?is)<body[^>]*>(.*?)</body>') {
+		$main = $Matches[1]
+	}
+	if (-not $main) { $main = $work }
+
+	# Strip common chrome from body extract
+	$main = [regex]::Replace($main, '(?is)<(nav|footer|header|aside|form)\b[^>]*>.*?</\1>', ' ')
+	$main = [regex]::Replace($main, '(?is)<div[^>]+class=["''][^"'']*\b(nav|menu|sidebar|footer|cookie|banner|ads?|share|comment)[^"'']*["''][^>]*>.*?</div>', ' ')
+
+	$text = Convert-MBHtmlStripToText -HtmlChunk $main
+	# Prefer native cleaner when available and text is thin
+	if ($script:HasNative -and $text.Length -lt 40 -and $Html.Length -gt 200) {
+		try {
+			$nat = [MiniBot.Core.Native]::HtmlToText($Html, $MaxLength)
+			if ($nat -match '(?s)\*\*Content:\*\*\s*(.*)$') {
+				$nt = $Matches[1].Trim()
+				if ($nt.Length -gt $text.Length) { $text = $nt }
+			}
+		} catch {}
+	}
+
+	$truncated = $false
+	if ($text.Length -gt $MaxLength) {
+		$text = $text.Substring(0, $MaxLength) + "`n`n[content truncated]"
+		$truncated = $true
+	}
+
+	# Link harvest
+	$links = New-Object System.Collections.ArrayList
+	if ($ExtractLinks) {
+		$seen = @{}
+		$ms = [regex]::Matches($Html, '(?is)<a\b[^>]*href\s*=\s*["'']([^"'']+)["''][^>]*>(.*?)</a>')
+		foreach ($lm in $ms) {
+			if ($links.Count -ge $MaxLinks) { break }
+			$href = $lm.Groups[1].Value.Trim()
+			$abs = Convert-MBResolveAbsoluteUrl -BaseUrl $BaseUrl -Href $href
+			if (-not $abs) { continue }
+			if ($seen.ContainsKey($abs.ToLowerInvariant())) { continue }
+			$seen[$abs.ToLowerInvariant()] = $true
+			$lt = Convert-MBHtmlStripToText -HtmlChunk $lm.Groups[2].Value
+			$lt = ($lt -replace '\s+', ' ').Trim()
+			if ($lt.Length -gt 120) { $lt = $lt.Substring(0, 117) + '...' }
+			if (-not $lt) { $lt = $abs }
+			[void]$links.Add([ordered]@{ text = $lt; url = $abs })
+		}
+	}
+
+	# JS-shell / SPA detection
+	$scriptBytes = 0
+	foreach ($sm in [regex]::Matches($Html, '(?is)<script\b[^>]*>(.*?)</script>')) {
+		$scriptBytes += $sm.Groups[1].Value.Length
+	}
+	$scriptTagCount = ([regex]::Matches($Html, '(?i)<script\b')).Count
+	$plainLen = $text.Length
+	$needsRender = $false
+	$renderReasons = New-Object System.Collections.ArrayList
+	if ($Html -match '(?i)enable\s+javascript|requires?\s+javascript|noscript') {
+		if ($plainLen -lt 400) {
+			$needsRender = $true
+			[void]$renderReasons.Add('javascript_required_message')
+		}
+	}
+	if ($plainLen -lt 180 -and $scriptBytes -gt 4000) {
+		$needsRender = $true
+		[void]$renderReasons.Add('thin_text_heavy_script')
+	}
+	if ($plainLen -lt 120 -and $scriptTagCount -ge 6) {
+		$needsRender = $true
+		[void]$renderReasons.Add('many_scripts_little_text')
+	}
+	if ($Html -match '(?i)id=["''](root|app|__next|__nuxt)["'']' -and $plainLen -lt 250) {
+		$needsRender = $true
+		[void]$renderReasons.Add('spa_root_shell')
+	}
+	if ($Html -match '(?i)__NEXT_DATA__|ng-version=|data-reactroot' -and $plainLen -lt 300) {
+		$needsRender = $true
+		[void]$renderReasons.Add('framework_shell')
+	}
+
+	return [ordered]@{
+		title           = $title
+		text            = $text
+		text_length     = $plainLen
+		truncated      = $truncated
+		links           = @($links)
+		link_count      = $links.Count
+		needs_render    = $needsRender
+		render_reasons  = @($renderReasons)
+		script_tags     = $scriptTagCount
+		script_bytes    = $scriptBytes
+	}
+}
+
+function Get-MBContentKindFromTypeAndBody {
+	param(
+		[string]$ContentType = '',
+		[string]$Body = ''
+	)
+	$ct = ([string]$ContentType).ToLowerInvariant()
+	if ($ct -match 'json') { return 'json' }
+	if ($ct -match 'text/plain') { return 'text' }
+	if ($ct -match 'text/markdown|text/x-markdown') { return 'markdown' }
+	if ($ct -match 'text/csv') { return 'csv' }
+	if ($ct -match 'text/html|application/xhtml') { return 'html' }
+	if ($ct -match 'image/') { return 'image' }
+	if ($ct -match 'audio/|video/') { return 'media' }
+	if ($ct -match 'application/pdf') { return 'pdf' }
+	if ($ct -match 'application/octet-stream|application/zip|application/x-|application/wasm') { return 'binary' }
+	$trim = if ($null -eq $Body) { '' } else { $Body.TrimStart() }
+	if ($trim.StartsWith('{') -or $trim.StartsWith('[')) {
+		try { $null = $trim | ConvertFrom-Json -ErrorAction Stop; return 'json' } catch {}
+	}
+	if ($trim -match '(?i)^<!DOCTYPE\s+html|^<html\b') { return 'html' }
+	if ($ct -match 'text/') { return 'text' }
+	if ([string]::IsNullOrWhiteSpace($ct) -and $trim.Length -gt 0) {
+		# Heuristic: high ratio of non-printables → binary
+		$sample = if ($trim.Length -gt 512) { $trim.Substring(0, 512) } else { $trim }
+		$ctrl = 0
+		foreach ($ch in $sample.ToCharArray()) {
+			$o = [int]$ch
+			if ($o -lt 9 -or ($o -gt 13 -and $o -lt 32)) { $ctrl++ }
+		}
+		if ($sample.Length -gt 0 -and ($ctrl / $sample.Length) -gt 0.15) { return 'binary' }
+		return 'text'
+	}
+	if ([string]::IsNullOrWhiteSpace($ct)) { return 'unknown' }
+	return 'other'
+}
+
+function Invoke-MBHttpGetPage {
+	# Shared GET for BrowsePage / SearchWeb. Returns status, body, final_url, content_type, headers, transport.
+	param(
+		[Parameter(Mandatory)][string]$Url,
+		[bool]$VerifySsl = $false,
+		[string]$UserAgent = '',
+		[int]$TimeoutSec = 30,
+		[hashtable]$ExtraHeaders = $null
+	)
+	$ua = if ($UserAgent) { $UserAgent } else { Get-MBDefaultBrowserUserAgent }
+	$headers = @{
+		'User-Agent' = $ua
+		'Accept'     = 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7'
+		'Accept-Language' = 'en-US,en;q=0.9'
+	}
+	if ($ExtraHeaders) {
+		foreach ($k in @($ExtraHeaders.Keys)) { $headers[[string]$k] = [string]$ExtraHeaders[$k] }
+	}
+	$result = [ordered]@{
+		ok           = $false
+		status_code  = 0
+		body         = ''
+		final_url    = $Url
+		content_type = ''
+		headers      = @{}
+		transport    = ''
+		error        = $null
+	}
+	if ((-not $VerifySsl) -and ($Url -match '^(?i)https:')) {
+		$curl = Resolve-MBCurlExe
+		if (-not $curl) {
+			$result.error = 'Bad/self-signed HTTPS needs system curl.exe (System32). Install curl or pass verify_ssl=true.'
+			return $result
+		}
+		$cr = Invoke-MBCurlHttp -CurlPath $curl -Method 'GET' -Url $Url -Headers $headers -TimeoutSec $TimeoutSec -VerifySsl $false
+		$result.transport = 'curl'
+		$result.status_code = [int]$(if ($cr.status_code) { $cr.status_code } else { 0 })
+		$result.body = [string]$cr.body_text
+		if ($cr.final_url) { $result.final_url = [string]$cr.final_url }
+		if ($cr.content_type) { $result.content_type = [string]$cr.content_type }
+		elseif ($cr.headers) {
+			$ct = Get-MBHttpHeaderValueInsensitive -Headers $cr.headers -Name 'Content-Type'
+			if ($ct) { $result.content_type = $ct }
+		}
+		if ($cr.headers) { $result.headers = $cr.headers }
+		if (-not $cr.ok -and $result.status_code -lt 100) {
+			$result.error = $(if ($cr.error) { $cr.error } else { 'curl failed' })
+			return $result
+		}
+		$result.ok = $true
+		return $result
+	}
+	$iwr = @{
+		Uri             = $Url
+		UseBasicParsing = $true
+		TimeoutSec      = $TimeoutSec
+		Headers         = $headers
+	}
+	Enable-MBHttpTls
+	try {
+		$resp = Invoke-WebRequest @iwr -ErrorAction Stop
+		$result.transport = 'iwr'
+		$result.ok = $true
+		$result.status_code = [int]$resp.StatusCode
+		$result.body = [string]$resp.Content
+		try { $result.final_url = $resp.BaseResponse.ResponseUri.AbsoluteUri } catch {}
+		$hdrs = @{}
+		try {
+			foreach ($h in $resp.Headers.GetEnumerator()) {
+				$hdrs[[string]$h.Key] = ($h.Value -join ', ')
+			}
+		} catch {}
+		$result.headers = $hdrs
+		$ct = Get-MBHttpHeaderValueInsensitive -Headers $hdrs -Name 'Content-Type'
+		if ($ct) { $result.content_type = $ct }
+		return $result
+	} catch {
+		$result.transport = 'iwr'
+		$result.error = $_.Exception.Message
+		try {
+			$respObj = $_.Exception.Response
+			if ($respObj) {
+				$result.status_code = [int]$respObj.StatusCode
+				$errBody = Read-MBHttpErrorResponseBody -Response $respObj
+				if ($errBody) { $result.body = $errBody; $result.ok = $true }
+			}
+		} catch {}
+		return $result
+	}
+}
+
 function Invoke-BrowsePage {
 	param(
 		[Parameter(Mandatory = $true)][string]$url,
 		[int]$max_length = 12000,
 		[object]$verify_ssl = $false,
 		[string]$user_agent = $null,
-		[bool]$extract_links = $false
+		[bool]$extract_links = $true,
+		[int]$max_links = 24
 	)
 	if (-not (Request-MBNetworkApproval -Method 'GET' -Url $url -HasCredentials $false -ToolName 'BrowsePage')) {
 		return "BLOCKED BY USER: BrowsePage denied by operator."
 	}
 	$doVerify = $true
 	try { $doVerify = Convert-MBToBool -Value $verify_ssl -Default $false } catch { $doVerify = $false }
-	$ua = if ($user_agent) { $user_agent } else {
-		'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-	}
 	$url = ([string]$url).Trim()
-	$html = $null
-	$finalUrl = $url
-
-	# Insecure HTTPS via curl -k (avoid process cert-validation hooks that trip AV)
-	if ((-not $doVerify) -and ($url -match '^(?i)https:')) {
-		$curl = Resolve-MBCurlExe
-		if (-not $curl) {
-			return 'ERROR: Bad/self-signed HTTPS needs system curl.exe (System32). Install curl or pass verify_ssl=true.'
-		}
-		$cr = Invoke-MBCurlHttp -CurlPath $curl -Method 'GET' -Url $url -Headers @{ 'User-Agent' = $ua } -TimeoutSec 30 -VerifySsl $false
-		if (-not $cr.ok -and -not $cr.status_code) {
-			return "ERROR: $($cr.error)"
-		}
-		$html = [string]$cr.body_text
-		if ($cr.final_url) { $finalUrl = [string]$cr.final_url }
-	} else {
-		$iwr = @{
-			Uri             = $url
-			UseBasicParsing = $true
-			TimeoutSec      = 30
-			Headers         = @{ 'User-Agent' = $ua }
-		}
-		Enable-MBHttpTls
-		try {
-			$resp = Invoke-WebRequest @iwr -ErrorAction Stop
-			$html = [string]$resp.Content
-			try { $finalUrl = $resp.BaseResponse.ResponseUri.AbsoluteUri } catch {}
-		} catch {
-			return "ERROR: $($_.Exception.Message)"
-		}
+	if ($url -notmatch '^(?i)https?://') {
+		return ConvertTo-MBJson ([ordered]@{ success = $false; error = 'url must start with http:// or https://'; url = $url })
 	}
 
 	try {
-		if ($script:HasNative) {
-			$text = [MiniBot.Core.Native]::HtmlToText($html, $max_length)
-			$result = $text + "`n**URL:** $finalUrl"
-		} else {
-			$title = if ($html -match '<title[^>]*>(.*?)</title>') { ($matches[1] -replace '\s+', ' ').Trim() } else { "No title" }
-			$html2 = [regex]::Replace($html, '<script[^>]*>.*?</script>', ' ', 'Singleline,IgnoreCase')
-			$html2 = [regex]::Replace($html2, '<style[^>]*>.*?</style>', ' ', 'Singleline,IgnoreCase')
-			$text = [regex]::Replace($html2, '<[^>]+>', ' ')
-			$text = [System.Net.WebUtility]::HtmlDecode($text)
-			$text = ($text -replace '\s+', ' ').Trim()
-			if ($text.Length -gt $max_length) { $text = $text.Substring(0, $max_length) + "`n`n[content truncated]" }
-			$result = "**Title:** $title`n**URL:** $finalUrl`n`n**Content:**`n$text"
+		$got = Invoke-MBHttpGetPage -Url $url -VerifySsl $doVerify -UserAgent $user_agent -TimeoutSec 30
+		if (-not $got.ok -and -not $got.body) {
+			return ConvertTo-MBJson ([ordered]@{
+				success = $false
+				error   = $(if ($got.error) { $got.error } else { 'request failed' })
+				url     = $url
+				final_url = $got.final_url
+				status_code = $got.status_code
+				transport = $got.transport
+			})
 		}
 
-		if ($extract_links) {
-			$links = @()
-			$linkRegex = '<a[^>]+href=["'']([^"'' >]+)["''][^>]*>(.*?)</a>'
-			$ms = [regex]::Matches($html, $linkRegex, 'IgnoreCase')
-			$count = 0
-			foreach ($m in $ms) {
-				if ($count -ge 15) { break }
-				$href = $m.Groups[1].Value.Trim()
-				if ($href -match '^https?://') {
-					$linkText = ($m.Groups[2].Value -replace '<[^>]+>', '').Trim()
-					if (-not $linkText) { $linkText = $href }
-					$links += "- ${linkText}: $href"
-					$count++
+		$finalUrl = if ($got.final_url) { [string]$got.final_url } else { $url }
+		$body = [string]$got.body
+		$ct = [string]$got.content_type
+		$kind = Get-MBContentKindFromTypeAndBody -ContentType $ct -Body $body
+		$status = [int]$got.status_code
+		$okHttp = ($status -ge 200 -and $status -lt 400) -or ($status -eq 0 -and $body.Length -gt 0)
+
+		$payload = [ordered]@{
+			success       = [bool]$okHttp
+			status_code   = $status
+			url           = $url
+			final_url     = $finalUrl
+			content_type  = $ct
+			content_kind  = $kind
+			transport     = $got.transport
+			verify_ssl    = [bool]$doVerify
+		}
+		if ($got.error -and -not $okHttp) { $payload['error'] = $got.error }
+
+		switch ($kind) {
+			'json' {
+				$pack = ConvertFrom-MBHttpBodyPreferJson -BodyText $body -MaxChars $max_length
+				$payload['title'] = 'JSON'
+				$payload['text'] = $(if ($pack.text) { [string]$pack.text } else { $body })
+				$payload['body'] = $pack.body
+				$payload['truncated'] = [bool]$pack.truncated
+				$payload['needs_render'] = $false
+				$payload['links'] = @()
+				$payload['hint'] = 'JSON response — use fields in body; no HTML extract.'
+			}
+			'binary' {
+				$payload['title'] = 'Binary'
+				$payload['text'] = ''
+				$payload['truncated'] = $false
+				$payload['needs_render'] = $false
+				$payload['links'] = @()
+				$payload['hint'] = 'Binary/non-text content. Use DownloadFile (files group) instead of BrowsePage.'
+				$payload['success'] = $false
+				$payload['error'] = "content_kind=binary ($ct). Prefer DownloadFile."
+			}
+			'image' {
+				$payload['title'] = 'Image'
+				$payload['text'] = ''
+				$payload['needs_render'] = $false
+				$payload['links'] = @()
+				$payload['hint'] = 'Image URL — use DownloadFile or vision ReadImage, not BrowsePage text extract.'
+				$payload['success'] = $false
+				$payload['error'] = "content_kind=image ($ct)."
+			}
+			'pdf' {
+				$payload['title'] = 'PDF'
+				$payload['text'] = ''
+				$payload['needs_render'] = $false
+				$payload['links'] = @()
+				$payload['hint'] = 'PDF — DownloadFile then ReadPdf (vision group).'
+				$payload['success'] = $false
+				$payload['error'] = "content_kind=pdf ($ct)."
+			}
+			'html' {
+				$ex = Convert-MBHtmlToReadable -Html $body -BaseUrl $finalUrl -MaxLength $max_length -MaxLinks $max_links -ExtractLinks $extract_links
+				$payload['title'] = $ex.title
+				$payload['text'] = $ex.text
+				$payload['text_length'] = $ex.text_length
+				$payload['truncated'] = $ex.truncated
+				$payload['links'] = $ex.links
+				$payload['link_count'] = $ex.link_count
+				$payload['needs_render'] = $ex.needs_render
+				$payload['render_reasons'] = $ex.render_reasons
+				if ($ex.needs_render) {
+					$payload['hint'] = 'Page looks JS-rendered (SPA/shell). Text may be incomplete. Try SearchWeb for alternate sources, raw/API URLs, or GitHub raw. Full headless render is not built into MiniBot.'
+				} else {
+					$payload['hint'] = 'Readable extract. Use links[] for follow-ups; SearchWeb to discover URLs.'
 				}
 			}
-			if ($links.Count -gt 0) {
-				$result += "`n`n**Links:**`n" + ($links -join "`n")
+			default {
+				# plain text / markdown / other
+				$t = $body
+				$trunc = $false
+				if ($t.Length -gt $max_length) {
+					$t = $t.Substring(0, $max_length) + "`n`n[content truncated]"
+					$trunc = $true
+				}
+				$payload['title'] = $(if ($kind -eq 'markdown') { 'Markdown' } else { 'Text' })
+				$payload['text'] = $t
+				$payload['text_length'] = $t.Length
+				$payload['truncated'] = $trunc
+				$payload['needs_render'] = $false
+				$payload['links'] = @()
+				$payload['hint'] = "content_kind=$kind"
 			}
 		}
-		return $result
+
+		# Human-friendly block for models that skim string fields
+		$summary = New-Object System.Collections.Generic.List[string]
+		[void]$summary.Add(('**Title:** {0}' -f $payload['title']))
+		[void]$summary.Add(('**URL:** {0}' -f $finalUrl))
+		if ($payload['content_kind']) { [void]$summary.Add(('**Kind:** {0}' -f $payload['content_kind'])) }
+		if ($payload['needs_render']) { [void]$summary.Add('**needs_render:** true (JS shell likely)') }
+		if ($payload['text']) {
+			[void]$summary.Add('')
+			[void]$summary.Add('**Content:**')
+			[void]$summary.Add([string]$payload['text'])
+		}
+		if ($payload['links'] -and @($payload['links']).Count -gt 0) {
+			[void]$summary.Add('')
+			[void]$summary.Add('**Links:**')
+			foreach ($lk in @($payload['links'] | Select-Object -First 15)) {
+				[void]$summary.Add(('- {0}: {1}' -f $lk.text, $lk.url))
+			}
+		}
+		$payload['summary'] = ($summary -join "`n")
+
+		return Limit-MBResult (ConvertTo-MBJson $payload -Depth 10)
 	} catch {
-		return "ERROR: $($_.Exception.Message)"
+		return ConvertTo-MBJson ([ordered]@{ success = $false; error = $_.Exception.Message; url = $url })
 	}
+}
+
+function Test-MBSearchResultUrlKeep {
+	# Keep external search hits; drop SERP chrome.
+	param([string]$Url)
+	if ([string]::IsNullOrWhiteSpace($Url)) { return $false }
+	if ($Url -notmatch '^(?i)https?://') { return $false }
+	# Drop pure DDG chrome; keep unwrapped external targets
+	if ($Url -match '(?i)^https?://([^/]*\.)?duckduckgo\.com(/|$)') {
+		# still on DDG after unwrap → not a real result
+		if ($Url -notmatch '(?i)[?&]uddg=') { return $false }
+	}
+	if ($Url -match '(?i)duckduckgo\.com/(y\.js|html/?$|chrome_newtab)') { return $false }
+	if ($Url -match '(?i)^https?://(www\.)?(bing|google|brave)\.com/(search|web|speller)') { return $false }
+	return $true
+}
+
+function Invoke-SearchWeb {
+	# Web search: unwrap DDG uddg= redirects; fall through Bing/Brave when blocked.
+	param(
+		[Parameter(Mandatory = $true)][string]$query,
+		[int]$max_results = 8,
+		[string]$engine = 'auto', # auto | duckduckgo | bing | brave
+		[object]$verify_ssl = $true,
+		[string]$user_agent = $null
+	)
+	$q = ([string]$query).Trim()
+	if ([string]::IsNullOrWhiteSpace($q)) {
+		return ConvertTo-MBJson ([ordered]@{ success = $false; error = 'query required' })
+	}
+	if ($max_results -le 0) { $max_results = 8 }
+	if ($max_results -gt 20) { $max_results = 20 }
+	$doVerify = $true
+	try { $doVerify = Convert-MBToBool -Value $verify_ssl -Default $true } catch { $doVerify = $true }
+	$eng = ([string]$engine).Trim().ToLowerInvariant()
+	if ($eng -notin @('auto', 'duckduckgo', 'ddg', 'bing', 'brave')) { $eng = 'auto' }
+	if ($eng -eq 'ddg') { $eng = 'duckduckgo' }
+
+	$probeUrl = 'https://html.duckduckgo.com/html/'
+	if (-not (Request-MBNetworkApproval -Method 'GET' -Url $probeUrl -HasCredentials $false -ToolName 'SearchWeb')) {
+		return "BLOCKED BY USER: SearchWeb denied by operator."
+	}
+
+	$results = New-Object System.Collections.ArrayList
+	$seen = @{}
+	$sourcesTried = New-Object System.Collections.ArrayList
+	$notes = New-Object System.Collections.ArrayList
+	$abstract = $null
+	$ua = if ($user_agent) { $user_agent } else { Get-MBDefaultBrowserUserAgent }
+
+	$addHit = {
+		param([string]$Title, [string]$Url, [string]$Snippet, [string]$Source)
+		if ([string]::IsNullOrWhiteSpace($Url)) { return }
+		$abs = Convert-MBResolveAbsoluteUrl -BaseUrl 'https://duckduckgo.com/' -Href $Url
+		if (-not $abs) { $abs = $Url.Trim() }
+		# protocol-relative
+		if ($abs -match '^//') { $abs = 'https:' + $abs }
+		if ($abs -notmatch '^(?i)https?://') { return }
+		if (-not (Test-MBSearchResultUrlKeep -Url $abs)) { return }
+		$key = $abs.ToLowerInvariant()
+		# strip trivial fragments for dedupe
+		$key = $key -replace '#.*$', ''
+		if ($seen.ContainsKey($key)) { return }
+		if ($results.Count -ge $max_results) { return }
+		$seen[$key] = $true
+		$t = if ($Title) { ($Title -replace '\s+', ' ').Trim() } else { $abs }
+		if ($t.Length -gt 160) { $t = $t.Substring(0, 157) + '...' }
+		$s = if ($Snippet) { ($Snippet -replace '\s+', ' ').Trim() } else { '' }
+		if ($s.Length -gt 280) { $s = $s.Substring(0, 277) + '...' }
+		[void]$results.Add([ordered]@{
+			title   = $t
+			url     = $abs
+			snippet = $s
+			source  = $Source
+		})
+	}.GetNewClosure()
+
+	$scrapeDdgHtml = {
+		param([string]$Html, [string]$SourceTag)
+		if ([string]::IsNullOrWhiteSpace($Html)) { return 0 }
+		$before = $results.Count
+		# Bot / challenge pages
+		if ($Html -match '(?i)(anomaly-modal|bots?\s+use|captcha|challenge-form|Please complete the following challenge|Unfortunately, bots)') {
+			# ${SourceTag} required — "$SourceTag:" is parsed as a drive-scoped variable in PS 5.1
+			[void]$notes.Add(('{0}: bot/challenge page' -f $SourceTag))
+			return 0
+		}
+		# result__a with any attribute order
+		$blocks = [regex]::Matches($Html, '(?is)<a\b[^>]*\bclass\s*=\s*["''][^"'']*\bresult__a\b[^"'']*["''][^>]*\bhref\s*=\s*["'']([^"'']+)["''][^>]*>(.*?)</a>')
+		if ($blocks.Count -eq 0) {
+			$blocks = [regex]::Matches($Html, '(?is)<a\b[^>]*\bhref\s*=\s*["'']([^"'']+)["''][^>]*\bclass\s*=\s*["''][^"'']*\bresult__a\b[^"'']*["''][^>]*>(.*?)</a>')
+		}
+		# Also pick any uddg= links with visible text
+		if ($blocks.Count -eq 0) {
+			$blocks = [regex]::Matches($Html, '(?is)<a\b[^>]*\bhref\s*=\s*["'']([^"'']*uddg=[^"'']+)["''][^>]*>(.*?)</a>')
+		}
+		foreach ($b in $blocks) {
+			if ($results.Count -ge $max_results) { break }
+			$href = $b.Groups[1].Value
+			$title = Convert-MBHtmlStripToText -HtmlChunk $b.Groups[2].Value
+			$snip = ''
+			# nearby snippet class
+			try {
+				$idx = $b.Index + $b.Length
+				$window = if ($idx -lt $Html.Length) { $Html.Substring($idx, [Math]::Min(800, $Html.Length - $idx)) } else { '' }
+				if ($window -match '(?is)class\s*=\s*["''][^"'']*result__snippet[^"'']*["''][^>]*>(.*?)</(?:a|td|div|span)>') {
+					$snip = Convert-MBHtmlStripToText -HtmlChunk $Matches[1]
+				}
+			} catch {}
+			& $addHit -Title $title -Url $href -Snippet $snip -Source $SourceTag
+		}
+		return ($results.Count - $before)
+	}.GetNewClosure()
+
+	# Instant Answer (JSON) — abstract + related (often empty for non-entity queries)
+	try {
+		$iaUrl = 'https://api.duckduckgo.com/?q={0}&format=json&no_html=1&skip_disambig=1&t=minibot' -f [uri]::EscapeDataString($q)
+		[void]$sourcesTried.Add('ddg_instant')
+		$ia = Invoke-MBHttpGetPage -Url $iaUrl -VerifySsl $doVerify -UserAgent $ua -TimeoutSec 20
+		if ($ia.ok -and $ia.body) {
+			$jo = $null
+			try { $jo = $ia.body | ConvertFrom-Json -ErrorAction Stop } catch { $jo = $null }
+			if ($jo) {
+				if ($jo.AbstractText) {
+					$abstract = [ordered]@{
+						text     = [string]$jo.AbstractText
+						url      = [string]$jo.AbstractURL
+						source   = [string]$jo.AbstractSource
+						heading  = [string]$jo.Heading
+					}
+					if ($jo.AbstractURL) {
+						& $addHit -Title $(if ($jo.Heading) { [string]$jo.Heading } else { $q }) -Url ([string]$jo.AbstractURL) -Snippet ([string]$jo.AbstractText) -Source 'ddg_instant'
+					}
+				}
+				foreach ($rt in @($jo.Results)) {
+					if ($results.Count -ge $max_results) { break }
+					try {
+						& $addHit -Title ([string]$rt.Text) -Url ([string]$rt.FirstURL) -Snippet ([string]$rt.Text) -Source 'ddg_instant'
+					} catch {}
+				}
+				foreach ($rt in @($jo.RelatedTopics)) {
+					if ($results.Count -ge $max_results) { break }
+					try {
+						if ($rt.FirstURL) {
+							& $addHit -Title ([string]$rt.Text) -Url ([string]$rt.FirstURL) -Snippet ([string]$rt.Text) -Source 'ddg_related'
+						} elseif ($rt.Topics) {
+							foreach ($sub in @($rt.Topics)) {
+								if ($results.Count -ge $max_results) { break }
+								if ($sub.FirstURL) {
+									& $addHit -Title ([string]$sub.Text) -Url ([string]$sub.FirstURL) -Snippet ([string]$sub.Text) -Source 'ddg_related'
+								}
+							}
+						}
+					} catch {}
+				}
+			}
+		}
+	} catch {}
+
+	$wantDdg = ($eng -in @('auto', 'duckduckgo'))
+	$wantBing = ($eng -in @('auto', 'bing'))
+	$wantBrave = ($eng -in @('auto', 'brave'))
+
+	# DuckDuckGo HTML
+	if ($wantDdg -and $results.Count -lt $max_results) {
+		try {
+			$ddgUrl = 'https://html.duckduckgo.com/html/?q={0}' -f [uri]::EscapeDataString($q)
+			[void]$sourcesTried.Add('ddg_html')
+			$pg = Invoke-MBHttpGetPage -Url $ddgUrl -VerifySsl $doVerify -UserAgent $ua -TimeoutSec 25 -ExtraHeaders @{
+				'Referer' = 'https://duckduckgo.com/'
+			}
+			if ($pg.ok -and $pg.body) {
+				$nAdd = & $scrapeDdgHtml -Html ([string]$pg.body) -SourceTag 'ddg_html'
+				if ($nAdd -eq 0 -and [string]$pg.body -match '(?i)(anomaly|captcha|bots?)') {
+					[void]$notes.Add('ddg_html blocked or empty after unwrap')
+				}
+			} else {
+				[void]$notes.Add(('ddg_html http fail status={0}' -f $(try { $pg.status_code } catch { '?' })))
+			}
+		} catch {
+			[void]$notes.Add(('ddg_html error: {0}' -f $_.Exception.Message))
+		}
+	}
+
+	# DuckDuckGo lite
+	if ($wantDdg -and $results.Count -lt $max_results) {
+		try {
+			$liteUrl = 'https://lite.duckduckgo.com/lite/?q={0}' -f [uri]::EscapeDataString($q)
+			[void]$sourcesTried.Add('ddg_lite')
+			$pg = Invoke-MBHttpGetPage -Url $liteUrl -VerifySsl $doVerify -UserAgent $ua -TimeoutSec 25 -ExtraHeaders @{
+				'Referer' = 'https://lite.duckduckgo.com/'
+			}
+			if ($pg.ok -and $pg.body) {
+				$html = [string]$pg.body
+				if ($html -match '(?i)(anomaly-modal|captcha|challenge-form)') {
+					[void]$notes.Add('ddg_lite: bot/challenge page')
+				} else {
+					$ms = [regex]::Matches($html, '(?is)<a\b[^>]*\brel\s*=\s*["'']nofollow["''][^>]*\bhref\s*=\s*["'']([^"'']+)["''][^>]*>(.*?)</a>')
+					if ($ms.Count -eq 0) {
+						$ms = [regex]::Matches($html, '(?is)<a\b[^>]*\bhref\s*=\s*["'']([^"'']*uddg=[^"'']+)["''][^>]*>(.*?)</a>')
+					}
+					if ($ms.Count -eq 0) {
+						$ms = [regex]::Matches($html, '(?is)<a\b[^>]*\bhref\s*=\s*["''](https?://[^"'']+)["''][^>]*>(.*?)</a>')
+					}
+					foreach ($m in $ms) {
+						if ($results.Count -ge $max_results) { break }
+						$href = $m.Groups[1].Value
+						$title = Convert-MBHtmlStripToText -HtmlChunk $m.Groups[2].Value
+						if ($title.Length -lt 2) { continue }
+						& $addHit -Title $title -Url $href -Snippet '' -Source 'ddg_lite'
+					}
+				}
+			}
+		} catch {
+			[void]$notes.Add(('ddg_lite error: {0}' -f $_.Exception.Message))
+		}
+	}
+
+	# Bing fallback
+	if ($wantBing -and $results.Count -lt $max_results) {
+		try {
+			$bingUrl = 'https://www.bing.com/search?q={0}&setlang=en-US&cc=US' -f [uri]::EscapeDataString($q)
+			[void]$sourcesTried.Add('bing_html')
+			$pg = Invoke-MBHttpGetPage -Url $bingUrl -VerifySsl $doVerify -UserAgent $ua -TimeoutSec 25 -ExtraHeaders @{
+				'Referer' = 'https://www.bing.com/'
+				'Accept'  = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+			}
+			if ($pg.ok -and $pg.body) {
+				$html = [string]$pg.body
+				$ms = [regex]::Matches($html, '(?is)<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>.*?<h2[^>]*>\s*<a[^>]+href=["'']([^"'']+)["''][^>]*>(.*?)</a>')
+				if ($ms.Count -eq 0) {
+					$ms = [regex]::Matches($html, '(?is)<h2[^>]*>\s*<a[^>]+href=["''](https?://[^"'']+)["''][^>]*>(.*?)</a>\s*</h2>')
+				}
+				foreach ($m in $ms) {
+					if ($results.Count -ge $max_results) { break }
+					$href = $m.Groups[1].Value
+					$title = Convert-MBHtmlStripToText -HtmlChunk $m.Groups[2].Value
+					$snip = ''
+					try {
+						$idx = $m.Index + $m.Length
+						$window = if ($idx -lt $html.Length) { $html.Substring($idx, [Math]::Min(600, $html.Length - $idx)) } else { '' }
+						if ($window -match '(?is)<p>(.*?)</p>') {
+							$snip = Convert-MBHtmlStripToText -HtmlChunk $Matches[1]
+						}
+					} catch {}
+					& $addHit -Title $title -Url $href -Snippet $snip -Source 'bing'
+				}
+				if ($results.Count -eq 0) { [void]$notes.Add('bing_html: no parseable results') }
+			} else {
+				[void]$notes.Add(('bing_html http fail status={0}' -f $(try { $pg.status_code } catch { '?' })))
+			}
+		} catch {
+			[void]$notes.Add(('bing_html error: {0}' -f $_.Exception.Message))
+		}
+	}
+
+	# Brave fallback
+	if ($wantBrave -and $results.Count -lt $max_results) {
+		try {
+			$braveUrl = 'https://search.brave.com/search?q={0}&source=web' -f [uri]::EscapeDataString($q)
+			[void]$sourcesTried.Add('brave_html')
+			$pg = Invoke-MBHttpGetPage -Url $braveUrl -VerifySsl $doVerify -UserAgent $ua -TimeoutSec 25 -ExtraHeaders @{
+				'Referer' = 'https://search.brave.com/'
+			}
+			if ($pg.ok -and $pg.body) {
+				$html = [string]$pg.body
+				$ms = [regex]::Matches($html, '(?is)<a[^>]+href=["''](https?://[^"'']+)["''][^>]*class=["''][^"'']*result-header[^"'']*["''][^>]*>(.*?)</a>')
+				if ($ms.Count -eq 0) {
+					$ms = [regex]::Matches($html, '(?is)<a[^>]+class=["''][^"'']*(?:result-header|title)[^"'']*["''][^>]+href=["''](https?://[^"'']+)["''][^>]*>(.*?)</a>')
+				}
+				if ($ms.Count -eq 0) {
+					# broader: cite links in main results
+					$ms = [regex]::Matches($html, '(?is)<div[^>]+class=["''][^"'']*snippet[^"'']*["''][^>]*>.*?<a[^>]+href=["''](https?://[^"'']+)["''][^>]*>(.*?)</a>')
+				}
+				foreach ($m in $ms) {
+					if ($results.Count -ge $max_results) { break }
+					$href = $m.Groups[1].Value
+					if ($href -match '(?i)search\.brave\.com') { continue }
+					$title = Convert-MBHtmlStripToText -HtmlChunk $m.Groups[2].Value
+					& $addHit -Title $title -Url $href -Snippet '' -Source 'brave'
+				}
+				if ($results.Count -eq 0) { [void]$notes.Add('brave_html: no parseable results') }
+			}
+		} catch {
+			[void]$notes.Add(('brave_html error: {0}' -f $_.Exception.Message))
+		}
+	}
+
+	$hint = 'Pick 1–3 URLs and call BrowsePage. If needs_render on BrowsePage, try another result or a docs/raw URL.'
+	if ($results.Count -eq 0) {
+		$hint = 'No organic hits (DuckDuckGo often bot-blocks datacenter IPs). Retried Bing/Brave. Try engine=bing, a more specific query, BrowsePage on a known docs URL, or SearchMicrosoftLearn for MS docs.'
+	} elseif ($notes.Count -gt 0 -and ($notes -join ' ') -match 'bot|blocked|challenge') {
+		$hint = 'Some engines bot-blocked; using whatever results unwrapped. Prefer BrowsePage on these URLs; for MS docs use SearchMicrosoftLearn.'
+	}
+
+	return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
+		success       = ($results.Count -gt 0 -or $null -ne $abstract)
+		query         = $q
+		count         = $results.Count
+		results       = @($results)
+		abstract      = $abstract
+		sources_tried = @($sourcesTried)
+		notes         = @($notes)
+		hint          = $hint
+	}) -Depth 8)
+}
+
+function Test-MBDocsAllowedHost {
+	# Restrict docs tools to Microsoft Learn / SS64 only.
+	param(
+		[string]$Url,
+		[switch]$Learn,
+		[switch]$Ss64
+	)
+	try {
+		$u = ([string]$Url).Trim()
+		if ($u -notmatch '^(?i)https?://') { return $false }
+		$uri = [uri]$u
+		$h = $uri.Host.ToLowerInvariant()
+		if ($Learn) {
+			if ($h -eq 'learn.microsoft.com') { return $true }
+			if ($h -eq 'docs.microsoft.com') { return $true }
+			if ($h.EndsWith('.learn.microsoft.com')) { return $true }
+			if ($h.EndsWith('.docs.microsoft.com')) { return $true }
+		}
+		if ($Ss64) {
+			if ($h -eq 'ss64.com') { return $true }
+			if ($h.EndsWith('.ss64.com')) { return $true }
+		}
+	} catch {}
+	return $false
+}
+
+function Invoke-SearchMicrosoftLearn {
+	param(
+		[Parameter(Mandatory = $true)][string]$query,
+		[int]$max_results = 8,
+		[string]$locale = 'en-us'
+	)
+	$q = ([string]$query).Trim()
+	if ([string]::IsNullOrWhiteSpace($q)) {
+		return ConvertTo-MBJson ([ordered]@{ success = $false; error = 'query required' })
+	}
+	if ($max_results -le 0) { $max_results = 8 }
+	if ($max_results -gt 15) { $max_results = 15 }
+	$loc = ([string]$locale).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($loc)) { $loc = 'en-us' }
+
+	$probe = 'https://learn.microsoft.com/api/search'
+	if (-not (Request-MBNetworkApproval -Method 'GET' -Url $probe -HasCredentials $false -ToolName 'SearchMicrosoftLearn')) {
+		return "BLOCKED BY USER: SearchMicrosoftLearn denied by operator."
+	}
+
+	$results = New-Object System.Collections.ArrayList
+	$seen = @{}
+	$sources = New-Object System.Collections.ArrayList
+	$ua = Get-MBDefaultBrowserUserAgent
+
+	$add = {
+		param([string]$Title, [string]$Url, [string]$Snippet, [string]$Source)
+		if ([string]::IsNullOrWhiteSpace($Url)) { return }
+		$abs = [string]$Url.Trim()
+		if ($abs -notmatch '^(?i)https?://') {
+			if ($abs.StartsWith('/')) { $abs = 'https://learn.microsoft.com' + $abs }
+			else { return }
+		}
+		if (-not (Test-MBDocsAllowedHost -Url $abs -Learn)) { return }
+		$key = $abs.ToLowerInvariant()
+		if ($seen.ContainsKey($key)) { return }
+		if ($results.Count -ge $max_results) { return }
+		$seen[$key] = $true
+		$t = if ($Title) { ($Title -replace '\s+', ' ').Trim() } else { $abs }
+		if ($t.Length -gt 180) { $t = $t.Substring(0, 177) + '...' }
+		$s = if ($Snippet) { ($Snippet -replace '\s+', ' ').Trim() } else { '' }
+		if ($s.Length -gt 320) { $s = $s.Substring(0, 317) + '...' }
+		[void]$results.Add([ordered]@{ title = $t; url = $abs; snippet = $s; source = $Source })
+	}.GetNewClosure()
+
+	# Official Learn search API
+	try {
+		$apiUrl = 'https://learn.microsoft.com/api/search?search={0}&locale={1}&$top={2}' -f `
+			[uri]::EscapeDataString($q), [uri]::EscapeDataString($loc), $max_results
+		[void]$sources.Add('learn_api')
+		$pg = Invoke-MBHttpGetPage -Url $apiUrl -VerifySsl $true -UserAgent $ua -TimeoutSec 25
+		if ($pg.ok -and $pg.body) {
+			$jo = $null
+			try { $jo = $pg.body | ConvertFrom-Json -ErrorAction Stop } catch { $jo = $null }
+			if ($jo) {
+				$items = @()
+				try {
+					if ($jo.results) { $items = @($jo.results) }
+					elseif ($jo.value) { $items = @($jo.value) }
+					elseif ($jo.Results) { $items = @($jo.Results) }
+				} catch { $items = @() }
+				foreach ($it in $items) {
+					if ($results.Count -ge $max_results) { break }
+					try {
+						$title = ''
+						$url = ''
+						$snip = ''
+						try { $title = [string]$it.title } catch {}
+						if (-not $title) { try { $title = [string]$it.Title } catch {} }
+						try { $url = [string]$it.url } catch {}
+						if (-not $url) { try { $url = [string]$it.Url } catch {} }
+						if (-not $url) { try { $url = [string]$it.uri } catch {} }
+						if (-not $url) { try { $url = [string]$it.documentLink } catch {} }
+						try { $snip = [string]$it.description } catch {}
+						if (-not $snip) { try { $snip = [string]$it.summary } catch {} }
+						if (-not $snip) { try { $snip = [string]$it.snippet } catch {} }
+						& $add -Title $title -Url $url -Snippet $snip -Source 'learn_api'
+					} catch {}
+				}
+			}
+		}
+	} catch {}
+
+	# Fallback: scoped web search
+	if ($results.Count -lt [Math]::Max(2, [int]($max_results / 2))) {
+		try {
+			[void]$sources.Add('web_site_filter')
+			$sq = 'site:learn.microsoft.com {0}' -f $q
+			$raw = Invoke-SearchWeb -query $sq -max_results $max_results -engine 'auto' -verify_ssl $true
+			$jo = $null
+			try {
+				if ($raw -is [string] -and $raw.TrimStart().StartsWith('{')) {
+					$jo = $raw | ConvertFrom-Json -ErrorAction Stop
+				}
+			} catch { $jo = $null }
+			if ($jo -and $jo.results) {
+				foreach ($r in @($jo.results)) {
+					if ($results.Count -ge $max_results) { break }
+					try {
+						& $add -Title ([string]$r.title) -Url ([string]$r.url) -Snippet ([string]$r.snippet) -Source 'web_site_filter'
+					} catch {}
+				}
+			}
+		} catch {}
+	}
+
+	$hint = if ($results.Count -gt 0) {
+		'Pick the best learn.microsoft.com URL and call ReadMicrosoftLearn url=...'
+	} else {
+		'No Learn hits. Try a more specific query (cmdlet name, product + feature), or SearchWeb for non-MS sources.'
+	}
+	return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
+		success       = ($results.Count -gt 0)
+		query         = $q
+		locale        = $loc
+		count         = $results.Count
+		results       = @($results)
+		sources_tried = @($sources)
+		hint          = $hint
+	}) -Depth 8)
+}
+
+function Invoke-ReadMicrosoftLearn {
+	param(
+		[Parameter(Mandatory = $true)][string]$url,
+		[int]$max_length = 10000
+	)
+	$u = ([string]$url).Trim()
+	if ($u -notmatch '^(?i)https?://') {
+		return ConvertTo-MBJson ([ordered]@{ success = $false; error = 'url must start with http:// or https://'; url = $u })
+	}
+	if (-not (Test-MBDocsAllowedHost -Url $u -Learn)) {
+		return ConvertTo-MBJson ([ordered]@{
+			success = $false
+			error   = 'url host must be learn.microsoft.com (or docs.microsoft.com). Use SearchMicrosoftLearn first, or BrowsePage for other sites.'
+			url     = $u
+		})
+	}
+	if ($max_length -le 0) { $max_length = 10000 }
+	if ($max_length -gt 20000) { $max_length = 20000 }
+	# Reuse BrowsePage (network approval + extract); stamp tool name in approval via wrapper path
+	$raw = Invoke-BrowsePage -url $u -max_length $max_length -verify_ssl $true -extract_links $true -max_links 20
+	# Relabel if string JSON so model sees docs context
+	try {
+		if ($raw -is [string] -and $raw.TrimStart().StartsWith('{')) {
+			$jo = $raw | ConvertFrom-Json -ErrorAction Stop
+			$od = [ordered]@{}
+			foreach ($p in @($jo.PSObject.Properties)) {
+				$od[$p.Name] = $p.Value
+			}
+			$od['docs_source'] = 'microsoft_learn'
+			$od['hint'] = 'Microsoft Learn extract. Prefer official steps/cmdlets over inventing APIs. Follow links only on learn.microsoft.com via ReadMicrosoftLearn.'
+			return Limit-MBResult (ConvertTo-MBJson $od -Depth 10)
+		}
+	} catch {}
+	return $raw
+}
+
+function Invoke-SearchSs64 {
+	param(
+		[Parameter(Mandatory = $true)][string]$query,
+		[int]$max_results = 8,
+		[string]$scope = 'auto'
+	)
+	$q = ([string]$query).Trim()
+	if ([string]::IsNullOrWhiteSpace($q)) {
+		return ConvertTo-MBJson ([ordered]@{ success = $false; error = 'query required' })
+	}
+	if ($max_results -le 0) { $max_results = 8 }
+	if ($max_results -gt 15) { $max_results = 15 }
+	$sc = ([string]$scope).Trim().ToLowerInvariant()
+	if ($sc -notin @('auto', 'ps', 'nt', 'bash', 'powershell', 'cmd', 'linux')) { $sc = 'auto' }
+	if ($sc -eq 'powershell') { $sc = 'ps' }
+	if ($sc -eq 'cmd') { $sc = 'nt' }
+	if ($sc -eq 'linux') { $sc = 'bash' }
+
+	$probe = 'https://ss64.com/'
+	if (-not (Request-MBNetworkApproval -Method 'GET' -Url $probe -HasCredentials $false -ToolName 'SearchSs64')) {
+		return "BLOCKED BY USER: SearchSs64 denied by operator."
+	}
+
+	$results = New-Object System.Collections.ArrayList
+	$seen = @{}
+	$sources = New-Object System.Collections.ArrayList
+
+	$add = {
+		param([string]$Title, [string]$Url, [string]$Snippet, [string]$Source)
+		if ([string]::IsNullOrWhiteSpace($Url)) { return }
+		$abs = [string]$Url.Trim()
+		if ($abs -notmatch '^(?i)https?://') {
+			if ($abs.StartsWith('/')) { $abs = 'https://ss64.com' + $abs }
+			else { return }
+		}
+		if (-not (Test-MBDocsAllowedHost -Url $abs -Ss64)) { return }
+		$key = $abs.ToLowerInvariant()
+		if ($seen.ContainsKey($key)) { return }
+		if ($results.Count -ge $max_results) { return }
+		$seen[$key] = $true
+		$t = if ($Title) { ($Title -replace '\s+', ' ').Trim() } else { $abs }
+		if ($t.Length -gt 160) { $t = $t.Substring(0, 157) + '...' }
+		$s = if ($Snippet) { ($Snippet -replace '\s+', ' ').Trim() } else { '' }
+		if ($s.Length -gt 280) { $s = $s.Substring(0, 277) + '...' }
+		[void]$results.Add([ordered]@{ title = $t; url = $abs; snippet = $s; source = $Source })
+	}.GetNewClosure()
+
+	# Direct command page guesses (fast path)
+	$cmdGuess = ($q -replace '\s+', '').Trim().ToLowerInvariant()
+	$cmdGuess = $cmdGuess -replace '[^a-z0-9\.\-_]', ''
+	if ($cmdGuess.Length -ge 2) {
+		$paths = New-Object System.Collections.ArrayList
+		switch ($sc) {
+			'ps'   { [void]$paths.Add(("https://ss64.com/ps/{0}.html" -f $cmdGuess)) }
+			'nt'   { [void]$paths.Add(("https://ss64.com/nt/{0}.html" -f $cmdGuess)) }
+			'bash' { [void]$paths.Add(("https://ss64.com/bash/{0}.html" -f $cmdGuess)) }
+			default {
+				[void]$paths.Add(("https://ss64.com/ps/{0}.html" -f $cmdGuess))
+				[void]$paths.Add(("https://ss64.com/nt/{0}.html" -f $cmdGuess))
+				[void]$paths.Add(("https://ss64.com/bash/{0}.html" -f $cmdGuess))
+			}
+		}
+		[void]$sources.Add('direct_guess')
+		foreach ($pu in @($paths)) {
+			if ($results.Count -ge $max_results) { break }
+			try {
+				$chk = Invoke-MBHttpGetPage -Url $pu -VerifySsl $true -UserAgent (Get-MBDefaultBrowserUserAgent) -TimeoutSec 12
+				if ($chk.ok -and $chk.status_code -ge 200 -and $chk.status_code -lt 400 -and $chk.body -and $chk.body.Length -gt 200) {
+					$lab = switch -Regex ($pu) {
+						'/ps/' { 'PowerShell' }
+						'/nt/' { 'Windows CMD' }
+						'/bash/' { 'bash' }
+						default { 'SS64' }
+					}
+					& $add -Title ("{0} — {1}" -f $cmdGuess, $lab) -Url $pu -Snippet ("Direct SS64 page for {0}" -f $cmdGuess) -Source 'direct_guess'
+				}
+			} catch {}
+		}
+	}
+
+	# Site-scoped search
+	try {
+		[void]$sources.Add('web_site_filter')
+		$siteQ = switch ($sc) {
+			'ps'   { 'site:ss64.com/ps {0}' -f $q }
+			'nt'   { 'site:ss64.com/nt {0}' -f $q }
+			'bash' { 'site:ss64.com/bash {0}' -f $q }
+			default { 'site:ss64.com {0}' -f $q }
+		}
+		$raw = Invoke-SearchWeb -query $siteQ -max_results $max_results -engine 'auto' -verify_ssl $true
+		$jo = $null
+		try {
+			if ($raw -is [string] -and $raw.TrimStart().StartsWith('{')) {
+				$jo = $raw | ConvertFrom-Json -ErrorAction Stop
+			}
+		} catch { $jo = $null }
+		if ($jo -and $jo.results) {
+			foreach ($r in @($jo.results)) {
+				if ($results.Count -ge $max_results) { break }
+				try {
+					& $add -Title ([string]$r.title) -Url ([string]$r.url) -Snippet ([string]$r.snippet) -Source 'web_site_filter'
+				} catch {}
+			}
+		}
+	} catch {}
+
+	$hint = if ($results.Count -gt 0) {
+		'Call ReadSs64 url=... (or command=name scope=ps|nt|bash) for the best hit.'
+	} else {
+		'No SS64 hits. Try scope=ps|nt|bash or a shorter command name.'
+	}
+	return Limit-MBResult (ConvertTo-MBJson ([ordered]@{
+		success       = ($results.Count -gt 0)
+		query         = $q
+		scope         = $sc
+		count         = $results.Count
+		results       = @($results)
+		sources_tried = @($sources)
+		hint          = $hint
+	}) -Depth 8)
+}
+
+function Invoke-ReadSs64 {
+	param(
+		[string]$url = '',
+		[string]$command = '',
+		[string]$scope = 'auto',
+		[int]$max_length = 10000
+	)
+	$u = ([string]$url).Trim()
+	$cmd = ([string]$command).Trim()
+	$sc = ([string]$scope).Trim().ToLowerInvariant()
+	if ($sc -notin @('auto', 'ps', 'nt', 'bash', 'powershell', 'cmd', 'linux')) { $sc = 'auto' }
+	if ($sc -eq 'powershell') { $sc = 'ps' }
+	if ($sc -eq 'cmd') { $sc = 'nt' }
+	if ($sc -eq 'linux') { $sc = 'bash' }
+
+	if ([string]::IsNullOrWhiteSpace($u) -and -not [string]::IsNullOrWhiteSpace($cmd)) {
+		$c = ($cmd -replace '\s+', '').ToLowerInvariant() -replace '[^a-z0-9\.\-_]', ''
+		if ($c.Length -lt 1) {
+			return ConvertTo-MBJson ([ordered]@{ success = $false; error = 'command empty after normalize' })
+		}
+		$tryUrls = New-Object System.Collections.ArrayList
+		switch ($sc) {
+			'ps'   { [void]$tryUrls.Add(("https://ss64.com/ps/{0}.html" -f $c)) }
+			'nt'   { [void]$tryUrls.Add(("https://ss64.com/nt/{0}.html" -f $c)) }
+			'bash' { [void]$tryUrls.Add(("https://ss64.com/bash/{0}.html" -f $c)) }
+			default {
+				[void]$tryUrls.Add(("https://ss64.com/ps/{0}.html" -f $c))
+				[void]$tryUrls.Add(("https://ss64.com/nt/{0}.html" -f $c))
+				[void]$tryUrls.Add(("https://ss64.com/bash/{0}.html" -f $c))
+			}
+		}
+		foreach ($tu in @($tryUrls)) {
+			try {
+				$chk = Invoke-MBHttpGetPage -Url $tu -VerifySsl $true -UserAgent (Get-MBDefaultBrowserUserAgent) -TimeoutSec 12
+				if ($chk.ok -and $chk.status_code -ge 200 -and $chk.status_code -lt 400 -and $chk.body -and $chk.body.Length -gt 200) {
+					$u = $tu
+					break
+				}
+			} catch {}
+		}
+		if ([string]::IsNullOrWhiteSpace($u)) {
+			return ConvertTo-MBJson ([ordered]@{
+				success = $false
+				error   = ("No SS64 page for command '{0}' (scope={1}). Use SearchSs64 first." -f $cmd, $sc)
+				command = $cmd
+				scope   = $sc
+				tried   = @($tryUrls)
+			})
+		}
+	}
+
+	if ([string]::IsNullOrWhiteSpace($u)) {
+		return ConvertTo-MBJson ([ordered]@{ success = $false; error = 'url or command required' })
+	}
+	if ($u -notmatch '^(?i)https?://') {
+		return ConvertTo-MBJson ([ordered]@{ success = $false; error = 'url must start with http:// or https://'; url = $u })
+	}
+	if (-not (Test-MBDocsAllowedHost -Url $u -Ss64)) {
+		return ConvertTo-MBJson ([ordered]@{
+			success = $false
+			error   = 'url host must be ss64.com. Use SearchSs64 first, or BrowsePage for other sites.'
+			url     = $u
+		})
+	}
+	if ($max_length -le 0) { $max_length = 10000 }
+	if ($max_length -gt 20000) { $max_length = 20000 }
+
+	$raw = Invoke-BrowsePage -url $u -max_length $max_length -verify_ssl $true -extract_links $true -max_links 16
+	try {
+		if ($raw -is [string] -and $raw.TrimStart().StartsWith('{')) {
+			$jo = $raw | ConvertFrom-Json -ErrorAction Stop
+			$od = [ordered]@{}
+			foreach ($p in @($jo.PSObject.Properties)) {
+				$od[$p.Name] = $p.Value
+			}
+			$od['docs_source'] = 'ss64'
+			$od['hint'] = 'SS64 command reference. Prefer documented switches/flags; verify version differences vs local Get-Help when needed.'
+			return Limit-MBResult (ConvertTo-MBJson $od -Depth 10)
+		}
+	} catch {}
+	return $raw
 }
 
 function Invoke-ConvertGitHubUrl {
@@ -22284,7 +27291,16 @@ function Invoke-GetGitHubRawFile {
 	else { return "Could not determine raw URL. Original: $github_url" }
 	try {
 		$content = Invoke-BrowsePage -url $rawUrl -max_length $max_length -extract_links $false
-		return "Successfully fetched: $rawUrl`n`n$content"
+		$text = [string]$content
+		if ($text.TrimStart().StartsWith('{')) {
+			try {
+				$jo = $text | ConvertFrom-Json -ErrorAction Stop
+				if ($jo.text) { $text = [string]$jo.text }
+				elseif ($jo.summary) { $text = [string]$jo.summary }
+				if ($jo.final_url) { $rawUrl = [string]$jo.final_url }
+			} catch {}
+		}
+		return "Successfully fetched: $rawUrl`n`n$text"
 	} catch {
 		return "Failed to fetch $rawUrl`nError: $($_.Exception.Message)"
 	}
@@ -22320,7 +27336,16 @@ function Invoke-ListGitHubDirectory {
 		}
 		if (-not $content) {
 			$htmlUrl = "https://github.com/$owner/$repo/tree/$ref$(if ($subPath) { '/' + $subPath })"
-			return "API access limited. Try:`n$htmlUrl`n`n" + (Invoke-BrowsePage -url $htmlUrl -max_length 8000)
+			$br = Invoke-BrowsePage -url $htmlUrl -max_length 8000
+			$bt = [string]$br
+			if ($bt.TrimStart().StartsWith('{')) {
+				try {
+					$jo = $bt | ConvertFrom-Json -ErrorAction Stop
+					if ($jo.summary) { $bt = [string]$jo.summary }
+					elseif ($jo.text) { $bt = [string]$jo.text }
+				} catch {}
+			}
+			return "API access limited. Try:`n$htmlUrl`n`n$bt"
 		}
 		$tree = @($content.tree)
 		if ($subPath) {
@@ -22701,14 +27726,83 @@ function Invoke-ModelStreaming {
 
 			# Mutable bag so nested helpers can update stream state reliably (PS closure assign pitfalls).
 			$st = @{
-				FullContent  = ''
-				StartedOut   = $false
-				FinishReason = $null
-				HasTools     = $false
-				HaveUsage    = $false
-				ParseDrops   = 0
-				ToolCalls    = $toolCalls
+				FullContent   = ''
+				StartedOut    = $false
+				FinishReason  = $null
+				HasTools      = $false
+				HaveUsage     = $false
+				ParseDrops    = 0
+				ToolCalls     = $toolCalls
+				ToolUiStarted = $false
+				ToolUiLastTick = 0
+				ToolArgChars  = 0
 			}
+			# Tool-call-only streams never emit content — without this the chat looks frozen while llama.cpp burns tokens.
+			$noteToolStreamUi = {
+				param($Bag)
+				try {
+					$now = [Environment]::TickCount
+					if (-not [bool]$Bag.ToolUiStarted) {
+						$Bag.ToolUiStarted = $true
+						if ([int]$script:MB.StreamFirstTokTick -eq 0) { $script:MB.StreamFirstTokTick = $now }
+						if ([int]$script:MB.FirstTokenTick -eq 0) { $script:MB.FirstTokenTick = $now }
+						try { Stop-MBAnimation } catch {}
+						$script:MB.WorkStartTick = $now
+						try { if ($script:MB.Wpf) { $script:MB.Wpf.StatusBusySince = $now } } catch {}
+						Write-MBDebugLog -Step 'STREAM_TOOL_FIRST' -Detail 'tool_calls delta (no content yet)'
+					}
+					# Throttle sticky refresh (~4/s) so huge arg streams stay responsive
+					$last = 0
+					try { $last = [int]$Bag.ToolUiLastTick } catch { $last = 0 }
+					if ($last -ne 0 -and ((($now - $last) -band 0x7fffffff) -lt 250)) { return }
+					$Bag.ToolUiLastTick = $now
+					$names = New-Object System.Collections.ArrayList
+					$argN = 0
+					foreach ($k in @($Bag.ToolCalls.Keys)) {
+						$tc = $Bag.ToolCalls[$k]
+						$nm = ''
+						try { $nm = [string]$tc.function.name } catch { $nm = '' }
+						if (-not [string]::IsNullOrWhiteSpace($nm)) {
+							if (-not ($names -contains $nm)) { [void]$names.Add($nm) }
+						}
+						try { $argN += ([string]$tc.function.arguments).Length } catch {}
+					}
+					$Bag.ToolArgChars = $argN
+					# TaskBoard is flyout-only — omit from stream chrome labels
+					$namesShow = New-Object System.Collections.ArrayList
+					foreach ($nm0 in @($names)) {
+						$n0 = [string]$nm0
+						if ($n0 -match '^(?i)TaskBoard|todo_write|todo|checklist|task_board|taskboard$') { continue }
+						try {
+							$res0 = Resolve-MBToolName -Name $n0
+							if ($res0 -eq 'TaskBoard') { continue }
+						} catch {}
+						[void]$namesShow.Add($n0)
+					}
+					$lab = if ($namesShow.Count -gt 0) { ($namesShow -join '+') } else { '' }
+					if ([string]::IsNullOrWhiteSpace($lab) -and $names.Count -gt 0) {
+						# Only TaskBoard (or aliases) — quiet sticky, no console stream line
+						try {
+							Update-MBWpfSticky -Status 'working' -Hint ("esc interrupt  {0}  taskboard" -f ([char]0x00B7))
+						} catch {}
+						return
+					}
+					if ([string]::IsNullOrWhiteSpace($lab)) { $lab = 'tools' }
+					$hint = ("esc interrupt  {0}  preparing {1}" -f ([char]0x00B7), $lab)
+					if ($argN -gt 0) {
+						if ($argN -ge 1000) {
+							$hint = ("esc interrupt  {0}  {1} args ~{2:N0}k" -f ([char]0x00B7), $lab, [math]::Round($argN / 1000.0, 1))
+						} else {
+							$hint = ("esc interrupt  {0}  {1} args {2}" -f ([char]0x00B7), $lab, $argN)
+						}
+					}
+					try {
+						Update-MBWpfSticky -Status 'working' -Hint $hint
+					} catch {}
+					# No console "streaming tool call" line — sticky hint is enough;
+					# the green "-> ToolName" line (with optional flags after) prints when the tool runs.
+				} catch {}
+			}.GetNewClosure()
 
 			while ($true) {
 				if ((Test-MBInterrupt)) { break }
@@ -22866,6 +27960,7 @@ function Invoke-ModelStreaming {
 							if ($null -ne $tc.function.arguments) { $st.ToolCalls[$idx].function.arguments += [string]$tc.function.arguments }
 						}
 					}
+					try { & $noteToolStreamUi $st } catch {}
 				}
 
 				$piece = $null
@@ -22921,7 +28016,6 @@ function Invoke-ModelStreaming {
 			$haveUsageThisStream = [bool]$st.HaveUsage
 			$streamParseDrops = [int]$st.ParseDrops
 			$toolCalls = $st.ToolCalls
-
 			# Finalize speeds at stream end — before markdown flush / UI (those were padding t/s down).
 			try {
 				$script:MB.LastReplyChars = $(if ($null -eq $fullContent) { 0 } else { $fullContent.Length })
@@ -23213,7 +28307,18 @@ function Invoke-MBModelSummary {
 	$msgs = @(
 		@{
 			role    = 'system'
-			content = 'You compress agent conversation history into a dense sticky digest. Output plain text only: max 12 short bullets covering goals, key findings, file paths, errors, commands tried, and decisions. No tools. No preamble.'
+			content = @'
+You compress MiniBot agent history into a dense sticky digest. Plain text only. Max 14 short lines using these labels when known:
+Goals: ...
+CWD: ...
+Task board: ...
+Files: path (read|edit|write)
+Errors: path — last error
+Tools: names tried
+Decisions: ...
+Open asks: ...
+No tools. No preamble. Prefer facts over narration.
+'@
 		}
 		@{
 			role    = 'user'
@@ -23240,8 +28345,8 @@ function Get-MBToolFingerprint {
 			[void]$parts.Add($shell.ToLowerInvariant())
 			[void]$parts.Add($cmd)
 		}
-		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^FindFiles$|^HexView$|^HexEdit$|^SandBox$|^SandBoxWrite$' {
-			foreach ($k in @('path','path2','compare','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','annotate','next_diff','side_by_side','max_scan','disasm','trace','at_entry','max_insns','max_steps','follow_calls','prefer_branch','arch','dump_hex','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description')) {
+		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^FindFiles$|^DiffText$|^HexView$|^HexEdit$|^HexSearch$|^StringsScan$|^SandBox$|^SandBoxWrite$' {
+			foreach ($k in @('path','path2','compare','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','annotate','next_diff','side_by_side','max_scan','disasm','trace','at_entry','max_insns','max_steps','follow_calls','prefer_branch','arch','dump_hex','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description','left','right','leftIsFile','rightIsFile','context','maxLines','content','edits','entropy','carve','rva','section','entropy_blocks','minLen','maxHits','encoding','filter','hash','functions','preset')) {
 				if (Test-MBHasProp $ArgsObj $k) {
 					$v = Get-MBProp $ArgsObj $k
 					if ($null -ne $v) {
@@ -23290,16 +28395,16 @@ function Get-MBToolFingerprint {
 				}
 			}
 		}
-		'^MakeHttpRequest$|^BrowsePage$|^GetGitHubRawFile$|^ListGitHubDirectory$|^ConvertGitHubUrl$|^DownloadFile$' {
-			foreach ($k in @('method','url','github_url','ref','max_length','path','overwrite','max_mb','timeout_sec')) {
+		'^MakeHttpRequest$|^BrowsePage$|^SearchWeb$|^GetGitHubRawFile$|^ListGitHubDirectory$|^ConvertGitHubUrl$|^DownloadFile$' {
+			foreach ($k in @('method','url','github_url','ref','max_length','path','overwrite','max_mb','timeout_sec','query','max_results','engine','extract_links','max_links','verify_ssl')) {
 				if (Test-MBHasProp $ArgsObj $k) {
 					$v = Get-MBProp $ArgsObj $k
 					if ($null -ne $v) { [void]$parts.Add("$k=$v") }
 				}
 			}
 		}
-		'^ControlService$|^ExpandArchive$|^CompressArchive$|^MakeCab$|^ExpandCab$|^MakeIso$|^MountIso$|^UnmountIso$|^FindPSModule$|^GetInstalledPSModule$|^InstallPSModule$|^UpdatePSModule$' {
-			foreach ($k in @('name','action','startup_type','path','source','destination','iso_path','cab_path','boot_file','title','force','include_folder','media','letter','files','recursive','compression','compression_level','compression_memory','version','scope','allow_prerelease','max_results')) {
+		'^ControlService$|^ExpandArchive$|^CompressArchive$|^MakeCab$|^ExpandCab$|^MakeIso$|^MountIso$|^UnmountIso$|^BulkRename$|^FindDuplicates$|^FindPSModule$|^GetInstalledPSModule$|^InstallPSModule$|^UpdatePSModule$' {
+			foreach ($k in @('name','action','startup_type','path','directory','source','destination','iso_path','cab_path','boot_file','title','force','include_folder','media','letter','files','recursive','compression','compression_level','compression_memory','version','scope','allow_prerelease','max_results','glob','find','replace','use_regex','template','start_index','dry_run','max','min_bytes','max_scan','max_groups','max_per_group')) {
 				if (Test-MBHasProp $ArgsObj $k) {
 					$v = Get-MBProp $ArgsObj $k
 					if ($null -ne $v -and "$v" -ne '') { [void]$parts.Add("$k=$v") }
@@ -23330,6 +28435,29 @@ function Test-MBToolLoopGuard {
 	if ($preview.Length -gt 600) { $preview = $preview.Substring(0, 597) + '...' }
 	if (-not $preview) { $preview = '(previous result not retained)' }
 
+	# Repeated BLOCKED / NEED_INPUT for same fingerprint this turn → stop and ask
+	try {
+		if ($null -eq $script:MB.FpForceStop) { $script:MB.FpForceStop = @{} }
+		if ($script:MB.FpForceStop.ContainsKey($fp) -and $script:MB.FpForceStop[$fp]) {
+			$script:MB.LoopGuardsFired++
+			Write-Host "    loop-guard: NEED_INPUT stop (blocked/need_input twice)" -ForegroundColor Red
+			$msg = @"
+LOOP GUARD HARD STOP: NEED_INPUT=1 TOOLS_DONE=1 NO_MORE_TOOLS=1 FINISH_TURN=1
+
+Tool: $Name
+
+This exact call already failed or was blocked twice this turn (operator deny, NEED_INPUT, or hard stop).
+Further identical retries will not help.
+
+Previous result (truncated):
+$preview
+
+REQUIRED: STOP all tools. Reply to the operator with what you need (credentials, approval, path, clarification). Do NOT call tools again until they answer.
+"@
+			return @{ Block = $true; Message = $msg; Fingerprint = $fp; NeedInput = $true }
+		}
+	} catch {}
+
 	$alreadyConfirmedThisTurn = $false
 	foreach ($x in @($script:MB.LoopConfirmedFps)) {
 		if ($x -eq $fp) { $alreadyConfirmedThisTurn = $true; break }
@@ -23338,8 +28466,14 @@ function Test-MBToolLoopGuard {
 	if ($script:MB.LastToolFp -eq $fp -and ($alreadyConfirmedThisTurn -or $script:MB.LastToolAction -eq 'confirmed_ran')) {
 		$script:MB.LoopGuardsFired++
 		Write-Host "    loop-guard: HARD STOP (already retested once)" -ForegroundColor Red
+		try {
+			if ($null -eq $script:MB.FpForceStop) { $script:MB.FpForceStop = @{} }
+			$script:MB.FpForceStop[$fp] = $true
+		} catch {}
 		$msg = @"
-LOOP GUARD HARD STOP: You already re-ran this exact tool call once this turn (timing retest used up).
+LOOP GUARD HARD STOP: TOOLS_DONE=1 NO_MORE_TOOLS=1 FINISH_TURN=1
+
+You already re-ran this exact tool call once this turn (timing retest used up).
 
 Tool: $Name
 
@@ -23350,8 +28484,8 @@ $preview
 
 REQUIRED: Stop calling this tool with these args. Do one of:
 1) Use a DIFFERENT tool or DIFFERENT arguments
-2) Synthesize an answer for the user from results you already have
-3) Ask the user what to do next
+2) Synthesize an answer for the user from results you already have — end with DID / NEXT
+3) NEED_INPUT: Ask the user what to do next
 
 Do NOT reconfirm or re-request this same call.
 "@
@@ -23365,27 +28499,22 @@ Do NOT reconfirm or re-request this same call.
 		Write-Host "    loop-guard: blocked - same command will not magically change" -ForegroundColor Yellow
 
 		$msg = @"
-LOOP GUARD: You just ran this exact tool call. It was NOT executed again.
+LOOP GUARD: You just ran this exact tool call. It was NOT executed again. (same command ⇒ same result)
 
 Tool: $Name
 
-IMPORTANT - same command ⇒ same result:
+IMPORTANT:
 - Re-running the identical tool with identical arguments will NOT produce new information.
-- The OS/file/service state does not change because you asked twice in a row.
 - Do NOT keep confirming or retrying this call expecting a different outcome.
 
-The ONLY valid reason to run it again is a deliberate timing/poll check, e.g.:
-- waiting for a long job (DISM, download, service start) to finish
-- guessing whether an async change has completed after real time passed
-If that is NOT what you are doing, you are stuck in a loop.
+The ONLY valid reason to run it again is a deliberate timing/poll check (DISM, download, service start) after real time passed.
 
-Previous result (truncated) - USE THIS, do not re-fetch the same thing:
+Previous result (truncated) - USE THIS:
 $preview
 
 What to do instead:
-1) Analyze the previous result and continue the investigation with a different tool or different args
-2) Or report findings to the user
-3) ONLY if you are polling over time: call this exact tool ONE more time to confirm a timing retest (allowed once). After that, further repeats are hard-blocked.
+1) Different tool or different args, or report findings (DID / NEXT)
+2) ONLY if polling over time: call this exact tool ONE more time (allowed once). After that: TOOLS_DONE hard-block.
 "@
 		return @{ Block = $true; Message = $msg; Fingerprint = $fp }
 	}
@@ -23393,10 +28522,14 @@ What to do instead:
 	if ($script:MB.LastToolFp -eq $fp -and $script:MB.LastToolAction -eq 'warned') {
 		if ($alreadyConfirmedThisTurn) {
 			$script:MB.LoopGuardsFired++
+			try {
+				if ($null -eq $script:MB.FpForceStop) { $script:MB.FpForceStop = @{} }
+				$script:MB.FpForceStop[$fp] = $true
+			} catch {}
 			return @{
 				Block = $true
 				Fingerprint = $fp
-				Message = "LOOP GUARD HARD STOP: Timing retest already used for this call. Change approach."
+				Message = "LOOP GUARD HARD STOP: TOOLS_DONE=1 NO_MORE_TOOLS=1 FINISH_TURN=1 Timing retest already used. Change approach or ASK the operator."
 			}
 		}
 		Write-Host "    loop-guard: one timing retest allowed - executing" -ForegroundColor Green
@@ -23406,11 +28539,272 @@ What to do instead:
 	return @{ Block = $false; Confirmed = $false; Fingerprint = $fp }
 }
 
+function Register-MBPathPin {
+	# Sticky pin for files the agent read/edited/wrote this session (cheap path list).
+	param(
+		[string]$Path,
+		[ValidateSet('read','edit','write','error')]$Action = 'read'
+	)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return }
+	try {
+		$full = $Path
+		try { $full = [System.IO.Path]::GetFullPath($Path) } catch { $full = $Path }
+		$key = $full.ToLowerInvariant()
+		if ($null -eq $script:MB.PinnedPaths) { $script:MB.PinnedPaths = [ordered]@{} }
+		$entry = $null
+		if ($script:MB.PinnedPaths.Contains($key)) {
+			$entry = $script:MB.PinnedPaths[$key]
+		} else {
+			$entry = [ordered]@{ path = $full; actions = New-Object System.Collections.ArrayList; last = 0L }
+			$script:MB.PinnedPaths[$key] = $entry
+		}
+		$acts = $entry.actions
+		if ($acts -isnot [System.Collections.ArrayList]) {
+			$acts = New-Object System.Collections.ArrayList
+			foreach ($a in @($entry.actions)) { [void]$acts.Add($a) }
+			$entry.actions = $acts
+		}
+		$al = $Action.ToLowerInvariant()
+		$has = $false
+		foreach ($x in @($acts)) { if ([string]$x -eq $al) { $has = $true; break } }
+		if (-not $has) { [void]$acts.Add($al) }
+		$entry.last = [datetime]::UtcNow.Ticks
+		$entry.path = $full
+		# Cap pins (keep newest 16)
+		if ($script:MB.PinnedPaths.Count -gt 20) {
+			$ordered = @($script:MB.PinnedPaths.GetEnumerator() | Sort-Object { $_.Value.last } -Descending)
+			$keep = [ordered]@{}
+			$n = 0
+			foreach ($e in $ordered) {
+				if ($n -ge 16) { break }
+				$keep[$e.Key] = $e.Value
+				$n++
+			}
+			$script:MB.PinnedPaths = $keep
+		}
+	} catch {}
+}
+
+function Register-MBToolErrorForPath {
+	param([string]$Path, [string]$Snippet)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return }
+	try {
+		$full = $Path
+		try { $full = [System.IO.Path]::GetFullPath($Path) } catch { $full = $Path }
+		$key = $full.ToLowerInvariant()
+		if ($null -eq $script:MB.ToolErrorsByPath) { $script:MB.ToolErrorsByPath = @{} }
+		$s = ([string]$Snippet) -replace '\s+', ' '
+		if ($s.Length -gt 280) { $s = $s.Substring(0, 277) + '...' }
+		$script:MB.ToolErrorsByPath[$key] = [ordered]@{
+			path    = $full
+			error   = $s
+			at      = [datetime]::UtcNow.Ticks
+		}
+		if ($script:MB.ToolErrorsByPath.Count -gt 24) {
+			$ordered = @($script:MB.ToolErrorsByPath.GetEnumerator() | Sort-Object { $_.Value.at } -Descending)
+			$keep = @{}
+			$n = 0
+			foreach ($e in $ordered) {
+				if ($n -ge 16) { break }
+				$keep[$e.Key] = $e.Value
+				$n++
+			}
+			$script:MB.ToolErrorsByPath = $keep
+		}
+	} catch {}
+}
+
+function Get-MBToolArgPath {
+	param($ArgsObj)
+	if ($null -eq $ArgsObj) { return $null }
+	foreach ($k in @('path', 'path2', 'left', 'right', 'destination', 'source', 'github_url')) {
+		if (Test-MBHasProp $ArgsObj $k) {
+			$v = [string](Get-MBProp $ArgsObj $k)
+			if (-not [string]::IsNullOrWhiteSpace($v) -and $v -notmatch '^(?i)https?://') { return $v }
+		}
+	}
+	return $null
+}
+
+function Register-MBToolOutcome {
+	# After a tool runs: path pins, error retention, bad-outcome counts, turn summary.
+	param(
+		[string]$Name,
+		$ArgsObj,
+		[string]$Result,
+		[string]$Fingerprint = ''
+	)
+	try {
+		if ($null -eq $script:MB.TurnToolSummary) {
+			$script:MB.TurnToolSummary = New-Object System.Collections.ArrayList
+		}
+		$r = [string]$Result
+		$ok = $true
+		$tag = 'ok'
+		if ($r -match '(?i)^ERROR:|LOOP GUARD|BLOCKED BY USER|NEED_INPUT|TOOLS_DONE=1|remote_port_closed=1|remote_command_unavailable=1') {
+			$ok = $false
+			if ($r -match '(?i)BLOCKED BY USER') { $tag = 'blocked' }
+			elseif ($r -match '(?i)NEED_INPUT') { $tag = 'need_input' }
+			elseif ($r -match '(?i)LOOP GUARD') { $tag = 'loop_guard' }
+			elseif ($r -match '(?i)TOOLS_DONE=1') { $tag = 'tools_done' }
+			else { $tag = 'error' }
+		} elseif ($r -match '(?i)^SUCCESS') {
+			$tag = 'success'
+		}
+
+		$path = Get-MBToolArgPath -ArgsObj $ArgsObj
+		$line = $Name
+		if ($path) { $line += " $path" }
+		$line += " [$tag]"
+		if (-not $ok) {
+			$snip = ($r -replace '\s+', ' ').Trim()
+			if ($snip.Length -gt 100) { $snip = $snip.Substring(0, 97) + '...' }
+			$line += " $snip"
+		}
+		[void]$script:MB.TurnToolSummary.Add($line)
+		while ($script:MB.TurnToolSummary.Count -gt 24) { $script:MB.TurnToolSummary.RemoveAt(0) }
+
+		# Path pins by tool class
+		$nlow = ([string]$Name).ToLowerInvariant()
+		if ($path) {
+			if ($nlow -match 'readfile|hexview|hexsearch|stringsscan|list|searchfiles|findfiles|difftext') {
+				Register-MBPathPin -Path $path -Action 'read'
+			} elseif ($nlow -match 'editfile|applypatch|hexedit') {
+				Register-MBPathPin -Path $path -Action $(if ($ok) { 'edit' } else { 'error' })
+			} elseif ($nlow -match 'writefile|downloadfile') {
+				Register-MBPathPin -Path $path -Action $(if ($ok) { 'write' } else { 'error' })
+			}
+			if (-not $ok) {
+				Register-MBToolErrorForPath -Path $path -Snippet $r
+				Register-MBPathPin -Path $path -Action 'error'
+			}
+		}
+
+		# Bad outcome thrash → force stop next identical call
+		if (-not $ok -and $Fingerprint -and $tag -in @('blocked', 'need_input', 'loop_guard', 'tools_done', 'error')) {
+			if ($null -eq $script:MB.FpBadOutcomeHits) { $script:MB.FpBadOutcomeHits = @{} }
+			$hits = 0
+			if ($script:MB.FpBadOutcomeHits.ContainsKey($Fingerprint)) {
+				$hits = [int]$script:MB.FpBadOutcomeHits[$Fingerprint]
+			}
+			$hits++
+			$script:MB.FpBadOutcomeHits[$Fingerprint] = $hits
+			# Two operator blocks / NEED_INPUT / hard stops → stop third try
+			if ($hits -ge 2 -and $tag -in @('blocked', 'need_input', 'loop_guard', 'tools_done')) {
+				if ($null -eq $script:MB.FpForceStop) { $script:MB.FpForceStop = @{} }
+				$script:MB.FpForceStop[$Fingerprint] = $true
+			}
+			# Three plain errors (same call) also force stop
+			if ($hits -ge 3 -and $tag -eq 'error') {
+				if ($null -eq $script:MB.FpForceStop) { $script:MB.FpForceStop = @{} }
+				$script:MB.FpForceStop[$Fingerprint] = $true
+			}
+		}
+	} catch {}
+}
+
+function Get-MBPostToolTurnHint {
+	# Slim turn nudge after a tool batch. Stored in SESSION STATE (LastTurnHygiene) — never
+	# appended as mid-history system messages (local chat templates often reject those as invalid).
+	# Board text lives in SESSION STATE; hint is slim.
+	param([bool]$ForceFooter = $true)
+	$lines = New-Object System.Collections.ArrayList
+	[void]$lines.Add('[TURN_HYGIENE — follow before more tools or final reply]')
+
+	$sum = @()
+	try { $sum = @($script:MB.TurnToolSummary) } catch { $sum = @() }
+	if ($sum.Count -gt 0) {
+		[void]$lines.Add('Tools this turn:')
+		foreach ($s in ($sum | Select-Object -Last 8)) {
+			[void]$lines.Add(" - $s")
+		}
+	}
+
+	$needBoard = $false
+	try { $needBoard = -not (Test-MBTaskBoardHasOpen) -and [bool]$script:MB.PendingTaskBoardNudge } catch {}
+	if ($needBoard) {
+		[void]$lines.Add('MULTI-STEP (PRIORITY): TaskBoard is empty for a multi-step ask. Call TaskBoard action=set with goal= and items=[...] BEFORE more tools. Do not thrash without a board. Only skip if this is truly one simple tool call (say why).')
+	} elseif (Test-MBTaskBoardHasOpen) {
+		[void]$lines.Add('Open TaskBoard is in SESSION STATE above (PRIORITY: TaskBoard action=update status when done/blocked before more tools or final answer). Do not action=set a new board unless the goal changed.')
+		# One-line NOW pointer only — full list already in SESSION STATE
+		try {
+			$tb = Get-MBTaskBoardObject
+			foreach ($it in @($tb.Items)) {
+				if ($null -eq $it) { continue }
+				$st = ''
+				try { $st = ([string]$it.Status).ToLowerInvariant() } catch { $st = '' }
+				if ($st -eq 'in_progress' -or $st -eq 'active' -or $st -eq 'doing') {
+					$id = ''; $title = ''
+					try { $id = [string]$it.Id } catch {}
+					try { $title = [string]$it.Title } catch {}
+					if (-not $title) { $title = $id }
+					[void]$lines.Add(("NOW: {0}: {1}" -f $id, $title))
+					break
+				}
+			}
+		} catch {}
+	}
+
+	$hasForce = $false
+	try {
+		if ($script:MB.FpForceStop) {
+			foreach ($k in @($script:MB.FpForceStop.Keys)) {
+				if ($script:MB.FpForceStop[$k]) { $hasForce = $true; break }
+			}
+		}
+	} catch {}
+	if ($hasForce) {
+		[void]$lines.Add('STOP: A tool fingerprint is hard-stopped (TOOLS_DONE / NEED_INPUT). Do not retry it. Ask operator or change approach.')
+	}
+
+	if ($ForceFooter) {
+		[void]$lines.Add('If no more tools: end your user-facing reply with short lines:')
+		[void]$lines.Add('DID: <what worked>')
+		[void]$lines.Add('NEXT: <follow-up>  OR  ASK: <what you need from the operator>')
+	}
+	return ($lines -join "`n")
+}
+
+function Test-MBUserMessageMultiStep {
+	param([string]$Text)
+	if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+	$t = $Text.ToLowerInvariant()
+	# Heuristic: multi-clause goals / planning language
+	if ($t -match '\b(and then|then |after that|first |next |finally |step\s*\d|multi-?step|end[- ]to[- ]end|one by one|in order)\b') { return $true }
+	if ($t -match '\b(diagnose|investigate|troubleshoot|fix all|refactor|migrate|setup|configure|harden|audit|install and|find and|scan and|clean up|build|implement|wire up|create and)\b') { return $true }
+	if ($t -match '\b(and)\b' -and $t -match '\b(then|also|plus|as well|after)\b') { return $true }
+	if ($t -match '\b(several|multiple|all the|every |each |both )\b' -and $t -match '\b(file|host|share|service|error|issue|folder|machine|pc|user|path|tool|step|task)\b') { return $true }
+	# Two+ distinct action verbs often means multi-step
+	$verbs = @([regex]::Matches($t, '\b(read|write|edit|find|scan|fix|install|remove|map|share|check|test|update|create|delete|copy|move|rename|set|get|list|search|probe|connect)\b'))
+	if ($verbs.Count -ge 3) { return $true }
+	# Enumerated list
+	if ($t -match '(?m)^\s*[-*]\s+\S' -or $t -match '(?m)^\s*\d+[.)]\s+\S') {
+		$lines = @($t -split "`n" | Where-Object { $_ -match '^\s*([-*]|\d+[.)])\s+\S' })
+		if ($lines.Count -ge 2) { return $true }
+	}
+	# Long asks with multiple clauses (commas / semicolons) tend to be multi-step
+	if ($t.Length -gt 160 -and (($t -split '[;.]').Count -ge 3)) { return $true }
+	return $false
+}
+
+function Register-MBMultiStepNudgeFromUser {
+	param([string]$Text)
+	try {
+		$script:MB.PendingTaskBoardNudge = $false
+		if (-not (Test-MBUserMessageMultiStep -Text $Text)) { return }
+		if (Test-MBTaskBoardHasOpen) { return }
+		$script:MB.PendingTaskBoardNudge = $true
+		[void](Add-MBStickyNote -Text 'Multi-step ask detected - TaskBoard action=set (goal + items) BEFORE other tools.' -Kind 'note')
+	} catch {}
+}
+
 function Register-MBToolExecution {
 	param(
 		[string]$Fingerprint,
 		[string]$ResultPreview,
-		[bool]$WasConfirmed = $false
+		[bool]$WasConfirmed = $false,
+		[string]$ToolName = '',
+		$ArgsObj = $null
 	)
 	$script:MB.LastToolFp = $Fingerprint
 	if ($WasConfirmed) {
@@ -23428,6 +28822,9 @@ function Register-MBToolExecution {
 	$prev = Sanitize-MBText -Text ([string]$ResultPreview)
 	if ($prev.Length -gt 800) { $prev = $prev.Substring(0, 797) + '...' }
 	$script:MB.LastToolPreview = $prev
+	try {
+		Register-MBToolOutcome -Name $ToolName -ArgsObj $ArgsObj -Result $ResultPreview -Fingerprint $Fingerprint
+	} catch {}
 }
 
 function Reset-MBToolLoopGuard {
@@ -23438,6 +28835,19 @@ function Reset-MBToolLoopGuard {
 		$script:MB.LoopConfirmedFps = New-Object System.Collections.ArrayList
 	}
 	try { $script:MB.RemotePortClosedBlocks = @{} } catch {}
+	try { $script:MB.FpBadOutcomeHits = @{} } catch {}
+	try { $script:MB.FpForceStop = @{} } catch {}
+	try {
+		if ($null -eq $script:MB.TurnToolSummary) {
+			$script:MB.TurnToolSummary = New-Object System.Collections.ArrayList
+		} else {
+			$script:MB.TurnToolSummary.Clear()
+		}
+	} catch {
+		$script:MB.TurnToolSummary = New-Object System.Collections.ArrayList
+	}
+	try { $script:MB.PendingTaskBoardNudge = $false } catch {}
+	try { $script:MB.LastTurnHygiene = '' } catch {}
 }
 
 # Setup / tune and installer tools
@@ -28577,7 +33987,11 @@ function Invoke-MBTool {
 		$script:MB.LastToolMs = $sw.ElapsedMilliseconds
 		$script:MB.ToolCalls++
 		try { Update-MBWpfLiveChrome } catch {}
-		return [string]$guard.Message
+		$blockMsg = [string]$guard.Message
+		try {
+			Register-MBToolOutcome -Name $Name -ArgsObj $ArgsObj -Result $blockMsg -Fingerprint ([string]$guard.Fingerprint)
+		} catch {}
+		return $blockMsg
 	}
 	$fp = $guard.Fingerprint
 
@@ -28592,23 +34006,30 @@ function Invoke-MBTool {
 				Invoke-ReadFile @p
 			}
 			"WriteFile" {
-				Invoke-WriteFile -path (Get-MBProp $ArgsObj 'path') -content (Get-MBProp $ArgsObj 'content')
+				$p = @{
+					path    = (Get-MBProp $ArgsObj 'path')
+					content = (Get-MBProp $ArgsObj 'content')
+				}
+				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = [bool](Get-MBProp $ArgsObj 'backup') }
+				Invoke-WriteFile @p
 			}
 			"EditFile" {
 				$p = @{
-					path    = (Get-MBProp $ArgsObj 'path')
-					search  = (Get-MBProp $ArgsObj 'search')
-					replace = (Get-MBProp $ArgsObj 'replace')
+					path    = [string](Get-MBProp $ArgsObj 'path' '')
+					search  = [string](Get-MBProp $ArgsObj 'search' '')
+					replace = [string](Get-MBProp $ArgsObj 'replace' '')
 				}
-				if (Test-MBHasProp $ArgsObj 'useRegex') { $p['useRegex'] = [bool](Get-MBProp $ArgsObj 'useRegex') }
-				if (Test-MBHasProp $ArgsObj 'replaceAll') { $p['replaceAll'] = [bool](Get-MBProp $ArgsObj 'replaceAll') }
-				if (Test-MBHasProp $ArgsObj 'occurrence') { $p['occurrence'] = [int](Get-MBProp $ArgsObj 'occurrence') }
+				if (Test-MBHasProp $ArgsObj 'useRegex') { $p['useRegex'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'useRegex') $false) }
+				if (Test-MBHasProp $ArgsObj 'replaceAll') { $p['replaceAll'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'replaceAll') $false) }
+				if (Test-MBHasProp $ArgsObj 'occurrence') { $p['occurrence'] = (Convert-MBToInt (Get-MBProp $ArgsObj 'occurrence') 0) }
+				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'backup') $true) }
 				if (Test-MBHasProp $ArgsObj 'edits') { $p['edits'] = (Get-MBProp $ArgsObj 'edits') }
 				Invoke-EditFile @p
 			}
 			"ApplyPatch" {
-				$p = @{ patch = (Get-MBProp $ArgsObj 'patch') }
-				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				$p = @{ patch = [string](Get-MBProp $ArgsObj 'patch' '') }
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = [string](Get-MBProp $ArgsObj 'path' '') }
+				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'backup') $true) }
 				Invoke-ApplyPatch @p
 			}
 			"RunCommand" {
@@ -28625,7 +34046,7 @@ function Invoke-MBTool {
 					$codeLang = if ([string]$shell -match '^(?i)cmd') { 'bat' } else { 'ps' }
 					if (-not (Request-Confirmation -Title "RunCommand requires approval" -Details $cmdDetails -Code ([string]$cmd) -CodeLang $codeLang)) {
 						Write-Host "    denied" -ForegroundColor Red
-						"BLOCKED BY USER: Operator denied this RunCommand. Do NOT retry the same shell approach. Re-read ROUTER/MAP: volume/mute->EnableToolGroup system + AudioVolume; brightness->system + DisplayBrightness; services->system + ControlService. EnableToolGroup then call specialized tool same turn."
+						"BLOCKED BY USER: Operator denied this RunCommand. Do NOT retry the same shell approach. Re-read ROUTER/MAP: volume/mute->EnableToolGroup sound + AudioVolume; speak->sound + SpeakText; brightness->system + DisplayBrightness; services->system + ControlService. EnableToolGroup then call specialized tool same turn."
 					} else {
 						if ($script:MB.AutoApprove) {
 							if ($script:MB.ModeSwitch) { $script:MB.ModeSwitch = $false }
@@ -28775,12 +34196,19 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'disasm') { $p['disasm'] = [bool](Get-MBProp $ArgsObj 'disasm') }
 				if (Test-MBHasProp $ArgsObj 'trace') { $p['trace'] = [bool](Get-MBProp $ArgsObj 'trace') }
 				if (Test-MBHasProp $ArgsObj 'at_entry') { $p['at_entry'] = [bool](Get-MBProp $ArgsObj 'at_entry') }
+				if (Test-MBHasProp $ArgsObj 'rva') { $p['rva'] = (Get-MBProp $ArgsObj 'rva') }
+				if (Test-MBHasProp $ArgsObj 'section') { $p['section'] = [string](Get-MBProp $ArgsObj 'section') }
 				if (Test-MBHasProp $ArgsObj 'max_insns') { $p['max_insns'] = [int](Get-MBProp $ArgsObj 'max_insns') }
 				if (Test-MBHasProp $ArgsObj 'max_steps') { $p['max_steps'] = [int](Get-MBProp $ArgsObj 'max_steps') }
 				if (Test-MBHasProp $ArgsObj 'follow_calls') { $p['follow_calls'] = [bool](Get-MBProp $ArgsObj 'follow_calls') }
 				if (Test-MBHasProp $ArgsObj 'prefer_branch') { $p['prefer_branch'] = [string](Get-MBProp $ArgsObj 'prefer_branch') }
 				if (Test-MBHasProp $ArgsObj 'arch') { $p['arch'] = [string](Get-MBProp $ArgsObj 'arch') }
 				if (Test-MBHasProp $ArgsObj 'dump_hex') { $p['dump_hex'] = [bool](Get-MBProp $ArgsObj 'dump_hex') }
+				if (Test-MBHasProp $ArgsObj 'entropy') { $p['entropy'] = [bool](Get-MBProp $ArgsObj 'entropy') }
+				if (Test-MBHasProp $ArgsObj 'entropy_blocks') { $p['entropy_blocks'] = [int](Get-MBProp $ArgsObj 'entropy_blocks') }
+				if (Test-MBHasProp $ArgsObj 'carve') { $p['carve'] = [bool](Get-MBProp $ArgsObj 'carve') }
+				if (Test-MBHasProp $ArgsObj 'hash') { $p['hash'] = [bool](Get-MBProp $ArgsObj 'hash') }
+				if (Test-MBHasProp $ArgsObj 'functions') { $p['functions'] = [bool](Get-MBProp $ArgsObj 'functions') }
 				Invoke-HexView @p
 			}
 			"HexEdit" {
@@ -28788,9 +34216,30 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
 				if (Test-MBHasProp $ArgsObj 'hex') { $p['hex'] = [string](Get-MBProp $ArgsObj 'hex') }
 				if (Test-MBHasProp $ArgsObj 'bytes') { $p['bytes'] = (Get-MBProp $ArgsObj 'bytes') }
+				if (Test-MBHasProp $ArgsObj 'preset') { $p['preset'] = [string](Get-MBProp $ArgsObj 'preset') }
+				if (Test-MBHasProp $ArgsObj 'length') { $p['length'] = [int](Get-MBProp $ArgsObj 'length') }
 				if (Test-MBHasProp $ArgsObj 'extend') { $p['extend'] = [bool](Get-MBProp $ArgsObj 'extend') }
 				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = [bool](Get-MBProp $ArgsObj 'backup') }
 				Invoke-HexEdit @p
+			}
+			"HexSearch" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'pattern') { $p['pattern'] = [string](Get-MBProp $ArgsObj 'pattern') }
+				if (Test-MBHasProp $ArgsObj 'hex') { $p['hex'] = [string](Get-MBProp $ArgsObj 'hex') }
+				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
+				if (Test-MBHasProp $ArgsObj 'maxResults') { $p['maxResults'] = [int](Get-MBProp $ArgsObj 'maxResults') }
+				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = (Get-MBProp $ArgsObj 'max_scan') }
+				Invoke-HexSearch @p
+			}
+			"StringsScan" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'minLen') { $p['minLen'] = [int](Get-MBProp $ArgsObj 'minLen') }
+				if (Test-MBHasProp $ArgsObj 'maxHits') { $p['maxHits'] = [int](Get-MBProp $ArgsObj 'maxHits') }
+				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
+				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = (Get-MBProp $ArgsObj 'max_scan') }
+				if (Test-MBHasProp $ArgsObj 'encoding') { $p['encoding'] = [string](Get-MBProp $ArgsObj 'encoding') }
+				if (Test-MBHasProp $ArgsObj 'filter') { $p['filter'] = [string](Get-MBProp $ArgsObj 'filter') }
+				Invoke-StringsScan @p
 			}
 			"ReadImage" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
@@ -28807,9 +34256,14 @@ function Invoke-MBTool {
 				Invoke-ReadPdf @p
 			}
 			"DiffText" {
-				$p = @{ left = (Get-MBProp $ArgsObj 'left'); right = (Get-MBProp $ArgsObj 'right') }
-				if (Test-MBHasProp $ArgsObj 'leftIsFile')  { $p['leftIsFile']  = [bool](Get-MBProp $ArgsObj 'leftIsFile') }
-				if (Test-MBHasProp $ArgsObj 'rightIsFile') { $p['rightIsFile'] = [bool](Get-MBProp $ArgsObj 'rightIsFile') }
+				$p = @{
+					left  = [string](Get-MBProp $ArgsObj 'left' '')
+					right = [string](Get-MBProp $ArgsObj 'right' '')
+				}
+				if (Test-MBHasProp $ArgsObj 'leftIsFile')  { $p['leftIsFile']  = (Convert-MBToBool (Get-MBProp $ArgsObj 'leftIsFile') $false) }
+				if (Test-MBHasProp $ArgsObj 'rightIsFile') { $p['rightIsFile'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'rightIsFile') $false) }
+				if (Test-MBHasProp $ArgsObj 'context')     { $p['context']     = (Convert-MBToInt (Get-MBProp $ArgsObj 'context') 3) }
+				if (Test-MBHasProp $ArgsObj 'maxLines')    { $p['maxLines']    = (Convert-MBToInt (Get-MBProp $ArgsObj 'maxLines') 200) }
 				Invoke-DiffText @p
 			}
 			"GetWorkingDirectory" { Invoke-GetWorkingDirectory }
@@ -29071,6 +34525,38 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = [bool](Get-MBProp $ArgsObj 'force') }
 				Invoke-ExpandCab @p
 			}
+			"BulkRename" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = [string](Get-MBProp $ArgsObj 'path') }
+				elseif (Test-MBHasProp $ArgsObj 'directory') { $p['path'] = [string](Get-MBProp $ArgsObj 'directory') }
+				if (Test-MBHasProp $ArgsObj 'directory') { $p['directory'] = [string](Get-MBProp $ArgsObj 'directory') }
+				if (Test-MBHasProp $ArgsObj 'glob') { $p['glob'] = [string](Get-MBProp $ArgsObj 'glob') }
+				if (Test-MBHasProp $ArgsObj 'recursive') { $p['recursive'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'recursive') $false) }
+				if (Test-MBHasProp $ArgsObj 'find') { $p['find'] = [string](Get-MBProp $ArgsObj 'find') }
+				if (Test-MBHasProp $ArgsObj 'replace') { $p['replace'] = [string](Get-MBProp $ArgsObj 'replace') }
+				if (Test-MBHasProp $ArgsObj 'use_regex') { $p['use_regex'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'use_regex') $false) }
+				if (Test-MBHasProp $ArgsObj 'template') { $p['template'] = [string](Get-MBProp $ArgsObj 'template') }
+				if (Test-MBHasProp $ArgsObj 'start_index') { $p['start_index'] = (Convert-MBToInt (Get-MBProp $ArgsObj 'start_index') 1) }
+				# dry_run defaults true when omitted
+				if (Test-MBHasProp $ArgsObj 'dry_run') { $p['dry_run'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'dry_run') $true) }
+				else { $p['dry_run'] = $true }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Convert-MBToInt (Get-MBProp $ArgsObj 'max') 200) }
+				if (Test-MBHasProp $ArgsObj 'force') { $p['force'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'force') $false) }
+				Invoke-BulkRename @p
+			}
+			"FindDuplicates" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = [string](Get-MBProp $ArgsObj 'path') }
+				elseif (Test-MBHasProp $ArgsObj 'directory') { $p['path'] = [string](Get-MBProp $ArgsObj 'directory') }
+				if (Test-MBHasProp $ArgsObj 'directory') { $p['directory'] = [string](Get-MBProp $ArgsObj 'directory') }
+				if (Test-MBHasProp $ArgsObj 'recursive') { $p['recursive'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'recursive') $true) }
+				if (Test-MBHasProp $ArgsObj 'glob') { $p['glob'] = [string](Get-MBProp $ArgsObj 'glob') }
+				if (Test-MBHasProp $ArgsObj 'min_bytes') { $p['min_bytes'] = [long](Convert-MBToInt (Get-MBProp $ArgsObj 'min_bytes') 1) }
+				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = (Convert-MBToInt (Get-MBProp $ArgsObj 'max_scan') 10000) }
+				if (Test-MBHasProp $ArgsObj 'max_groups') { $p['max_groups'] = (Convert-MBToInt (Get-MBProp $ArgsObj 'max_groups') 40) }
+				if (Test-MBHasProp $ArgsObj 'max_per_group') { $p['max_per_group'] = (Convert-MBToInt (Get-MBProp $ArgsObj 'max_per_group') 12) }
+				Invoke-FindDuplicates @p
+			}
 			"FindPSModule" {
 				$p = @{ name = (Get-MBProp $ArgsObj 'name') }
 				if (Test-MBHasProp $ArgsObj 'max_results') { $p['max_results'] = [int](Get-MBProp $ArgsObj 'max_results') }
@@ -29101,7 +34587,15 @@ function Invoke-MBTool {
 					name  = (Get-MBProp $ArgsObj 'name')
 					value = (Get-MBProp $ArgsObj 'value')
 				}
-				if (Test-MBHasProp $ArgsObj 'type') { $p['type'] = (Get-MBProp $ArgsObj 'type') }
+				# Map type/value_type → ValueType for SetRegistry.
+				$vt = $null
+				foreach ($tk in @('ValueType', 'value_type', 'type', 'Type', 'reg_type', 'kind')) {
+					if (Test-MBHasProp $ArgsObj $tk) {
+						$vt = Get-MBProp $ArgsObj $tk
+						if (-not [string]::IsNullOrWhiteSpace([string]$vt)) { break }
+					}
+				}
+				if (-not [string]::IsNullOrWhiteSpace([string]$vt)) { $p['ValueType'] = [string]$vt }
 				Invoke-SetRegistry @p
 			}
 			"GetPowerInfo"     { Invoke-GetPowerInfo }
@@ -29136,7 +34630,41 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'verify_ssl')    { $p['verify_ssl']    = [bool](Get-MBProp $ArgsObj 'verify_ssl') }
 				if (Test-MBHasProp $ArgsObj 'user_agent')    { $p['user_agent']    = (Get-MBProp $ArgsObj 'user_agent') }
 				if (Test-MBHasProp $ArgsObj 'extract_links') { $p['extract_links'] = [bool](Get-MBProp $ArgsObj 'extract_links') }
+				if (Test-MBHasProp $ArgsObj 'max_links')     { $p['max_links']     = [int](Get-MBProp $ArgsObj 'max_links') }
 				Invoke-BrowsePage @p
+			}
+			"SearchWeb" {
+				$p = @{ query = (Get-MBProp $ArgsObj 'query') }
+				if (Test-MBHasProp $ArgsObj 'max_results') { $p['max_results'] = [int](Get-MBProp $ArgsObj 'max_results') }
+				if (Test-MBHasProp $ArgsObj 'engine')      { $p['engine']      = [string](Get-MBProp $ArgsObj 'engine') }
+				if (Test-MBHasProp $ArgsObj 'verify_ssl')  { $p['verify_ssl']  = [bool](Get-MBProp $ArgsObj 'verify_ssl') }
+				if (Test-MBHasProp $ArgsObj 'user_agent')  { $p['user_agent']  = (Get-MBProp $ArgsObj 'user_agent') }
+				Invoke-SearchWeb @p
+			}
+			"SearchMicrosoftLearn" {
+				$p = @{ query = (Get-MBProp $ArgsObj 'query') }
+				if (Test-MBHasProp $ArgsObj 'max_results') { $p['max_results'] = [int](Get-MBProp $ArgsObj 'max_results') }
+				if (Test-MBHasProp $ArgsObj 'locale')      { $p['locale']      = [string](Get-MBProp $ArgsObj 'locale') }
+				Invoke-SearchMicrosoftLearn @p
+			}
+			"ReadMicrosoftLearn" {
+				$p = @{ url = (Get-MBProp $ArgsObj 'url') }
+				if (Test-MBHasProp $ArgsObj 'max_length') { $p['max_length'] = [int](Get-MBProp $ArgsObj 'max_length') }
+				Invoke-ReadMicrosoftLearn @p
+			}
+			"SearchSs64" {
+				$p = @{ query = (Get-MBProp $ArgsObj 'query') }
+				if (Test-MBHasProp $ArgsObj 'max_results') { $p['max_results'] = [int](Get-MBProp $ArgsObj 'max_results') }
+				if (Test-MBHasProp $ArgsObj 'scope')       { $p['scope']       = [string](Get-MBProp $ArgsObj 'scope') }
+				Invoke-SearchSs64 @p
+			}
+			"ReadSs64" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'url')     { $p['url']     = [string](Get-MBProp $ArgsObj 'url') }
+				if (Test-MBHasProp $ArgsObj 'command') { $p['command'] = [string](Get-MBProp $ArgsObj 'command') }
+				if (Test-MBHasProp $ArgsObj 'scope')   { $p['scope']   = [string](Get-MBProp $ArgsObj 'scope') }
+				if (Test-MBHasProp $ArgsObj 'max_length') { $p['max_length'] = [int](Get-MBProp $ArgsObj 'max_length') }
+				Invoke-ReadSs64 @p
 			}
 			"ConvertGitHubUrl"    { Invoke-ConvertGitHubUrl -github_url (Get-MBProp $ArgsObj 'github_url') }
 			"GetGitHubRawFile" {
@@ -29350,6 +34878,24 @@ function Invoke-MBTool {
 				Enable-MBToolGroup @p
 			}
 			"ListToolGroups"  { Get-MBToolGroupsStatus }
+			"TaskBoard" {
+				$p = @{ action = (Get-MBProp $ArgsObj 'action' 'status') }
+				if (Test-MBHasProp $ArgsObj 'goal') { $p['goal'] = (Get-MBProp $ArgsObj 'goal') }
+				if (Test-MBHasProp $ArgsObj 'items') { $p['items'] = (Get-MBProp $ArgsObj 'items') }
+				if (Test-MBHasProp $ArgsObj 'id') { $p['id'] = (Get-MBProp $ArgsObj 'id') }
+				if (Test-MBHasProp $ArgsObj 'status') { $p['status'] = (Get-MBProp $ArgsObj 'status') }
+				if (Test-MBHasProp $ArgsObj 'title') { $p['title'] = (Get-MBProp $ArgsObj 'title') }
+				if (Test-MBHasProp $ArgsObj 'note') { $p['note'] = (Get-MBProp $ArgsObj 'note') }
+				$r = Invoke-TaskBoard @p
+				# Sticky UI via Write-MBTaskBoardInline; skip mid-loop SESSION STATE rewrite when frozen.
+				# Board deltas also in tool results when wire is frozen.
+				try {
+					if (-not [bool]$script:MB.WireStateFrozen) {
+						$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+					}
+				} catch {}
+				$r
+			}
 			default {
 				$hint = Get-MBToolEnableHint -ToolName $Name
 				$resolved = Resolve-MBToolName -Name $Name
@@ -29391,7 +34937,12 @@ function Invoke-MBTool {
 			$previewNote = "[timing retest - one-shot]`n" + $text
 			$wasConfirmed = $true
 		}
-		Register-MBToolExecution -Fingerprint $fp -ResultPreview $previewNote -WasConfirmed $wasConfirmed
+		Register-MBToolExecution -Fingerprint $fp -ResultPreview $previewNote -WasConfirmed $wasConfirmed -ToolName $Name -ArgsObj $ArgsObj
+	} elseif ($guard -and $guard.Block) {
+		# Count blocked loop-guard as bad outcome (drives NEED_INPUT after repeat)
+		try {
+			Register-MBToolOutcome -Name $Name -ArgsObj $ArgsObj -Result $text -Fingerprint $fp
+		} catch {}
 	}
 
 	return $text
@@ -29742,7 +35293,808 @@ function Get-MBContextEstimate {
 	}
 }
 
-function Get-MBStickySystemContent {
+function Get-MBTaskBoardObject {
+	$tb = $null
+	try { $tb = $script:MB.TaskBoard } catch { $tb = $null }
+	if ($null -eq $tb) {
+		$tb = [ordered]@{
+			Goal    = ''
+			Items   = @()
+			Updated = ''
+		}
+		$script:MB.TaskBoard = $tb
+	}
+	return $tb
+}
+
+function Format-MBTaskBoardText {
+	$tb = Get-MBTaskBoardObject
+	$items = @()
+	try { $items = @($tb.Items) } catch { $items = @() }
+	if ($items.Count -eq 0 -and [string]::IsNullOrWhiteSpace([string]$tb.Goal)) { return '' }
+	$paused = $false
+	try { $paused = [bool]$script:MB.TaskBoardPaused } catch { $paused = $false }
+	$lines = New-Object System.Collections.ArrayList
+	$goal = [string]$tb.Goal
+	if ([string]::IsNullOrWhiteSpace($goal)) { $goal = '(no goal set)' }
+	if ($paused) {
+		[void]$lines.Add(("Task board (PAUSED - operator Stop/Esc): {0}" -f $goal))
+	} else {
+		[void]$lines.Add(("Task board: {0}" -f $goal))
+	}
+	$open = 0
+	$current = ''
+	$currentId = ''
+	foreach ($it in $items) {
+		if ($null -eq $it) { continue }
+		$id = ''; $title = ''; $st = 'pending'; $note = ''
+		try { $id = [string]$it.Id } catch {}
+		try { $title = [string]$it.Title } catch {}
+		try { $st = ([string]$it.Status).ToLowerInvariant() } catch { $st = 'pending' }
+		try { $note = [string]$it.Note } catch {}
+		if ([string]::IsNullOrWhiteSpace($title)) { $title = $id }
+		$mark = '[ ]'
+		if ($st -eq 'done') { $mark = '[x]' }
+		elseif ($st -eq 'in_progress' -or $st -eq 'active' -or $st -eq 'doing') {
+			$mark = '[>]'
+			$st = 'in_progress'
+			$open++
+			if (-not $current) { $current = $title; $currentId = $id }
+		}
+		elseif ($st -eq 'blocked') { $mark = '[!]'; $open++ }
+		else { $st = 'pending'; $open++ }
+		$line = (" {0} {1}: {2}" -f $mark, $id, $title)
+		if ($st -eq 'blocked' -and $note) { $line += (" (blocked: {0})" -f $note) }
+		elseif ($note -and $st -ne 'done') { $line += (" ({0})" -f $note) }
+		[void]$lines.Add($line)
+	}
+	if ($current) {
+		[void]$lines.Add(("NOW: {0}" -f $current))
+	}
+	if ($paused) {
+		[void]$lines.Add('PAUSED: Operator stopped mid-board. Sticky shows only the stopped task (kept for resume).')
+		[void]$lines.Add('DEFAULT after stop: TaskBoard action=clear then action=set a NEW board for any new request.')
+		[void]$lines.Add('RESUME only if operator explicitly asked to continue/resume this plan - then TaskBoard update from the NOW item and keep going (do not clear).')
+	} elseif ($open -gt 0) {
+		[void]$lines.Add(("Open items: {0} - continue next [>] or next [ ] before final answer." -f $open))
+	} else {
+		[void]$lines.Add('Open items: 0 - board complete (or empty).')
+	}
+	return ($lines -join "`n")
+}
+
+function Suspend-MBTaskBoardForInterrupt {
+	# Stop/Esc: collapse sticky to the active task (yellow); keep full board data for resume.
+	try {
+		if (-not (Test-MBTaskBoardHasOpen)) { return }
+	} catch { return }
+	try { $script:MB.TaskBoardPaused = $true } catch {}
+	try { Update-MBWpfTaskBoardSticky -Action 'pause' } catch {}
+	try {
+		Update-MBWpfSticky -Status 'ready' -Hint ("stopped  {0}  taskboard paused (resume or clear)" -f ([char]0x00B7))
+	} catch {}
+}
+
+function Resume-MBTaskBoardUi {
+	# Expand full sticky again (board data already present).
+	try { $script:MB.TaskBoardPaused = $false } catch {}
+	try { Update-MBWpfTaskBoardSticky -Action 'status' } catch {}
+}
+
+function Write-MBTaskBoardInline {
+	# Operator UI: sticky flyout under tool chips only (no chat / console lines).
+	# Model still gets the JSON tool result from Invoke-TaskBoard.
+	param(
+		[string]$Action = '',
+		[string]$HighlightId = ''
+	)
+	try {
+		$act = ([string]$Action).Trim().ToLowerInvariant()
+		# Always drive the sticky flyout when WPF is up
+		try { Update-MBWpfTaskBoardSticky -Action $act -HighlightId $HighlightId } catch {}
+
+		$tb = Get-MBTaskBoardObject
+		$goal = ''
+		try { $goal = [string]$tb.Goal } catch {}
+		$items = @()
+		try { $items = @($tb.Items) } catch { $items = @() }
+		$empty = ($act -eq 'clear') -or ($items.Count -eq 0 -and [string]::IsNullOrWhiteSpace($goal))
+
+		# Status-bar hint only (not chat log) — same field reader as listview snapshot
+		try {
+			if ($empty) {
+				Update-MBWpfSticky -Status 'working' -Hint ("esc interrupt  {0}  taskboard empty" -f ([char]0x00B7))
+			} else {
+				$progTitle = ''
+				$progIdHint = ''
+				$openN = 0; $total = 0
+				foreach ($it in $items) {
+					if ($null -eq $it) { continue }
+					$total++
+					$st = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+					if ($st -in @('active', 'doing', 'wip', 'working')) { $st = 'in_progress' }
+					if ($st -in @('complete', 'completed', 'finished')) { $st = 'done' }
+					if ($st -eq 'done') { continue }
+					$openN++
+					if ($st -eq 'in_progress' -and -not $progTitle) {
+						$progIdHint = Get-MBTaskBoardItemField -Item $it -Name 'Id'
+						$progTitle = Get-MBTaskBoardItemField -Item $it -Name 'Title'
+						if (-not $progTitle) { $progTitle = $progIdHint }
+					}
+				}
+				if ($progTitle) {
+					$label = $progTitle
+					if ($progIdHint) { $label = ('{0} {1}' -f $progIdHint, $progTitle) }
+					$hint = ("esc interrupt  {0}  task: {1}" -f ([char]0x00B7), $label)
+					if ($hint.Length -gt 72) { $hint = $hint.Substring(0, 69) + '...' }
+					Update-MBWpfSticky -Status 'working' -Hint $hint
+				} elseif ($openN -eq 0 -and $total -gt 0) {
+					Update-MBWpfSticky -Status 'working' -Hint ("esc interrupt  {0}  taskboard complete" -f ([char]0x00B7))
+				}
+			}
+		} catch {}
+
+		# No console/chat dump — sticky flyout (WPF) is the only operator view
+	} catch {}
+}
+
+function Test-MBTaskBoardHasOpen {
+	# True when the board has items and at least one is not done/cancelled.
+	$tb = Get-MBTaskBoardObject
+	$items = @()
+	try { $items = @($tb.Items) } catch { $items = @() }
+	if ($items.Count -eq 0) { return $false }
+	foreach ($it in $items) {
+		if ($null -eq $it) { continue }
+		$st = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+		if ($st -in @('active', 'doing', 'wip', 'working')) { $st = 'in_progress' }
+		if ($st -in @('complete', 'completed', 'finished', 'ok')) { $st = 'done' }
+		if ($st -notin @('done', 'cancelled', 'canceled')) { return $true }
+	}
+	return $false
+}
+
+function Test-MBTaskBoardAllDone {
+	# Board exists with items and every item is done/cancelled.
+	$tb = Get-MBTaskBoardObject
+	$items = @()
+	try { $items = @($tb.Items) } catch { $items = @() }
+	if ($items.Count -eq 0) { return $false }
+	return -not (Test-MBTaskBoardHasOpen)
+}
+
+function Test-MBReplySignalsTaskBoardDone {
+	# Model gave a final "we're finished" reply without necessarily marking board done.
+	param([string]$Text)
+	if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+	$t = $Text.ToLowerInvariant()
+	if ($t -match 'all\s+passed|all\s+\d+\s+(smoke\s+)?(test|tests|item|items|check|checks|categor(?:y|ies))\s+(passed|complete|ok|verified)') { return $true }
+	if ($t -match '✅\s*all|all\s+(tests?|items?|checks?)\s+(passed|complete)|smoke\s+tests?\s+.*\bpass') { return $true }
+	if ($t -match '\bdid:\s*.{0,80}\b(pass|complete|verified|functional)\b' -and $t -match '\b(all|complete|done)\b') { return $true }
+	if ($t -match 'board\s+complete|open\s+items:\s*0|task\s*board\s+(cleared|complete)') { return $true }
+	return $false
+}
+
+function Complete-MBTaskBoard {
+	# Mark any remaining open items done, paint once, then clear so sticky resets cleanly.
+	param(
+		[switch]$ForceMarkDone,
+		[string]$Reason = 'complete'
+	)
+	$tb = Get-MBTaskBoardObject
+	$items = New-Object System.Collections.ArrayList
+	foreach ($it in @($tb.Items)) {
+		if ($null -eq $it) { continue }
+		$st = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+		if ($ForceMarkDone -and $st -notin @('done', 'complete', 'completed', 'cancelled', 'canceled')) {
+			Set-MBTaskBoardItemField -Item $it -Name 'Status' -Value 'done'
+			$st = 'done'
+		}
+		[void]$items.Add($it)
+	}
+	if ($items.Count -eq 0) {
+		try { Write-MBTaskBoardInline -Action 'clear' } catch {}
+		return $false
+	}
+	$goalKeep = ''
+	try { $goalKeep = [string]$tb.Goal } catch {}
+	$norm = New-Object System.Collections.ArrayList
+	foreach ($it in $items) {
+		$nst = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+		if ($nst -in @('complete', 'completed', 'finished', 'ok')) { $nst = 'done' }
+		if ($nst -notin @('pending', 'in_progress', 'done', 'blocked')) { $nst = 'done' }
+		[void]$norm.Add([ordered]@{
+			Id     = (Get-MBTaskBoardItemField -Item $it -Name 'Id')
+			Title  = (Get-MBTaskBoardItemField -Item $it -Name 'Title')
+			Status = $nst
+			Note   = (Get-MBTaskBoardItemField -Item $it -Name 'Note')
+		})
+	}
+	$script:MB.TaskBoard = [ordered]@{
+		Goal    = $goalKeep
+		Items   = @($norm.ToArray())
+		Updated = (Get-Date).ToString('o')
+	}
+	try { $script:MB.TaskBoardPaused = $false } catch {}
+	# Show completed board briefly, then clear sticky + data
+	try {
+		if ($script:MB.Wpf) { $script:MB.Wpf.TaskBoardLastFp = '' }
+	} catch {}
+	try { Write-MBTaskBoardInline -Action 'status' } catch {}
+	# Clear data so incomplete-nudge cannot fire again and sticky fully resets
+	$script:MB.TaskBoard = [ordered]@{
+		Goal    = ''
+		Items   = @()
+		Updated = (Get-Date).ToString('o')
+	}
+	try { $script:MB.TaskBoardPaused = $false } catch {}
+	try { $script:MB.PendingTaskBoardNudge = $false } catch {}
+	try { Write-MBTaskBoardInline -Action 'clear' } catch {}
+	# Refresh frozen SESSION STATE if mid tool-loop so the model sees empty board
+	try {
+		if ([bool]$script:MB.WireStateFrozen) {
+			Freeze-MBWireState -Refresh
+			if ($script:Messages) {
+				$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+			}
+		}
+	} catch {}
+	return $true
+}
+
+function Stop-MBWpfTaskBoardPulse {
+	# Clear color/opacity pulses on sticky TaskBoard rows (UI thread).
+	try {
+		$W = $script:MB.Wpf
+		if (-not $W) { return }
+		foreach ($el in @($W.TaskBoardPulseEls)) {
+			if ($null -eq $el) { continue }
+			try {
+				if ($el -is [System.Windows.Media.SolidColorBrush]) {
+					Stop-MBBrushColorPulse -Brush $el
+				} else {
+					Stop-MBElementOpacityPulse -Element $el -RestOpacity 1.0
+				}
+			} catch {}
+		}
+		$W.TaskBoardPulseEls = New-Object System.Collections.ArrayList
+	} catch {}
+}
+
+function Get-MBTaskBoardItemField {
+	# Robust field read for OrderedDictionary / PSCustomObject / mixed case keys.
+	param($Item, [string]$Name)
+	if ($null -eq $Item -or [string]::IsNullOrWhiteSpace($Name)) { return '' }
+	try {
+		if ($Item -is [System.Collections.IDictionary]) {
+			if ($Item.Contains($Name)) {
+				$v = $Item[$Name]
+				if ($null -ne $v) { return [string]$v }
+			}
+			foreach ($k in @($Item.Keys)) {
+				if ([string]::Equals([string]$k, $Name, [StringComparison]::OrdinalIgnoreCase)) {
+					$v = $Item[$k]
+					if ($null -ne $v) { return [string]$v }
+				}
+			}
+		}
+	} catch {}
+	try {
+		$v = $Item.$Name
+		if ($null -ne $v) { return [string]$v }
+	} catch {}
+	return ''
+}
+
+function Set-MBTaskBoardItemField {
+	param($Item, [string]$Name, $Value)
+	if ($null -eq $Item -or [string]::IsNullOrWhiteSpace($Name)) { return }
+	try {
+		if ($Item -is [System.Collections.IDictionary]) {
+			$key = $Name
+			foreach ($k in @($Item.Keys)) {
+				if ([string]::Equals([string]$k, $Name, [StringComparison]::OrdinalIgnoreCase)) { $key = $k; break }
+			}
+			$Item[$key] = $Value
+		}
+	} catch {}
+	try { $Item.$Name = $Value } catch {}
+}
+
+function Request-MBWpfTaskBoardPaint {
+	param($Snap)
+	if ($null -eq $Snap) { return }
+	try {
+		if (-not $script:MB.Wpf) { return }
+		try { $script:MB.Wpf.TaskBoardLastFp = '' } catch {}
+		try { $script:MB.Wpf.TaskBoardPaintUrgent = $true } catch {}
+		try { $script:MB.Wpf.TaskBoardPaintRetry = 0 } catch {}
+		try {
+			$sq = 0
+			try { $sq = [int]$Snap.Seq } catch { $sq = 0 }
+			if ($sq -gt 0) { $script:MB.Wpf.TaskBoardWantSeq = $sq }
+		} catch {}
+		$script:MB.Wpf.PendingTaskBoard = $Snap
+		# STA kick (Action created on WPF thread).
+		try {
+			$d = $null
+			try { $d = $script:MB.Wpf.Dispatcher } catch { $d = $null }
+			$kick = $null
+			try { $kick = $script:MB.Wpf.KickTaskBoardPaint } catch { $kick = $null }
+			if ($null -ne $d -and $null -ne $kick) {
+				if ($kick -is [System.Action]) {
+					if ($d.CheckAccess()) { try { $kick.Invoke() } catch {} }
+					else { [void]$d.BeginInvoke($kick, [System.Windows.Threading.DispatcherPriority]::Normal) }
+				} elseif ($kick -is [scriptblock]) {
+					[void]$d.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, $kick)
+				}
+			}
+		} catch {}
+	} catch {}
+}
+
+function Update-MBWpfTaskBoardSticky {
+	# Build TaskBoard sticky snapshot for STA paint.
+	param(
+		[string]$Action = '',
+		[string]$HighlightId = ''
+	)
+	if (-not $script:MB.Wpf) { return }
+	try {
+		if (-not [bool]$script:MB.Wpf.Ready -and -not $script:MB.Wpf.Window) { return }
+	} catch {}
+	$tb = $null
+	try { $tb = Get-MBTaskBoardObject } catch { $tb = $null }
+	$goal = ''
+	$items = @()
+	try { $goal = [string]$tb.Goal } catch {}
+	try { $items = @($tb.Items) } catch { $items = @() }
+	$act = ([string]$Action).Trim().ToLowerInvariant()
+	if ($act -in @('pause', 'suspend', 'stop')) { $act = 'pause' }
+	# pause: keep board data; sticky shows only the stopped task (yellow)
+	$pausedFlag = $false
+	try { $pausedFlag = [bool]$script:MB.TaskBoardPaused } catch { $pausedFlag = $false }
+	if ($act -eq 'pause') { $pausedFlag = $true }
+	$empty = ($act -eq 'clear') -or ($act -eq 'retract') -or ($items.Count -eq 0 -and [string]::IsNullOrWhiteSpace($goal))
+
+	$rows = New-Object System.Collections.ArrayList
+	$doneN = 0; $openN = 0; $blockN = 0; $progTitle = ''; $progId = ''; $progNote = ''
+	$firstOpen = $null
+	if (-not $empty) {
+		foreach ($it in $items) {
+			if ($null -eq $it) { continue }
+			$id = Get-MBTaskBoardItemField -Item $it -Name 'Id'
+			$title = Get-MBTaskBoardItemField -Item $it -Name 'Title'
+			$st = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+			$note = Get-MBTaskBoardItemField -Item $it -Name 'Note'
+			if ([string]::IsNullOrWhiteSpace($st)) { $st = 'pending' }
+			if ([string]::IsNullOrWhiteSpace($title)) { $title = $id }
+			if ($st -in @('active', 'doing', 'wip', 'working')) { $st = 'in_progress' }
+			if ($st -in @('complete', 'completed', 'finished')) { $st = 'done' }
+			if ($st -eq 'done') { $doneN++ }
+			elseif ($st -eq 'blocked') {
+				$blockN++; $openN++
+				if ($null -eq $firstOpen) {
+					$firstOpen = [pscustomobject]@{ Id = $id; Title = $title; Status = 'blocked'; Note = $note }
+				}
+			}
+			elseif ($st -eq 'in_progress') {
+				$openN++
+				if (-not $progTitle) {
+					$progTitle = $title
+					$progId = $id
+					$progNote = $note
+				}
+				if ($null -eq $firstOpen) {
+					$firstOpen = [pscustomobject]@{ Id = $id; Title = $title; Status = 'in_progress'; Note = $note }
+				}
+			} else {
+				$st = 'pending'
+				$openN++
+				if ($null -eq $firstOpen) {
+					$firstOpen = [pscustomobject]@{ Id = $id; Title = $title; Status = 'pending'; Note = $note }
+				}
+			}
+			if (-not $pausedFlag -or $act -ne 'pause') {
+				[void]$rows.Add([pscustomobject]@{
+					Id = [string]$id; Title = [string]$title; Status = [string]$st; Note = [string]$note
+				})
+			}
+		}
+	}
+	# Pause sticky: single yellow row = where the operator stopped (full list still in TaskBoard)
+	if ($pausedFlag -and -not $empty) {
+		$rows = New-Object System.Collections.ArrayList
+		$stopId = $progId
+		$stopTitle = $progTitle
+		$stopNote = $progNote
+		if ([string]::IsNullOrWhiteSpace($stopTitle) -and $firstOpen) {
+			try { $stopId = [string]$firstOpen.Id } catch {}
+			try { $stopTitle = [string]$firstOpen.Title } catch {}
+			try { $stopNote = [string]$firstOpen.Note } catch {}
+		}
+		if ([string]::IsNullOrWhiteSpace($stopTitle)) { $stopTitle = 'stopped' }
+		if ([string]::IsNullOrWhiteSpace($stopId)) { $stopId = 'stop' }
+		[void]$rows.Add([pscustomobject]@{
+			Id = [string]$stopId
+			Title = [string]$stopTitle
+			Status = 'paused'
+			Note = $(if ($stopNote) { $stopNote } else { 'operator stop' })
+		})
+	}
+	if ([string]::IsNullOrWhiteSpace($goal) -and -not $empty) { $goal = '(no goal set)' }
+	$totalAll = 0
+	try { $totalAll = @($items).Count } catch { $totalAll = $rows.Count }
+	$total = $rows.Count
+	$sum = ''
+	if (-not $empty) {
+		if ($pausedFlag) {
+			$sum = ('paused  {0}/{1} done' -f $doneN, $totalAll)
+			if ($progTitle) { $sum += ('  |  stop: {0}' -f $progTitle) }
+			else { $sum += '  |  stop here' }
+		} else {
+			$sum = ('{0}/{1} done' -f $doneN, $totalAll)
+			if ($openN -gt 0) { $sum += (', {0} open' -f $openN) }
+			if ($blockN -gt 0) { $sum += (', {0} blocked' -f $blockN) }
+			if ($progTitle) { $sum += ('  |  now: {0}' -f $progTitle) }
+			elseif ($openN -eq 0 -and $totalAll -gt 0) { $sum += '  |  complete' }
+		}
+	}
+	$wantShow = (-not $empty) -and ($total -gt 0 -or -not [string]::IsNullOrWhiteSpace($goal) -or $pausedFlag)
+	$wantRetract = $false
+	if ($act -eq 'clear' -or $act -eq 'retract') {
+		$wantShow = $false
+		$wantRetract = $true
+		$pausedFlag = $false
+	} elseif ($wantShow -and -not $pausedFlag -and $openN -eq 0 -and $totalAll -gt 0) {
+		# Complete: show then auto-retract
+		$wantRetract = $true
+	}
+
+	# Focus active in_progress row (HighlightId only if still active).
+	$focusId = ''
+	$firstProgId = ''
+	foreach ($rr0 in @($rows)) {
+		try {
+			$rs0 = [string]$rr0.Status
+			$rid0 = [string]$rr0.Id
+			if (($rs0 -eq 'in_progress' -or $rs0 -eq 'paused') -and -not [string]::IsNullOrWhiteSpace($rid0)) {
+				if (-not $firstProgId) { $firstProgId = $rid0 }
+			}
+		} catch {}
+	}
+	$hiIn = ([string]$HighlightId).Trim()
+	if (-not [string]::IsNullOrWhiteSpace($hiIn)) {
+		foreach ($rr1 in @($rows)) {
+			try {
+				if ([string]::Equals([string]$rr1.Id, $hiIn, [StringComparison]::OrdinalIgnoreCase) -and
+					(([string]$rr1.Status) -eq 'in_progress' -or ([string]$rr1.Status) -eq 'paused')) {
+					$focusId = [string]$rr1.Id
+					break
+				}
+			} catch {}
+		}
+	}
+	if ([string]::IsNullOrWhiteSpace($focusId)) { $focusId = $firstProgId }
+	$seq = [int]([Environment]::TickCount)
+	if ($seq -eq 0) { $seq = 1 }
+	# Monotonic paint seq.
+	try {
+		$prevSeq = 0
+		try { $prevSeq = [int]$script:MB.Wpf.TaskBoardSeqCounter } catch { $prevSeq = 0 }
+		if ($prevSeq -lt 0) { $prevSeq = 0 }
+		$seq = $prevSeq + 1
+		$script:MB.Wpf.TaskBoardSeqCounter = $seq
+	} catch {}
+	# Snapshot rows for STA paint.
+	$rowCopies = New-Object System.Collections.ArrayList
+	foreach ($rCopy in @($rows)) {
+		if ($null -eq $rCopy) { continue }
+		$cId = ''; $cTitle = ''; $cSt = ''; $cNote = ''
+		try { $cId = [string]$rCopy.Id } catch {}
+		try { $cTitle = [string]$rCopy.Title } catch {}
+		try { $cSt = [string]$rCopy.Status } catch {}
+		try { $cNote = [string]$rCopy.Note } catch {}
+		[void]$rowCopies.Add(@{
+			Id     = $cId
+			Title  = $cTitle
+			Status = $cSt
+			Note   = $cNote
+		})
+	}
+	$snap = @{
+		WantShow    = [bool]$wantShow
+		WantRetract = [bool]$wantRetract
+		Empty       = [bool]$empty
+		Paused      = [bool]$pausedFlag
+		Goal        = [string]$goal
+		Summary     = [string]$sum
+		Rows        = @($rowCopies.ToArray())
+		Action      = [string]$act
+		OpenN       = [int]$openN
+		DoneN       = [int]$doneN
+		Total       = [int]$totalAll
+		FocusId     = [string]$focusId
+		Seq         = $seq
+	}
+	try { Request-MBWpfTaskBoardPaint -Snap $snap } catch {
+		try {
+			$script:MB.Wpf.PendingTaskBoard = $snap
+			$script:MB.Wpf.TaskBoardPaintUrgent = $true
+			$script:MB.Wpf.TaskBoardLastFp = ''
+		} catch {}
+	}
+}
+
+function Apply-MBWpfTaskBoardSticky {
+	# Queues PendingTaskBoard for STA ApplyTaskBoardSticky.
+	param($S)
+	if ($null -eq $S) { return }
+	try {
+		if ($script:MB.Wpf) { $script:MB.Wpf.PendingTaskBoard = $S }
+	} catch {}
+}
+
+function Invoke-TaskBoard {
+	param(
+		[string]$action = 'status',
+		[string]$goal = '',
+		$items = $null,
+		[string]$id = '',
+		[string]$status = '',
+		[string]$title = '',
+		[string]$note = ''
+	)
+	$act = ([string]$action).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($act)) { $act = 'status' }
+	if ($act -in @('show', 'get', 'list', 'read')) { $act = 'status' }
+	if ($act -in @('reset', 'wipe')) { $act = 'clear' }
+	if ($act -in @('replace', 'new', 'create', 'plan')) { $act = 'set' }
+	if ($act -in @('patch', 'mark', 'complete', 'finish', 'start')) { $act = 'update' }
+
+	if ($act -eq 'clear') {
+		$script:MB.TaskBoard = [ordered]@{ Goal = ''; Items = @(); Updated = (Get-Date).ToString('o') }
+		try { $script:MB.TaskBoardPaused = $false } catch {}
+		try { Write-MBTaskBoardInline -Action 'clear' } catch {}
+		return (ConvertTo-MBJson ([ordered]@{ ok = $true; action = 'clear'; board = 'empty' }) -Depth 4)
+	}
+
+	if ($act -eq 'status') {
+		$txt = Format-MBTaskBoardText
+		if ([string]::IsNullOrWhiteSpace($txt)) {
+			try { Write-MBTaskBoardInline -Action 'status' } catch {}
+			return (ConvertTo-MBJson ([ordered]@{
+				ok = $true
+				action = 'status'
+				empty = $true
+				note = 'No TaskBoard yet. Multi-step work: action=set goal=... items=[...]'
+			}) -Depth 4)
+		}
+		try { Write-MBTaskBoardInline -Action 'status' } catch {}
+		return (ConvertTo-MBJson ([ordered]@{
+			ok = $true
+			action = 'status'
+			board = $txt
+			open = [bool](Test-MBTaskBoardHasOpen)
+		}) -Depth 4)
+	}
+
+	if ($act -eq 'set') {
+		$g = ([string]$goal).Trim()
+		$rawItems = @()
+		if ($null -ne $items) {
+			if ($items -is [string]) {
+				foreach ($p in ($items -split '[\r\n;|]+')) {
+					if ($p.Trim()) { $rawItems += $p.Trim() }
+				}
+			} else {
+				foreach ($x in @($items)) {
+					if ($null -eq $x) { continue }
+					$rawItems += $x
+				}
+			}
+		}
+		if ($rawItems.Count -eq 0 -and $g) {
+			# goal only — still ok
+		}
+		$list = New-Object System.Collections.ArrayList
+		$n = 0
+		foreach ($x in $rawItems) {
+			$n++
+			$iid = ''; $ititle = ''; $ist = 'pending'
+			if ($x -is [string]) {
+				$ititle = $x.Trim()
+				$iid = ('t{0}' -f $n)
+			} else {
+				try { $iid = [string](Get-MBProp $x 'id') } catch {}
+				try { if (-not $iid) { $iid = [string](Get-MBProp $x 'Id') } } catch {}
+				try { $ititle = [string](Get-MBProp $x 'title') } catch {}
+				try { if (-not $ititle) { $ititle = [string](Get-MBProp $x 'Title') } } catch {}
+				try { if (-not $ititle) { $ititle = [string](Get-MBProp $x 'text') } } catch {}
+				try { if (-not $ititle) { $ititle = [string](Get-MBProp $x 'name') } } catch {}
+				try { $ist = [string](Get-MBProp $x 'status') } catch {}
+				if ([string]::IsNullOrWhiteSpace($ititle)) { $ititle = [string]$x }
+				if ([string]::IsNullOrWhiteSpace($iid)) { $iid = ('t{0}' -f $n) }
+			}
+			$ist = $ist.Trim().ToLowerInvariant()
+			if ($ist -in @('active', 'doing', 'wip', 'working')) { $ist = 'in_progress' }
+			if ($ist -in @('complete', 'completed', 'finished', 'ok')) { $ist = 'done' }
+			if ($ist -notin @('pending', 'in_progress', 'done', 'blocked')) { $ist = 'pending' }
+			[void]$list.Add([ordered]@{
+				Id     = $iid.Trim()
+				Title  = $ititle.Trim()
+				Status = $ist
+				Note   = ''
+			})
+		}
+		# If nothing in progress and items exist, mark first pending as in_progress
+		$anyProg = $false
+		foreach ($it in $list) { if ($it.Status -eq 'in_progress') { $anyProg = $true; break } }
+		if (-not $anyProg -and $list.Count -gt 0) {
+			foreach ($it in $list) {
+				if ($it.Status -eq 'pending') { $it.Status = 'in_progress'; break }
+			}
+		}
+		$script:MB.TaskBoard = [ordered]@{
+			Goal    = $g
+			Items   = @($list)
+			Updated = (Get-Date).ToString('o')
+		}
+		# New board always expands (clears pause from a prior Stop)
+		try { $script:MB.TaskBoardPaused = $false } catch {}
+		try { $script:MB.PendingTaskBoardNudge = $false } catch {}
+		try { Write-MBTaskBoardInline -Action 'set' } catch {}
+		return (ConvertTo-MBJson ([ordered]@{
+			ok = $true
+			action = 'set'
+			item_count = $list.Count
+			board = (Format-MBTaskBoardText)
+		}) -Depth 5)
+	}
+
+	if ($act -eq 'update') {
+		$tb = Get-MBTaskBoardObject
+		$items = New-Object System.Collections.ArrayList
+		foreach ($it in @($tb.Items)) { if ($it) { [void]$items.Add($it) } }
+		$tid = ([string]$id).Trim()
+		if ([string]::IsNullOrWhiteSpace($tid)) {
+			return "ERROR: TaskBoard update needs id= (item id from board)."
+		}
+		$found = $null
+		foreach ($it in $items) {
+			$iid = Get-MBTaskBoardItemField -Item $it -Name 'Id'
+			if ([string]::Equals($iid, $tid, [StringComparison]::OrdinalIgnoreCase)) { $found = $it; break }
+		}
+		if (-not $found) {
+			return (ConvertTo-MBJson ([ordered]@{
+				ok = $false
+				error = ("Unknown item id '{0}'. Call TaskBoard action=status first." -f $tid)
+				board = (Format-MBTaskBoardText)
+			}) -Depth 4)
+		}
+		$st = ([string]$status).Trim().ToLowerInvariant()
+		if ($st) {
+			if ($st -in @('active', 'doing', 'wip', 'working', 'start')) { $st = 'in_progress' }
+			if ($st -in @('complete', 'completed', 'finished', 'ok', 'finish')) { $st = 'done' }
+			if ($st -in @('fail', 'stuck')) { $st = 'blocked' }
+			if ($st -notin @('pending', 'in_progress', 'done', 'blocked')) {
+				return "ERROR: status must be pending|in_progress|done|blocked."
+			}
+			Set-MBTaskBoardItemField -Item $found -Name 'Status' -Value $st
+			# Only one in_progress at a time
+			if ($st -eq 'in_progress') {
+				foreach ($it in $items) {
+					if ($it -eq $found) { continue }
+					$ist0 = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+					if ($ist0 -eq 'in_progress' -or $ist0 -in @('active', 'doing', 'wip', 'working')) {
+						Set-MBTaskBoardItemField -Item $it -Name 'Status' -Value 'pending'
+					}
+				}
+			}
+		}
+		if (-not [string]::IsNullOrWhiteSpace($title)) { Set-MBTaskBoardItemField -Item $found -Name 'Title' -Value $title.Trim() }
+		if ($null -ne $note -and [string]$note -ne '') { Set-MBTaskBoardItemField -Item $found -Name 'Note' -Value ([string]$note).Trim() }
+		# Auto-advance: if closed an item and none in progress, promote next pending
+		$hasProg = $false
+		$progId = ''
+		foreach ($it in $items) {
+			$ist1 = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+			if ($ist1 -eq 'in_progress' -or $ist1 -in @('active', 'doing', 'wip', 'working')) {
+				$hasProg = $true
+				$progId = Get-MBTaskBoardItemField -Item $it -Name 'Id'
+				break
+			}
+		}
+		if (-not $hasProg) {
+			foreach ($it in $items) {
+				$ist2 = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+				if ($ist2 -eq 'pending' -or [string]::IsNullOrWhiteSpace($ist2)) {
+					Set-MBTaskBoardItemField -Item $it -Name 'Status' -Value 'in_progress'
+					$progId = Get-MBTaskBoardItemField -Item $it -Name 'Id'
+					if ([string]::IsNullOrWhiteSpace($progId)) { $progId = Get-MBTaskBoardItemField -Item $found -Name 'Id' }
+					break
+				}
+			}
+		}
+		# Normalize items to plain ordered rows so listview snapshot always sees final Status
+		$normItems = New-Object System.Collections.ArrayList
+		foreach ($it in $items) {
+			if ($null -eq $it) { continue }
+			$nst = (Get-MBTaskBoardItemField -Item $it -Name 'Status').ToLowerInvariant()
+			if ($nst -in @('active', 'doing', 'wip', 'working')) { $nst = 'in_progress' }
+			if ($nst -in @('complete', 'completed', 'finished', 'ok')) { $nst = 'done' }
+			if ($nst -notin @('pending', 'in_progress', 'done', 'blocked')) { $nst = 'pending' }
+			[void]$normItems.Add([ordered]@{
+				Id     = (Get-MBTaskBoardItemField -Item $it -Name 'Id')
+				Title  = (Get-MBTaskBoardItemField -Item $it -Name 'Title')
+				Status = $nst
+				Note   = (Get-MBTaskBoardItemField -Item $it -Name 'Note')
+			})
+		}
+		# Replace TaskBoard object after update.
+		$goalKeep = ''
+		try { $goalKeep = [string]$tb.Goal } catch { $goalKeep = '' }
+		$script:MB.TaskBoard = [ordered]@{
+			Goal    = $goalKeep
+			Items   = @($normItems.ToArray())
+			Updated = (Get-Date).ToString('o')
+		}
+		# Update after Stop = resume path: expand full sticky again
+		try {
+			if ([bool]$script:MB.TaskBoardPaused) { $script:MB.TaskBoardPaused = $false }
+		} catch {}
+		# Focus the active task (not the one just marked done) so sticky scrolls/pulses correctly
+		$hi = ''
+		foreach ($nit in @($normItems)) {
+			if (([string]$nit.Status) -eq 'in_progress') { $hi = [string]$nit.Id; break }
+		}
+		if ([string]::IsNullOrWhiteSpace($hi)) { $hi = $progId }
+		if ([string]::IsNullOrWhiteSpace($hi)) { $hi = Get-MBTaskBoardItemField -Item $found -Name 'Id' }
+		try { if ($script:MB.Wpf) { $script:MB.Wpf.TaskBoardLastFp = '' } } catch {}
+		try { Write-MBTaskBoardInline -Action 'update' -HighlightId $hi } catch {}
+		$foundStatus = 'pending'
+		foreach ($nit in @($normItems)) {
+			if ([string]::Equals([string]$nit.Id, $tid, [StringComparison]::OrdinalIgnoreCase)) {
+				$foundStatus = [string]$nit.Status
+				break
+			}
+		}
+		$stillOpen = [bool](Test-MBTaskBoardHasOpen)
+		$boardComplete = $false
+		# Last open item finished -> clear sticky/data so final answers don't re-nudge "incomplete"
+		if (-not $stillOpen -and $normItems.Count -gt 0) {
+			try {
+				$boardComplete = [bool](Complete-MBTaskBoard)
+			} catch { $boardComplete = $false }
+			$stillOpen = $false
+			$hi = ''
+		}
+		# Slim tool result (board lives in SESSION STATE / sticky).
+		$outId = $tid
+		if ([string]::IsNullOrWhiteSpace($outId)) {
+			$outId = Get-MBTaskBoardItemField -Item $found -Name 'Id'
+		}
+		$note = 'Full board is in SESSION STATE. Prefer action=update; do not action=set unless goal changed.'
+		if ($boardComplete) {
+			$note = 'Board complete - sticky cleared. Start a new TaskBoard only for new multi-step work.'
+		}
+		return (ConvertTo-MBJson ([ordered]@{
+			ok = $true
+			action = 'update'
+			id = $outId
+			status = $foundStatus
+			now = $hi
+			open = $stillOpen
+			complete = $boardComplete
+			note = $note
+		}) -Depth 5)
+	}
+
+	return "ERROR: TaskBoard action must be set|update|status|clear."
+}
+
+function Build-MBStickySystemContentLive {
+	# Always builds from live session fields (ignores wire freeze).
 	$lines = New-Object System.Collections.ArrayList
 	[void]$lines.Add("$script:MB_STATE_MARKER - always trust this over older chat if conflict]")
 	[void]$lines.Add("Machine: $env:COMPUTERNAME  User: $env:USERNAME")
@@ -29750,6 +36102,36 @@ function Get-MBStickySystemContent {
 	[void]$lines.Add("AutoApprove: $($script:MB.AutoApprove)")
 	# Omit live token stats from this system message
 	# live stats change every request and break prompt cache.
+
+	$tbText = ''
+	try { $tbText = Format-MBTaskBoardText } catch { $tbText = '' }
+	if (-not [string]::IsNullOrWhiteSpace($tbText)) {
+		[void]$lines.Add($tbText)
+	}
+
+	# Pinned files (read/edit/write this session) — cheap path list for local models
+	try {
+		if ($script:MB.PinnedPaths -and $script:MB.PinnedPaths.Count -gt 0) {
+			[void]$lines.Add('Pinned files (session):')
+			$pins = @($script:MB.PinnedPaths.GetEnumerator() | Sort-Object { $_.Value.last } -Descending | Select-Object -First 12)
+			foreach ($pe in $pins) {
+				$pv = $pe.Value
+				$acts = @($pv.actions) -join ','
+				[void]$lines.Add((' - [{0}] {1}' -f $acts, $pv.path))
+			}
+		}
+	} catch {}
+
+	# Open errors by path (never fully forget last failure on a file)
+	try {
+		if ($script:MB.ToolErrorsByPath -and $script:MB.ToolErrorsByPath.Count -gt 0) {
+			[void]$lines.Add('Open file errors (last):')
+			$errs = @($script:MB.ToolErrorsByPath.GetEnumerator() | Sort-Object { $_.Value.at } -Descending | Select-Object -First 8)
+			foreach ($ee in $errs) {
+				[void]$lines.Add((' - {0}: {1}' -f $ee.Value.path, $ee.Value.error))
+			}
+		}
+	} catch {}
 
 	$findings = @($script:MB.StickyFindings)
 	if ($findings.Count -gt 0) {
@@ -29770,7 +36152,49 @@ function Get-MBStickySystemContent {
 		[void]$lines.Add([string]$script:MB.StickyExtra)
 	}
 
+	# Turn hygiene not embedded here (would rewrite system msg every tool).
+
 	return ($lines -join "`n")
+}
+
+function Get-MBStickySystemContent {
+	# Sticky system content; frozen mid tool-loop for prompt-cache stability.
+	try {
+		if ([bool]$script:MB.WireStateFrozen -and -not [string]::IsNullOrEmpty([string]$script:MB.FrozenStickyContent)) {
+			return [string]$script:MB.FrozenStickyContent
+		}
+	} catch {}
+	return (Build-MBStickySystemContentLive)
+}
+
+function Freeze-MBWireState {
+	# Freeze base system + SESSION STATE for this user tool-loop.
+	# Live UI may update; model wire uses frozen bytes until thaw.
+	param([switch]$Refresh)
+	try {
+		$need = $Refresh -or -not [bool]$script:MB.WireStateFrozen
+		if (-not $need) {
+			if ([string]::IsNullOrEmpty([string]$script:MB.FrozenStickyContent)) { $need = $true }
+			if ([string]::IsNullOrEmpty([string]$script:MB.FrozenBaseContent)) { $need = $true }
+		}
+		if ($need) {
+			# Build live while unfrozen so we do not re-read old freeze values
+			$script:MB.WireStateFrozen = $false
+			$script:MB.FrozenBaseContent = Build-MBSystemPromptLive
+			$script:MB.FrozenStickyContent = Build-MBStickySystemContentLive
+			$script:MB.WireStateFrozen = $true
+		} else {
+			$script:MB.WireStateFrozen = $true
+		}
+	} catch {
+		try { $script:MB.WireStateFrozen = $false } catch {}
+	}
+}
+
+function Thaw-MBWireState {
+	try { $script:MB.WireStateFrozen = $false } catch {}
+	try { $script:MB.FrozenStickyContent = '' } catch {}
+	try { $script:MB.FrozenBaseContent = '' } catch {}
 }
 
 function Test-MBIsStateMessage {
@@ -29815,6 +36239,8 @@ function Sync-MBSystemMessages {
 		$c = [string](Get-MBProp $m 'content')
 		$r = Get-MBProp $m 'role'
 		if ($r -eq 'system' -and $c.StartsWith('[Context compacted:')) { continue }
+		# Strip legacy mid-history TURN_HYGIENE system messages.
+		if (Test-MBIsTurnHygieneMessage $m) { continue }
 		[void]$rest.Add($m)
 	}
 
@@ -29855,6 +36281,48 @@ function Clear-MBSticky {
 	$script:MB.StickyNotes.Clear()
 	$script:MB.StickyFindings.Clear()
 	$script:MB.StickyExtra = ''
+	try {
+		$script:MB.TaskBoard = [ordered]@{ Goal = ''; Items = @(); Updated = '' }
+	} catch {}
+	try { $script:MB.TaskBoardPaused = $false } catch {}
+	try { $script:MB.PinnedPaths = [ordered]@{} } catch {}
+	try { $script:MB.ToolErrorsByPath = @{} } catch {}
+	try { $script:MB.RecentFileReads = @{} } catch {}
+	try { $script:MB.PendingTaskBoardNudge = $false } catch {}
+	try { $script:MB.LastTurnHygiene = '' } catch {}
+	try { Thaw-MBWireState } catch {}
+	try { Update-MBWpfTaskBoardSticky -Action 'clear' } catch {}
+}
+
+function Get-MBToolResultDigest {
+	# Compact old tool payloads while preserving outcome + paths/errors.
+	param(
+		[string]$Content,
+		[int]$MaxChars = 400
+	)
+	$s = [string]$Content
+	if ([string]::IsNullOrEmpty($s)) { return '' }
+	$status = 'ok'
+	if ($s -match '(?i)BLOCKED BY USER') { $status = 'blocked' }
+	elseif ($s -match '(?i)NEED_INPUT') { $status = 'need_input' }
+	elseif ($s -match '(?i)LOOP GUARD') { $status = 'loop_guard' }
+	elseif ($s -match '(?i)^ERROR:|TOOLS_DONE=1') { $status = 'error' }
+	elseif ($s -match '(?i)^SUCCESS') { $status = 'success' }
+
+	$pathHint = ''
+	if ($s -match '(?i)(?:File|Path|path|CREATE|UPDATE|Written)\s*[:=]?\s*([A-Za-z]:\\[^\s\r\n"'']+)') {
+		$pathHint = $Matches[1]
+	} elseif ($s -match '(?i)"path"\s*:\s*"([^"]+)"') {
+		$pathHint = $Matches[1]
+	}
+
+	$head = ($s -replace '\s+', ' ').Trim()
+	if ($head.Length -gt 220) { $head = $head.Substring(0, 217) + '...' }
+	$dig = "[tool digest status=$status"
+	if ($pathHint) { $dig += " path=$pathHint" }
+	$dig += "] $head"
+	if ($dig.Length -gt $MaxChars) { $dig = $dig.Substring(0, $MaxChars - 3) + '...' }
+	return $dig
 }
 
 function Shrink-MBToolPayloads {
@@ -29864,6 +36332,28 @@ function Shrink-MBToolPayloads {
 		[int]$OldMaxChars = 2500,
 		[int]$RecentMaxChars = 12000
 	)
+	# Protect last ERROR tool message per path (never shrink away the final failure)
+	$protectedIds = @{}
+	try {
+		$lastErrByPath = @{}
+		$idx = 0
+		foreach ($m in @($Messages)) {
+			$idx++
+			$role = Get-MBProp $m 'role'
+			if ($role -ne 'tool') { continue }
+			$c = [string](Get-MBProp $m 'content')
+			if ($c -notmatch '(?i)^ERROR:|BLOCKED BY USER|NEED_INPUT') { continue }
+			$path = $null
+			if ($c -match '(?i)([A-Za-z]:\\[^\s\r\n"'']+)') { $path = $Matches[1].ToLowerInvariant() }
+			elseif ($c -match '(?i)"path"\s*:\s*"([^"]+)"') { $path = $Matches[1].ToLowerInvariant() }
+			if (-not $path) { $path = '__nopath__' }
+			$tcid = [string](Get-MBProp $m 'tool_call_id')
+			if (-not $tcid) { $tcid = "idx_$idx" }
+			$lastErrByPath[$path] = $tcid
+		}
+		foreach ($k in @($lastErrByPath.Keys)) { $protectedIds[$lastErrByPath[$k]] = $true }
+	} catch {}
+
 	$out = New-Object System.Collections.ArrayList
 	$total = @($Messages).Count
 	$i = 0
@@ -29874,12 +36364,25 @@ function Shrink-MBToolPayloads {
 		$isRecent = ($i -gt ($total - $RecentKeep))
 		if ($role -eq 'tool' -and $content) {
 			$s = [string]$content
+			$tcid = [string](Get-MBProp $m 'tool_call_id')
+			$isProtected = $false
+			if ($tcid -and $protectedIds.ContainsKey($tcid)) { $isProtected = $true }
 			$cap = if ($isRecent) { $RecentMaxChars } else { $OldMaxChars }
+			if ($isProtected) {
+				# Keep more of last path error
+				$cap = [math]::Max($cap, [math]::Min(6000, $RecentMaxChars))
+			}
 			if ($s.Length -gt $cap) {
+				if ($isRecent -or $isProtected) {
+					$body = Limit-MBResult $s $cap
+				} else {
+					# Older tools: structured digest, not arbitrary truncate mid-JSON
+					$body = Get-MBToolResultDigest -Content $s -MaxChars ([math]::Min(500, $OldMaxChars))
+				}
 				[void]$out.Add(@{
 					role         = 'tool'
-					tool_call_id = [string](Get-MBProp $m 'tool_call_id')
-					content      = (Limit-MBResult $s $cap)
+					tool_call_id = $tcid
+					content      = $body
 				})
 				continue
 			}
@@ -29887,6 +36390,79 @@ function Shrink-MBToolPayloads {
 		[void]$out.Add($m)
 	}
 	return $out.ToArray()
+}
+
+function Build-MBStructuredCompactDigest {
+	# Goals / files / errors / CWD / board — for StickyExtra and model digest material.
+	param(
+		[array]$DroppedMessages,
+		[string]$ExtractiveFallback = ''
+	)
+	$bits = New-Object System.Collections.ArrayList
+	[void]$bits.Add(('CWD: {0}' -f $script:MB.WorkingDir))
+
+	$tb = ''
+	try { $tb = Format-MBTaskBoardText } catch {}
+	if ($tb) {
+		[void]$bits.Add('Task board:')
+		foreach ($ln in ($tb -split "`n" | Select-Object -First 10)) { [void]$bits.Add("  $ln") }
+	}
+
+	try {
+		if ($script:MB.PinnedPaths -and $script:MB.PinnedPaths.Count -gt 0) {
+			[void]$bits.Add('Files touched:')
+			foreach ($pe in @($script:MB.PinnedPaths.GetEnumerator() | Sort-Object { $_.Value.last } -Descending | Select-Object -First 10)) {
+				$actStr = (@($pe.Value.actions) -join ',')
+				[void]$bits.Add(('  [{0}] {1}' -f $actStr, $pe.Value.path))
+			}
+		}
+	} catch {}
+
+	try {
+		if ($script:MB.ToolErrorsByPath -and $script:MB.ToolErrorsByPath.Count -gt 0) {
+			[void]$bits.Add('Open errors:')
+			foreach ($ee in @($script:MB.ToolErrorsByPath.GetEnumerator() | Sort-Object { $_.Value.at } -Descending | Select-Object -First 6)) {
+				[void]$bits.Add(('  {0}: {1}' -f $ee.Value.path, $ee.Value.error))
+			}
+		}
+	} catch {}
+
+	$users = New-Object System.Collections.ArrayList
+	$tools = New-Object System.Collections.ArrayList
+	foreach ($m in @($DroppedMessages)) {
+		$r = Get-MBProp $m 'role'
+		$c = [string](Get-MBProp $m 'content')
+		if ($r -eq 'user' -and $c) {
+			$line = ($c -replace '\s+', ' ').Trim()
+			if ($line.Length -gt 140) { $line = $line.Substring(0, 137) + '...' }
+			[void]$users.Add($line)
+		} elseif ($r -eq 'assistant') {
+			$tcs = Get-MBProp $m 'tool_calls'
+			if ($tcs) {
+				try {
+					foreach ($tc in @($tcs)) {
+						$tn = Get-MBProp (Get-MBProp $tc 'function') 'name'
+						if ($tn) { [void]$tools.Add([string]$tn) }
+					}
+				} catch {}
+			}
+		}
+	}
+	if ($users.Count -gt 0) {
+		[void]$bits.Add('Goals / user asks (dropped window):')
+		foreach ($u in ($users | Select-Object -First 5)) { [void]$bits.Add("  - $u") }
+	}
+	if ($tools.Count -gt 0) {
+		$uniq = @($tools | Select-Object -Unique | Select-Object -First 12)
+		[void]$bits.Add(('Tools used: {0}' -f ($uniq -join ', ')))
+	}
+	if ($ExtractiveFallback) {
+		[void]$bits.Add('Highlights:')
+		[void]$bits.Add($ExtractiveFallback)
+	}
+	$out = $bits -join "`n"
+	if ($out.Length -gt 1400) { $out = $out.Substring(0, 1397) + '...' }
+	return $out
 }
 
 function Enter-MBCompacting {
@@ -29942,13 +36518,18 @@ function Compact-MBHistory {
 
 	if ($rest.Count -le $KeepLast) {
 		$shrunk = @(Shrink-MBToolPayloads -Messages (@($head) + @($rest)) -RecentKeep 8 -OldMaxChars 2000)
+		try { $shrunk = @(Repair-MBToolMessageSequence -Messages $shrunk) } catch {}
 		return $shrunk
 	}
 
 	Enter-MBCompacting
 	try {
-	$dropped = $rest.Count - $KeepLast
-	$kept = @($rest | Select-Object -Last $KeepLast)
+	$keepStart = Get-MBSafeHistoryKeepStart -Rest @($rest) -KeepLast $KeepLast
+	$dropped = $keepStart
+	$kept = @()
+	if ($keepStart -lt $rest.Count) {
+		$kept = @($rest[$keepStart..($rest.Count - 1)])
+	}
 
 	$summaryBits = New-Object System.Collections.ArrayList
 	$materialBits = New-Object System.Collections.ArrayList
@@ -29982,8 +36563,7 @@ function Compact-MBHistory {
 				[void]$materialBits.Add("Agent: $full")
 			}
 		} elseif ($r -eq 'tool' -and $c) {
-			$line = $c -replace '\s+', ' '
-			if ($line.Length -gt 220) { $line = $line.Substring(0, 217) + '...' }
+			$line = Get-MBToolResultDigest -Content $c -MaxChars 220
 			[void]$materialBits.Add("Tool: $line")
 		}
 		if ($summaryBits.Count -ge 10) { break }
@@ -29991,39 +36571,41 @@ function Compact-MBHistory {
 	$extractive = if ($summaryBits.Count -gt 0) { ($summaryBits -join ' | ') } else { '(tool-heavy stretch)' }
 	if ($extractive.Length -gt 900) { $extractive = $extractive.Substring(0, 897) + '...' }
 
-	$digest = $extractive
-	$digestSource = 'extractive'
+	# Structured digest always (CWD / board / pins / errors / goals)
+	$structured = Build-MBStructuredCompactDigest -DroppedMessages $droppedArr -ExtractiveFallback $extractive
+
+	$digest = $structured
+	$digestSource = 'structured'
 	$canModel = $script:MB.ModelCompact -and $PreferModelDigest -and $materialBits.Count -gt 0 -and ([int]$script:MB.ApiFailures -lt 2)
 	if ($canModel) {
 		try {
-			$material = ($materialBits -join "`n")
+			$material = "STRUCTURED STATE:`n$structured`n`nEXCERPT:`n" + ($materialBits -join "`n")
 			$modelDigest = Invoke-MBModelSummary -Material $material -MaxTok 450
 			if ($modelDigest -and $modelDigest.Trim().Length -gt 40) {
 				$digest = $modelDigest.Trim()
-				$digestSource = 'model'
+				$digestSource = 'model+structured'
 				if ($digest.Length -gt 1100) { $digest = $digest.Substring(0, 1097) + '...' }
 			}
 		} catch {
-			$digest = $extractive
-			$digestSource = 'extractive'
+			$digest = $structured
+			$digestSource = 'structured'
 		}
 	}
 
-	$script:MB.StickyExtra = "Earlier conversation compressed ($dropped msgs, $digestSource): $digest"
-	if ($script:MB.StickyExtra.Length -gt 1400) {
-		$script:MB.StickyExtra = $script:MB.StickyExtra.Substring(0, 1397) + '...'
+	$script:MB.StickyExtra = "Earlier conversation compressed ($dropped msgs, $digestSource):`n$digest"
+	if ($script:MB.StickyExtra.Length -gt 1600) {
+		$script:MB.StickyExtra = $script:MB.StickyExtra.Substring(0, 1597) + '...'
 	}
 
 	$notice = @{
 		role    = 'system'
-		content = "[Context compacted: dropped $dropped earlier messages ($digestSource digest). Sticky SESSION STATE has the digest. CWD=$($script:MB.WorkingDir)]"
+		content = "[Context compacted: dropped $dropped earlier messages ($digestSource digest). SESSION STATE holds goals/files/errors/board. CWD=$($script:MB.WorkingDir)]"
 	}
 
-	# Refresh state after StickyExtra update
+	# Body only — Sync-MBSystemMessages reuses the base system object when unchanged (prompt-cache friendly).
+	# Sticky/state content changes after StickyExtra update (expected cache break at state, not whole history).
+	# Note: Sync strips old "[Context compacted:…]" systems; re-inject notice after base+state.
 	$out = New-Object System.Collections.ArrayList
-	[void]$out.Add(@{ role = 'system'; content = (Get-MBSystemPrompt) })
-	[void]$out.Add(@{ role = 'system'; content = (Get-MBStickySystemContent) })
-	[void]$out.Add($notice)
 	foreach ($m in $kept) {
 		if (Test-MBIsStateMessage $m) { continue }
 		if (Test-MBIsBaseSystemMessage $m) { continue }
@@ -30031,9 +36613,23 @@ function Compact-MBHistory {
 	}
 
 	$script:MB.CompactionCount++
-	$script:MB.LastCompactReason = "dropped $dropped msgs, keep last $KeepLast"
+	$script:MB.LastCompactReason = ("dropped {0} msgs, keep last {1} ({2})" -f $dropped, $KeepLast, $digestSource)
 
-	return @(Shrink-MBToolPayloads -Messages $out.ToArray() -RecentKeep 6 -OldMaxChars 1800 -RecentMaxChars 8000)
+	$synced = @(Sync-MBSystemMessages -Messages $out.ToArray())
+	$final = New-Object System.Collections.ArrayList
+	$sysN = 0
+	foreach ($m in $synced) {
+		[void]$final.Add($m)
+		$r = Get-MBProp $m 'role'
+		if ($r -eq 'system') {
+			$sysN++
+			if ($sysN -eq 2) { [void]$final.Add($notice) }
+		}
+	}
+	if ($sysN -lt 2) { [void]$final.Add($notice) }
+	$finalArr = @(Shrink-MBToolPayloads -Messages $final.ToArray() -RecentKeep 6 -OldMaxChars 1800 -RecentMaxChars 8000)
+	try { $finalArr = @(Repair-MBToolMessageSequence -Messages $finalArr) } catch {}
+	return $finalArr
 	} finally {
 		Exit-MBCompacting
 	}
@@ -30062,6 +36658,15 @@ function Ensure-MBPromptBudget {
 	$budget = Get-MBEffectivePromptBudget
 	$targetTok = [math]::Floor($budget * $TargetPct)
 	$beforeTok = (Get-MBContextEstimate -Messages $Messages).PromptTokens
+	$useModelDigest = $false
+	try { $useModelDigest = [bool]$script:MB.ModelCompact } catch { $useModelDigest = $false }
+
+	# Under wire freeze, skip soft shrink (preserves prompt-cache prefix).
+	try {
+		if ([bool]$script:MB.WireStateFrozen -and $beforeTok -le [math]::Floor($budget * 0.92)) {
+			return $Messages
+		}
+	} catch {}
 
 	$pass = 0
 	while ($pass -lt $MaxPasses) {
@@ -30075,26 +36680,42 @@ function Ensure-MBPromptBudget {
 		}
 
 		if ($pass -eq 1) {
+			# Shrink tools first (fast). If still over budget after this pass, drop turns next.
 			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 5 -OldMaxChars 1500 -RecentMaxChars 5000)
 		} elseif ($pass -eq 2) {
 			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 3 -OldMaxChars 800 -RecentMaxChars 3000)
-			$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 18)
+			if ($useModelDigest) {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 18 -PreferModelDigest)
+			} else {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 18)
+			}
 		} elseif ($pass -eq 3) {
-			$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 12 -Aggressive)
+			if ($useModelDigest) {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 12 -Aggressive -PreferModelDigest)
+			} else {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 12 -Aggressive)
+			}
 			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 2 -OldMaxChars 500 -RecentMaxChars 2000)
 		} elseif ($pass -eq 4) {
-			$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 8 -Aggressive)
+			if ($useModelDigest) {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 8 -Aggressive -PreferModelDigest)
+			} else {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 8 -Aggressive)
+			}
 			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 2 -OldMaxChars 400 -RecentMaxChars 1200)
 		} else {
-			# Retain system, state, and last few non-system messages
-			$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 6 -Aggressive)
+			if ($useModelDigest) {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 6 -Aggressive -PreferModelDigest)
+			} else {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 6 -Aggressive)
+			}
 			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 1 -OldMaxChars 300 -RecentMaxChars 800)
 		}
 		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
 	}
 
 	$final = Get-MBContextEstimate -Messages $Messages
-	if ($final.PromptTokens -lt $beforeTok) {
+	if ($final.PromptTokens -lt $beforeTok -and [string]::IsNullOrWhiteSpace([string]$script:MB.LastCompactReason)) {
 		$script:MB.LastCompactReason = ("silent trim ~{0:N0}->{1:N0} tok" -f $beforeTok, $final.PromptTokens)
 	}
 	if ($final.PromptTokens -gt $budget) {
@@ -30106,18 +36727,46 @@ function Ensure-MBPromptBudget {
 function Manage-MBContext {
 	param(
 		[array]$Messages,
-		[switch]$ForceCompact
+		[switch]$ForceCompact,
+		# Tool-loop path: keep system/state bytes identical; only append-friendly Sync.
+		# Mutating SESSION STATE or shrinking older tool bodies invalidates llama.cpp
+		[switch]$AppendOnly
 	)
 	try { Sync-MBAutoCompactFromWpf } catch {}
 
+	$wireFrozen = $false
+	try { $wireFrozen = [bool]$script:MB.WireStateFrozen } catch { $wireFrozen = $false }
+	if ($AppendOnly -or ($wireFrozen -and -not $ForceCompact)) {
+		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+		$estAO = Get-MBContextEstimate -Messages $Messages
+		# Emergency only — intentional cache break beats OOM / hard overflow
+		if ($ForceCompact -or $estAO.Level -eq 'hard' -or $estAO.Pct -ge 0.95 -or $estAO.PromptTokens -gt (Get-MBEffectivePromptBudget)) {
+			try { Thaw-MBWireState } catch {}
+			$Messages = @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.68)
+			try {
+				Freeze-MBWireState -Refresh
+				$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+			} catch {}
+		}
+		return $Messages
+	}
+
 	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
 	$est = Get-MBContextEstimate -Messages $Messages
+	$useModelDigest = $false
+	try { $useModelDigest = [bool]$script:MB.ModelCompact } catch { $useModelDigest = $false }
 
 	if ($ForceCompact) {
+		try { Thaw-MBWireState } catch {}
 		$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 3 -OldMaxChars 800 -RecentMaxChars 2500)
-		$Messages = @(Compact-MBHistory -Messages $Messages -Aggressive -PreferModelDigest)
+		if ($useModelDigest) {
+			$Messages = @(Compact-MBHistory -Messages $Messages -Aggressive -PreferModelDigest)
+		} else {
+			$Messages = @(Compact-MBHistory -Messages $Messages -Aggressive)
+		}
 		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
 		$Messages = @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.65)
+		try { Freeze-MBWireState -Refresh } catch {}
 		return $Messages
 	}
 
@@ -30129,11 +36778,24 @@ function Manage-MBContext {
 	}
 
 	if ($est.Level -eq 'hard' -or $est.Pct -ge 0.92 -or $est.PromptTokens -gt (Get-MBEffectivePromptBudget)) {
+		# Real compact (drop turns + optional model digest), not tool-trim alone
 		return @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.68)
 	}
 
 	if ($est.Level -eq 'soft') {
+		# Soft used to only Shrink-MBToolPayloads — context % fell instantly while full turn
+		# history remained, so the next request rebuilt prompt cache over nearly the same log.
 		$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 5 -OldMaxChars 1800 -RecentMaxChars ([math]::Min(8000, $MaxToolResultChars)))
+		$est2 = Get-MBContextEstimate -Messages $Messages
+		# Drop middle turns when still soft/hard or history is long
+		$needDrop = ($est2.Level -ne 'ok') -or ($est2.Pct -ge [double]$script:MB.ContextSoftPct) -or (@($Messages).Count -gt [math]::Max(28, [int]($MaxHistoryMessages * 0.85)))
+		if ($needDrop) {
+			if ($useModelDigest) {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 20 -PreferModelDigest)
+			} else {
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 20)
+			}
+		}
 		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
 		[void](Get-MBContextEstimate -Messages $Messages)
 		return $Messages
@@ -30568,19 +37230,19 @@ function Enable-MBSpeechMode {
 			return "Speech mode ON but init failed: $($script:MB.SpeechInitError)"
 		}
 		try {
-			if (-not ($script:MB.ActiveToolGroups -contains 'senses')) {
-				[void]$script:MB.ActiveToolGroups.Add('senses')
+			if (-not ($script:MB.ActiveToolGroups -contains 'sound')) {
+				[void]$script:MB.ActiveToolGroups.Add('sound')
 				try { Sync-MBPromptAfterToolGroups } catch { try { Initialize-MBToolsOverhead } catch {} }
 			}
 		} catch {}
 		try { Start-MBSpeechWaveVisualizer } catch {}
 		$dict = if ($script:MB.SpeechEngine) { 'dictation OK' } else { 'dictation UNAVAILABLE (TTS only)' }
 		$auto = if ($script:MB.SpeechAutoReply) { 'ON' } else { 'off' }
-		return "Speech mode ON ($dict). Hold Right-Ctrl to talk, release to stop. Typing works when RCtrl is up. Auto-speak: $auto. Tool: SpeakText."
+		return "Speech mode ON ($dict). Hold Right-Ctrl to talk, release to stop. Typing works when RCtrl is up. Auto-speak: $auto. Tool: SpeakText (group sound)."
 	} else {
 		try {
-			if ($script:MB.ActiveToolGroups -contains 'senses') {
-				[void]$script:MB.ActiveToolGroups.Remove('senses')
+			if ($script:MB.ActiveToolGroups -contains 'sound') {
+				[void]$script:MB.ActiveToolGroups.Remove('sound')
 				try { Sync-MBPromptAfterToolGroups } catch { try { Initialize-MBToolsOverhead } catch {} }
 			}
 		} catch {}
@@ -31586,6 +38248,24 @@ function Save-MBSessionJson {
 			notes    = @($script:MB.StickyNotes | ForEach-Object { [string]$_ })
 			findings = @($script:MB.StickyFindings | ForEach-Object { [string]$_ })
 			extra    = [string]$script:MB.StickyExtra
+			taskboard = $(
+				try {
+					$tb = Get-MBTaskBoardObject
+					[ordered]@{
+						goal  = [string]$tb.Goal
+						items = @(
+							@($tb.Items) | ForEach-Object {
+								[ordered]@{
+									id     = [string]$_.Id
+									title  = [string]$_.Title
+									status = [string]$_.Status
+									note   = [string]$_.Note
+								}
+							}
+						)
+					}
+				} catch { $null }
+			)
 		}
 	}
 	$json = $null
@@ -31701,6 +38381,29 @@ function Load-MBSessionJson {
 			if ($f) { [void]$script:MB.StickyFindings.Add([string]$f) }
 		}
 		if ($obj.sticky.extra) { $script:MB.StickyExtra = [string]$obj.sticky.extra }
+		try {
+			$tbIn = $null
+			try { $tbIn = $obj.sticky.taskboard } catch { $tbIn = $null }
+			if ($tbIn) {
+				$g = ''
+				try { $g = [string]$tbIn.goal } catch {}
+				$its = New-Object System.Collections.ArrayList
+				foreach ($it in @($tbIn.items)) {
+					if ($null -eq $it) { continue }
+					[void]$its.Add([ordered]@{
+						Id     = $(try { [string]$it.id } catch { '' })
+						Title  = $(try { [string]$it.title } catch { '' })
+						Status = $(try { [string]$it.status } catch { 'pending' })
+						Note   = $(try { [string]$it.note } catch { '' })
+					})
+				}
+				$script:MB.TaskBoard = [ordered]@{
+					Goal    = $g
+					Items   = @($its)
+					Updated = (Get-Date).ToString('o')
+				}
+			}
+		} catch {}
 	}
 	if ($obj.tools) {
 		try { $null = Set-MBActiveToolGroupsFromList -Groups @($obj.tools) } catch {}
@@ -31735,6 +38438,13 @@ function Load-MBSessionJson {
 		try { Show-MBImportedMessages -Messages @($paint) -Label 'loaded' } catch {}
 	}
 	try { Refresh-MBWpfStickyFromSession } catch {}
+	try {
+		if (Test-MBTaskBoardHasOpen) {
+			Update-MBWpfTaskBoardSticky -Action 'status'
+		} else {
+			Update-MBWpfTaskBoardSticky -Action 'clear'
+		}
+	} catch {}
 	return [pscustomobject]@{
 		Path   = $lp
 		Format = 'json'
@@ -33056,31 +39766,44 @@ function Disable-MBWpfActiveApprovalButtons {
 function Write-MBWpfSynText {
 	param(
 		[AllowNull()][string]$Text,
-		[string]$Lang = 'ps'
+		[string]$Lang = 'ps',
+		[string]$Title = ''
 	)
 	if (-not (Test-MBWpfActive)) { return }
 	if ($null -eq $Text -or $Text.Length -eq 0) { return }
 	try { $Text = ConvertTo-MBWpfSafeText -Text $Text } catch {}
-	if (-not $script:MB.Wpf.WriteQueue) {
-		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
-	}
 	$lang = ([string]$Lang).Trim()
 	if ([string]::IsNullOrWhiteSpace($lang)) { $lang = 'ps' }
-	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
-		Kind      = 'syn-inline'
-		Text      = $Text
-		Lang      = $lang
-		Color     = 'Cyan'
-		NoNewline = $true
-		MdBold    = 0
-		MdItalic  = 0
-		MdStrike  = 0
-		MdCode    = 1
-		MdFontSize = 0
-		MdHead    = 0
-		MdNoLinks = 1
-		Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
-	})
+	$title = ([string]$Title).Trim()
+	try { $title = ConvertTo-MBWpfSafeText -Text $title } catch {}
+	# Full code box (title + lang chip + syntax highlight + Copy)
+	try {
+		Write-MBMdCodeOpen -Lang $lang -Title $title
+		$body = [string]$Text
+		if (-not $body.EndsWith("`n")) { $body = $body + "`n" }
+		Write-MBMdCodeAppend -Text $body
+		Write-MBMdCodeClose
+	} catch {
+		try {
+			if (-not $script:MB.Wpf.WriteQueue) {
+				$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+			}
+			$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
+				Kind      = 'text'
+				Text      = $Text
+				Color     = 'Gray'
+				NoNewline = $false
+				MdBold    = 0
+				MdItalic  = 0
+				MdStrike  = 0
+				MdCode    = 1
+				MdFontSize = 0
+				MdHead    = 0
+				MdNoLinks = 1
+				Brand     = $(try { [string]$AgentName } catch { 'MiniBot' })
+			})
+		} catch {}
+	}
 }
 
 function Get-MBVizOpenMarker  { return '@@@RenderOpen' }
@@ -33173,13 +39896,11 @@ namespace MiniBot.Live {
       _canvas.Margin = new Thickness(0);
       _viewbox = new Viewbox();
       _viewbox.Margin = new Thickness(0);
-      // Uniform + DownOnly: never upscale past intrinsic SVG size; host may letterbox.
       _viewbox.Stretch = Stretch.Uniform;
       _viewbox.StretchDirection = StretchDirection.DownOnly;
       _viewbox.HorizontalAlignment = HorizontalAlignment.Center;
       _viewbox.VerticalAlignment = VerticalAlignment.Center;
       _viewbox.Child = _canvas;
-      // Grid reliably centers Uniform letterboxing; Border alone can pin top-left.
       Grid host = new Grid();
       host.ClipToBounds = true;
       host.Margin = new Thickness(0);
@@ -33244,7 +39965,6 @@ namespace MiniBot.Live {
         else
           _canvas.RenderTransform = null;
 
-        // preserveAspectRatio: meet (default) → Uniform letterbox; slice → fill+crop; none → stretch
         ApplyPreserveAspectRatio(Attr(root, "preserveAspectRatio"));
 
         int shapes = 0, skipped = 0;
@@ -33273,7 +39993,6 @@ namespace MiniBot.Live {
         _viewbox.StretchDirection = StretchDirection.Both;
         return;
       }
-      // meet (default): fit inside host, never upscale
       _viewbox.Stretch = Stretch.Uniform;
       _viewbox.StretchDirection = StretchDirection.DownOnly;
     }
@@ -33312,7 +40031,6 @@ namespace MiniBot.Live {
         if (el == null) continue;
         Dictionary<string, string> ctx = MergePaint(inherit, el);
         if (NameIs(el, "g") || NameIs(el, "svg")) {
-          // Nested layer: honor transform / nested-svg x,y (else content sits at 0,0 top-left)
           Canvas layer = new Canvas();
           layer.IsHitTestVisible = true;
           Transform layerTf = BuildNodeTransform(el);
@@ -33337,13 +40055,11 @@ namespace MiniBot.Live {
       }
     }
 
-    // transform="" plus nested <svg x y>; style transform if present
     static Transform BuildNodeTransform(XmlElement el) {
       if (el == null) return null;
       TransformGroup g = new TransformGroup();
       double x = ParseD(Attr(el, "x"), 0);
       double y = ParseD(Attr(el, "y"), 0);
-      // x/y on shapes are geometry; only treat as placement for nested svg / foreignObject-like hosts
       string local = Local(el);
       if ((local == "svg" || local == "g") && (x != 0 || y != 0))
         g.Children.Add(new TranslateTransform(x, y));
@@ -33364,7 +40080,6 @@ namespace MiniBot.Live {
 
     static void ApplyNodeTransform(UIElement u, XmlElement el) {
       if (u == null || el == null) return;
-      // Element-level transform only (x/y already in geometry via Canvas.SetLeft/Top)
       string ts = Attr(el, "transform");
       if (string.IsNullOrEmpty(ts)) {
         string style = Attr(el, "style");
@@ -33376,7 +40091,6 @@ namespace MiniBot.Live {
       Transform t = ParseSvgTransform(ts);
       if (t == null) return;
       FrameworkElement fe = u as FrameworkElement;
-      // SVG transform is in parent user space; default origin top-left of element is OK for translate/scale after x/y placement
       if (fe != null) fe.RenderTransformOrigin = new Point(0, 0);
       if (u.RenderTransform == null || u.RenderTransform == Transform.Identity) {
         u.RenderTransform = t;
@@ -33388,7 +40102,6 @@ namespace MiniBot.Live {
       }
     }
 
-    // SVG transform list applied left-to-right (same as WPF TransformGroup order)
     static Transform ParseSvgTransform(string s) {
       if (string.IsNullOrEmpty(s)) return null;
       s = s.Trim();
@@ -33413,7 +40126,6 @@ namespace MiniBot.Live {
           else
             g.Children.Add(new RotateTransform(ang));
         } else if (fn == "matrix" && a.Length >= 6) {
-          // SVG matrix(a b c d e f) == WPF Matrix(M11,M12,M21,M22,OffX,OffY)
           g.Children.Add(new MatrixTransform(new Matrix(a[0], a[1], a[2], a[3], a[4], a[5])));
         } else if (fn == "skewx") {
           g.Children.Add(new SkewTransform(a.Length > 0 ? a[0] : 0, 0));
@@ -33954,16 +40666,23 @@ function Write-MBMdViz {
 }
 
 function Write-MBMdCodeOpen {
-	param([string]$Lang = '')
+	param(
+		[string]$Lang = '',
+		[string]$Title = ''
+	)
 	if (-not (Test-MBWpfActive)) { return }
 	if (-not $script:MB.Wpf.WriteQueue) {
 		$script:MB.Wpf.WriteQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 	}
 	$lang = ([string]$Lang).Trim()
 	if ($lang.StartsWith('```')) { $lang = $lang.TrimStart('`').Trim() }
+	$title = ([string]$Title).Trim()
+	try { $title = ConvertTo-MBWpfSafeText -Text $title } catch {}
+	try { $lang = ConvertTo-MBWpfSafeText -Text $lang } catch {}
 	$script:MB.Wpf.WriteQueue.Enqueue([pscustomobject]@{
 		Kind      = 'md-code-open'
 		Text      = $lang
+		Title     = $title
 		Color     = 'Cyan'
 		NoNewline = $true
 		MdBold    = 0
@@ -35160,7 +41879,7 @@ function global:Start-MBInlineVideoInHost {
 	$chrome.Child = $chromeCol
 	[void]$root.Children.Add($chrome)
 
-	# Progress slider: click-to-seek + drag (PowerPlayer-style position control)
+	# Progress slider: click-to-seek + drag
 	$slider.Minimum = 0
 	$slider.Maximum = 100
 	$slider.IsMoveToPointEnabled = $true
@@ -37181,9 +43900,114 @@ function Sync-MBAutoCompactFromWpf {
 	}
 }
 
+function Get-MBConfiguredMaxTurns {
+	$n = 30
+	try {
+		if ($null -ne $script:MB.MaxTurns -and [int]$script:MB.MaxTurns -gt 0) {
+			$n = [int]$script:MB.MaxTurns
+		} else {
+			$n = [int]$MaxTurns
+		}
+	} catch {
+		try { $n = [int]$MaxTurns } catch { $n = 30 }
+	}
+	if ($n -lt 1) { $n = 1 }
+	if ($n -gt 200) { $n = 200 }
+	return $n
+}
+
+function Set-MBUnlimitedTurnsState {
+	# Enable/disable unlimited turns. While ∞ is on the limited counter does not count down.
+	# Turning ∞ off restores the frozen remaining (same value as when ∞ was enabled), then counts from there.
+	param([bool]$Enabled)
+	$was = $false
+	try { $was = [bool]$script:MB.UnlimitedTurns } catch { $was = $false }
+	if ($Enabled -eq $was) {
+		try { if ($script:MB.Wpf) { $script:MB.Wpf.UnlimitedTurns = $Enabled } } catch {}
+		return
+	}
+	$cfgMax = Get-MBConfiguredMaxTurns
+	if ($Enabled) {
+		$snap = $cfgMax
+		try {
+			if ([bool]$script:MB.TurnsInFlight) {
+				$snap = [int]$script:MB.TurnsLeft
+			} else {
+				$snap = $cfgMax
+			}
+		} catch { $snap = $cfgMax }
+		if ($snap -lt 0) { $snap = 0 }
+		if ($snap -gt $cfgMax) { $snap = $cfgMax }
+		$script:MB.TurnsLeftFrozen = $snap
+		$script:MB.TurnsResumeTurn0 = $null
+		$script:MB.TurnsLeft = $snap
+		$script:MB.UnlimitedTurns = $true
+		try {
+			if ($script:MB.Wpf) {
+				$script:MB.Wpf.UnlimitedTurns = $true
+				$script:MB.Wpf.TurnsLeft = $snap
+				$script:MB.Wpf.TurnsLeftFrozen = $snap
+			}
+		} catch {}
+	} else {
+		$rest = $null
+		try { $rest = $script:MB.TurnsLeftFrozen } catch { $rest = $null }
+		if ($null -eq $rest) {
+			try { $rest = [int]$script:MB.TurnsLeft } catch { $rest = $cfgMax }
+		}
+		try { $rest = [int]$rest } catch { $rest = $cfgMax }
+		if ($rest -lt 0) { $rest = 0 }
+		if ($rest -gt $cfgMax) { $rest = $cfgMax }
+		$script:MB.TurnsLeft = $rest
+		$script:MB.UnlimitedTurns = $false
+		# Keep frozen value for mid-flight resume math until idle clears it
+		$script:MB.TurnsLeftFrozen = $rest
+		try {
+			if ([bool]$script:MB.TurnsInFlight) {
+				$t0 = 0
+				try { $t0 = [int]$script:MB.TurnsUsed } catch { $t0 = 0 }
+				if ($t0 -lt 0) { $t0 = 0 }
+				$script:MB.TurnsResumeTurn0 = $t0
+			} else {
+				$script:MB.TurnsResumeTurn0 = $null
+				$script:MB.TurnsLeftFrozen = $null
+				$script:MB.TurnsLeft = $cfgMax
+				$rest = $cfgMax
+			}
+		} catch {
+			$script:MB.TurnsResumeTurn0 = $null
+		}
+		try {
+			if ($script:MB.Wpf) {
+				$script:MB.Wpf.UnlimitedTurns = $false
+				$script:MB.Wpf.TurnsLeft = [int]$script:MB.TurnsLeft
+				try { $script:MB.Wpf.TurnsLeftFrozen = $script:MB.TurnsLeftFrozen } catch {}
+				try {
+					$disp = [int]$script:MB.TurnsLeft
+					if (-not [bool]$script:MB.TurnsInFlight) { $disp = $cfgMax }
+					Update-MBWpfTurnsNumText -Value $disp
+				} catch {}
+			}
+		} catch {}
+	}
+}
+
 function Sync-MBMaxTurnsFromWpf {
 	if (-not $script:MB.Wpf) { return }
 	try {
+		# Unlimited turns flag (disables numeric MaxTurns cap while active)
+		try {
+			if ([bool]$script:MB.Wpf.UnlimitedTurnsDirty) {
+				$want = [bool]$script:MB.Wpf.UnlimitedTurns
+				$script:MB.Wpf.UnlimitedTurnsDirty = $false
+				Set-MBUnlimitedTurnsState -Enabled $want
+			} else {
+				$script:MB.Wpf.UnlimitedTurns = [bool]$script:MB.UnlimitedTurns
+			}
+		} catch {
+			try { $script:MB.Wpf.UnlimitedTurns = [bool]$script:MB.UnlimitedTurns } catch {}
+		}
+
 		if ([bool]$script:MB.Wpf.MaxTurnsDirty) {
 			$n = 30
 			try { $n = [int]$script:MB.Wpf.MaxTurnsSetting } catch { $n = 30 }
@@ -37192,15 +44016,30 @@ function Sync-MBMaxTurnsFromWpf {
 			$script:MB.MaxTurns = $n
 			try { Set-Variable -Name MaxTurns -Scope Script -Value $n -Force -ErrorAction SilentlyContinue } catch {}
 			try {
-				if (-not [bool]$script:MB.TurnsInFlight) {
-					$script:MB.TurnsLeft = $n
-					$script:MB.Wpf.TurnsLeft = $n
+				if ([bool]$script:MB.UnlimitedTurns) {
+					# While ∞ is on: never burn frozen remaining; only clamp if max setting shrinks
+					$fr = $null
+					try { $fr = $script:MB.TurnsLeftFrozen } catch { $fr = $null }
+					if ($null -eq $fr) {
+						try { $fr = [int]$script:MB.TurnsLeft } catch { $fr = $n }
+					}
+					try { $fr = [int]$fr } catch { $fr = $n }
+					if ($fr -gt $n) { $fr = $n }
+					if ($fr -lt 0) { $fr = 0 }
+					$script:MB.TurnsLeftFrozen = $fr
+					$script:MB.TurnsLeft = $fr
+					$script:MB.Wpf.TurnsLeft = $fr
 				} else {
-					$left = 0
-					try { $left = [int]$script:MB.TurnsLeft } catch { $left = $n }
-					if ($left -gt $n) { $left = $n }
-					$script:MB.TurnsLeft = $left
-					$script:MB.Wpf.TurnsLeft = $left
+					if (-not [bool]$script:MB.TurnsInFlight) {
+						$script:MB.TurnsLeft = $n
+						$script:MB.Wpf.TurnsLeft = $n
+					} else {
+						$left = 0
+						try { $left = [int]$script:MB.TurnsLeft } catch { $left = $n }
+						if ($left -gt $n) { $left = $n }
+						$script:MB.TurnsLeft = $left
+						$script:MB.Wpf.TurnsLeft = $left
+					}
 				}
 			} catch {}
 			$script:MB.Wpf.MaxTurnsDirty = $false
@@ -37215,20 +44054,112 @@ function Sync-MBMaxTurnsFromWpf {
 	} catch {}
 }
 
-function Get-MBEffectiveMaxTurns {
-	$n = 30
+function Test-MBUnlimitedTurns {
 	try {
-		if ($null -ne $script:MB.MaxTurns -and [int]$script:MB.MaxTurns -gt 0) {
-			$n = [int]$script:MB.MaxTurns
-		} else {
-			$n = [int]$MaxTurns
+		if ($script:MB.Wpf -and [bool]$script:MB.Wpf.UnlimitedTurnsDirty) {
+			return [bool]$script:MB.Wpf.UnlimitedTurns
 		}
-	} catch {
-		try { $n = [int]$MaxTurns } catch { $n = 30 }
-	}
-	if ($n -lt 1) { $n = 1 }
-	if ($n -gt 200) { $n = 200 }
-	return $n
+	} catch {}
+	try { return [bool]$script:MB.UnlimitedTurns } catch { return $false }
+}
+
+function Get-MBInfinityPathData {
+	# From infinity.xaml (24x24 Material-style infinity glyph)
+	return 'M18.6,6.62C21.58,6.62 24,9 24,12C24,14.96 21.58,17.37 18.6,17.37C17.15,17.37 15.8,16.81 14.78,15.8L12,13.34L9.17,15.85C8.2,16.82 6.84,17.38 5.4,17.38C2.42,17.38 0,14.96 0,12C0,9.04 2.42,6.62 5.4,6.62C6.84,6.62 8.2,7.18 9.22,8.2L12,10.66L14.83,8.15C15.8,7.18 17.16,6.62 18.6,6.62M7.8,14.39L10.5,12L7.84,9.65C7.16,8.97 6.31,8.62 5.4,8.62C3.53,8.62 2,10.13 2,12C2,13.87 3.53,15.38 5.4,15.38C6.31,15.38 7.16,15.03 7.8,14.39M16.2,9.61L13.5,12L16.16,14.35C16.84,15.03 17.7,15.38 18.6,15.38C20.47,15.38 22,13.87 22,12C22,10.13 20.47,8.62 18.6,8.62C17.69,8.62 16.84,8.97 16.2,9.61Z'
+}
+
+function Start-MBElementOpacityPulse {
+	param(
+		$Element,
+		[double]$From = 0.4,
+		[double]$To = 1.0,
+		[int]$Ms = 900
+	)
+	if (-not $Element) { return }
+	try {
+		$anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+		$anim.From = $From
+		$anim.To = $To
+		$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds([Math]::Max(200, $Ms)))
+		$anim.AutoReverse = $true
+		$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+		try {
+			$ease = New-Object System.Windows.Media.Animation.SineEase
+			$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+			$anim.EasingFunction = $ease
+		} catch {}
+		$Element.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
+	} catch {}
+}
+
+function Stop-MBElementOpacityPulse {
+	param($Element, [double]$RestOpacity = 1.0)
+	if (-not $Element) { return }
+	try {
+		$Element.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+		$Element.Opacity = $RestOpacity
+	} catch {}
+}
+
+function Start-MBBrushColorPulse {
+	param(
+		$Brush,
+		[string]$FromHex,
+		[string]$ToHex,
+		[int]$Ms = 1100
+	)
+	if (-not $Brush) { return }
+	try {
+		$conv = New-Object System.Windows.Media.BrushConverter
+		$fromC = ([System.Windows.Media.SolidColorBrush]$conv.ConvertFromString($FromHex)).Color
+		$toC = ([System.Windows.Media.SolidColorBrush]$conv.ConvertFromString($ToHex)).Color
+		$anim = New-Object System.Windows.Media.Animation.ColorAnimation
+		$anim.From = $fromC
+		$anim.To = $toC
+		$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds([Math]::Max(250, $Ms)))
+		$anim.AutoReverse = $true
+		$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+		try {
+			$ease = New-Object System.Windows.Media.Animation.SineEase
+			$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+			$anim.EasingFunction = $ease
+		} catch {}
+		$Brush.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $anim)
+	} catch {}
+}
+
+function Stop-MBBrushColorPulse {
+	param($Brush, [string]$RestHex = '')
+	if (-not $Brush) { return }
+	try {
+		$Brush.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $null)
+		if (-not [string]::IsNullOrWhiteSpace($RestHex)) {
+			try {
+				$conv = New-Object System.Windows.Media.BrushConverter
+				$c = ([System.Windows.Media.SolidColorBrush]$conv.ConvertFromString($RestHex)).Color
+				$Brush.Color = $c
+			} catch {}
+		}
+	} catch {}
+}
+
+function Get-MBEffectiveMaxTurns {
+	# Unlimited: no practical cap (Esc/Stop still works)
+	if (Test-MBUnlimitedTurns) { return 1000000 }
+	$cfg = Get-MBConfiguredMaxTurns
+	# After ∞ ends mid-flight: allow resumeTurn0 + frozen remaining more iterations
+	try {
+		if ([bool]$script:MB.TurnsInFlight -and $null -ne $script:MB.TurnsResumeTurn0 -and $null -ne $script:MB.TurnsLeftFrozen) {
+			$t0 = [int]$script:MB.TurnsResumeTurn0
+			$fr = [int]$script:MB.TurnsLeftFrozen
+			if ($t0 -lt 0) { $t0 = 0 }
+			if ($fr -lt 0) { $fr = 0 }
+			$cap = $t0 + $fr
+			if ($cap -lt 1) { $cap = 1 }
+			return $cap
+		}
+	} catch {}
+	return $cfg
 }
 
 function Get-MBWpfTurnsDisplayValue {
@@ -37281,25 +44212,64 @@ function Update-MBWpfTurnsNumText {
 function Update-MBTurnsCountdown {
 	param([int]$Turn = 0, [switch]$Idle)
 	try {
-		$max = Get-MBEffectiveMaxTurns
+		$unlim = Test-MBUnlimitedTurns
+		$cfgMax = Get-MBConfiguredMaxTurns
+
 		if ($Idle) {
 			$script:MB.TurnsInFlight = $false
 			$script:MB.TurnsUsed = 0
-			$script:MB.TurnsLeft = $max
+			$script:MB.TurnsResumeTurn0 = $null
+			if ($unlim) {
+				# New user message under ∞: park a full configured budget for when ∞ ends
+				$script:MB.TurnsLeftFrozen = $cfgMax
+				$script:MB.TurnsLeft = $cfgMax
+			} else {
+				$script:MB.TurnsLeft = $cfgMax
+				$script:MB.TurnsLeftFrozen = $null
+			}
 		} else {
 			$script:MB.TurnsInFlight = $true
 			$script:MB.TurnsUsed = [int]$Turn
-			$left = $max - [int]$Turn
-			if ($left -lt 0) { $left = 0 }
-			$script:MB.TurnsLeft = $left
+			if ($unlim) {
+				# Frozen: do not count down while ∞ is on
+				$fr = $null
+				try { $fr = $script:MB.TurnsLeftFrozen } catch { $fr = $null }
+				if ($null -eq $fr) {
+					try { $fr = [int]$script:MB.TurnsLeft } catch { $fr = $cfgMax }
+				}
+				try { $fr = [int]$fr } catch { $fr = $cfgMax }
+				if ($fr -lt 0) { $fr = 0 }
+				if ($fr -gt $cfgMax) { $fr = $cfgMax }
+				$script:MB.TurnsLeftFrozen = $fr
+				$script:MB.TurnsLeft = $fr
+			} else {
+				$t0 = $null
+				try { $t0 = $script:MB.TurnsResumeTurn0 } catch { $t0 = $null }
+				$fr = $null
+				try { $fr = $script:MB.TurnsLeftFrozen } catch { $fr = $null }
+				if ($null -ne $t0 -and $null -ne $fr) {
+					# Resumed after ∞: burn only from the frozen remainder
+					$left = [int]$fr - ([int]$Turn - [int]$t0)
+					if ($left -lt 0) { $left = 0 }
+					$script:MB.TurnsLeft = $left
+				} else {
+					$left = $cfgMax - [int]$Turn
+					if ($left -lt 0) { $left = 0 }
+					$script:MB.TurnsLeft = $left
+				}
+			}
 		}
 		if ($script:MB.Wpf) {
 			$script:MB.Wpf.TurnsLeft = [int]$script:MB.TurnsLeft
-			$script:MB.Wpf.TurnsUsed = [int]$(if ($Idle) { 0 } else { $Turn })
+			$script:MB.Wpf.TurnsUsed = [int]$script:MB.TurnsUsed
 			$script:MB.Wpf.TurnsInFlight = [bool]$script:MB.TurnsInFlight
-			$script:MB.Wpf.MaxTurnsSetting = $max
-			$disp = if ($Idle) { $max } else { [int]$script:MB.TurnsLeft }
-			Update-MBWpfTurnsNumText -Value $disp
+			try { $script:MB.Wpf.MaxTurnsSetting = $cfgMax } catch {}
+			if (-not $unlim) {
+				$disp = if ($Idle) { $cfgMax } else { [int]$script:MB.TurnsLeft }
+				if ($disp -lt 0) { $disp = 0 }
+				if ($disp -gt 200) { $disp = $cfgMax }
+				Update-MBWpfTurnsNumText -Value $disp
+			}
 		}
 	} catch {}
 }
@@ -37366,8 +44336,12 @@ function Update-MBWpfWindowTitle {
 		$W.PendingTitleBrandName = $agent
 		$W.PendingTitlePath = $(if ($path) { [string]$path } else { '' })
 		$W.PendingTitlePoweredBy = $powered
+		# Keep picker bag in sync (do not bump seq here — callers bump when the list changes)
 		try { $W.ActiveModel = [string]$script:MB.ActiveModel } catch {}
+		try { $W.ActiveModelBase = [string]$script:MB.ActiveModelBase } catch {}
+		try { $W.ActiveModelKey = [string]$script:MB.ActiveModelKey } catch {}
 		try { $W.RemoteModels = @($script:MB.RemoteModels) } catch {}
+		try { $W.RemoteModelEntries = @($script:MB.RemoteModelEntries) } catch {}
 		try { $W.CurrentCwd = [string]$script:MB.WorkingDir } catch {}
 	} catch {}
 }
@@ -37632,29 +44606,67 @@ function Request-MBWpfConfirmation {
 		[string]$CodeLang = "ps"
 	)
 	if (-not (Test-MBWpfActive)) { return $null }
+	$safeTitle = ([string]$Title).Trim()
+	try { $safeTitle = ConvertTo-MBWpfSafeText -Text $safeTitle } catch {}
 	Write-MBWpfRaw -Text "" -Color DarkGray
 	Write-MBWpfApprovalBanner -Label 'approval'
 	Write-MBWpfRaw -Text "" -Color DarkGray
-	if (-not [string]::IsNullOrWhiteSpace($Title)) {
-		Write-MBWpfRaw -Text ("  {0}" -f $Title) -Color White
+	if (-not [string]::IsNullOrWhiteSpace($safeTitle)) {
+		Write-MBWpfRaw -Text ("  {0}" -f $safeTitle) -Color White
 	}
-	if ($Details) {
-		foreach ($line in ($Details -split "`r?`n")) {
-			if ([string]::IsNullOrWhiteSpace($line)) {
-				Write-MBWpfRaw -Text "" -Color DarkGray
-			} else {
-				Write-MBWpfRaw -Text ("  {0}" -f $line) -Color DarkGray
+	# Body goes in a code box (highlight + Copy); short meta stays as grey notes above
+	$codeText = ''
+	$metaLines = New-Object System.Collections.ArrayList
+	try {
+		if (-not [string]::IsNullOrWhiteSpace($Code)) {
+			$codeText = ([string]$Code) -replace "`r`n", "`n" -replace "`r", "`n"
+		}
+		if ($Details) {
+			$detailLines = @(($Details -split "`r?`n"))
+			foreach ($line in $detailLines) {
+				$t = [string]$line
+				try { $t = ConvertTo-MBWpfSafeText -Text $t } catch {}
+				if ([string]::IsNullOrWhiteSpace($t)) {
+					if ($metaLines.Count -gt 0) { [void]$metaLines.Add('') }
+					continue
+				}
+				# Promote "Command: ..." into the code box when Code= was not passed
+				if ([string]::IsNullOrWhiteSpace($codeText) -and $t -match '^(?i)\s*Command\s*:\s*(.+)$') {
+					$codeText = [string]$Matches[1]
+					continue
+				}
+				[void]$metaLines.Add($t)
+			}
+			# No Code= and multi-line / long details → put the whole details block in the code box
+			if ([string]::IsNullOrWhiteSpace($codeText)) {
+				$joined = ($detailLines -join "`n").Trim()
+				try { $joined = ConvertTo-MBWpfSafeText -Text $joined } catch {}
+				$lineN = @($detailLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+				if ($lineN -ge 3 -or $joined.Length -gt 160) {
+					$codeText = $joined
+					try { $metaLines.Clear() } catch { $metaLines = New-Object System.Collections.ArrayList }
+					if ([string]::IsNullOrWhiteSpace($CodeLang) -or $CodeLang -eq 'ps') {
+						$CodeLang = 'text'
+					}
+				}
 			}
 		}
+	} catch {}
+	foreach ($line in @($metaLines)) {
+		if ([string]::IsNullOrWhiteSpace($line)) {
+			Write-MBWpfRaw -Text "" -Color DarkGray
+		} else {
+			Write-MBWpfRaw -Text ("  {0}" -f $line) -Color DarkGray
+		}
 	}
-	if (-not [string]::IsNullOrWhiteSpace($Code)) {
+	if (-not [string]::IsNullOrWhiteSpace($codeText)) {
 		$lang = ([string]$CodeLang).Trim()
-		if ([string]::IsNullOrWhiteSpace($lang)) { $lang = 'ps' }
-		$codeText = [string]$Code
-		$codeText = $codeText -replace "`r`n", "`n" -replace "`r", "`n"
-		Write-MBWpfSynText -Text $codeText -Lang $lang
+		if ([string]::IsNullOrWhiteSpace($lang)) { $lang = 'text' }
+		# Code box header: approval title (path/tool) + lang — sanitize avoids mojibake
+		$codeTitle = $safeTitle
+		if ([string]::IsNullOrWhiteSpace($codeTitle)) { $codeTitle = $lang }
+		Write-MBWpfSynText -Text $codeText -Lang $lang -Title $codeTitle
 	}
-	Write-MBWpfRaw -Text "" -Color DarkGray
 	Write-MBWpfApprovalButtons
 	Write-MBWpfRaw -Text "" -Color DarkGray
 	Update-MBWpfSticky -Hint "approval: Y / N / A  (buttons or keyboard)"
@@ -37936,6 +44948,31 @@ function Start-MBWpfHost {
 		ToolGroupsBuilt = $false
 		ToolGroupsDirty = $true
 		ToolGroupsData  = $null
+		TaskBoardSticky = $null
+		TaskBoardStickyScroll = $null
+		TaskBoardStickyInner = $null
+		TaskBoardStickyHeader = $null
+		TaskBoardStickyItems = $null
+		TaskBoardStickyGoal = $null
+		TaskBoardStickySum = $null
+		TaskBoardStickyLabel = $null
+		TaskBoardMaxScrollH = 260.0
+		TaskBoardPulseEls = $null
+		TaskBoardExpanded = $false
+		TaskBoardRetractTimer = $null
+		TaskBoardSeqCounter = 0
+		TaskBoardAppliedSeq = 0
+		TaskBoardWantSeq = 0
+		TaskBoardPaintRetry = 0
+		TaskBoardPaintBusy = $false
+		TaskBoardPaintQueued = $false
+		TaskBoardPaintUrgent = $false
+		TaskBoardLastFp = ''
+		PendingTaskBoard = $null
+		PendingClearLog = $false
+		HdrBrandAccent = $null
+		BrandAccentShimmerOn = $false
+		BrandAccentTranslate = $null
 		HdrPoweredBy  = $null
 		HdrPoweredByShadow = $null
 		HdrPoweredByHost = $null
@@ -38008,6 +45045,7 @@ function Start-MBWpfHost {
 		PendingAddBaseAuthMode = 'apikey'
 		PendingAddBaseDirty = $false
 		PendingAddBaseResult = $null
+		PendingShowAddEndpoint = $false
 		ModelDirty    = $false
 		ModelPickerUpdating = $false
 		AutoCompactOn = $(try { [bool]$script:MB.AutoCompact } catch { $true })
@@ -38016,13 +45054,23 @@ function Start-MBWpfHost {
 		AutoCompactDirty = $false
 		MaxTurnsSetting = $(try { [int]$script:MB.MaxTurns } catch { try { [int]$MaxTurns } catch { 30 } })
 		MaxTurnsDirty = $false
+		UnlimitedTurns = $(try { [bool]$script:MB.UnlimitedTurns } catch { $false })
+		UnlimitedTurnsDirty = $false
 		TurnsLeft = $(try { [int]$script:MB.TurnsLeft } catch { try { [int]$MaxTurns } catch { 30 } })
 		TurnsUsed = 0
 		TurnsInFlight = $false
 		AaTurnsNumTb = $null
+		AaTurnsMidHost = $null
+		AaInfinityHost = $null
+		AaInfinityPath = $null
 		AaApprovePopup = $null
 		AaLabel = $null
 		AaPopupWantOpen = $false
+		AaUnlimOffSeg = $null
+		AaUnlimOnSeg = $null
+		AaUnlimHit = $null
+		BtnAaMinus = $null
+		BtnAaPlus = $null
 		ToolsUsedTb = $null
 		PendingUiCommand = $null
 		PendingWindowTitle = $null
@@ -38617,17 +45665,20 @@ function Start-MBWpfHost {
           <Grid>
             <Grid.RowDefinitions>
               <RowDefinition Height="Auto"/>
-              <RowDefinition Height="2"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
             <Grid Grid.Row="0">
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" MinWidth="80"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-              <!-- Two-line wrap for tool group chips; brand/path/PoweredBy live in window Title -->
+              <!-- Tool group chips: fixed catalog order, wrap across rows; title bar holds brand/path/PoweredBy -->
               <WrapPanel x:Name="HdrToolGroups" Grid.Column="0" Orientation="Horizontal"
                          VerticalAlignment="Center" Margin="0,0,12,0"
-                         MaxHeight="44"/>
+                         ItemWidth="76" ItemHeight="24" MaxHeight="76"
+                         SnapsToDevicePixels="True" UseLayoutRounding="True"
+                         ClipToBounds="False"/>
               <!-- Legacy header nodes (collapsed) -->
               <TextBlock x:Name="HdrLine1" Visibility="Collapsed"/>
               <TextBlock x:Name="HdrLine1Shadow" Visibility="Collapsed"/>
@@ -38646,16 +45697,58 @@ function Start-MBWpfHost {
                 </CheckBox.Content>
               </CheckBox>
             </Grid>
- <!-- Brand accent -->
-            <Rectangle Grid.Row="1" Height="2" Margin="0,6,0,0" RadiusX="1" RadiusY="1">
-              <Rectangle.Fill>
-                <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
-                  <GradientStop Color="#B80F0A" Offset="0"/>
-                  <GradientStop Color="#7AA2F7" Offset="0.55"/>
-                  <GradientStop Color="#3A3A42" Offset="1"/>
-                </LinearGradientBrush>
-              </Rectangle.Fill>
-            </Rectangle>
+ <!-- Brand accent: dark idle; TaskBoard open = subtle dark shimmer (not red/blue) -->
+            <Rectangle x:Name="HdrBrandAccent" Grid.Row="1" Height="2" Margin="0,6,0,0"
+                       RadiusX="1" RadiusY="1" Fill="#25252C"/>
+            <!-- TaskBoard sticky: header stays fixed; only task rows scroll (see ApplyTaskBoardSticky) -->
+            <Border x:Name="TaskBoardSticky" Grid.Row="2" Visibility="Collapsed"
+                    Background="#16161C" BorderBrush="#3A3A42" BorderThickness="0,1,0,0"
+                    ClipToBounds="True" MaxHeight="0" Margin="0,0,0,0"
+                    SnapsToDevicePixels="True">
+              <Grid x:Name="TaskBoardStickyInner">
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <!-- Title banner: not inside ScrollViewer so it stays visible while rows scroll -->
+                <Border x:Name="TaskBoardStickyHeader" Grid.Row="0" Background="#16161C"
+                        Padding="10,8,10,4" BorderBrush="#2A2A30" BorderThickness="0,0,0,1"
+                        SnapsToDevicePixels="True">
+                  <Grid>
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
+                      <TextBlock x:Name="TaskBoardStickyLabel" Text="TaskBoard" Foreground="#7DCFFF"
+                                 FontSize="11.5" FontWeight="SemiBold"
+                                 FontFamily="Consolas, Cascadia Mono, Courier New"
+                                 VerticalAlignment="Center" Margin="0,0,8,0"/>
+                      <TextBlock x:Name="TaskBoardStickyGoal" Text="" Foreground="#C8C8D0"
+                                 FontSize="11.5"
+                                 FontFamily="Consolas, Cascadia Mono, Courier New"
+                                 VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                                 MaxWidth="520"/>
+                    </StackPanel>
+                    <TextBlock x:Name="TaskBoardStickySum" Grid.Column="1" Text=""
+                               Foreground="#6A6A76" FontSize="11"
+                               FontFamily="Consolas, Cascadia Mono, Courier New"
+                               VerticalAlignment="Center" Margin="8,0,0,0"/>
+                  </Grid>
+                </Border>
+                <!-- Only the checklist scrolls; cap ~5 visible rows -->
+                <ScrollViewer x:Name="TaskBoardStickyScroll" Grid.Row="1"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled"
+                              CanContentScroll="False"
+                              MaxHeight="140"
+                              Focusable="False"
+                              PanningMode="VerticalOnly"
+                              Padding="0">
+                  <StackPanel x:Name="TaskBoardStickyItems" Orientation="Vertical" Margin="10,4,10,6"/>
+                </ScrollViewer>
+              </Grid>
+            </Border>
           </Grid>
         </Border>
         <Rectangle Grid.Row="1" Height="1" Fill="#3A3A42" Panel.ZIndex="2"/>
@@ -39138,6 +46231,802 @@ function Start-MBWpfHost {
 			$W.ToolGroupsBuilt = $false
 			$W.ToolGroupsDirty = $true
 			$W.ToolGroupsData = $null
+			# TaskBoard sticky under chips (paint must run in this STA runspace — not main-runspace functions)
+			$W.TaskBoardSticky = $window.FindName('TaskBoardSticky')
+			$W.TaskBoardStickyScroll = $window.FindName('TaskBoardStickyScroll')
+			$W.TaskBoardStickyInner = $window.FindName('TaskBoardStickyInner')
+			$W.TaskBoardStickyHeader = $window.FindName('TaskBoardStickyHeader')
+			$W.TaskBoardStickyItems = $window.FindName('TaskBoardStickyItems')
+			$W.TaskBoardStickyGoal = $window.FindName('TaskBoardStickyGoal')
+			$W.TaskBoardStickySum = $window.FindName('TaskBoardStickySum')
+			$W.TaskBoardStickyLabel = $window.FindName('TaskBoardStickyLabel')
+			$W.HdrBrandAccent = $window.FindName('HdrBrandAccent')
+			# Items scroller shows at most 5 rows; title banner stays fixed above it
+			$W.TaskBoardMaxVisibleRows = 5
+			$W.TaskBoardMaxScrollH = 140.0
+			$W.TaskBoardPulseEls = New-Object System.Collections.ArrayList
+			$W.TaskBoardExpanded = $false
+			$W.TaskBoardRetractTimer = $null
+			$W.BrandAccentShimmerOn = $false
+			$W.BrandAccentTranslate = $null
+			# Mostly-dark accent: solid when TaskBoard closed; soft light/dark slide while open
+			$W.SetBrandAccentIdle = {
+				try {
+					$rect = $W.HdrBrandAccent
+					if (-not $rect) { return }
+					try {
+						if ($W.BrandAccentTranslate) {
+							$W.BrandAccentTranslate.BeginAnimation([System.Windows.Media.TranslateTransform]::XProperty, $null)
+						}
+					} catch {}
+					$W.BrandAccentTranslate = $null
+					$W.BrandAccentShimmerOn = $false
+					$bc = New-Object System.Windows.Media.BrushConverter
+					# Deep dark resting line (not bright)
+					$rect.Fill = $bc.ConvertFromString('#25252C')
+				} catch {}
+			}.GetNewClosure()
+			$W.SetBrandAccentShimmer = {
+				try {
+					$rect = $W.HdrBrandAccent
+					if (-not $rect) { return }
+					if ([bool]$W.BrandAccentShimmerOn) { return }
+					# Dark base with a dim mid highlight that drifts left→right forever
+					$brush = New-Object System.Windows.Media.LinearGradientBrush
+					$brush.StartPoint = New-Object System.Windows.Point(0, 0.5)
+					$brush.EndPoint = New-Object System.Windows.Point(1, 0.5)
+					$brush.MappingMode = [System.Windows.Media.BrushMappingMode]::RelativeToBoundingBox
+					$cDark = [System.Windows.Media.Color]::FromRgb(0x1A, 0x1A, 0x20)   # almost black
+					$cMid  = [System.Windows.Media.Color]::FromRgb(0x3A, 0x3A, 0x46)   # soft lift (still muted)
+					$cEdge = [System.Windows.Media.Color]::FromRgb(0x22, 0x22, 0x2A)
+					# Wide dark regions; narrow lighter band for a slow slide
+					[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($cDark, 0.0)))
+					[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($cDark, 0.32)))
+					[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($cMid, 0.50)))
+					[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($cDark, 0.68)))
+					[void]$brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop($cEdge, 1.0)))
+					$tt = New-Object System.Windows.Media.TranslateTransform(0, 0)
+					# RelativeTransform so X is in 0..1 brush space
+					$tg = New-Object System.Windows.Media.TransformGroup
+					[void]$tg.Children.Add($tt)
+					$brush.RelativeTransform = $tg
+					$rect.Fill = $brush
+					$W.BrandAccentTranslate = $tt
+					$anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+					# Drift the highlight band across the bar, then reverse
+					$anim.From = -0.55
+					$anim.To = 0.55
+					$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(3200))
+					$anim.AutoReverse = $true
+					$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+					try {
+						$ease = New-Object System.Windows.Media.Animation.SineEase
+						$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+						$anim.EasingFunction = $ease
+					} catch {}
+					$tt.BeginAnimation([System.Windows.Media.TranslateTransform]::XProperty, $anim)
+					$W.BrandAccentShimmerOn = $true
+				} catch {}
+			}.GetNewClosure()
+			try { & $W.SetBrandAccentIdle } catch {}
+			$W.StopTaskBoardPulse = {
+				try {
+					foreach ($el in @($W.TaskBoardPulseEls)) {
+						if ($null -eq $el) { continue }
+						try {
+							if ($el -is [System.Windows.Media.SolidColorBrush]) {
+								$el.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $null)
+							} else {
+								$el.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+								try { $el.Opacity = 1.0 } catch {}
+							}
+						} catch {}
+					}
+					$W.TaskBoardPulseEls = New-Object System.Collections.ArrayList
+				} catch {}
+			}.GetNewClosure()
+			$W.StartColorPulse = {
+				param($Brush, [string]$FromHex, [string]$ToHex, [int]$Ms = 1000)
+				if (-not $Brush) { return }
+				try {
+					$bc = New-Object System.Windows.Media.BrushConverter
+					$fromC = ([System.Windows.Media.SolidColorBrush]$bc.ConvertFromString($FromHex)).Color
+					$toC = ([System.Windows.Media.SolidColorBrush]$bc.ConvertFromString($ToHex)).Color
+					$anim = New-Object System.Windows.Media.Animation.ColorAnimation
+					$anim.From = $fromC
+					$anim.To = $toC
+					$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds([Math]::Max(250, $Ms)))
+					$anim.AutoReverse = $true
+					$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+					try {
+						$ease = New-Object System.Windows.Media.Animation.SineEase
+						$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+						$anim.EasingFunction = $ease
+					} catch {}
+					$Brush.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $anim)
+				} catch {}
+			}.GetNewClosure()
+			$W.StartOpacityPulse = {
+				param($Element, [double]$From = 0.82, [double]$To = 1.0, [int]$Ms = 1000)
+				if (-not $Element) { return }
+				try {
+					$anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+					$anim.From = $From
+					$anim.To = $To
+					$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds([Math]::Max(200, $Ms)))
+					$anim.AutoReverse = $true
+					$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+					try {
+						$ease = New-Object System.Windows.Media.Animation.SineEase
+						$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+						$anim.EasingFunction = $ease
+					} catch {}
+					$Element.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
+				} catch {}
+			}.GetNewClosure()
+			# Coalesce TaskBoard paints on STA; finish on latest Pending.
+			$W.DrainTaskBoardPaint = {
+				try {
+					$busy = $false
+					try { $busy = [bool]$W.TaskBoardPaintBusy } catch { $busy = $false }
+					if ($busy) {
+						try { $W.TaskBoardPaintQueued = $true } catch {}
+						return
+					}
+					try { $W.TaskBoardPaintBusy = $true } catch {}
+					try {
+						$guard = 0
+						do {
+							$guard++
+							if ($guard -gt 12) { break }
+							try { $W.TaskBoardPaintQueued = $false } catch {}
+							$tbPend = $null
+							try { $tbPend = $W.PendingTaskBoard } catch { $tbPend = $null }
+							if ($null -eq $tbPend) { break }
+							try { $W.PendingTaskBoard = $null } catch {}
+							try {
+								$want = 0; $inSeq = 0
+								try { $want = [int]$W.TaskBoardWantSeq } catch { $want = 0 }
+								try { $inSeq = [int]$tbPend.Seq } catch { $inSeq = 0 }
+								if ($want -gt 0 -and $inSeq -gt 0 -and $inSeq -lt $want) { continue }
+							} catch {}
+							try {
+								$apply = $null
+								try { $apply = $W.ApplyTaskBoardSticky } catch { $apply = $null }
+								if ($apply -is [scriptblock]) {
+									& $apply $tbPend
+								}
+								try { $W.TaskBoardPaintRetry = 0 } catch {}
+							} catch {
+								try { $W.LastTaskBoardPaintErr = [string]$_.Exception.Message } catch {}
+								try {
+									$retry = 0
+									try { $retry = [int]$W.TaskBoardPaintRetry } catch { $retry = 0 }
+									if ($retry -lt 3 -and $null -eq $W.PendingTaskBoard) {
+										$W.TaskBoardPaintRetry = $retry + 1
+										$W.PendingTaskBoard = $tbPend
+									}
+								} catch {}
+							}
+							$again = $false
+							try { if ([bool]$W.TaskBoardPaintQueued) { $again = $true } } catch {}
+							try { if ($null -ne $W.PendingTaskBoard) { $again = $true } } catch {}
+						} while ($again)
+					} finally {
+						try { $W.TaskBoardPaintBusy = $false } catch {}
+						try {
+							if ($null -ne $W.PendingTaskBoard -and $W.KickTaskBoardPaint -is [System.Action]) {
+								[void]$W.Window.Dispatcher.BeginInvoke(
+									$W.KickTaskBoardPaint,
+									[System.Windows.Threading.DispatcherPriority]::Render
+								)
+							}
+						} catch {}
+					}
+				} catch {}
+			}.GetNewClosure()
+
+			# STA entry point for agent BeginInvoke.
+			$W.KickTaskBoardPaint = $null
+			try {
+				$kickSb = {
+					try {
+						$fn = $null
+						try { $fn = $W.DrainTaskBoardPaint } catch { $fn = $null }
+						if ($null -ne $fn) { & $fn }
+					} catch {}
+				}.GetNewClosure()
+				try {
+					$W.KickTaskBoardPaint = [System.Action]$kickSb
+				} catch {
+					$W.KickTaskBoardPaint = $kickSb
+				}
+			} catch {
+				try { $W.KickTaskBoardPaint = $null } catch {}
+			}
+
+			$W.ApplyTaskBoardSticky = {
+				param($S)
+				if ($null -eq $S) { return }
+				# Skip if snap seq is older than already painted.
+				try {
+					$inSeq = 0; $had = 0
+					try {
+						if ($S -is [System.Collections.IDictionary] -and $S.Contains('Seq')) { $inSeq = [int]$S['Seq'] }
+						else { $inSeq = [int]$S.Seq }
+					} catch { $inSeq = 0 }
+					try { $had = [int]$W.TaskBoardAppliedSeq } catch { $had = 0 }
+					if ($inSeq -gt 0 -and $had -gt 0 -and $inSeq -lt $had) { return }
+				} catch {}
+				try { $W.TaskBoardPaintUrgent = $false } catch {}
+				try {
+					if ((-not $W.TaskBoardSticky -or -not $W.TaskBoardStickyScroll) -and $W.Window) {
+						if (-not $W.TaskBoardSticky) { $W.TaskBoardSticky = $W.Window.FindName('TaskBoardSticky') }
+						if (-not $W.TaskBoardStickyScroll) { $W.TaskBoardStickyScroll = $W.Window.FindName('TaskBoardStickyScroll') }
+						if (-not $W.TaskBoardStickyInner) { $W.TaskBoardStickyInner = $W.Window.FindName('TaskBoardStickyInner') }
+						if (-not $W.TaskBoardStickyHeader) { $W.TaskBoardStickyHeader = $W.Window.FindName('TaskBoardStickyHeader') }
+						if (-not $W.TaskBoardStickyItems) { $W.TaskBoardStickyItems = $W.Window.FindName('TaskBoardStickyItems') }
+						if (-not $W.TaskBoardStickyGoal) { $W.TaskBoardStickyGoal = $W.Window.FindName('TaskBoardStickyGoal') }
+						if (-not $W.TaskBoardStickySum) { $W.TaskBoardStickySum = $W.Window.FindName('TaskBoardStickySum') }
+						if (-not $W.TaskBoardStickyLabel) { $W.TaskBoardStickyLabel = $W.Window.FindName('TaskBoardStickyLabel') }
+					}
+				} catch {}
+				if (-not $W.TaskBoardSticky) { return }
+				$hostBd = $W.TaskBoardSticky
+				$inner = $W.TaskBoardStickyInner
+				$hdrBd = $null
+				try { $hdrBd = $W.TaskBoardStickyHeader } catch { $hdrBd = $null }
+				$itemsSp = $W.TaskBoardStickyItems
+				$goalTb = $W.TaskBoardStickyGoal
+				$sumTb = $W.TaskBoardStickySum
+				$labelTb = $W.TaskBoardStickyLabel
+				if (-not $itemsSp) { return }
+				try {
+					if ($W.TaskBoardRetractTimer) {
+						$W.TaskBoardRetractTimer.Stop()
+						$W.TaskBoardRetractTimer = $null
+					}
+				} catch {}
+				try { & $W.StopTaskBoardPulse } catch {}
+
+				$hide = $false
+				try {
+					$emp = $false; $wshow = $true
+					if ($S -is [System.Collections.IDictionary]) {
+						if ($S.Contains('Empty')) { $emp = [bool]$S['Empty'] }
+						if ($S.Contains('WantShow')) { $wshow = [bool]$S['WantShow'] }
+					} else {
+						$emp = [bool]$S.Empty
+						$wshow = [bool]$S.WantShow
+					}
+					$hide = $emp -or -not $wshow
+				} catch { $hide = $true }
+				if ($hide) {
+					try { if ($W.SetBrandAccentIdle) { & $W.SetBrandAccentIdle } } catch {}
+					try {
+						$curH = 0.0
+						try {
+							if ($hostBd.Visibility -eq [System.Windows.Visibility]::Visible -and $hostBd.ActualHeight -gt 0) {
+								$curH = [double]$hostBd.ActualHeight
+							}
+						} catch {}
+						try { $hostBd.BeginAnimation([System.Windows.FrameworkElement]::MaxHeightProperty, $null) } catch {}
+						if ($curH -le 1.0) {
+							$hostBd.MaxHeight = 0
+							$hostBd.Visibility = [System.Windows.Visibility]::Collapsed
+							try { $itemsSp.Children.Clear() } catch {}
+							$W.TaskBoardExpanded = $false
+							return
+						}
+						$hostBd.MaxHeight = $curH
+						$anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+						$anim.From = $curH
+						$anim.To = 0.0
+						$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(260))
+						try {
+							$ease = New-Object System.Windows.Media.Animation.QuadraticEase
+							$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseIn
+							$anim.EasingFunction = $ease
+						} catch {}
+						$anim.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
+						$anim.add_Completed({
+							try {
+								$hostBd.BeginAnimation([System.Windows.FrameworkElement]::MaxHeightProperty, $null)
+								$hostBd.MaxHeight = 0
+								$hostBd.Visibility = [System.Windows.Visibility]::Collapsed
+								try { $itemsSp.Children.Clear() } catch {}
+								$W.TaskBoardExpanded = $false
+							} catch {}
+						}.GetNewClosure())
+						$hostBd.BeginAnimation([System.Windows.FrameworkElement]::MaxHeightProperty, $anim)
+					} catch {
+						try {
+							$hostBd.MaxHeight = 0
+							$hostBd.Visibility = [System.Windows.Visibility]::Collapsed
+							$W.TaskBoardExpanded = $false
+						} catch {}
+					}
+					return
+				}
+
+				# TaskBoard open: keep accent mostly dark with a slow sliding highlight
+				try { if ($W.SetBrandAccentShimmer) { & $W.SetBrandAccentShimmer } } catch {}
+
+				$snapGoal = ''; $snapSum = ''; $snapOpenN = 0; $snapFocus = ''
+				$pausedUi = $false
+				try {
+					if ($S -is [System.Collections.IDictionary]) {
+						if ($S.Contains('Goal')) { $snapGoal = [string]$S['Goal'] }
+						if ($S.Contains('Summary')) { $snapSum = [string]$S['Summary'] }
+						if ($S.Contains('OpenN')) { $snapOpenN = [int]$S['OpenN'] }
+						if ($S.Contains('FocusId')) { $snapFocus = [string]$S['FocusId'] }
+						if ($S.Contains('Paused')) { $pausedUi = [bool]$S['Paused'] }
+					} else {
+						$snapGoal = [string]$S.Goal
+						$snapSum = [string]$S.Summary
+						$snapOpenN = [int]$S.OpenN
+						$snapFocus = [string]$S.FocusId
+						$pausedUi = [bool]$S.Paused
+					}
+				} catch {}
+				try { if ($goalTb) { $goalTb.Text = $snapGoal } } catch {}
+				try { if ($sumTb) { $sumTb.Text = $snapSum } } catch {}
+				$conv = New-Object System.Windows.Media.BrushConverter
+				if (-not $W.BrushCache) { $W.BrushCache = @{} }
+				$hxLabel = '#7DCFFF'
+				try {
+					if ($pausedUi) { $hxLabel = '#E0AF68' }
+					elseif ($snapOpenN -le 0) { $hxLabel = '#9ECE6A' }
+				} catch {}
+				try {
+					if ($labelTb) {
+						$labelTb.Text = $(if ($pausedUi) { 'TaskBoard paused' } else { 'TaskBoard' })
+						if (-not $W.BrushCache.ContainsKey($hxLabel)) {
+							$W.BrushCache[$hxLabel] = $conv.ConvertFromString($hxLabel)
+						}
+						$labelTb.Foreground = $W.BrushCache[$hxLabel]
+					}
+				} catch {}
+
+				$hxPend = '#A0A0AA'; $hxProg = '#BB9AF7'; $hxDone = '#9ECE6A'; $hxBlock = '#F7768E'
+				$hxPause = '#E0AF68'   # same yellow used elsewhere (compacting / soft warn)
+				$hxProgBg = '#2A2238'; $hxProgBg2 = '#3D2F55'
+				$hxDoneBg = '#1E2A1C'; $hxBlockBg = '#3D2228'; $hxPendBg = '#14141A'
+				$hxPauseBg = '#3D3422'; $hxPauseBg2 = '#5C4A28'
+				$hxProgFg2 = '#D4B8FF'; $hxPauseFg2 = '#FFD9A0'
+				foreach ($hx in @($hxPend, $hxProg, $hxDone, $hxBlock, $hxPause, $hxProgBg, $hxProgBg2, $hxDoneBg, $hxBlockBg, $hxPendBg, $hxPauseBg, $hxPauseBg2, $hxProgFg2, $hxPauseFg2)) {
+					if (-not $W.BrushCache.ContainsKey($hx)) {
+						try { $W.BrushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+					}
+				}
+				$mono = $null
+				try { $mono = $W.MonoFont } catch {}
+				if (-not $mono) {
+					try { $mono = New-Object System.Windows.Media.FontFamily('Consolas, Cascadia Mono, Courier New') } catch {}
+				}
+				try { $itemsSp.Children.Clear() } catch {}
+				$pulseList = New-Object System.Collections.ArrayList
+				$focusId = $snapFocus
+				if ([string]::IsNullOrWhiteSpace($focusId)) {
+					try { $focusId = [string]$S.FocusId } catch { $focusId = '' }
+				}
+				$focusRow = $null
+				$firstProgRow = $null
+				# Body max width for ellipsis (avoid GridLength star ctor issues on PS 5.1)
+				$bodyMaxW = 520.0
+				try {
+					$aw = 0.0
+					try { $aw = [double]$hostBd.ActualWidth } catch { $aw = 0 }
+					if ($aw -lt 80 -and $hostBd.Parent) {
+						try { $aw = [double]$hostBd.Parent.ActualWidth } catch {}
+					}
+					if ($aw -gt 120) { $bodyMaxW = [math]::Max(160.0, $aw - 80.0) }
+				} catch {}
+				$snapRows = @()
+				try {
+					if ($S -is [System.Collections.IDictionary] -and $S.Contains('Rows')) { $snapRows = @($S['Rows']) }
+					else { $snapRows = @($S.Rows) }
+				} catch { $snapRows = @() }
+				foreach ($rr in $snapRows) {
+					try {
+						$id = ''; $titleR = ''; $st = 'pending'; $note = ''
+						if ($rr -is [System.Collections.IDictionary]) {
+							try { if ($rr.Contains('Id')) { $id = [string]$rr['Id'] } } catch {}
+							try { if ($rr.Contains('Title')) { $titleR = [string]$rr['Title'] } } catch {}
+							try { if ($rr.Contains('Status')) { $st = ([string]$rr['Status']).ToLowerInvariant() } } catch { $st = 'pending' }
+							try { if ($rr.Contains('Note')) { $note = [string]$rr['Note'] } } catch {}
+						} else {
+							try { $id = [string]$rr.Id } catch {}
+							try { $titleR = [string]$rr.Title } catch {}
+							try { $st = ([string]$rr.Status).ToLowerInvariant() } catch { $st = 'pending' }
+							try { $note = [string]$rr.Note } catch {}
+						}
+						if ([string]::IsNullOrWhiteSpace($st)) { $st = 'pending' }
+						if ($st -in @('active', 'doing', 'wip', 'working')) { $st = 'in_progress' }
+						if ($st -in @('complete', 'completed', 'finished')) { $st = 'done' }
+						$mark = '[ ]'; $fgHex = $hxPend; $bgHex = $hxPendBg
+						if ($st -eq 'done') { $mark = '[x]'; $fgHex = $hxDone; $bgHex = $hxDoneBg }
+						elseif ($st -eq 'in_progress') { $mark = '[>]'; $fgHex = $hxProg; $bgHex = $hxProgBg }
+						elseif ($st -eq 'paused') { $mark = '[=]'; $fgHex = $hxPause; $bgHex = $hxPauseBg }
+						elseif ($st -eq 'blocked') { $mark = '[!]'; $fgHex = $hxBlock; $bgHex = $hxBlockBg }
+
+						$rowBd = New-Object System.Windows.Controls.Border
+						$rowBd.CornerRadius = New-Object System.Windows.CornerRadius(3)
+						$rowBd.Padding = New-Object System.Windows.Thickness(8, 3, 8, 3)
+						$rowBd.Margin = New-Object System.Windows.Thickness(0, 0, 0, 2)
+						$rowBd.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+						$rowBd.SnapsToDevicePixels = $true
+						try { $rowBd.Focusable = $false } catch {}
+						try { $rowBd.Tag = $id } catch {}
+
+						$bgBrush = New-Object System.Windows.Media.SolidColorBrush
+						try {
+							$bgBrush.Color = ([System.Windows.Media.SolidColorBrush]$conv.ConvertFromString($bgHex)).Color
+						} catch {
+							$bgBrush.Color = [System.Windows.Media.Color]::FromRgb(20, 20, 26)
+						}
+						$rowBd.Background = $bgBrush
+
+						$sp = New-Object System.Windows.Controls.StackPanel
+						$sp.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+						$fgBrush = New-Object System.Windows.Media.SolidColorBrush
+						try {
+							$fgBrush.Color = ([System.Windows.Media.SolidColorBrush]$conv.ConvertFromString($fgHex)).Color
+						} catch {
+							$fgBrush.Color = [System.Windows.Media.Color]::FromRgb(200, 200, 208)
+						}
+						$markTb = New-Object System.Windows.Controls.TextBlock
+						$markTb.Text = $mark
+						$markTb.Width = 28
+						$markTb.FontFamily = $mono
+						$markTb.FontSize = 12
+						$markTb.FontWeight = [System.Windows.FontWeights]::SemiBold
+						$markTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+						$markTb.Foreground = $fgBrush
+						try { $markTb.IsHitTestVisible = $false } catch {}
+
+						$body = $titleR
+						if ($id) { $body = ('{0}: {1}' -f $id, $titleR) }
+						if ($note) { $body += ('  - {0}' -f $note) }
+						$tipText = ('{0} {1}' -f $mark, $body).Trim()
+						$bodyTb = New-Object System.Windows.Controls.TextBlock
+						$bodyTb.Text = $body
+						$bodyTb.FontFamily = $mono
+						$bodyTb.FontSize = 12
+						$bodyTb.TextWrapping = [System.Windows.TextWrapping]::NoWrap
+						$bodyTb.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
+						$bodyTb.MaxWidth = $bodyMaxW
+						$bodyTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+						$bodyTb.Foreground = $fgBrush
+						try { $bodyTb.IsHitTestVisible = $false } catch {}
+						if ($st -eq 'in_progress' -or $st -eq 'paused') {
+							try { $bodyTb.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+						}
+						[void]$sp.Children.Add($markTb)
+						[void]$sp.Children.Add($bodyTb)
+						$rowBd.Child = $sp
+						# Themed full-text tooltip (never fail the row if tip build breaks)
+						try {
+							if (-not [string]::IsNullOrWhiteSpace($tipText)) {
+								$tipOk = $false
+								try {
+									if ($W.SetThemedToolTip) {
+										& $W.SetThemedToolTip $rowBd $tipText 420
+										$tipOk = $true
+									}
+								} catch { $tipOk = $false }
+								if (-not $tipOk) {
+									# Inline dark tip (no SystemBrush chrome)
+									$tip = New-Object System.Windows.Controls.ToolTip
+									try { $tip.OverridesDefaultStyle = $true } catch {}
+									$tip.Background = $conv.ConvertFromString('#1A1A1E')
+									$tip.Foreground = $conv.ConvertFromString('#C8C8D0')
+									$tip.BorderBrush = $conv.ConvertFromString('#3A3A42')
+									$tip.BorderThickness = New-Object System.Windows.Thickness(1)
+									$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
+									$ttb = New-Object System.Windows.Controls.TextBlock
+									$ttb.Text = $tipText
+									$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
+									$ttb.MaxWidth = 420
+									$ttb.Foreground = $tip.Foreground
+									$ttb.FontSize = 12
+									if ($mono) { $ttb.FontFamily = $mono }
+									$tip.Content = $ttb
+									$rowBd.ToolTip = $tip
+								}
+							}
+						} catch {
+							try { $rowBd.ToolTip = $tipText } catch {}
+						}
+						[void]$itemsSp.Children.Add($rowBd)
+						if ($st -eq 'in_progress' -or $st -eq 'paused') {
+							if ($null -eq $firstProgRow) { $firstProgRow = $rowBd }
+						}
+						if ($focusId -and $id -and [string]::Equals($id, $focusId, [StringComparison]::OrdinalIgnoreCase)) {
+							$focusRow = $rowBd
+						}
+						# Pulse focused active row (color only).
+						$doPulse = $false
+						if ($st -eq 'in_progress' -or $st -eq 'paused') {
+							if ($focusId -and $id -and [string]::Equals($id, $focusId, [StringComparison]::OrdinalIgnoreCase)) {
+								$doPulse = $true
+							} elseif (-not $focusId -and [object]::ReferenceEquals($rowBd, $firstProgRow)) {
+								$doPulse = $true
+							}
+						}
+						if ($doPulse) {
+							try {
+								if ($W.StartColorPulse) {
+									if ($st -eq 'paused') {
+										& $W.StartColorPulse $bgBrush $hxPauseBg $hxPauseBg2 1400
+										& $W.StartColorPulse $fgBrush $hxPause $hxPauseFg2 1400
+									} else {
+										& $W.StartColorPulse $bgBrush $hxProgBg $hxProgBg2 1200
+										& $W.StartColorPulse $fgBrush $hxProg $hxProgFg2 1200
+									}
+									[void]$pulseList.Add($bgBrush)
+									[void]$pulseList.Add($fgBrush)
+								}
+							} catch {}
+						}
+					} catch {
+						# One bad row must not kill the whole board paint
+						try { $W.LastTaskBoardPaintErr = [string]$_.Exception.Message } catch {}
+					}
+				}
+				if ($null -eq $focusRow) { $focusRow = $firstProgRow }
+				$W.TaskBoardPulseEls = $pulseList
+				$W.TaskBoardFocusRow = $focusRow
+
+				try { $hostBd.BeginAnimation([System.Windows.FrameworkElement]::MaxHeightProperty, $null) } catch {}
+				# Header is fixed outside the scroller; ScrollViewer height = first N task rows only
+				$maxRowsVis = 5
+				try {
+					if ($null -ne $W.TaskBoardMaxVisibleRows -and [int]$W.TaskBoardMaxVisibleRows -gt 0) {
+						$maxRowsVis = [int]$W.TaskBoardMaxVisibleRows
+					}
+				} catch {}
+				if ($maxRowsVis -lt 1) { $maxRowsVis = 5 }
+				$maxScroll = 140.0
+				$targetH = 96.0
+				$headerH = 28.0
+				$hostCap = 180.0
+				$availW = 640.0
+				try {
+					try { $availW = [double]$hostBd.ActualWidth } catch { $availW = 0 }
+					if ($availW -lt 40) {
+						try { if ($hostBd.Parent) { $availW = [double]$hostBd.Parent.ActualWidth } } catch {}
+					}
+					if ($availW -lt 40) { $availW = 640.0 }
+					$measureW = [math]::Max(80.0, $availW - 4.0)
+					$measSize = New-Object System.Windows.Size($measureW, [double]::PositiveInfinity)
+					try {
+						if ($hdrBd) {
+							$hdrBd.Measure($measSize)
+							$headerH = [double]$hdrBd.DesiredSize.Height
+						} elseif ($inner -and $inner.Children.Count -gt 0) {
+							$hdrEl = $inner.Children[0]
+							$hdrEl.Measure($measSize)
+							$headerH = [double]$hdrEl.DesiredSize.Height
+						}
+					} catch {}
+					if ($headerH -lt 20) { $headerH = 28.0 }
+					$rowsH = 0.0
+					$nRow = 0
+					try {
+						foreach ($c in @($itemsSp.Children)) {
+							if ($nRow -ge $maxRowsVis) { break }
+							$c.Measure($measSize)
+							$rowsH += [double]$c.DesiredSize.Height
+							try { $rowsH += [double]$c.Margin.Top + [double]$c.Margin.Bottom } catch {}
+							$nRow++
+						}
+					} catch {}
+					# Scroll viewport = rows only (header is outside)
+					$maxScroll = [math]::Max(48.0, $rowsH + 10.0)
+					try { $W.TaskBoardMaxScrollH = $maxScroll } catch {}
+					# Host = fixed header + scroller viewport
+					$targetH = [math]::Max(40.0, $headerH + $maxScroll + 2.0)
+					# If fewer than N rows, shrink host to content (no empty scroll space)
+					try {
+						$allRowsH = 0.0
+						foreach ($c2 in @($itemsSp.Children)) {
+							$c2.Measure($measSize)
+							$allRowsH += [double]$c2.DesiredSize.Height
+							try { $allRowsH += [double]$c2.Margin.Top + [double]$c2.Margin.Bottom } catch {}
+						}
+						$contentH = $headerH + $allRowsH + 12.0
+						if ($contentH -lt $targetH) { $targetH = [math]::Max(40.0, $contentH) }
+						if ($allRowsH + 10.0 -lt $maxScroll) { $maxScroll = [math]::Max(24.0, $allRowsH + 10.0) }
+					} catch {}
+				} catch {
+					try {
+						if ($null -ne $W.TaskBoardMaxScrollH -and [double]$W.TaskBoardMaxScrollH -gt 40) {
+							$maxScroll = [double]$W.TaskBoardMaxScrollH
+						}
+					} catch {}
+				}
+				$sv = $null
+				try {
+					$sv = $W.TaskBoardStickyScroll
+					if (-not $sv -and $W.Window) {
+						try { $sv = $W.Window.FindName('TaskBoardStickyScroll'); $W.TaskBoardStickyScroll = $sv } catch {}
+					}
+					if ($sv) {
+						# Only the items list scrolls under the fixed title banner
+						$sv.MaxHeight = $maxScroll
+						try { $sv.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto } catch {}
+						try { $sv.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled } catch {}
+					}
+				} catch {}
+				# Host = header + scroll viewport
+				$hostCap = $headerH + $maxScroll + 4.0
+				if ($targetH -gt $hostCap) { $targetH = $hostCap }
+
+				# Scroll active / highlighted task into view (items panel only; header stays put)
+				$scrollFocusIntoView = {
+					param($ScrollViewer, $Row, $ItemsPanel)
+					if (-not $ScrollViewer -or -not $Row) { return }
+					try {
+						try { $ScrollViewer.UpdateLayout() } catch {}
+						try { if ($ItemsPanel) { $ItemsPanel.UpdateLayout() } } catch {}
+						try { $Row.UpdateLayout() } catch {}
+						try { $Row.BringIntoView() } catch {}
+						try {
+							$origin = $null
+							if ($ItemsPanel) { $origin = $ItemsPanel }
+							if (-not $origin) {
+								try { $origin = $ScrollViewer.Content } catch { $origin = $null }
+							}
+							if (-not $origin) { return }
+							$t = $Row.TransformToAncestor($origin)
+							if (-not $t) { return }
+							$pt = $t.Transform((New-Object System.Windows.Point(0, 0)))
+							$rowTop = [double]$pt.Y
+							$rowH = [double]$Row.ActualHeight
+							if ($rowH -le 0) {
+								try { $rowH = [double]$Row.DesiredSize.Height } catch { $rowH = 24.0 }
+							}
+							if ($rowH -le 0) { $rowH = 24.0 }
+							$rowBot = $rowTop + $rowH
+							$vp = [double]$ScrollViewer.ViewportHeight
+							if ($vp -le 1) { $vp = [double]$ScrollViewer.ActualHeight }
+							$off = [double]$ScrollViewer.VerticalOffset
+							$pad = 4.0
+							$newOff = $off
+							if ($rowTop -lt ($off + $pad)) {
+								$newOff = [math]::Max(0.0, $rowTop - $pad)
+							} elseif ($rowBot -gt ($off + $vp - $pad)) {
+								$newOff = [math]::Max(0.0, $rowBot - $vp + $pad)
+							}
+							$maxOff = 0.0
+							try { $maxOff = [double]$ScrollViewer.ScrollableHeight } catch { $maxOff = 0.0 }
+							if ($newOff -gt $maxOff) { $newOff = $maxOff }
+							if ([math]::Abs($newOff - $off) -gt 0.5) {
+								$ScrollViewer.ScrollToVerticalOffset($newOff)
+							}
+						} catch {}
+					} catch {}
+				}.GetNewClosure()
+
+				$wasOpen = $false
+				try { $wasOpen = [bool]$W.TaskBoardExpanded } catch { $wasOpen = $false }
+				# Ensure expand animation is not holding MaxHeight at 0 after a mid-flight update
+				try { $hostBd.BeginAnimation([System.Windows.FrameworkElement]::MaxHeightProperty, $null) } catch {}
+				$hostBd.Visibility = [System.Windows.Visibility]::Visible
+				# Host height = fixed title banner + items scroller (not scroller alone)
+				$showH = $targetH
+				if ($showH -lt 40) { $showH = $hostCap }
+				if ($showH -gt $hostCap) { $showH = $hostCap }
+				if ($showH -lt 40) { $showH = 96.0 }
+				if (-not $wasOpen) {
+					$hostBd.MaxHeight = 0
+					try { $hostBd.UpdateLayout() } catch {}
+					$anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+					$anim.From = 0.0
+					$anim.To = $showH
+					$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(300))
+					try {
+						$ease = New-Object System.Windows.Media.Animation.QuadraticEase
+						$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
+						$anim.EasingFunction = $ease
+					} catch {}
+					$anim.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
+					$capH = $hostCap
+					$focusRowCap = $focusRow
+					$svCap = $sv
+					$itemsCap = $itemsSp
+					$anim.add_Completed({
+						try {
+							$hostBd.BeginAnimation([System.Windows.FrameworkElement]::MaxHeightProperty, $null)
+							# Cap at header + scroll viewport so items can scroll under fixed title
+							$hostBd.MaxHeight = $capH
+							$W.TaskBoardExpanded = $true
+							try { & $scrollFocusIntoView $svCap $focusRowCap $itemsCap } catch {}
+						} catch {}
+					}.GetNewClosure())
+					$hostBd.BeginAnimation([System.Windows.FrameworkElement]::MaxHeightProperty, $anim)
+					$W.TaskBoardExpanded = $true
+				} else {
+					# Already open: force height + layout so status/color changes repaint
+					$hostBd.MaxHeight = $hostCap
+					$W.TaskBoardExpanded = $true
+					try { $itemsSp.InvalidateMeasure(); $itemsSp.InvalidateArrange() } catch {}
+					try { if ($inner) { $inner.InvalidateMeasure(); $inner.UpdateLayout() } } catch {}
+					try { $hostBd.InvalidateMeasure(); $hostBd.UpdateLayout() } catch {}
+					try {
+						if ($sv) {
+							try { $sv.UpdateLayout() } catch {}
+							try {
+								$maxOff = [double]$sv.ScrollableHeight
+								if ($sv.VerticalOffset -gt $maxOff) {
+									$sv.ScrollToVerticalOffset($maxOff)
+								}
+							} catch {}
+							try { & $scrollFocusIntoView $sv $focusRow $itemsSp } catch {}
+						}
+					} catch {}
+					# Second scroll after layout settles (listview was a frame behind auto-advance)
+					try {
+						$sv2 = $sv; $fr2 = $focusRow; $ip2 = $itemsSp
+						$scrollAgain = {
+							try { & $scrollFocusIntoView $sv2 $fr2 $ip2 } catch {}
+						}.GetNewClosure()
+						if ($W.Window -and $W.Window.Dispatcher) {
+							[void]$W.Window.Dispatcher.BeginInvoke(
+								[Action]$scrollAgain,
+								[System.Windows.Threading.DispatcherPriority]::Loaded
+							)
+						}
+					} catch {}
+				}
+				try {
+					$seqDone = 0
+					try { $seqDone = [int]$S.Seq } catch { $seqDone = 0 }
+					if ($seqDone -gt 0) {
+						$prevA = 0
+						try { $prevA = [int]$W.TaskBoardAppliedSeq } catch { $prevA = 0 }
+						if ($seqDone -ge $prevA) { $W.TaskBoardAppliedSeq = $seqDone }
+					}
+				} catch {}
+
+				# Auto-retract after complete
+				$doRetract = $false
+				try {
+					$doRetract = [bool]$S.WantRetract -and [int]$S.Total -gt 0 -and [int]$S.OpenN -eq 0
+				} catch { $doRetract = $false }
+				if ($doRetract) {
+					try {
+						$tmr = New-Object System.Windows.Threading.DispatcherTimer
+						$tmr.Interval = [TimeSpan]::FromMilliseconds(2000)
+						$tmr.add_Tick({
+							param($sender, $e)
+							try {
+								$sender.Stop()
+								$W.TaskBoardRetractTimer = $null
+								# Only hide if still complete (PendingTaskBoard may have reopened)
+								$stillOpen = $false
+								try {
+									# open if a newer pending board is queued
+									if ($W.PendingTaskBoard -and [bool]$W.PendingTaskBoard.WantShow -and [int]$W.PendingTaskBoard.OpenN -gt 0) {
+										$stillOpen = $true
+									}
+								} catch {}
+								if (-not $stillOpen) {
+									$W.PendingTaskBoard = [pscustomobject]@{
+										WantShow = $false; WantRetract = $true; Empty = $true
+										Goal = ''; Summary = ''; Rows = @()
+										Action = 'retract'; OpenN = 0; DoneN = 0; Total = 0
+										Seq = [int]([Environment]::TickCount)
+									}
+								}
+							} catch {}
+						}.GetNewClosure())
+						$W.TaskBoardRetractTimer = $tmr
+						$tmr.Start()
+					} catch {}
+				}
+			}.GetNewClosure()
 			$W.HdrPoweredBy = $window.FindName('HdrPoweredBy')
 			$W.HdrPoweredByShadow = $window.FindName('HdrPoweredByShadow')
 			$W.HdrPoweredByHost = $window.FindName('HdrPoweredByHost')
@@ -39381,13 +47270,13 @@ function Start-MBWpfHost {
 				if ($m2.Length -le $MaxLen) { return $m2 }
 				return ($m2.Substring(0, [math]::Max(1, $MaxLen - 3)) + '...')
 			}.GetNewClosure()
-			# Dark themed ToolTip (matches tool-group chips / menus)
+			# Dark themed ToolTip (no SystemBrush / highlight chrome)
 			$W.MakeThemedToolTip = {
 				param([string]$Text, [double]$MaxWidth = 340)
 				if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
 				try {
 					$bc = New-Object System.Windows.Media.BrushConverter
-					foreach ($hx in @('#1A1A1E', '#C8C8D0', '#3A3A42')) {
+					foreach ($hx in @('#1A1A1E', '#C8C8D0', '#3A3A42', '#121216')) {
 						if (-not $W.BrushCache.ContainsKey($hx)) {
 							try { $W.BrushCache[$hx] = $bc.ConvertFromString($hx) } catch {}
 						}
@@ -39396,6 +47285,7 @@ function Start-MBWpfHost {
 					$tipFg = $W.BrushCache['#C8C8D0']
 					$tipBd = $W.BrushCache['#3A3A42']
 					$tip = New-Object System.Windows.Controls.ToolTip
+					try { $tip.OverridesDefaultStyle = $true } catch {}
 					$tip.Background = $tipBg
 					$tip.Foreground = $tipFg
 					$tip.BorderBrush = $tipBd
@@ -39403,11 +47293,52 @@ function Start-MBWpfHost {
 					$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
 					$tip.HasDropShadow = $true
 					try { $tip.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Mouse } catch {}
+					# Kill system highlight / control brushes on the popup
+					try {
+						if ($null -eq $tip.Resources) { $tip.Resources = New-Object System.Windows.ResourceDictionary }
+						$sysKeys = @(
+							[System.Windows.SystemColors]::ControlBrushKey,
+							[System.Windows.SystemColors]::ControlLightBrushKey,
+							[System.Windows.SystemColors]::ControlLightLightBrushKey,
+							[System.Windows.SystemColors]::ControlDarkBrushKey,
+							[System.Windows.SystemColors]::HighlightBrushKey,
+							[System.Windows.SystemColors]::HighlightTextBrushKey,
+							[System.Windows.SystemColors]::InfoBrushKey,
+							[System.Windows.SystemColors]::InfoTextBrushKey,
+							[System.Windows.SystemColors]::WindowBrushKey,
+							[System.Windows.SystemColors]::WindowTextBrushKey,
+							[System.Windows.SystemColors]::InactiveSelectionHighlightBrushKey
+						)
+						foreach ($sk in $sysKeys) {
+							try { $tip.Resources[$sk] = $tipBg } catch {}
+						}
+						try { $tip.Resources[[System.Windows.SystemColors]::ControlTextBrushKey] = $tipFg } catch {}
+						try { $tip.Resources[[System.Windows.SystemColors]::InfoTextBrushKey] = $tipFg } catch {}
+						try { $tip.Resources[[System.Windows.SystemColors]::WindowTextBrushKey] = $tipFg } catch {}
+						try { $tip.Resources[[System.Windows.SystemColors]::HighlightTextBrushKey] = $tipFg } catch {}
+					} catch {}
+					try {
+						$tipTplXaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ToolTip">
+  <Border Background="{TemplateBinding Background}"
+          BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}"
+          Padding="{TemplateBinding Padding}"
+          CornerRadius="4" SnapsToDevicePixels="True">
+    <ContentPresenter HorizontalAlignment="Left" VerticalAlignment="Center"
+                      TextElement.Foreground="{TemplateBinding Foreground}"/>
+  </Border>
+</ControlTemplate>
+'@
+						$tipTpl = [Windows.Markup.XamlReader]::Parse($tipTplXaml)
+						if ($null -ne $tipTpl) { $tip.Template = $tipTpl }
+					} catch {}
 					$ttb = New-Object System.Windows.Controls.TextBlock
 					$ttb.Text = [string]$Text
 					$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
 					$ttb.MaxWidth = [double]$MaxWidth
 					$ttb.Foreground = $tipFg
+					$ttb.Background = [System.Windows.Media.Brushes]::Transparent
 					$ttb.FontSize = 12
 					$ttb.LineHeight = 16
 					try {
@@ -39430,6 +47361,9 @@ function Start-MBWpfHost {
 						try {
 							[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($Target, 350)
 							[System.Windows.Controls.ToolTipService]::SetShowDuration($Target, 20000)
+							[System.Windows.Controls.ToolTipService]::SetBetweenShowDelay($Target, 100)
+							# No system "highlight" flash while tip is open
+							[System.Windows.Controls.ToolTipService]::SetShowsToolTipOnKeyboardFocus($Target, $false)
 						} catch {}
 					} else {
 						$Target.ToolTip = [string]$Text
@@ -39766,659 +47700,9 @@ function Start-MBWpfHost {
 				} catch {}
 			}.GetNewClosure()
 			$W.ShowAddEndpointDialog = {
-				try {
-					$owner = $W.Window
-					if (-not $owner) { return }
-					$bc = New-Object System.Windows.Media.BrushConverter
-					$dlg = New-Object System.Windows.Window
-					$dlg.Title = 'MiniBot - Add endpoint'
-					$dlg.Width = 480
-					$dlg.Height = 380
-					$dlg.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterOwner
-					$dlg.Owner = $owner
-					$dlg.ResizeMode = [System.Windows.ResizeMode]::NoResize
-					$dlg.WindowStyle = [System.Windows.WindowStyle]::None
-					$dlg.AllowsTransparency = $true
-					$dlg.Background = [System.Windows.Media.Brushes]::Transparent
-					$dlg.Foreground = $bc.ConvertFromString('#C8C8D0')
-					try {
-						if ($W.Window -and $W.Window.Icon) { $dlg.Icon = $W.Window.Icon }
-					} catch {}
-					$outer = New-Object System.Windows.Controls.Border
-					$outer.Background = $bc.ConvertFromString('#121216')
-					$outer.BorderBrush = $bc.ConvertFromString('#2A2A30')
-					$outer.BorderThickness = New-Object System.Windows.Thickness(1)
-					$outer.CornerRadius = New-Object System.Windows.CornerRadius(8)
-					$outer.SnapsToDevicePixels = $true
-					try { $outer.ClipToBounds = $true } catch {}
-					$shell = New-Object System.Windows.Controls.Grid
-					$rTitle = New-Object System.Windows.Controls.RowDefinition
-					$rTitle.Height = New-Object System.Windows.GridLength(36)
-					$rBody = New-Object System.Windows.Controls.RowDefinition
-					$rBody.Height = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
-					[void]$shell.RowDefinitions.Add($rTitle)
-					[void]$shell.RowDefinitions.Add($rBody)
-					# Title bar
-					$titleBar = New-Object System.Windows.Controls.Border
-					$titleBar.Background = $bc.ConvertFromString('#2A2A30')
-					$titleBar.BorderBrush = $bc.ConvertFromString('#3A3A42')
-					$titleBar.BorderThickness = New-Object System.Windows.Thickness(0, 0, 0, 1)
-					$titleBar.CornerRadius = New-Object System.Windows.CornerRadius(8, 8, 0, 0)
-					$titleBar.Cursor = [System.Windows.Input.Cursors]::SizeAll
-					$titleGrid = New-Object System.Windows.Controls.Grid
-					$c0 = New-Object System.Windows.Controls.ColumnDefinition
-					$c0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
-					$c1 = New-Object System.Windows.Controls.ColumnDefinition
-					$c1.Width = [System.Windows.GridLength]::Auto
-					[void]$titleGrid.ColumnDefinitions.Add($c0)
-					[void]$titleGrid.ColumnDefinitions.Add($c1)
-					$titleLeft = New-Object System.Windows.Controls.StackPanel
-					$titleLeft.Orientation = [System.Windows.Controls.Orientation]::Horizontal
-					$titleLeft.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-					$titleLeft.Margin = New-Object System.Windows.Thickness(10, 0, 8, 0)
-					$mkTitleDot = {
-						$el = New-Object System.Windows.Shapes.Ellipse
-						$el.Width = 3.5
-						$el.Height = 3.5
-						$el.Fill = $bc.ConvertFromString('#8A8A96')
-						$el.Margin = New-Object System.Windows.Thickness(9, 1, 9, 0)
-						$el.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-						$el.Opacity = 0.9
-						$el.SnapsToDevicePixels = $false
-						try {
-							$de = New-Object System.Windows.Media.Effects.DropShadowEffect
-							$de.Color = [System.Windows.Media.Colors]::Black
-							$de.BlurRadius = 1.5
-							$de.ShadowDepth = 0.5
-							$de.Opacity = 0.45
-							$de.Direction = 270
-							$el.Effect = $de
-						} catch {}
-						return $el
-					}.GetNewClosure()
-					try {
-						$iconPath = New-Object System.Windows.Shapes.Path
-						$iconPath.Width = 22
-						$iconPath.Height = 22
-						$iconPath.Stretch = [System.Windows.Media.Stretch]::Uniform
-						$iconPath.Margin = New-Object System.Windows.Thickness(4, 0, 0, 0)
-						$iconPath.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-						$iconData = 'M12,2A2,2 0 0,1 14,4C14,4.74 13.6,5.39 13,5.73V7H14A7,7 0 0,1 21,14H22A1,1 0 0,1 23,15V18A1,1 0 0,1 22,19H21V20A2,2 0 0,1 19,22H5A2,2 0 0,1 3,20V19H2A1,1 0 0,1 1,18V15A1,1 0 0,1 2,14H3A7,7 0 0,1 10,7H11V5.73C10.4,5.39 10,4.74 10,4A2,2 0 0,1 12,2M7.5,13A2.5,2.5 0 0,0 5,15.5A2.5,2.5 0 0,0 7.5,18A2.5,2.5 0 0,0 10,15.5A2.5,2.5 0 0,0 7.5,13M16.5,13A2.5,2.5 0 0,0 14,15.5A2.5,2.5 0 0,0 16.5,18A2.5,2.5 0 0,0 19,15.5A2.5,2.5 0 0,0 16.5,13Z'
-						$iconPath.Data = [System.Windows.Media.Geometry]::Parse($iconData)
-						$ibrush = New-Object System.Windows.Media.LinearGradientBrush
-						$ibrush.StartPoint = New-Object System.Windows.Point(0.15, 0)
-						$ibrush.EndPoint = New-Object System.Windows.Point(0.9, 1)
-						[void]$ibrush.GradientStops.Add((New-Object System.Windows.Media.GradientStop(($bc.ConvertFromString('#C8C8D0')).Color, 0)))
-						[void]$ibrush.GradientStops.Add((New-Object System.Windows.Media.GradientStop(($bc.ConvertFromString('#6A6A74')).Color, 0.48)))
-						[void]$ibrush.GradientStops.Add((New-Object System.Windows.Media.GradientStop(($bc.ConvertFromString('#3A3A42')).Color, 1)))
-						$iconPath.Fill = $ibrush
-						[void]$titleLeft.Children.Add($iconPath)
-					} catch {}
-					try { [void]$titleLeft.Children.Add((& $mkTitleDot)) } catch {}
-					$agentNm = 'MiniBot'
-					try {
-						if ($W.AgentName) { $agentNm = [string]$W.AgentName }
-						elseif ($AgentName) { $agentNm = [string]$AgentName }
-					} catch {}
-					if ([string]::IsNullOrWhiteSpace($agentNm)) { $agentNm = 'MiniBot' }
-					$brandSp = New-Object System.Windows.Controls.StackPanel
-					$brandSp.Orientation = [System.Windows.Controls.Orientation]::Horizontal
-					$brandSp.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-					$mkBrandRun = {
-						param([string]$Txt, [string]$Hex, [double]$GlowOp = 0)
-						$tb = New-Object System.Windows.Controls.TextBlock
-						$tb.Text = $Txt
-						$tb.FontSize = 13
-						$tb.FontWeight = [System.Windows.FontWeights]::SemiBold
-						$tb.Foreground = $bc.ConvertFromString($Hex)
-						$tb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-						if ($GlowOp -gt 0) {
-							try {
-								$glow = New-Object System.Windows.Media.Effects.DropShadowEffect
-								$glow.Color = ($bc.ConvertFromString('#FF3A1A')).Color
-								$glow.BlurRadius = 10
-								$glow.ShadowDepth = 0
-								$glow.Opacity = $GlowOp
-								$tb.Effect = $glow
-							} catch {}
-						}
-						return $tb
-					}.GetNewClosure()
-					[void]$brandSp.Children.Add((& $mkBrandRun '[' '#A0A0AA' 0))
-					[void]$brandSp.Children.Add((& $mkBrandRun $agentNm '#B80F0A' 0.72))
-					[void]$brandSp.Children.Add((& $mkBrandRun '-' '#A0A0AA' 0))
-					[void]$brandSp.Children.Add((& $mkBrandRun 'Agent' '#B80F0A' 0.55))
-					[void]$brandSp.Children.Add((& $mkBrandRun ']' '#A0A0AA' 0))
-					[void]$titleLeft.Children.Add($brandSp)
-					try { [void]$titleLeft.Children.Add((& $mkTitleDot)) } catch {}
-					$titleTb = New-Object System.Windows.Controls.TextBlock
-					$titleTb.Text = 'Add endpoint'
-					$titleTb.FontSize = 12
-					$titleTb.Foreground = $bc.ConvertFromString('#C8C8D0')
-					$titleTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-					[void]$titleLeft.Children.Add($titleTb)
-					[System.Windows.Controls.Grid]::SetColumn($titleLeft, 0)
-					[void]$titleGrid.Children.Add($titleLeft)
-					$closeBtn = New-Object System.Windows.Controls.Border
-					$closeBtn.Width = 46
-					$closeBtn.Height = 36
-					$closeBtn.Background = [System.Windows.Media.Brushes]::Transparent
-					$closeBtn.Cursor = [System.Windows.Input.Cursors]::Hand
-					# Match outer top-right radius so red hover does not square the window corner
-					$closeBtn.CornerRadius = New-Object System.Windows.CornerRadius(0, 8, 0, 0)
-					try { $closeBtn.SnapsToDevicePixels = $true } catch {}
-					$closePath = New-Object System.Windows.Shapes.Path
-					$closePath.Width = 10
-					$closePath.Height = 10
-					$closePath.Stretch = [System.Windows.Media.Stretch]::Uniform
-					$closePath.Stroke = $bc.ConvertFromString('#C8C8D0')
-					$closePath.StrokeThickness = 1.15
-					$closePath.Data = [System.Windows.Media.Geometry]::Parse('M0,0 L10,10 M10,0 L0,10')
-					$closePath.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
-					$closePath.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-					$closeBtn.Child = $closePath
-					[System.Windows.Controls.Grid]::SetColumn($closeBtn, 1)
-					[void]$titleGrid.Children.Add($closeBtn)
-					$titleBar.Child = $titleGrid
-					try { $titleBar.ClipToBounds = $true } catch {}
-					[System.Windows.Controls.Grid]::SetRow($titleBar, 0)
-					[void]$shell.Children.Add($titleBar)
-					$titleBar.add_MouseLeftButtonDown({
-						param($s, $e)
-						try {
-							if ($null -ne $closeBtn -and $closeBtn.IsMouseOver) { return }
-							if ($e.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) { $dlg.DragMove() }
-						} catch {}
-					}.GetNewClosure())
-					$closeBtn.add_MouseEnter({
-						try {
-							$closeBtn.Background = $bc.ConvertFromString('#E81123')
-							$closeBtn.CornerRadius = New-Object System.Windows.CornerRadius(0, 8, 0, 0)
-							$closePath.Stroke = $bc.ConvertFromString('#FFFFFF')
-						} catch {}
-					}.GetNewClosure())
-					$closeBtn.add_MouseLeave({
-						try {
-							$closeBtn.Background = [System.Windows.Media.Brushes]::Transparent
-							$closeBtn.CornerRadius = New-Object System.Windows.CornerRadius(0, 8, 0, 0)
-							$closePath.Stroke = $bc.ConvertFromString('#C8C8D0')
-						} catch {}
-					}.GetNewClosure())
-					$closeBtn.add_PreviewMouseLeftButtonDown({
-						param($s, $e)
-						try { $e.Handled = $true } catch {}
-						try {
-							$dlg.DialogResult = $false
-							$dlg.Close()
-						} catch {
-							try { $dlg.Close() } catch {}
-						}
-					}.GetNewClosure())
-					$bodyHost = New-Object System.Windows.Controls.Border
-					$bodyHost.Background = $bc.ConvertFromString('#121216')
-					$bodyHost.CornerRadius = New-Object System.Windows.CornerRadius(0, 0, 8, 8)
-					$bodyHost.SnapsToDevicePixels = $true
-					try { $bodyHost.ClipToBounds = $true } catch {}
-					$body = New-Object System.Windows.Controls.Grid
-					$body.Margin = New-Object System.Windows.Thickness(14, 12, 14, 14)
-					foreach ($i in 0..7) {
-						$rd = New-Object System.Windows.Controls.RowDefinition
-						$rd.Height = [System.Windows.GridLength]::Auto
-						[void]$body.RowDefinitions.Add($rd)
-					}
-					# ASCII-only UI strings (avoid ellipsis/em-dash mojibake in PS 5.1 WPF)
-					$hint = New-Object System.Windows.Controls.TextBlock
-					$hint.Text = 'OpenAI-compatible base (vLLM, Unsloth, llama.cpp). Prefer .../v1.'
-					$hint.TextWrapping = [System.Windows.TextWrapping]::Wrap
-					$hint.Foreground = $bc.ConvertFromString('#8A8A96')
-					$hint.FontSize = 12
-					$hint.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
-					[System.Windows.Controls.Grid]::SetRow($hint, 0)
-					[void]$body.Children.Add($hint)
-					$urlLbl = New-Object System.Windows.Controls.TextBlock
-					$urlLbl.Text = 'Base URL'
-					$urlLbl.FontSize = 11
-					$urlLbl.Foreground = $bc.ConvertFromString('#8A8A96')
-					$urlLbl.Margin = New-Object System.Windows.Thickness(0, 0, 0, 3)
-					[System.Windows.Controls.Grid]::SetRow($urlLbl, 1)
-					[void]$body.Children.Add($urlLbl)
-					$box = New-Object System.Windows.Controls.TextBox
-					$box.Text = 'http://127.0.0.1:8000/v1'
-					$box.FontSize = 13
-					$box.Padding = New-Object System.Windows.Thickness(8, 6, 8, 6)
-					$box.Background = $bc.ConvertFromString('#1A1A1E')
-					$box.Foreground = $bc.ConvertFromString('#E0E0E8')
-					$box.BorderBrush = $bc.ConvertFromString('#3A3A42')
-					$box.CaretBrush = $bc.ConvertFromString('#C8C8D0')
-					$box.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
-					[System.Windows.Controls.Grid]::SetRow($box, 2)
-					[void]$body.Children.Add($box)
-					# Auth mode: None | API | Basic (NPM)
-					$authLbl = New-Object System.Windows.Controls.TextBlock
-					$authLbl.Text = 'Auth mode (HTTP header for this endpoint only)'
-					$authLbl.FontSize = 11
-					$authLbl.Foreground = $bc.ConvertFromString('#8A8A96')
-					$authLbl.Margin = New-Object System.Windows.Thickness(0, 0, 0, 4)
-					[System.Windows.Controls.Grid]::SetRow($authLbl, 3)
-					[void]$body.Children.Add($authLbl)
-					$authRow = New-Object System.Windows.Controls.StackPanel
-					$authRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
-					$authRow.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
-					$rbNone = New-Object System.Windows.Controls.RadioButton
-					$rbNone.Content = 'None'
-					$rbNone.GroupName = 'MbEndpointAuth'
-					$rbNone.IsChecked = $false
-					$rbNone.Foreground = $bc.ConvertFromString('#C8C8D0')
-					$rbNone.FontSize = 12
-					$rbNone.Margin = New-Object System.Windows.Thickness(0, 0, 16, 0)
-					$rbNone.Cursor = [System.Windows.Input.Cursors]::Hand
-					$rbKey = New-Object System.Windows.Controls.RadioButton
-					$rbKey.Content = 'API'
-					$rbKey.GroupName = 'MbEndpointAuth'
-					$rbKey.IsChecked = $true
-					$rbKey.Foreground = $bc.ConvertFromString('#C8C8D0')
-					$rbKey.FontSize = 12
-					$rbKey.Margin = New-Object System.Windows.Thickness(0, 0, 16, 0)
-					$rbKey.Cursor = [System.Windows.Input.Cursors]::Hand
-					$rbNpm = New-Object System.Windows.Controls.RadioButton
-					$rbNpm.Content = 'Basic (NPM)'
-					$rbNpm.GroupName = 'MbEndpointAuth'
-					$rbNpm.IsChecked = $false
-					$rbNpm.Foreground = $bc.ConvertFromString('#C8C8D0')
-					$rbNpm.FontSize = 12
-					$rbNpm.Cursor = [System.Windows.Input.Cursors]::Hand
-					[void]$authRow.Children.Add($rbNone)
-					[void]$authRow.Children.Add($rbKey)
-					[void]$authRow.Children.Add($rbNpm)
-					# Themed auth-mode tooltips (None / API / Basic (NPM))
-					try {
-						$mkEpTip = {
-							param([string]$Text, [double]$MaxWidth = 300)
-							$bcT = New-Object System.Windows.Media.BrushConverter
-							$tip = New-Object System.Windows.Controls.ToolTip
-							$tip.Background = $bcT.ConvertFromString('#1A1A1E')
-							$tip.Foreground = $bcT.ConvertFromString('#C8C8D0')
-							$tip.BorderBrush = $bcT.ConvertFromString('#3A3A42')
-							$tip.BorderThickness = New-Object System.Windows.Thickness(1)
-							$tip.Padding = New-Object System.Windows.Thickness(10, 7, 10, 7)
-							$tip.HasDropShadow = $true
-							$ttb = New-Object System.Windows.Controls.TextBlock
-							$ttb.Text = $Text
-							$ttb.TextWrapping = [System.Windows.TextWrapping]::Wrap
-							$ttb.MaxWidth = $MaxWidth
-							$ttb.Foreground = $bcT.ConvertFromString('#C8C8D0')
-							$ttb.FontSize = 12
-							$tip.Content = $ttb
-							return $tip
-						}
-						$rbNone.ToolTip = & $mkEpTip 'No Authorization header (open LAN servers)'
-						$rbKey.ToolTip = & $mkEpTip 'Bearer token (Unsloth, vLLM --api-key, OpenAI-compat keys)'
-						$rbNpm.ToolTip = & $mkEpTip 'HTTP Basic - use for NPM reverse-proxy / session login credentials'
-						foreach ($rb in @($rbNone, $rbKey, $rbNpm)) {
-							try {
-								[System.Windows.Controls.ToolTipService]::SetInitialShowDelay($rb, 350)
-								[System.Windows.Controls.ToolTipService]::SetShowDuration($rb, 20000)
-							} catch {}
-						}
-					} catch {}
-					[System.Windows.Controls.Grid]::SetRow($authRow, 4)
-					[void]$body.Children.Add($authRow)
-					$keyLbl = New-Object System.Windows.Controls.TextBlock
-					$keyLbl.Text = 'API token (Unsloth sk-unsloth-..., vLLM --api-key; unused for Basic (NPM) / None)'
-					$keyLbl.FontSize = 11
-					$keyLbl.Foreground = $bc.ConvertFromString('#8A8A96')
-					$keyLbl.Margin = New-Object System.Windows.Thickness(0, 0, 0, 3)
-					[System.Windows.Controls.Grid]::SetRow($keyLbl, 5)
-					[void]$body.Children.Add($keyLbl)
-					$keyBox = New-Object System.Windows.Controls.PasswordBox
-					$keyBox.FontSize = 13
-					$keyBox.Padding = New-Object System.Windows.Thickness(8, 6, 8, 6)
-					$keyBox.Background = $bc.ConvertFromString('#1A1A1E')
-					$keyBox.Foreground = $bc.ConvertFromString('#E0E0E8')
-					$keyBox.BorderBrush = $bc.ConvertFromString('#3A3A42')
-					$keyBox.CaretBrush = $bc.ConvertFromString('#C8C8D0')
-					try { $keyBox.PasswordChar = '*' } catch {}
-					[System.Windows.Controls.Grid]::SetRow($keyBox, 6)
-					[void]$body.Children.Add($keyBox)
-					$syncAuthUi = {
-						try {
-							$useKey = [bool]$rbKey.IsChecked
-							$keyBox.IsEnabled = $useKey
-							$keyBox.Opacity = $(if ($useKey) { 1.0 } else { 0.45 })
-							$keyLbl.Opacity = $(if ($useKey) { 1.0 } else { 0.55 })
-						} catch {}
-					}.GetNewClosure()
-					$null = $rbKey.Add_Checked({ & $syncAuthUi }.GetNewClosure())
-					$null = $rbNpm.Add_Checked({ & $syncAuthUi }.GetNewClosure())
-					$null = $rbNone.Add_Checked({ & $syncAuthUi }.GetNewClosure())
-					& $syncAuthUi
-					$status = New-Object System.Windows.Controls.TextBlock
-					$status.Text = ''
-					$status.FontSize = 11
-					$status.Margin = New-Object System.Windows.Thickness(0, 8, 0, 8)
-					$status.TextWrapping = [System.Windows.TextWrapping]::Wrap
-					$status.Foreground = $bc.ConvertFromString('#8A8A96')
-					[System.Windows.Controls.Grid]::SetRow($status, 7)
-					[void]$body.Children.Add($status)
-					# buttons row
-					$rdBtns = New-Object System.Windows.Controls.RowDefinition
-					$rdBtns.Height = [System.Windows.GridLength]::Auto
-					[void]$body.RowDefinitions.Add($rdBtns)
-					$btns = New-Object System.Windows.Controls.StackPanel
-					$btns.Orientation = [System.Windows.Controls.Orientation]::Horizontal
-					$btns.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
-					$testBtn = New-Object System.Windows.Controls.Button
-					$testBtn.Content = 'Test & add'
-					$testBtn.Padding = New-Object System.Windows.Thickness(12, 5, 12, 5)
-					$testBtn.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
-					$testBtn.MinWidth = 96
-					$testBtn.Height = 30
-					$testBtn.Cursor = [System.Windows.Input.Cursors]::Hand
-					$testBtn.Focusable = $true
-					$cancelBtn = New-Object System.Windows.Controls.Button
-					$cancelBtn.Content = 'Cancel'
-					$cancelBtn.Padding = New-Object System.Windows.Thickness(12, 5, 12, 5)
-					$cancelBtn.MinWidth = 88
-					$cancelBtn.Height = 30
-					$cancelBtn.Cursor = [System.Windows.Input.Cursors]::Hand
-					$cancelBtn.Focusable = $true
-					# Prefer themed styles from main window (custom brushes, no system chrome)
-					$usedThemeStyle = $false
-					try {
-						$pri = $owner.TryFindResource('MbAuthPrimaryBtn')
-						$sec = $owner.TryFindResource('MbAuthSecondaryBtn')
-						if ($null -ne $pri) { $testBtn.Style = $pri; $usedThemeStyle = $true }
-						if ($null -ne $sec) { $cancelBtn.Style = $sec; $usedThemeStyle = $true }
-					} catch { $usedThemeStyle = $false }
-					if (-not $usedThemeStyle) {
-						$noMo = $null
-						try { $noMo = $owner.TryFindResource('NoMouseOverButtonTemplate') } catch {}
-						if ($null -eq $noMo) {
-							try {
-								$noMoXaml = '<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}" CornerRadius="3" SnapsToDevicePixels="True"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
-								$noMo = [System.Windows.Markup.XamlReader]::Parse($noMoXaml)
-							} catch {}
-						}
-						if ($null -ne $noMo) {
-							try { $testBtn.Template = $noMo } catch {}
-							try { $cancelBtn.Template = $noMo } catch {}
-						}
-						$testBtn.Background = $bc.ConvertFromString('#4A4A56')
-						$testBtn.Foreground = $bc.ConvertFromString('#E0E0E8')
-						$testBtn.BorderThickness = New-Object System.Windows.Thickness(0)
-						$testBtn.FontWeight = [System.Windows.FontWeights]::Bold
-						$cancelBtn.Background = $bc.ConvertFromString('#2A2A30')
-						$cancelBtn.Foreground = $bc.ConvertFromString('#C8C8D0')
-						$cancelBtn.BorderBrush = $bc.ConvertFromString('#3A3A42')
-						$cancelBtn.BorderThickness = New-Object System.Windows.Thickness(1)
-						$testBtn.add_MouseEnter({ try { $testBtn.Background = $bc.ConvertFromString('#5C5C6A') } catch {} }.GetNewClosure())
-						$testBtn.add_MouseLeave({ try { $testBtn.Background = $bc.ConvertFromString('#4A4A56') } catch {} }.GetNewClosure())
-						$cancelBtn.add_MouseEnter({ try { $cancelBtn.Background = $bc.ConvertFromString('#3A3A42') } catch {} }.GetNewClosure())
-						$cancelBtn.add_MouseLeave({ try { $cancelBtn.Background = $bc.ConvertFromString('#2A2A30') } catch {} }.GetNewClosure())
-					}
-					[void]$btns.Children.Add($testBtn)
-					[void]$btns.Children.Add($cancelBtn)
-					[System.Windows.Controls.Grid]::SetRow($btns, 8)
-					[void]$body.Children.Add($btns)
-					$bodyHost.Child = $body
-					[System.Windows.Controls.Grid]::SetRow($bodyHost, 1)
-					[void]$shell.Children.Add($bodyHost)
-					$outer.Child = $shell
-					$dlg.Content = $outer
-					$cancelBtn.add_Click({ try { $dlg.DialogResult = $false; $dlg.Close() } catch { try { $dlg.Close() } catch {} } }.GetNewClosure())
-					$testBtn.add_Click({
-						try {
-							$url = [string]$box.Text
-							$apiKeyIn = ''
-							try { $apiKeyIn = [string]$keyBox.Password } catch { $apiKeyIn = '' }
-							$authMode = 'apikey'
-							try {
-								if ([bool]$rbNpm.IsChecked) { $authMode = 'npm' }
-								elseif ([bool]$rbNone.IsChecked) { $authMode = 'none' }
-								else { $authMode = 'apikey' }
-							} catch { $authMode = 'apikey' }
-							$status.Foreground = $bc.ConvertFromString('#8A8A96')
-							$status.Text = 'Testing connection...'
-							$dlg.IsEnabled = $false
-							try { $dlg.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background) } catch {}
-							$ok = $false
-							$msg = ''
-							try {
-								$testUrl = [string]$url
-								if ($testUrl -notmatch '^(?i)https?://') {
-									if ($testUrl -match '^\d+$') { $testUrl = "http://127.0.0.1:$testUrl" }
-									else { $testUrl = "http://$testUrl" }
-								}
-								while ($testUrl.EndsWith('/')) { $testUrl = $testUrl.Substring(0, $testUrl.Length - 1) }
-								$testUrl = $testUrl -replace '/chat/completions\s*$', '' -replace '/models\s*$', ''
-								$testUrl = $testUrl -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
-								$candidates = New-Object System.Collections.ArrayList
-								# Prefer /v1 first (vLLM / Unsloth / OpenAI-compat)
-								if ($testUrl -match '/v1$') {
-									[void]$candidates.Add($testUrl)
-									$rootCand = $testUrl -replace '/v1$', ''
-									if ($rootCand) { [void]$candidates.Add($rootCand) }
-								} else {
-									[void]$candidates.Add($testUrl + '/v1')
-									[void]$candidates.Add($testUrl)
-								}
-								$headers = @{}
-								try {
-									if ($authMode -eq 'apikey' -and -not [string]::IsNullOrWhiteSpace($apiKeyIn) -and $apiKeyIn -notin @('none','null','-')) {
-										$headers['Authorization'] = 'Bearer ' + $apiKeyIn.Trim()
-									} elseif ($authMode -eq 'npm') {
-										if ($W.NpmUser -and $W.NpmPass) {
-											$b64 = [System.Text.Encoding]::UTF8.GetBytes(("{0}:{1}" -f $W.NpmUser, $W.NpmPass))
-											$headers['Authorization'] = 'Basic ' + [Convert]::ToBase64String($b64)
-										} else {
-											throw 'NPM auth selected but session has no NPM credentials (log in first).'
-										}
-									}
-									# authMode 'none' -> no Authorization header
-								} catch {
-									$lastErr = $_.Exception.Message
-									throw
-								}
-								$foundBase = ''
-								$foundIds = New-Object System.Collections.ArrayList
-								$lastErr = ''
-								foreach ($base in $candidates) {
-									try {
-										$resp = Invoke-WebRequest -Uri "$base/models" -Method GET -Headers $headers -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
-										if ([int]$resp.StatusCode -ne 200) { continue }
-										$bodyTxt = [string]$resp.Content
-										if ($bodyTxt.TrimStart().StartsWith('<')) { continue }
-										$obj = $bodyTxt | ConvertFrom-Json -ErrorAction Stop
-										$ids = New-Object System.Collections.ArrayList
-										$rows = @()
-										if ($obj.data) { $rows = @($obj.data) }
-										elseif ($obj.models) { $rows = @($obj.models) }
-										elseif ($obj -is [System.Array]) { $rows = @($obj) }
-										elseif ($obj.id) { $rows = @($obj) }
-										foreach ($row in $rows) {
-											$sid = ''
-											if ($row -is [string]) { $sid = $row }
-											else {
-												try { $sid = [string]$row.id } catch {}
-												if (-not $sid) { try { $sid = [string]$row.model } catch {} }
-												if (-not $sid) { try { $sid = [string]$row.name } catch {} }
-												if (-not $sid) { try { $sid = [string]$row.display_name } catch {} }
-											}
-											$sid = ([string]$sid).Trim()
-											if ($sid -and $ids -notcontains $sid) { [void]$ids.Add($sid) }
-										}
-										if ($ids.Count -gt 0) {
-											$foundBase = $base
-											$foundIds = $ids
-											break
-										}
-									} catch {
-										$lastErr = $_.Exception.Message
-										continue
-									}
-								}
-								if ($foundBase -and $foundIds.Count -gt 0) {
-									$ok = $true
-									$modeLabel = switch ($authMode) { 'npm' { 'Basic (NPM)' } 'none' { 'None' } default { 'API' } }
-									$msg = ("OK - {0} model(s) at {1} ({2})" -f $foundIds.Count, $foundBase, $modeLabel)
-									try {
-										$lst = New-Object System.Collections.ArrayList
-										foreach ($x in @($W.ExtraApiBases)) {
-											if ($x) { [void]$lst.Add([string]$x) }
-										}
-										$haveBase = $false
-										foreach ($x in @($lst)) {
-											if ([string]::Equals([string]$x, $foundBase, [StringComparison]::OrdinalIgnoreCase)) { $haveBase = $true; break }
-										}
-										if (-not $haveBase) { [void]$lst.Add($foundBase) }
-										$W.ExtraApiBases = @($lst)
-										# Per-endpoint auth mode + optional Bearer key
-										try {
-											if ($null -eq $W.ExtraApiAuth -or -not ($W.ExtraApiAuth -is [hashtable])) {
-												$W.ExtraApiAuth = @{}
-											}
-											$W.ExtraApiAuth[$foundBase] = $authMode
-											$rootAuth = $foundBase -replace '/v1$', ''
-											if ($rootAuth) { $W.ExtraApiAuth[$rootAuth] = $authMode }
-											if ($foundBase -notmatch '/v1$') { $W.ExtraApiAuth[($foundBase + '/v1')] = $authMode }
-										} catch {}
-										if ($authMode -eq 'apikey' -and -not [string]::IsNullOrWhiteSpace($apiKeyIn) -and $apiKeyIn -notin @('none','null','-')) {
-											try {
-												if ($null -eq $W.ExtraApiKeys -or -not ($W.ExtraApiKeys -is [hashtable])) {
-													$W.ExtraApiKeys = @{}
-												}
-												$W.ExtraApiKeys[$foundBase] = $apiKeyIn.Trim()
-												$rootB = $foundBase -replace '/v1$', ''
-												if ($rootB) { $W.ExtraApiKeys[$rootB] = $apiKeyIn.Trim() }
-												if ($foundBase -notmatch '/v1$') { $W.ExtraApiKeys[($foundBase + '/v1')] = $apiKeyIn.Trim() }
-											} catch {}
-											$W.PendingAddBaseApiKey = $apiKeyIn.Trim()
-										} else {
-											$W.PendingAddBaseApiKey = ''
-										}
-										$W.PendingAddBaseAuthMode = $authMode
-										# Queue for main runspace: merge bases, re-probe, select model, reload banner text
-										$W.PendingAddBaseUrl = $foundBase
-										$W.PendingAddBaseDirty = $true
-										$W.RemoteModelsRefreshWanted = $true
-										# Optimistic: put new models into PoweredBy list immediately so they survive
-										# switching back to primary llama.cpp before main refresh finishes
-										try {
-											$hostLab = $foundBase
-											try {
-												$uTmp = [uri]$foundBase
-												if ($uTmp.IsDefaultPort) { $hostLab = $uTmp.Host }
-												else { $hostLab = ("{0}:{1}" -f $uTmp.Host, $uTmp.Port) }
-											} catch {}
-											$entList = New-Object System.Collections.ArrayList
-											$seenKeys = @{}
-											foreach ($ex in @($W.RemoteModelEntries)) {
-												if (-not $ex) { continue }
-												$ek = [string]$ex.Key
-												if ($ek -and -not $seenKeys.ContainsKey($ek)) {
-													$seenKeys[$ek] = $true
-													[void]$entList.Add($ex)
-												}
-											}
-											$idList = New-Object System.Collections.ArrayList
-											foreach ($xid in @($W.RemoteModels)) {
-												if ($xid -and $idList -notcontains [string]$xid) { [void]$idList.Add([string]$xid) }
-											}
-											$multi = ($entList.Count -gt 0) -or ($foundIds.Count -gt 0)
-											foreach ($nid in @($foundIds)) {
-												$nid = [string]$nid
-												if ([string]::IsNullOrWhiteSpace($nid)) { continue }
-												$nkey = ('{0}|{1}' -f $nid, $foundBase)
-												if ($seenKeys.ContainsKey($nkey)) { continue }
-												$seenKeys[$nkey] = $true
-												$lab = if ($multi) { "{0}  @  {1}" -f $nid, $hostLab } else { $nid }
-												[void]$entList.Add([pscustomobject]@{
-													Key = $nkey; Id = $nid; Base = $foundBase
-													Host = $hostLab; Label = $lab
-													NCtx = 0; NCtxTrain = 0; NParams = 0; Size = 0; Vision = $false
-												})
-												if ($idList -notcontains $nid) { [void]$idList.Add($nid) }
-											}
-											# Multi-endpoint labels for pre-existing entries too
-											if ($entList.Count -gt 1) {
-												$relabeled = New-Object System.Collections.ArrayList
-												foreach ($ex in @($entList)) {
-													$hid = if ($ex.Host) { [string]$ex.Host } else { 'endpoint' }
-													$lab2 = "{0}  @  {1}" -f [string]$ex.Id, $hid
-													[void]$relabeled.Add([pscustomobject]@{
-														Key = [string]$ex.Key; Id = [string]$ex.Id; Base = [string]$ex.Base
-														Host = $hid; Label = $lab2
-														NCtx = $(try { [int]$ex.NCtx } catch { 0 })
-														NCtxTrain = $(try { [int]$ex.NCtxTrain } catch { 0 })
-														NParams = $(try { [double]$ex.NParams } catch { 0 })
-														Size = $(try { [double]$ex.Size } catch { 0 })
-														Vision = $(try { [bool]$ex.Vision } catch { $false })
-													})
-												}
-												$entList = $relabeled
-											}
-											$W.RemoteModelEntries = @($entList)
-											$W.RemoteModels = @($idList)
-											$W.RemoteModelsSeq = (Get-Date).Ticks
-										} catch {}
-										# Optimistic PoweredBy label until main finishes refresh
-										try {
-											$firstId = [string](@($foundIds)[0])
-											if ($firstId) {
-												$W.ActiveModel = $firstId
-												$W.ActiveModelBase = $foundBase
-												$W.ActiveModelKey = ('{0}|{1}' -f $firstId, $foundBase)
-												$W.ModelDirty = $true
-												if ($W.TitleModelPickerText) {
-													$short = $firstId
-													if ($short.Length -gt 36) { $short = $short.Substring(0, 33) + '...' }
-													$W.TitleModelPickerText.Text = $short
-													$W.TitleModelPickerText.Foreground = $W.BrushCache['#BB9AF7']
-												}
-												if ($W.BuildModelMenu) {
-													& $W.BuildModelMenu @($W.RemoteModels) $firstId
-												}
-											}
-										} catch {}
-									} catch {}
-								} else {
-									$ok = $false
-									if ($lastErr -match '(?i)401|Not authenticated|Invalid token|Unauthorized') {
-										$msg = 'Auth failed - pick API and enter a Bearer token, or pick Basic (NPM) if this host uses reverse-proxy login.'
-									} elseif ($lastErr) {
-										$msg = $lastErr
-									} else {
-										$msg = 'Connection failed or no models at that endpoint'
-									}
-								}
-							} catch {
-								$ok = $false
-								$msg = $_.Exception.Message
-							}
-							$dlg.IsEnabled = $true
-							if ($ok) {
-								$status.Foreground = $bc.ConvertFromString('#9ECE6A')
-								$status.Text = $msg
-								# Do not rebuild menu from stale RemoteModels — wait for RemoteModelsSeq after main refresh
-								Start-Sleep -Milliseconds 250
-								try { $dlg.DialogResult = $true } catch {}
-								$dlg.Close()
-							} else {
-								$status.Foreground = $bc.ConvertFromString('#F05C5C')
-								$status.Text = $(if ($msg) { $msg } else { 'Connection failed' })
-							}
-						} catch {
-							try { $dlg.IsEnabled = $true } catch {}
-							try {
-								$status.Foreground = $bc.ConvertFromString('#F05C5C')
-								$status.Text = $_.Exception.Message
-							} catch {}
-						}
-					}.GetNewClosure())
-					try { $box.Focus() } catch {}
-					try { $box.SelectAll() } catch {}
-					[void]$dlg.ShowDialog()
-				} catch {}
+				# Use the same Connect window as boot/login (layout, PasswordBox dots, chrome).
+				# Main runspace opens it via Sync-MBActiveModelFromWpf (cannot block STA timer).
+				try { $W.PendingShowAddEndpoint = $true } catch {}
 			}.GetNewClosure()
 			try {
 				$initModels = @()
@@ -40593,10 +47877,21 @@ function Start-MBWpfHost {
 						$cwdPopup = New-Object System.Windows.Controls.Primitives.Popup
 						$cwdPopup.StaysOpen = $true
 						$cwdPopup.AllowsTransparency = $true
-						$cwdPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
 						$cwdPopup.PlacementTarget = $W.TitlePath
+						# Custom: top-left of popup = bottom-left of title address (no left flyout)
+						$cwdPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Custom
 						$cwdPopup.HorizontalOffset = 0
-						$cwdPopup.VerticalOffset = 4
+						$cwdPopup.VerticalOffset = 0
+						$cwdPopup.CustomPopupPlacementCallback = [System.Windows.Controls.Primitives.CustomPopupPlacementCallback]{
+							param([System.Windows.Size]$popupSize, [System.Windows.Size]$targetSize, [System.Windows.Point]$offset)
+							# TitlePath bottom-left -> popup top-left, small vertical gap (no auto left-flyout)
+							$pt = New-Object System.Windows.Point(0, ($targetSize.Height + 4))
+							$place = New-Object System.Windows.Controls.Primitives.CustomPopupPlacement (
+								$pt,
+								[System.Windows.Controls.Primitives.PopupPrimaryAxis]::Horizontal
+							)
+							return [System.Windows.Controls.Primitives.CustomPopupPlacement[]]@($place)
+						}
 						$cwdShell = New-Object System.Windows.Controls.Border
 						$cwdShell.Background = $W.BrushCache['#121216']
 						$cwdShell.BorderBrush = $W.BrushCache['#2A2A30']
@@ -40617,6 +47912,63 @@ function Start-MBWpfHost {
 						$cwdRow = New-Object System.Windows.Controls.DockPanel
 						$cwdRow.LastChildFill = $true
 						$cwdRow.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
+						# NoMouseOverButtonTemplate — kills system highlight brush (same as title chrome / SessionPicker)
+						$cwdNoMoTpl = $null
+						$cwdSecStyle = $null
+						try { $cwdNoMoTpl = $window.TryFindResource('NoMouseOverButtonTemplate') } catch {}
+						try { $cwdSecStyle = $window.TryFindResource('MbAuthSecondaryBtn') } catch {}
+						if ($null -eq $cwdNoMoTpl) {
+							try {
+								$cwdNoMoTpl = [System.Windows.Markup.XamlReader]::Parse(
+									'<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}" CornerRadius="4" SnapsToDevicePixels="True"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
+								)
+							} catch {}
+						}
+						$styleCwdBtn = {
+							param($btn)
+							if ($null -ne $cwdSecStyle) {
+								try { $btn.Style = $cwdSecStyle } catch {}
+							}
+							if ($null -ne $cwdNoMoTpl) {
+								try { $btn.Template = $cwdNoMoTpl } catch {}
+							}
+							try {
+								$btn.Background = $W.BrushCache['#2A2A30']
+								$btn.Foreground = $W.BrushCache['#C8C8D0']
+								$btn.BorderBrush = $W.BrushCache['#3A3A42']
+								$btn.BorderThickness = New-Object System.Windows.Thickness(1)
+							} catch {}
+							# Themed hover without system chrome (NoMouseOver has no built-in hover)
+							try {
+								$btn.add_MouseEnter({
+									param($s2, $e2)
+									try { $s2.Background = $W.BrushCache['#363640']; $s2.BorderBrush = $W.BrushCache['#5A5A66'] } catch {}
+								}.GetNewClosure())
+								$btn.add_MouseLeave({
+									param($s2, $e2)
+									try { $s2.Background = $W.BrushCache['#2A2A30']; $s2.BorderBrush = $W.BrushCache['#3A3A42'] } catch {}
+								}.GetNewClosure())
+								$btn.add_PreviewMouseLeftButtonDown({
+									param($s2, $e2)
+									try { $s2.Background = $W.BrushCache['#222228'] } catch {}
+								}.GetNewClosure())
+								$btn.add_PreviewMouseLeftButtonUp({
+									param($s2, $e2)
+									try { $s2.Background = $W.BrushCache['#363640'] } catch {}
+								}.GetNewClosure())
+							} catch {}
+						}.GetNewClosure()
+						# Dock order: first Right = rightmost (Browse), then Go left of Browse — matches SessionPicker layout
+						$cwdBrowse = New-Object System.Windows.Controls.Button
+						$cwdBrowse.Content = 'Browse...'
+						$cwdBrowse.MinWidth = 84
+						$cwdBrowse.Height = 30
+						$cwdBrowse.Margin = New-Object System.Windows.Thickness(6, 0, 0, 0)
+						$cwdBrowse.Padding = New-Object System.Windows.Thickness(10, 0, 10, 0)
+						$cwdBrowse.Cursor = [System.Windows.Input.Cursors]::Hand
+						$cwdBrowse.Focusable = $true
+						& $styleCwdBtn $cwdBrowse
+						[System.Windows.Controls.DockPanel]::SetDock($cwdBrowse, [System.Windows.Controls.Dock]::Right)
 						$cwdGo = New-Object System.Windows.Controls.Button
 						$cwdGo.Content = 'Go'
 						$cwdGo.MinWidth = 52
@@ -40625,31 +47977,7 @@ function Start-MBWpfHost {
 						$cwdGo.Padding = New-Object System.Windows.Thickness(10, 0, 10, 0)
 						$cwdGo.Cursor = [System.Windows.Input.Cursors]::Hand
 						$cwdGo.Focusable = $true
-						$cwdGo.Background = $W.BrushCache['#2A2A30']
-						$cwdGo.Foreground = $W.BrushCache['#C8C8D0']
-						$cwdGo.BorderBrush = $W.BrushCache['#3A3A42']
-						$cwdGo.BorderThickness = New-Object System.Windows.Thickness(1)
-						try {
-							$cwdGo.Template = [System.Windows.Markup.XamlReader]::Parse(@'
-<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
-  <Border x:Name="Bd" Background="{TemplateBinding Background}"
-          BorderBrush="{TemplateBinding BorderBrush}"
-          BorderThickness="{TemplateBinding BorderThickness}"
-          CornerRadius="4" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
-    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
-  </Border>
-  <ControlTemplate.Triggers>
-    <Trigger Property="IsMouseOver" Value="True">
-      <Setter TargetName="Bd" Property="Background" Value="#363640"/>
-      <Setter TargetName="Bd" Property="BorderBrush" Value="#5A5A66"/>
-    </Trigger>
-    <Trigger Property="IsPressed" Value="True">
-      <Setter TargetName="Bd" Property="Background" Value="#222228"/>
-    </Trigger>
-  </ControlTemplate.Triggers>
-</ControlTemplate>
-'@)
-						} catch {}
+						& $styleCwdBtn $cwdGo
 						[System.Windows.Controls.DockPanel]::SetDock($cwdGo, [System.Windows.Controls.Dock]::Right)
 						$cwdBox = New-Object System.Windows.Controls.TextBox
 						$cwdBox.Height = 30
@@ -40664,10 +47992,12 @@ function Start-MBWpfHost {
 							$cwdBox.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas, Cascadia Mono, Courier New')
 						} catch {}
 						$cwdBox.FontSize = 13
+						# Children: Browse (right edge), Go (left of Browse), box fills remainder
+						[void]$cwdRow.Children.Add($cwdBrowse)
 						[void]$cwdRow.Children.Add($cwdGo)
 						[void]$cwdRow.Children.Add($cwdBox)
 						$cwdStatus = New-Object System.Windows.Controls.TextBlock
-						$cwdStatus.Text = 'Enter a folder path, then Go'
+						$cwdStatus.Text = 'Enter a folder path, then Go — or Browse...'
 						$cwdStatus.Foreground = $W.BrushCache['#6A6A76']
 						$cwdStatus.FontSize = 11
 						$cwdStatus.TextWrapping = [System.Windows.TextWrapping]::Wrap
@@ -40679,6 +48009,7 @@ function Start-MBWpfHost {
 						$W.CwdPopup = $cwdPopup
 						$W.CwdPopupBox = $cwdBox
 						$W.CwdPopupGo = $cwdGo
+						$W.CwdPopupBrowse = $cwdBrowse
 						$W.CwdPopupStatus = $cwdStatus
 						$openCwdPopup = {
 							try {
@@ -40687,13 +48018,20 @@ function Start-MBWpfHost {
 								if ([string]::IsNullOrWhiteSpace($cur)) {
 									try { $cur = [string]$W.TitlePath.Text } catch {}
 								}
+								if ([string]::IsNullOrWhiteSpace($cur) -or $cur.StartsWith('...')) {
+									try { $cur = [string]$W.CurrentCwd } catch {}
+								}
 								if ([string]::IsNullOrWhiteSpace($cur)) {
 									try { $cur = [Environment]::CurrentDirectory } catch { $cur = '' }
 								}
 								$W.CwdPopupBox.Text = $cur
-								$W.CwdPopupStatus.Text = 'Enter a folder path, then Go'
+								$W.CwdPopupStatus.Text = 'Enter a folder path, then Go — or Browse...'
 								try { $W.CwdPopupStatus.Foreground = $W.BrushCache['#6A6A76'] } catch {}
+								# Re-anchor under title path every open (title layout can shift)
 								$W.CwdPopup.PlacementTarget = $W.TitlePath
+								$W.CwdPopup.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Custom
+								$W.CwdPopup.HorizontalOffset = 0
+								$W.CwdPopup.VerticalOffset = 0
 								$W.CwdPopup.IsOpen = $true
 								try {
 									[void]$W.CwdPopupBox.Focus()
@@ -40736,12 +48074,48 @@ function Start-MBWpfHost {
 								try { $W.CwdPopup.IsOpen = $false } catch {}
 							} catch {}
 						}.GetNewClosure()
+						$browseCwdFolder = {
+							try {
+								Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+								$fb = New-Object System.Windows.Forms.FolderBrowserDialog
+								$fb.Description = 'Choose working directory'
+								$fb.ShowNewFolderButton = $true
+								try {
+									$cur = ([string]$W.CwdPopupBox.Text).Trim().Trim('"')
+									if ($cur -and [System.IO.Directory]::Exists($cur)) {
+										$fb.SelectedPath = $cur
+									} elseif ($W.CurrentCwd -and [System.IO.Directory]::Exists([string]$W.CurrentCwd)) {
+										$fb.SelectedPath = [string]$W.CurrentCwd
+									}
+								} catch {}
+								$dr = $fb.ShowDialog()
+								if ($dr -eq [System.Windows.Forms.DialogResult]::OK -and $fb.SelectedPath) {
+									$W.CwdPopupBox.Text = [string]$fb.SelectedPath
+									$W.CwdPopupStatus.Text = 'Folder selected — click Go to set working directory.'
+									try { $W.CwdPopupStatus.Foreground = $W.BrushCache['#7DCFFF'] } catch {}
+									try {
+										[void]$W.CwdPopupBox.Focus()
+										$W.CwdPopupBox.SelectAll()
+									} catch {}
+								}
+							} catch {
+								try {
+									$W.CwdPopupStatus.Text = ('Browse failed: {0}' -f $_.Exception.Message)
+									$W.CwdPopupStatus.Foreground = $W.BrushCache['#F05C5C']
+								} catch {}
+							}
+						}.GetNewClosure()
 						$W.OpenCwdPopup = $openCwdPopup
 						$W.CloseCwdPopup = $closeCwdPopup
 						$W.ApplyCwdGo = $applyCwdGo
+						$W.BrowseCwdFolder = $browseCwdFolder
 						$cwdGo.add_Click({
 							param($s, $e)
 							try { & $applyCwdGo } catch {}
+						}.GetNewClosure())
+						$cwdBrowse.add_Click({
+							param($s, $e)
+							try { & $browseCwdFolder } catch {}
 						}.GetNewClosure())
 						$cwdBox.add_KeyDown({
 							param($s, $e)
@@ -40783,7 +48157,10 @@ function Start-MBWpfHost {
 									try {
 										$vis = $src
 										while ($null -ne $vis) {
-											if ($vis -eq $W.TitlePath -or $vis -eq $W.CwdPopup.Child) { $keep = $true; break }
+											if ($vis -eq $W.TitlePath -or $vis -eq $W.CwdPopup.Child -or $vis -eq $W.CwdPopupBrowse -or $vis -eq $W.CwdPopupGo -or $vis -eq $W.CwdPopupBox) {
+												$keep = $true
+												break
+											}
 											try { $vis = [System.Windows.Media.VisualTreeHelper]::GetParent($vis) } catch { break }
 										}
 									} catch {}
@@ -42499,11 +49876,52 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				try {
 					# Session picker / modal open - freeze host UI work for smooth dialog
 					try { if ([bool]$W.ModalUi) { return } } catch {}
+					# TaskBoard paint before log queue.
+					try {
+						$needTb = $false
+						try {
+							if ($null -ne $W.PendingTaskBoard) { $needTb = $true }
+							elseif ([bool]$W.TaskBoardPaintUrgent) { $needTb = $true }
+						} catch { $needTb = ($null -ne $W.PendingTaskBoard) }
+						if ($needTb) {
+							$drainTb = $null
+							try { $drainTb = $W.DrainTaskBoardPaint } catch { $drainTb = $null }
+							if ($null -ne $drainTb) {
+								& $drainTb
+							} elseif ($null -ne $W.PendingTaskBoard -and $null -ne $W.ApplyTaskBoardSticky) {
+								$pTb = $W.PendingTaskBoard
+								$W.PendingTaskBoard = $null
+								& $W.ApplyTaskBoardSticky $pTb
+							}
+						}
+					} catch {}
 					$rtb = $W.Log
 					$q = $W.WriteQueue
 					if (-not $rtb -or -not $q) { return }
 					$doc = $rtb.Document
 					if (-not $doc) { return }
+					# Fresh model pick / clean start: wipe log before painting the new banner
+					try {
+						$doClear = $false
+						try { $doClear = [bool]$W.PendingClearLog } catch { $doClear = $false }
+						if ($doClear) {
+							$W.PendingClearLog = $false
+							try { $doc.Blocks.Clear() } catch {}
+							try {
+								$p0 = New-Object System.Windows.Documents.Paragraph
+								$p0.Margin = New-Object System.Windows.Thickness 0
+								$p0.Padding = New-Object System.Windows.Thickness 0
+								$p0.LineHeight = 16
+								$doc.Blocks.Add($p0)
+							} catch {}
+							try { $W.LogLineCharRun = 0 } catch {}
+							try { $W.LogMaxLineChars = 0 } catch {}
+							try {
+								if ($W.MdStretchElements) { $W.MdStretchElements.Clear() }
+							} catch {}
+							try { $rtb.ScrollToHome() } catch {}
+						}
+					} catch {}
 					try {
 						if ($W -is [hashtable]) {
 							if (-not $W.ContainsKey('BrushCache') -or $null -eq $W['BrushCache']) {
@@ -42515,6 +49933,256 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					} catch {
 						try { $W['BrushCache'] = @{} } catch {}
 					}
+
+					# Viz helpers once per tick (not inside queue loop) so save click closures stay valid
+					$newPara = {
+						$p = New-Object System.Windows.Documents.Paragraph
+						$p.Margin = New-Object System.Windows.Thickness 0
+						$p.Padding = New-Object System.Windows.Thickness 0
+						$p.LineHeight = 16
+						return $p
+					}
+					$trimTrailingEmptyParas = {
+						try {
+							while ($doc.Blocks.Count -gt 0) {
+								$last = $doc.Blocks.LastBlock
+								if (-not ($last -is [System.Windows.Documents.Paragraph])) { break }
+								$isEmpty = $false
+								try {
+									if ($last.Inlines.Count -eq 0) { $isEmpty = $true }
+									elseif ($last.Inlines.Count -eq 1) {
+										$fi = $last.Inlines.FirstInline
+										if ($fi -is [System.Windows.Documents.Run]) {
+											if ([string]::IsNullOrWhiteSpace([string]$fi.Text)) { $isEmpty = $true }
+										}
+									}
+								} catch { $isEmpty = $false }
+								if (-not $isEmpty) { break }
+								[void]$doc.Blocks.Remove($last)
+							}
+						} catch {}
+					}
+					$convertVizSvgToHtml = {
+						param([string]$SvgMarkup)
+						$svg = [string]$SvgMarkup
+						if ($null -eq $svg) { $svg = '' }
+						$svg = $svg.Trim()
+						if ($svg -notmatch '(?is)<svg\b') {
+							$svg = '<svg xmlns="http://www.w3.org/2000/svg" width="680" height="240" viewBox="0 0 680 240"></svg>'
+						}
+						$sb = New-Object System.Text.StringBuilder
+						[void]$sb.AppendLine('<!DOCTYPE html>')
+						[void]$sb.AppendLine('<html lang="en">')
+						[void]$sb.AppendLine('<head>')
+						[void]$sb.AppendLine('<meta charset="utf-8"/>')
+						[void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1"/>')
+						[void]$sb.AppendLine('<title>MiniBot visualization</title>')
+						[void]$sb.AppendLine('<style>')
+						[void]$sb.AppendLine('  html, body { margin: 0; background: #121216; color: #E5E7EB; min-height: 100%; }')
+						[void]$sb.AppendLine('  .wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 16px; box-sizing: border-box; }')
+						[void]$sb.AppendLine('  svg { max-width: 100%; height: auto; display: block; }')
+						[void]$sb.AppendLine('</style>')
+						[void]$sb.AppendLine('</head>')
+						[void]$sb.AppendLine('<body><div class="wrap">')
+						[void]$sb.AppendLine($svg)
+						[void]$sb.AppendLine('</div></body></html>')
+						return $sb.ToString()
+					}.GetNewClosure()
+					$saveVizMarkup = {
+						param($HostBorder, [string]$Markup)
+						try {
+							$svg = [string]$Markup
+							# Fallbacks: card Tag, button Tag already passed, last live slot
+							if ([string]::IsNullOrWhiteSpace($svg) -and $HostBorder) {
+								try {
+									if ($HostBorder.Tag -is [hashtable]) { $svg = [string]$HostBorder.Tag['Markup'] }
+								} catch { $svg = '' }
+							}
+							if ([string]::IsNullOrWhiteSpace($svg)) {
+								try {
+									$slots = $W.VizLiveSlots
+									if ($slots -and $slots.Count -gt 0) {
+										$last = $slots[$slots.Count - 1]
+										if ($last -is [hashtable] -and $last.ContainsKey('Markup')) {
+											$svg = [string]$last['Markup']
+										} elseif ($last.Markup) {
+											$svg = [string]$last.Markup
+										}
+									}
+								} catch {}
+							}
+							$owner = $null
+							try { $owner = $W.Window } catch { $owner = $null }
+							if ([string]::IsNullOrWhiteSpace($svg)) {
+								$msg = 'Nothing to save yet - wait for the visualization to finish rendering.'
+								if ($owner) {
+									[System.Windows.MessageBox]::Show($owner, $msg, 'Save visualization',
+										[System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+								} else {
+									[System.Windows.MessageBox]::Show($msg, 'Save visualization',
+										[System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+								}
+								return
+							}
+							$dlg = New-Object Microsoft.Win32.SaveFileDialog
+							$dlg.Title = 'Save visualization'
+							$dlg.Filter = 'SVG image (*.svg)|*.svg|HTML document (*.html)|*.html'
+							$dlg.FilterIndex = 1
+							$dlg.DefaultExt = 'svg'
+							$dlg.AddExtension = $true
+							$dlg.OverwritePrompt = $true
+							$dlg.FileName = ('minibot-viz-{0:yyyyMMdd-HHmmss}' -f (Get-Date))
+							try {
+								$desk = [Environment]::GetFolderPath('Desktop')
+								if ($desk -and (Test-Path -LiteralPath $desk)) { $dlg.InitialDirectory = $desk }
+							} catch {}
+							# Owner required so dialog is not hidden behind borderless chrome
+							$ok = $false
+							try {
+								if ($owner) { $ok = [bool]$dlg.ShowDialog($owner) }
+								else { $ok = [bool]$dlg.ShowDialog() }
+							} catch {
+								try { $ok = [bool]$dlg.ShowDialog() } catch { $ok = $false }
+							}
+							if (-not $ok) { return }
+							$path = [string]$dlg.FileName
+							if ([string]::IsNullOrWhiteSpace($path)) { return }
+							$ext = [System.IO.Path]::GetExtension($path)
+							$utf8 = New-Object System.Text.UTF8Encoding $false
+							if ($ext -match '(?i)^\.(html|htm)$') {
+								$html = & $convertVizSvgToHtml $svg
+								[System.IO.File]::WriteAllText($path, $html, $utf8)
+							} else {
+								if ($ext -notmatch '(?i)^\.svg$') {
+									$path = [System.IO.Path]::ChangeExtension($path, '.svg')
+								}
+								$body = $svg.Trim()
+								if ($body -notmatch '(?is)^\s*<svg\b') {
+									$body = '<svg xmlns="http://www.w3.org/2000/svg">' + $body + '</svg>'
+								}
+								[System.IO.File]::WriteAllText($path, $body, $utf8)
+							}
+							try { & $uiLog 'VIZ_UI_SAVE_OK' $path } catch {}
+						} catch {
+							try {
+								$owner2 = $null
+								try { $owner2 = $W.Window } catch {}
+								$em = $_.Exception.Message
+								if ($owner2) {
+									[System.Windows.MessageBox]::Show($owner2, $em, 'Save visualization failed',
+										[System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+								} else {
+									[System.Windows.MessageBox]::Show($em, 'Save visualization failed',
+										[System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+								}
+							} catch {}
+							try { & $uiLog 'VIZ_UI_SAVE_ERR' $_.Exception.Message } catch {}
+						}
+					}.GetNewClosure()
+					try { $W.SaveVizMarkup = $saveVizMarkup } catch {}
+					$buildVizHeader = {
+						param(
+							$BrushCache,
+							[string]$TitleMode = 'ready',
+							[string]$Markup = ''
+						)
+						$hdr = New-Object System.Windows.Controls.Border
+						$hdr.Background = $BrushCache['#252530']
+						$hdr.Padding = New-Object System.Windows.Thickness(10, 4, 8, 4)
+						$hdr.CornerRadius = New-Object System.Windows.CornerRadius(6, 6, 0, 0)
+						$grid = New-Object System.Windows.Controls.Grid
+						$col0 = New-Object System.Windows.Controls.ColumnDefinition
+						$col0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+						$col1 = New-Object System.Windows.Controls.ColumnDefinition
+						$col1.Width = [System.Windows.GridLength]::Auto
+						[void]$grid.ColumnDefinitions.Add($col0)
+						[void]$grid.ColumnDefinitions.Add($col1)
+						$hdrTb = New-Object System.Windows.Controls.TextBlock
+						$hdrTb.FontFamily = $W.MonoFont
+						$hdrTb.FontSize = 11
+						$hdrTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+						if ($TitleMode -eq 'loading') {
+							$runRen = New-Object System.Windows.Documents.Run 'rendering'
+							$runRen.Foreground = $BrushCache['#BB9AF7']
+							$runViz = New-Object System.Windows.Documents.Run ' visualization'
+							$runViz.Foreground = $BrushCache['#8A8A96']
+							[void]$hdrTb.Inlines.Add($runRen)
+							[void]$hdrTb.Inlines.Add($runViz)
+						} else {
+							$hdrTb.Text = 'visualization'
+							$hdrTb.Foreground = $BrushCache['#8A8A96']
+						}
+						[System.Windows.Controls.Grid]::SetColumn($hdrTb, 0)
+						[void]$grid.Children.Add($hdrTb)
+						$saveBtn = New-Object System.Windows.Controls.Button
+						$saveBtn.Content = 'save'
+						$saveBtn.FontFamily = $W.MonoFont
+						$saveBtn.FontSize = 11
+						$saveBtn.Foreground = $BrushCache['#8A8A96']
+						$saveBtn.Background = [System.Windows.Media.Brushes]::Transparent
+						$saveBtn.BorderThickness = New-Object System.Windows.Thickness(0)
+						$saveBtn.Padding = New-Object System.Windows.Thickness(8, 2, 4, 2)
+						$saveBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+						$saveBtn.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+						$saveBtn.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+						$saveBtn.Focusable = $true
+						try { $saveBtn.IsHitTestVisible = $true } catch {}
+						try {
+							$tpl = [System.Windows.Markup.XamlReader]::Parse(
+								'<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
+							)
+							$saveBtn.Template = $tpl
+						} catch {}
+						$saveBtn.Tag = @{ Markup = [string]$Markup; Outer = $null }
+						$saveBtn.IsEnabled = $true
+						if ([string]::IsNullOrWhiteSpace($Markup)) {
+							try { $saveBtn.Opacity = 0.45 } catch {}
+						} else {
+							try { $saveBtn.Opacity = 1.0 } catch {}
+						}
+						$saveBtn.Add_Click({
+							param($s, $e)
+							try {
+								try { if ($e) { $e.Handled = $true } } catch {}
+								$mk = ''
+								$outerRef = $null
+								if ($s.Tag -is [hashtable]) {
+									try { $mk = [string]$s.Tag['Markup'] } catch {}
+									try { $outerRef = $s.Tag['Outer'] } catch {}
+								}
+								if ([string]::IsNullOrWhiteSpace($mk) -and $outerRef -and $outerRef.Tag -is [hashtable]) {
+									try { $mk = [string]$outerRef.Tag['Markup'] } catch {}
+								}
+								$fn = $null
+								try { $fn = $W.SaveVizMarkup } catch { $fn = $null }
+								if ($null -eq $fn) { $fn = $saveVizMarkup }
+								if ($null -ne $fn) {
+									& $fn $outerRef $mk
+								}
+							} catch {
+								try { & $uiLog 'VIZ_UI_SAVE_CLICK_ERR' $_.Exception.Message } catch {}
+							}
+						}.GetNewClosure())
+						$saveBtn.Add_MouseEnter({
+							param($s, $e)
+							try {
+								if ($s.IsEnabled) { $s.Foreground = $BrushCache['#BB9AF7'] }
+							} catch {}
+						}.GetNewClosure())
+						$saveBtn.Add_MouseLeave({
+							param($s, $e)
+							try { $s.Foreground = $BrushCache['#8A8A96'] } catch {}
+						}.GetNewClosure())
+						[System.Windows.Controls.Grid]::SetColumn($saveBtn, 1)
+						[void]$grid.Children.Add($saveBtn)
+						$hdr.Child = $grid
+						return @{
+							Border   = $hdr
+							Title    = $hdrTb
+							SaveBtn  = $saveBtn
+						}
+					}.GetNewClosure()
+
 					$n = 0
 					$item = $null
 					while ($n -lt 120 -and $q.TryDequeue([ref]$item)) {
@@ -42523,212 +50191,6 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 						if ($null -eq $item) { continue }
 						$kind = 'text'
 						try { if ($item.Kind) { $kind = [string]$item.Kind } } catch {}
-
-						$newPara = {
-							$p = New-Object System.Windows.Documents.Paragraph
-							$p.Margin = New-Object System.Windows.Thickness 0
-							$p.Padding = New-Object System.Windows.Thickness 0
-							$p.LineHeight = 16
-							return $p
-						}
-						$trimTrailingEmptyParas = {
-							try {
-								while ($doc.Blocks.Count -gt 0) {
-									$last = $doc.Blocks.LastBlock
-									if (-not ($last -is [System.Windows.Documents.Paragraph])) { break }
-									$isEmpty = $false
-									try {
-										if ($last.Inlines.Count -eq 0) { $isEmpty = $true }
-										elseif ($last.Inlines.Count -eq 1) {
-											$fi = $last.Inlines.FirstInline
-											if ($fi -is [System.Windows.Documents.Run]) {
-												if ([string]::IsNullOrWhiteSpace([string]$fi.Text)) { $isEmpty = $true }
-											}
-										}
-									} catch { $isEmpty = $false }
-									if (-not $isEmpty) { break }
-									[void]$doc.Blocks.Remove($last)
-								}
-							} catch {}
-						}
-
-						$convertVizSvgToHtml = {
-							param([string]$SvgMarkup)
-							$svg = [string]$SvgMarkup
-							if ($null -eq $svg) { $svg = '' }
-							$svg = $svg.Trim()
-							if ($svg -notmatch '(?is)<svg\b') {
-								$svg = '<svg xmlns="http://www.w3.org/2000/svg" width="680" height="240" viewBox="0 0 680 240"></svg>'
-							}
-							$sb = New-Object System.Text.StringBuilder
-							[void]$sb.AppendLine('<!DOCTYPE html>')
-							[void]$sb.AppendLine('<html lang="en">')
-							[void]$sb.AppendLine('<head>')
-							[void]$sb.AppendLine('<meta charset="utf-8"/>')
-							[void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1"/>')
-							[void]$sb.AppendLine('<title>MiniBot visualization</title>')
-							[void]$sb.AppendLine('<style>')
-							[void]$sb.AppendLine('  html, body { margin: 0; background: #121216; color: #E5E7EB; min-height: 100%; }')
-							[void]$sb.AppendLine('  .wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 16px; box-sizing: border-box; }')
-							[void]$sb.AppendLine('  svg { max-width: 100%; height: auto; display: block; }')
-							[void]$sb.AppendLine('</style>')
-							[void]$sb.AppendLine('</head>')
-							[void]$sb.AppendLine('<body><div class="wrap">')
-							[void]$sb.AppendLine($svg)
-							[void]$sb.AppendLine('</div></body></html>')
-							return $sb.ToString()
-						}.GetNewClosure()
-
-						$saveVizMarkup = {
-							param($HostBorder, [string]$Markup)
-							try {
-								$svg = [string]$Markup
-								if ([string]::IsNullOrWhiteSpace($svg) -and $HostBorder -and $HostBorder.Tag -is [hashtable]) {
-									try { $svg = [string]$HostBorder.Tag['Markup'] } catch { $svg = '' }
-								}
-								if ([string]::IsNullOrWhiteSpace($svg)) {
-									[System.Windows.MessageBox]::Show(
-										'Nothing to save yet — wait for the visualization to finish rendering.',
-										'Save visualization',
-										[System.Windows.MessageBoxButton]::OK,
-										[System.Windows.MessageBoxImage]::Information
-									) | Out-Null
-									return
-								}
-								$dlg = New-Object Microsoft.Win32.SaveFileDialog
-								$dlg.Title = 'Save visualization'
-								$dlg.Filter = 'SVG image (*.svg)|*.svg|HTML document (*.html)|*.html'
-								$dlg.FilterIndex = 1
-								$dlg.DefaultExt = 'svg'
-								$dlg.AddExtension = $true
-								$dlg.OverwritePrompt = $true
-								$dlg.FileName = ('minibot-viz-{0:yyyyMMdd-HHmmss}' -f (Get-Date))
-								try {
-									$desk = [Environment]::GetFolderPath('Desktop')
-									if ($desk -and (Test-Path -LiteralPath $desk)) { $dlg.InitialDirectory = $desk }
-								} catch {}
-								$ok = $dlg.ShowDialog()
-								if (-not $ok) { return }
-								$path = [string]$dlg.FileName
-								if ([string]::IsNullOrWhiteSpace($path)) { return }
-								$ext = [System.IO.Path]::GetExtension($path)
-								$utf8 = New-Object System.Text.UTF8Encoding $false
-								if ($ext -match '(?i)^\.(html|htm)$') {
-									$html = & $convertVizSvgToHtml $svg
-									[System.IO.File]::WriteAllText($path, $html, $utf8)
-								} else {
-									if ($ext -notmatch '(?i)^\.svg$') {
-										$path = [System.IO.Path]::ChangeExtension($path, '.svg')
-									}
-									$body = $svg.Trim()
-									if ($body -notmatch '(?is)^\s*<svg\b') {
-										$body = '<svg xmlns="http://www.w3.org/2000/svg">' + $body + '</svg>'
-									}
-									[System.IO.File]::WriteAllText($path, $body, $utf8)
-								}
-								try { & $uiLog 'VIZ_UI_SAVE_OK' $path } catch {}
-							} catch {
-								try {
-									[System.Windows.MessageBox]::Show(
-										$_.Exception.Message,
-										'Save visualization failed',
-										[System.Windows.MessageBoxButton]::OK,
-										[System.Windows.MessageBoxImage]::Warning
-									) | Out-Null
-								} catch {}
-								try { & $uiLog 'VIZ_UI_SAVE_ERR' $_.Exception.Message } catch {}
-							}
-						}.GetNewClosure()
-
-						$buildVizHeader = {
-							param(
-								$BrushCache,
-								[string]$TitleMode = 'ready',
-								[string]$Markup = ''
-							)
-							# TitleMode: loading | ready
-							$hdr = New-Object System.Windows.Controls.Border
-							$hdr.Background = $BrushCache['#252530']
-							$hdr.Padding = New-Object System.Windows.Thickness(10, 4, 8, 4)
-							$hdr.CornerRadius = New-Object System.Windows.CornerRadius(6, 6, 0, 0)
-							$grid = New-Object System.Windows.Controls.Grid
-							$col0 = New-Object System.Windows.Controls.ColumnDefinition
-							$col0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
-							$col1 = New-Object System.Windows.Controls.ColumnDefinition
-							$col1.Width = [System.Windows.GridLength]::Auto
-							[void]$grid.ColumnDefinitions.Add($col0)
-							[void]$grid.ColumnDefinitions.Add($col1)
-							$hdrTb = New-Object System.Windows.Controls.TextBlock
-							$hdrTb.FontFamily = $W.MonoFont
-							$hdrTb.FontSize = 11
-							$hdrTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-							if ($TitleMode -eq 'loading') {
-								$runRen = New-Object System.Windows.Documents.Run 'rendering'
-								$runRen.Foreground = $BrushCache['#BB9AF7']
-								$runViz = New-Object System.Windows.Documents.Run ' visualization'
-								$runViz.Foreground = $BrushCache['#8A8A96']
-								[void]$hdrTb.Inlines.Add($runRen)
-								[void]$hdrTb.Inlines.Add($runViz)
-							} else {
-								$hdrTb.Text = 'visualization'
-								$hdrTb.Foreground = $BrushCache['#8A8A96']
-							}
-							[System.Windows.Controls.Grid]::SetColumn($hdrTb, 0)
-							[void]$grid.Children.Add($hdrTb)
-							$saveBtn = New-Object System.Windows.Controls.Button
-							$saveBtn.Content = 'save'
-							$saveBtn.FontFamily = $W.MonoFont
-							$saveBtn.FontSize = 11
-							$saveBtn.Foreground = $BrushCache['#8A8A96']
-							$saveBtn.Background = [System.Windows.Media.Brushes]::Transparent
-							$saveBtn.BorderThickness = New-Object System.Windows.Thickness(0)
-							$saveBtn.Padding = New-Object System.Windows.Thickness(8, 2, 4, 2)
-							$saveBtn.Cursor = [System.Windows.Input.Cursors]::Hand
-							$saveBtn.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-							$saveBtn.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
-							$saveBtn.Focusable = $false
-							try {
-								$tpl = [System.Windows.Markup.XamlReader]::Parse(
-									'<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button"><Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></ControlTemplate>'
-								)
-								$saveBtn.Template = $tpl
-							} catch {}
-							$saveBtn.Tag = @{ Markup = [string]$Markup; Outer = $null }
-							$saveBtn.IsEnabled = -not [string]::IsNullOrWhiteSpace($Markup)
-							if (-not $saveBtn.IsEnabled) {
-								try { $saveBtn.Opacity = 0.35 } catch {}
-							}
-							$saveBtn.Add_Click({
-								param($s, $e)
-								try {
-									$mk = ''
-									$outerRef = $null
-									if ($s.Tag -is [hashtable]) {
-										try { $mk = [string]$s.Tag['Markup'] } catch {}
-										try { $outerRef = $s.Tag['Outer'] } catch {}
-									}
-									& $saveVizMarkup $outerRef $mk
-								} catch {}
-							}.GetNewClosure())
-							$saveBtn.Add_MouseEnter({
-								param($s, $e)
-								try {
-									if ($s.IsEnabled) { $s.Foreground = $BrushCache['#BB9AF7'] }
-								} catch {}
-							}.GetNewClosure())
-							$saveBtn.Add_MouseLeave({
-								param($s, $e)
-								try { $s.Foreground = $BrushCache['#8A8A96'] } catch {}
-							}.GetNewClosure())
-							[System.Windows.Controls.Grid]::SetColumn($saveBtn, 1)
-							[void]$grid.Children.Add($saveBtn)
-							$hdr.Child = $grid
-							return @{
-								Border   = $hdr
-								Title    = $hdrTb
-								SaveBtn  = $saveBtn
-							}
-						}.GetNewClosure()
 
 						$stretchW = 280.0
 						try {
@@ -42894,6 +50356,27 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$lang = ''
 								try { $lang = [string]$item.Text } catch {}
 								if ([string]::IsNullOrWhiteSpace($lang)) { $lang = 'code' }
+								$codeTitle = ''
+								try { $codeTitle = [string]$item.Title } catch { $codeTitle = '' }
+								if ([string]::IsNullOrWhiteSpace($codeTitle)) {
+									try { $codeTitle = [string]$item.CodeTitle } catch { $codeTitle = '' }
+								}
+								# Header: "title  ·  lang" or just lang (middot built at runtime — no source mojibake)
+								$hdrLabel = $lang
+								try {
+									if (-not [string]::IsNullOrWhiteSpace($codeTitle)) {
+										$dot = [string][char]0x00B7
+										$langLow = $lang.ToLowerInvariant()
+										$titleLow = $codeTitle.ToLowerInvariant()
+										if ($langLow -ne 'code' -and $langLow -ne 'text' -and -not $titleLow.Contains($langLow)) {
+											$hdrLabel = ('{0}  {1}  {2}' -f $codeTitle, $dot, $lang)
+										} else {
+											$hdrLabel = $codeTitle
+										}
+									}
+								} catch {
+									if (-not [string]::IsNullOrWhiteSpace($codeTitle)) { $hdrLabel = $codeTitle }
+								}
 
 								$brushCache = $null
 								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
@@ -42929,17 +50412,18 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$hdr.CornerRadius = New-Object System.Windows.CornerRadius(6, 6, 0, 0)
 								$hdrGrid = New-Object System.Windows.Controls.Grid
 								$hc0 = New-Object System.Windows.Controls.ColumnDefinition
-								$hc0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+								$hc0.Width = New-Object System.Windows.GridLength -ArgumentList @(1.0, [System.Windows.GridUnitType]::Star)
 								$hc1 = New-Object System.Windows.Controls.ColumnDefinition
 								$hc1.Width = [System.Windows.GridLength]::Auto
 								[void]$hdrGrid.ColumnDefinitions.Add($hc0)
 								[void]$hdrGrid.ColumnDefinitions.Add($hc1)
 
 								$langTb = New-Object System.Windows.Controls.TextBlock
-								$langTb.Text = $lang
+								$langTb.Text = $hdrLabel
 								$langTb.Foreground = $brushCache['#8A8A96']
 								$langTb.FontFamily = $W.MonoFont
 								$langTb.FontSize = 11
+								$langTb.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
 								$langTb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
 								[System.Windows.Controls.Grid]::SetColumn($langTb, 0)
 								[void]$hdrGrid.Children.Add($langTb)
@@ -43767,7 +51251,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$errTb.FontSize = 12
 									$body.Child = $errTb
 								} elseif ($mediaKind -eq 'audio') {
-									# Minimal inline audio player (PowerPlayer-inspired: progress + volume 0-1 + mute + play/pause icons)
+									# Inline audio player: progress, volume, mute, play/pause
 									# Prefer display/path (keeps spaces/parens) over decoding file:// URIs
 									$filePath = ''
 									try {
@@ -43945,7 +51429,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									$ctrlRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
 									$ctrlRow.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
 
-									# Shared state (PowerPlayer-style mute volume)
+									# Shared mute / volume state
 									$flags = [System.Collections.Hashtable]::Synchronized(@{
 										Playing        = $true
 										Failed         = $false
@@ -44161,7 +51645,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									}.GetNewClosure())
 									[void]$ctrlRow.Children.Add($btnMute)
 
-									# Volume slider 0-1 (PowerPlayer style)
+									# Volume slider 0-1
 									$volSlider = New-Object System.Windows.Controls.Slider
 									$volSlider.Minimum = 0
 									$volSlider.Maximum = 1
@@ -44197,7 +51681,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											} catch {}
 										} catch {}
 									}.GetNewClosure())
-									# PreviewMouseUp also sets UnMutedVolume like PowerPlayer
+									# PreviewMouseUp also updates UnMutedVolume
 									$volSlider.Add_PreviewMouseUp({
 										param($s, $e)
 										try {
@@ -44675,6 +52159,193 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							continue
 						}
 
+						# TaskBoard lives in sticky flyout under tool chips (not chat cards)
+						if ($kind -eq 'taskboard-block') {
+							continue
+						}
+
+						# Grok Build–style diff card: line-number gutter + red/green band backgrounds
+						if ($kind -eq 'diff-block') {
+							try {
+								& $trimTrailingEmptyParas
+								$brushCache = $null
+								try { $brushCache = $W['BrushCache'] } catch { try { $brushCache = $W.BrushCache } catch {} }
+								if ($null -eq $brushCache) { $brushCache = @{}; try { $W['BrushCache'] = $brushCache } catch {} }
+								# Colors from Grok Build tokyonight theme (xai-grok-pager-render)
+								$hxDelBg = '#551014'   # diff_delete_bg rgb(85,15,20)
+								$hxInsBg = '#0F4114'   # diff_insert_bg rgb(15,65,20)
+								$hxEqBg  = '#16161E'
+								$hxCard  = '#1A1A1E'
+								$hxBd    = '#3A3A42'
+								$hxGut   = '#565F89'   # COMMENT / diff_gutter_fg
+								$hxDelFg = '#F7768E'   # RED
+								$hxInsFg = '#9ECE6A'   # GREEN
+								$hxEqFg  = '#A9B1D6'   # FG_DARK-ish
+								$hxMeta  = '#E0AF68'   # yellow hunk
+								$hxTitle = '#7DCFFF'
+								$hxSum   = '#6A6A76'
+								foreach ($hx in @($hxDelBg, $hxInsBg, $hxEqBg, $hxCard, $hxBd, $hxGut, $hxDelFg, $hxInsFg, $hxEqFg, $hxMeta, $hxTitle, $hxSum)) {
+									if (-not $brushCache.ContainsKey($hx)) {
+										try { $brushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
+									}
+								}
+								$title = ''
+								try { $title = [string]$item.Title } catch {}
+								$sum = ''
+								try { $sum = [string]$item.Summary } catch {}
+								$rows = @()
+								try { $rows = @($item.Rows) } catch { $rows = @() }
+
+								$card = New-Object System.Windows.Controls.Border
+								$card.Background = $brushCache[$hxCard]
+								$card.BorderBrush = $brushCache[$hxBd]
+								$card.BorderThickness = New-Object System.Windows.Thickness(1)
+								$card.CornerRadius = New-Object System.Windows.CornerRadius(4)
+								$card.Margin = New-Object System.Windows.Thickness(4, 6, 4, 8)
+								$card.Padding = New-Object System.Windows.Thickness(0, 4, 0, 4)
+								$card.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+								$card.SnapsToDevicePixels = $true
+
+								$colSp = New-Object System.Windows.Controls.StackPanel
+								$colSp.Orientation = [System.Windows.Controls.Orientation]::Vertical
+								$colSp.Margin = New-Object System.Windows.Thickness(0)
+
+								if (-not [string]::IsNullOrWhiteSpace($title)) {
+									$tbT = New-Object System.Windows.Controls.TextBlock
+									$tbT.Text = $title
+									$tbT.Foreground = $brushCache[$hxTitle]
+									$tbT.FontFamily = $W.MonoFont
+									$tbT.FontSize = 12.5
+									$tbT.FontWeight = [System.Windows.FontWeights]::SemiBold
+									$tbT.Margin = New-Object System.Windows.Thickness(10, 2, 10, 2)
+									$tbT.TextWrapping = [System.Windows.TextWrapping]::Wrap
+									[void]$colSp.Children.Add($tbT)
+								}
+								if (-not [string]::IsNullOrWhiteSpace($sum)) {
+									$tbS = New-Object System.Windows.Controls.TextBlock
+									$tbS.Text = $sum
+									$tbS.Foreground = $brushCache[$hxSum]
+									$tbS.FontFamily = $W.MonoFont
+									$tbS.FontSize = 11
+									$tbS.Margin = New-Object System.Windows.Thickness(10, 0, 10, 4)
+									[void]$colSp.Children.Add($tbS)
+								}
+
+								# Gutter width from max line number (Grok Build single-column default)
+								$maxNum = 1
+								foreach ($rr in $rows) {
+									try {
+										$o = 0; $n = 0
+										if ($rr -is [hashtable]) {
+											if ($rr.ContainsKey('OldNo')) { $o = [int]$rr['OldNo'] }
+											if ($rr.ContainsKey('NewNo')) { $n = [int]$rr['NewNo'] }
+										} else {
+											try { $o = [int]$rr.OldNo } catch {}
+											try { $n = [int]$rr.NewNo } catch {}
+										}
+										if ($o -gt $maxNum) { $maxNum = $o }
+										if ($n -gt $maxNum) { $maxNum = $n }
+									} catch {}
+								}
+								$gutterW = ([string]$maxNum).Length
+								if ($gutterW -lt 2) { $gutterW = 2 }
+								if ($gutterW -gt 6) { $gutterW = 6 }
+
+								foreach ($rr in $rows) {
+									$tag = 'eq'
+									$txt = ''
+									$oldNo = 0
+									$newNo = 0
+									try {
+										if ($rr -is [hashtable]) {
+											if ($rr.ContainsKey('Tag')) { $tag = [string]$rr['Tag'] }
+											if ($rr.ContainsKey('Text')) { $txt = [string]$rr['Text'] }
+											if ($rr.ContainsKey('OldNo')) { $oldNo = [int]$rr['OldNo'] }
+											if ($rr.ContainsKey('NewNo')) { $newNo = [int]$rr['NewNo'] }
+										} else {
+											try { $tag = [string]$rr.Tag } catch {}
+											try { $txt = [string]$rr.Text } catch {}
+											try { $oldNo = [int]$rr.OldNo } catch {}
+											try { $newNo = [int]$rr.NewNo } catch {}
+										}
+									} catch {}
+									if ($null -eq $txt) { $txt = '' }
+									if ($txt.Length -gt 500) { $txt = $txt.Substring(0, 497) + '...' }
+
+									$rowBd = New-Object System.Windows.Controls.Border
+									$rowBd.Padding = New-Object System.Windows.Thickness(8, 1, 8, 1)
+									$rowBd.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+									$rowBd.SnapsToDevicePixels = $true
+
+									$fg = $hxEqFg
+									$bg = $hxEqBg
+									$numStr = ''
+									if ($tag -eq 'del') {
+										$bg = $hxDelBg
+										$fg = $hxDelFg
+										$numStr = if ($oldNo -gt 0) { $oldNo.ToString().PadLeft($gutterW, ' ') } else { (' ' * $gutterW) }
+									} elseif ($tag -eq 'ins') {
+										$bg = $hxInsBg
+										$fg = $hxInsFg
+										$numStr = if ($newNo -gt 0) { $newNo.ToString().PadLeft($gutterW, ' ') } else { (' ' * $gutterW) }
+									} elseif ($tag -eq 'eq') {
+										$bg = $hxEqBg
+										$fg = $hxEqFg
+										$nn = if ($newNo -gt 0) { $newNo } elseif ($oldNo -gt 0) { $oldNo } else { 0 }
+										$numStr = if ($nn -gt 0) { $nn.ToString().PadLeft($gutterW, ' ') } else { (' ' * $gutterW) }
+									} elseif ($tag -eq 'hunk' -or $tag -eq 'meta') {
+										$bg = $hxCard
+										$fg = $hxMeta
+										$numStr = (' ' * $gutterW)
+									} else {
+										$numStr = (' ' * $gutterW)
+									}
+									try { $rowBd.Background = $brushCache[$bg] } catch {}
+
+									$lineGrid = New-Object System.Windows.Controls.Grid
+									$col0 = New-Object System.Windows.Controls.ColumnDefinition
+									$col0.Width = [System.Windows.GridLength]::Auto
+									$col1 = New-Object System.Windows.Controls.ColumnDefinition
+									$col1.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+									[void]$lineGrid.ColumnDefinitions.Add($col0)
+									[void]$lineGrid.ColumnDefinitions.Add($col1)
+
+									$tbG = New-Object System.Windows.Controls.TextBlock
+									$tbG.Text = $numStr
+									$tbG.FontFamily = $W.MonoFont
+									$tbG.FontSize = 11.5
+									if ($tag -eq 'del') { $tbG.Foreground = $brushCache[$hxDelFg] }
+									elseif ($tag -eq 'ins') { $tbG.Foreground = $brushCache[$hxInsFg] }
+									else { $tbG.Foreground = $brushCache[$hxGut] }
+									$tbG.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+									$tbG.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
+									[System.Windows.Controls.Grid]::SetColumn($tbG, 0)
+									[void]$lineGrid.Children.Add($tbG)
+
+									$tbC = New-Object System.Windows.Controls.TextBlock
+									$tbC.Text = $(if ($txt.Length -eq 0) { ' ' } else { $txt })
+									$tbC.FontFamily = $W.MonoFont
+									$tbC.FontSize = 11.5
+									$tbC.Foreground = $brushCache[$fg]
+									$tbC.TextWrapping = [System.Windows.TextWrapping]::Wrap
+									$tbC.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
+									[System.Windows.Controls.Grid]::SetColumn($tbC, 1)
+									[void]$lineGrid.Children.Add($tbC)
+
+									$rowBd.Child = $lineGrid
+									[void]$colSp.Children.Add($rowBd)
+								}
+
+								$card.Child = $colSp
+								$buc = New-Object System.Windows.Documents.BlockUIContainer ($card)
+								$buc.Margin = New-Object System.Windows.Thickness 0
+								$doc.Blocks.Add($buc)
+								$doc.Blocks.Add((& $newPara))
+								try { $W.LogLineCharRun = 0 } catch {}
+							} catch {}
+							continue
+						}
+
 						if ($kind -eq 'md-list-lead') {
 							try {
 								& $trimTrailingEmptyParas
@@ -44835,7 +52506,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								}
 								$sp = New-Object System.Windows.Controls.StackPanel
 								$sp.Orientation = [System.Windows.Controls.Orientation]::Horizontal
-								$sp.Margin = New-Object System.Windows.Thickness(8, 13, 8, 0)
+								# Sit tight under the code box (code box already has bottom margin)
+								$sp.Margin = New-Object System.Windows.Thickness(4, 4, 8, 8)
 								$sp.Tag = 'approval-buttons'
 								$lab = New-Object System.Windows.Controls.TextBlock
 								$lab.Text = 'Proceed?'
@@ -45631,6 +53303,12 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							}
 						} catch {}
 					} catch {}
+					# Re-drain TaskBoard if a snap arrived mid-tick.
+					try {
+						$drainTb2 = $null
+						try { $drainTb2 = $W.DrainTaskBoardPaint } catch { $drainTb2 = $null }
+						if ($drainTb2 -is [scriptblock]) { & $drainTb2 }
+					} catch {}
 					$pend = $W.PendingSticky
 					if ($pend) {
 						$W.PendingSticky = $null
@@ -45716,13 +53394,16 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								try { $acOn = [bool]$W.AutoCompactOn } catch {
 									$acOn = ($txt -match 'auto-compact:\s*ON')
 								}
+								$unlimOn = $false
+								try { $unlimOn = [bool]$W.UnlimitedTurns } catch { $unlimOn = $false }
 								$compactPart = ''
 								$toolsPart = ''
 								if ($txt -match '(x\d+)') { $compactPart = $Matches[1] }
 								elseif ($txt -match '(compact\s+\d+x)') { $compactPart = $Matches[1] }
 								if ($txt -match '(tools used\s+\d+)') { $toolsPart = $Matches[1] }
 								# Do NOT include tools count / turns left in sig - rebuilds destroy open flyouts mid-loop
-								$sig = ('{0}|ac={1}|aa={2}' -f $compactPart, $(if ($acOn) { 'ON' } else { 'OFF' }), $(if ($autoOn) { 'ON' } else { 'OFF' }))
+								# DO include unlimited (changes flyout chrome + AA pulse)
+								$sig = ('{0}|ac={1}|aa={2}|ul={3}' -f $compactPart, $(if ($acOn) { 'ON' } else { 'OFF' }), $(if ($autoOn) { 'ON' } else { 'OFF' }), $(if ($unlimOn) { '1' } else { '0' }))
 								$isPanel = $false
 								try { $isPanel = ($lr -is [System.Windows.Controls.Panel]) } catch { $isPanel = $false }
 								if ($isPanel) {
@@ -45732,14 +53413,17 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											if ($W.ToolsUsedTb -and $toolsPart) { $W.ToolsUsedTb.Text = $toolsPart }
 										} catch {}
 										try {
-											$disp = 30
-											if ([bool]$W.TurnsInFlight) {
-												$disp = [int]$W.TurnsLeft
-											} else {
-												$disp = [int]$W.MaxTurnsSetting
+											if (-not [bool]$W.UnlimitedTurns) {
+												$disp = 30
+												if ([bool]$W.TurnsInFlight) {
+													$disp = [int]$W.TurnsLeft
+												} else {
+													$disp = [int]$W.MaxTurnsSetting
+												}
+												if ($disp -lt 0) { $disp = 0 }
+												if ($disp -gt 200) { $disp = [int]$W.MaxTurnsSetting }
+												if ($W.AaTurnsNumTb) { $W.AaTurnsNumTb.Text = [string]$disp }
 											}
-											if ($disp -lt 0) { $disp = 0 }
-											if ($W.AaTurnsNumTb) { $W.AaTurnsNumTb.Text = [string]$disp }
 										} catch {}
 									} else {
 										$W.LowerRightSig = $sig
@@ -46121,7 +53805,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 													$cp = ''
 													if ($txt -match '(x\d+)') { $cp = $Matches[1] }
 													$aa = $false; try { $aa = [bool]$W.AutoApproveOn } catch {}
-													$W.LowerRightSig = ('{0}|ac={1}|aa={2}' -f $cp, $(if ($nxt) { 'ON' } else { 'OFF' }), $(if ($aa) { 'ON' } else { 'OFF' }))
+													$ul = $false; try { $ul = [bool]$W.UnlimitedTurns } catch {}
+													$W.LowerRightSig = ('{0}|ac={1}|aa={2}|ul={3}' -f $cp, $(if ($nxt) { 'ON' } else { 'OFF' }), $(if ($aa) { 'ON' } else { 'OFF' }), $(if ($ul) { '1' } else { '0' }))
 												} catch {}
 												try {
 													$msg = if ($nxt) { "`n  Auto-compact ON - context will trim automatically.`n" } else { "`n  Auto-compact OFF - context will not auto-trim.`n" }
@@ -46152,25 +53837,55 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$aaLabel.Cursor = [System.Windows.Input.Cursors]::Hand
 										try {
 											if ($W.SetThemedToolTip) {
-												& $W.SetThemedToolTip $aaLabel 'Click for max tool-loop turns (adjust with - / +)' 300
+												& $W.SetThemedToolTip $aaLabel 'Click for tool-loop turns (limit or Unlimited)' 320
 											} else {
-												$aaLabel.ToolTip = 'Click for max tool-loop turns'
+												$aaLabel.ToolTip = 'Click for tool-loop turns'
 											}
-										} catch { $aaLabel.ToolTip = 'Click for max tool-loop turns' }
+										} catch { $aaLabel.ToolTip = 'Click for tool-loop turns' }
 										if ($mono) { try { $aaLabel.FontFamily = $mono } catch {} }
 										$W.AaLabel = $aaLabel
-										# Turns flyout: - Turns[N] +  (matches auto-compact popup chrome)
+										# Turns flyout (2 rows tall): Unlimited on top, Turns below. STA has no main-script helpers — keep path/pulse inline.
 										$aaMenuBgHex = '#1E1E24'
 										$aaMenuFgHex = '#C8C8D0'
 										$aaMenuBorderHex = '#3A3A42'
 										$aaHoverBgHex = '#243D2A'
 										$aaHoverBdHex = '#9ECE6A'
 										$aaHoverFgHex = '#C3E6A0'
-										foreach ($hx in @($aaMenuBgHex, $aaMenuFgHex, $aaMenuBorderHex, $aaHoverBgHex, $aaHoverBdHex, $aaHoverFgHex)) {
+										$aaInfRedHex = '#F7768E'
+										$aaInfRedDimHex = '#3D2228'
+										$aaInfBlackHex = '#000000'
+										foreach ($hx in @($aaMenuBgHex, $aaMenuFgHex, $aaMenuBorderHex, $aaHoverBgHex, $aaHoverBdHex, $aaHoverFgHex, $aaInfRedHex, $aaInfRedDimHex, $aaInfBlackHex)) {
 											if (-not $W.BrushCache.ContainsKey($hx)) {
 												try { $W.BrushCache[$hx] = $conv.ConvertFromString($hx) } catch {}
 											}
 										}
+										# STA-local pulse helpers (BeginAnimation must run here; main-script fns are not in this runspace)
+										$startPulse = {
+											param($el, [double]$from = 0.35, [double]$to = 1.0, [int]$ms = 800)
+											if (-not $el) { return }
+											try {
+												$anim = New-Object System.Windows.Media.Animation.DoubleAnimation
+												$anim.From = $from
+												$anim.To = $to
+												$anim.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds($ms))
+												$anim.AutoReverse = $true
+												$anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+												try {
+													$ease = New-Object System.Windows.Media.Animation.SineEase
+													$ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+													$anim.EasingFunction = $ease
+												} catch {}
+												$el.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
+											} catch {}
+										}.GetNewClosure()
+										$stopPulse = {
+											param($el, [double]$rest = 1.0)
+											if (-not $el) { return }
+											try {
+												$el.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+												$el.Opacity = $rest
+											} catch {}
+										}.GetNewClosure()
 										$aaPopup = New-Object System.Windows.Controls.Primitives.Popup
 										$aaPopup.StaysOpen = $true
 										$aaPopup.AllowsTransparency = $true
@@ -46182,12 +53897,32 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$aaPopupShell.Background = $W.BrushCache[$aaMenuBgHex]
 										$aaPopupShell.BorderBrush = $W.BrushCache[$aaMenuBorderHex]
 										$aaPopupShell.BorderThickness = New-Object System.Windows.Thickness(1)
-										$aaPopupShell.Padding = New-Object System.Windows.Thickness(6, 4, 6, 4)
+										# ~2x vertical room for two rows; keep horizontal close to original
+										$aaPopupShell.Padding = New-Object System.Windows.Thickness(8, 8, 8, 8)
 										$aaPopupShell.CornerRadius = New-Object System.Windows.CornerRadius(0)
 										$aaPopupShell.SnapsToDevicePixels = $true
+										$aaPopupCol = New-Object System.Windows.Controls.StackPanel
+										$aaPopupCol.Orientation = [System.Windows.Controls.Orientation]::Vertical
+										# --- Row 1: Unlimited ---
+										$aaUnlimRow = New-Object System.Windows.Controls.StackPanel
+										$aaUnlimRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+										$aaUnlimRow.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$aaUnlimRow.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+										$aaUnlimRow.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
+										$aaUnlimLbl = New-Object System.Windows.Controls.TextBlock
+										$aaUnlimLbl.Text = 'Unlimited'
+										$aaUnlimLbl.FontSize = 12
+										$aaUnlimLbl.FontWeight = [System.Windows.FontWeights]::SemiBold
+										$aaUnlimLbl.Foreground = $W.BrushCache[$aaMenuFgHex]
+										$aaUnlimLbl.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$aaUnlimLbl.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+										if ($mono) { try { $aaUnlimLbl.FontFamily = $mono } catch {} }
+										[void]$aaUnlimRow.Children.Add($aaUnlimLbl)
+										# --- Row 2: - Turns[N] +  (mid becomes infinity when unlimited) ---
 										$aaTurnsRow = New-Object System.Windows.Controls.StackPanel
 										$aaTurnsRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
 										$aaTurnsRow.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$aaTurnsRow.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
 										$mkAaStepBtn = {
 											param([string]$Content, [scriptblock]$OnClick)
 											$b = New-Object System.Windows.Controls.Button
@@ -46220,6 +53955,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											} catch {}
 											$b.add_MouseEnter({
 												try {
+													if (-not [bool]$b.IsEnabled) { return }
 													$b.Background = $W.BrushCache['#243D2A']
 													$b.BorderBrush = $W.BrushCache['#9ECE6A']
 													$b.Foreground = $W.BrushCache['#C3E6A0']
@@ -46238,6 +53974,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$applyMaxTurnsUi = {
 											param([int]$Delta)
 											try {
+												if ([bool]$W.UnlimitedTurns) { return }
 												$cur = 30
 												try { $cur = [int]$W.MaxTurnsSetting } catch { $cur = 30 }
 												$nxt = $cur + [int]$Delta
@@ -46273,10 +54010,19 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											try { if ($null -ne $e) { $e.Handled = $true } } catch {}
 											& $applyMaxTurnsUi -Delta 1
 										}.GetNewClosure())
-										$aaTurnsMid = New-Object System.Windows.Controls.StackPanel
-										$aaTurnsMid.Orientation = [System.Windows.Controls.Orientation]::Horizontal
-										$aaTurnsMid.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-										$aaTurnsMid.Margin = New-Object System.Windows.Thickness(6, 0, 6, 0)
+										$W.BtnAaMinus = $btnAaMinus
+										$W.BtnAaPlus = $btnAaPlus
+										# Mid host: Turns[N] or red infinity (outlined) when unlimited
+										$aaTurnsMidHost = New-Object System.Windows.Controls.Grid
+										$aaTurnsMidHost.MinWidth = 88
+										$aaTurnsMidHost.MinHeight = 24
+										$aaTurnsMidHost.Margin = New-Object System.Windows.Thickness(6, 0, 6, 0)
+										$aaTurnsMidHost.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$W.AaTurnsMidHost = $aaTurnsMidHost
+										$aaTurnsCountPanel = New-Object System.Windows.Controls.StackPanel
+										$aaTurnsCountPanel.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+										$aaTurnsCountPanel.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$aaTurnsCountPanel.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
 										$mkAaMidTb = {
 											param([string]$t, [bool]$emph = $false)
 											$tb = New-Object System.Windows.Controls.TextBlock
@@ -46293,23 +54039,271 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										}.GetNewClosure()
 										$turnsShow = 30
 										try {
-											if ([bool]$W.TurnsInFlight) { $turnsShow = [int]$W.TurnsLeft }
+											if ([bool]$W.TurnsInFlight -and -not [bool]$W.UnlimitedTurns) { $turnsShow = [int]$W.TurnsLeft }
 											else { $turnsShow = [int]$W.MaxTurnsSetting }
 										} catch {
 											try { $turnsShow = [int]$W.MaxTurnsSetting } catch { $turnsShow = 30 }
 										}
 										if ($turnsShow -lt 0) { $turnsShow = 0 }
-										[void]$aaTurnsMid.Children.Add((& $mkAaMidTb 'Turns[' $false))
+										if ($turnsShow -gt 200) { $turnsShow = 30 }
+										[void]$aaTurnsCountPanel.Children.Add((& $mkAaMidTb 'Turns[' $false))
 										$aaTurnsNum = & $mkAaMidTb ([string]$turnsShow) $true
 										$W.AaTurnsNumTb = $aaTurnsNum
-										[void]$aaTurnsMid.Children.Add($aaTurnsNum)
-										[void]$aaTurnsMid.Children.Add((& $mkAaMidTb ']' $false))
+										[void]$aaTurnsCountPanel.Children.Add($aaTurnsNum)
+										[void]$aaTurnsCountPanel.Children.Add((& $mkAaMidTb ']' $false))
+										$W.AaTurnsCountPanel = $aaTurnsCountPanel
+										# Infinity glyph — path data inlined (from infinity.xaml); red fill + thin black outline
+										$aaInfHost = New-Object System.Windows.Controls.Border
+										$aaInfHost.Background = $W.BrushCache[$aaInfRedDimHex]
+										$aaInfHost.CornerRadius = New-Object System.Windows.CornerRadius(4)
+										$aaInfHost.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+										$aaInfHost.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+										$aaInfHost.Padding = New-Object System.Windows.Thickness(10, 2, 10, 2)
+										$aaInfHost.Visibility = [System.Windows.Visibility]::Collapsed
+										$aaInfHost.MinHeight = 22
+										$aaInfCanvas = New-Object System.Windows.Controls.Canvas
+										$aaInfCanvas.Width = 36
+										$aaInfCanvas.Height = 18
+										$aaInfCanvas.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+										$aaInfPath = New-Object System.Windows.Shapes.Path
+										# Material infinity (24x24) — inline so STA does not need Get-MBInfinityPathData
+										$infData = 'M18.6,6.62C21.58,6.62 24,9 24,12C24,14.96 21.58,17.37 18.6,17.37C17.15,17.37 15.8,16.81 14.78,15.8L12,13.34L9.17,15.85C8.2,16.82 6.84,17.38 5.4,17.38C2.42,17.38 0,14.96 0,12C0,9.04 2.42,6.62 5.4,6.62C6.84,6.62 8.2,7.18 9.22,8.2L12,10.66L14.83,8.15C15.8,7.18 17.16,6.62 18.6,6.62M7.8,14.39L10.5,12L7.84,9.65C7.16,8.97 6.31,8.62 5.4,8.62C3.53,8.62 2,10.13 2,12C2,13.87 3.53,15.38 5.4,15.38C6.31,15.38 7.16,15.03 7.8,14.39M16.2,9.61L13.5,12L16.16,14.35C16.84,15.03 17.7,15.38 18.6,15.38C20.47,15.38 22,13.87 22,12C22,10.13 20.47,8.62 18.6,8.62C17.69,8.62 16.84,8.97 16.2,9.61Z'
+										try {
+											$aaInfPath.Data = [System.Windows.Media.Geometry]::Parse($infData)
+										} catch {
+											# Fallback: unicode infinity if path parse fails
+											$aaInfPath = $null
+										}
+										if ($aaInfPath) {
+											$aaInfPath.Fill = $W.BrushCache[$aaInfRedHex]
+											$aaInfPath.Stroke = $W.BrushCache[$aaInfBlackHex]
+											$aaInfPath.StrokeThickness = 0.9
+											$aaInfPath.Width = 36
+											$aaInfPath.Height = 18
+											$aaInfPath.Stretch = [System.Windows.Media.Stretch]::Uniform
+											$aaInfPath.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+											$aaInfPath.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+											$aaInfHost.Child = $aaInfPath
+										} else {
+											$fb = New-Object System.Windows.Controls.TextBlock
+											$fb.Text = [string][char]0x221E
+											$fb.FontSize = 22
+											$fb.FontWeight = [System.Windows.FontWeights]::Bold
+											$fb.Foreground = $W.BrushCache[$aaInfRedHex]
+											$fb.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+											$fb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+											try {
+												$fb.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect
+												$fb.Effect.Color = [System.Windows.Media.Colors]::Black
+												$fb.Effect.BlurRadius = 0
+												$fb.Effect.ShadowDepth = 0.8
+												$fb.Effect.Opacity = 1
+											} catch {}
+											$aaInfHost.Child = $fb
+											$aaInfPath = $fb
+										}
+										$W.AaInfinityHost = $aaInfHost
+										$W.AaInfinityPath = $aaInfPath
+										[void]$aaTurnsMidHost.Children.Add($aaTurnsCountPanel)
+										[void]$aaTurnsMidHost.Children.Add($aaInfHost)
 										[void]$aaTurnsRow.Children.Add($btnAaMinus)
-										[void]$aaTurnsRow.Children.Add($aaTurnsMid)
+										[void]$aaTurnsRow.Children.Add($aaTurnsMidHost)
 										[void]$aaTurnsRow.Children.Add($btnAaPlus)
-										$aaPopupShell.Child = $aaTurnsRow
+										$applyUnlimitedTurnsLook = {
+											param([bool]$isUnlim)
+											try {
+												if ($W.AaTurnsCountPanel) {
+													$W.AaTurnsCountPanel.Visibility = $(if ($isUnlim) {
+														[System.Windows.Visibility]::Collapsed
+													} else {
+														[System.Windows.Visibility]::Visible
+													})
+												}
+												if ($W.AaInfinityHost) {
+													$W.AaInfinityHost.Visibility = $(if ($isUnlim) {
+														[System.Windows.Visibility]::Visible
+													} else {
+														[System.Windows.Visibility]::Collapsed
+													})
+													if ($isUnlim) {
+														try {
+															$W.AaInfinityHost.Opacity = 1.0
+															if ($W.AaInfinityPath) { $W.AaInfinityPath.Opacity = 1.0 }
+														} catch {}
+														# Pulse the chip only (parent); path stays solid red + black outline
+														& $startPulse $W.AaInfinityHost 0.45 1.0 700
+													} else {
+														& $stopPulse $W.AaInfinityHost 1.0
+														if ($W.AaInfinityPath) { & $stopPulse $W.AaInfinityPath 1.0 }
+													}
+												}
+												foreach ($btn in @($W.BtnAaMinus, $W.BtnAaPlus)) {
+													if (-not $btn) { continue }
+													try {
+														$btn.IsEnabled = (-not $isUnlim)
+														$btn.Opacity = $(if ($isUnlim) { 0.35 } else { 1.0 })
+													} catch {}
+												}
+												try {
+													& $applyToggleLook $W.AaUnlimOffSeg $W.AaUnlimOnSeg $W.AaUnlimHit `
+														$isUnlim $aaInfRedHex $aaOffHex $aaInfRedDimHex $activeBgCool `
+														'Unlimited turns ON - tool-loop turn limit disabled' `
+														'Unlimited turns OFF - use Turns[N] limit'
+												} catch {}
+												# Unlimited row: always red ON + pulse when unlimited is enabled
+												if ($W.AaUnlimOnSeg) {
+													if ($isUnlim) {
+														& $startPulse $W.AaUnlimOnSeg 0.4 1.0 750
+													} else {
+														& $stopPulse $W.AaUnlimOnSeg 1.0
+													}
+												}
+												# Main auto-approve toggle only:
+												#  unlimited+AA on  → red pulsing ON (not orange)
+												#  unlimited+AA off → normal OFF (green OFF, grey ON) — no red
+												#  limited + AA on  → normal orange ON
+												$aaNow = $false
+												try { $aaNow = [bool]$W.AutoApproveOn } catch { $aaNow = $false }
+												$onSeg = $null
+												try { $onSeg = $W.AutoApproveOnSeg } catch { $onSeg = $null }
+												if ($onSeg) { & $stopPulse $onSeg 1.0 }
+												if ($isUnlim -and $aaNow) {
+													try {
+														if ($onSeg) {
+															$onSeg.Background = $W.BrushCache[$aaInfRedDimHex]
+															if ($onSeg.Child) {
+																$onSeg.Child.Foreground = $W.BrushCache[$aaInfRedHex]
+																$onSeg.Child.Opacity = 1.0
+															}
+															$onSeg.Opacity = 1.0
+														}
+													} catch {}
+													if ($onSeg) { & $startPulse $onSeg 0.35 1.0 750 }
+												} else {
+													# Normal AA look (green OFF / orange ON when limited; green OFF when unlimited but AA off)
+													try {
+														& $applyToggleLook $W.AutoApproveOffSeg $W.AutoApproveOnSeg $W.AutoApproveToggleTip `
+															$aaNow $W.AaOnFg $W.AaOffFg $W.AaOnBg $W.AaOffBg $W.AaTipOn $W.AaTipOff
+													} catch {}
+												}
+											} catch {}
+										}.GetNewClosure()
+										$unlimClick = {
+											param($s, $e)
+											try {
+												if ($null -ne $e) { try { $e.Handled = $true } catch {} }
+												$now = [Environment]::TickCount
+												$last = 0
+												try { $last = [int]$W.UnlimitedTurnsClickTick } catch { $last = 0 }
+												if ($last -ne 0 -and ((($now - $last) -band 0x7fffffff) -lt 280)) { return }
+												$W.UnlimitedTurnsClickTick = $now
+												$cur = $false
+												try { $cur = [bool]$W.UnlimitedTurns } catch { $cur = $false }
+												$nxt = -not $cur
+												$W.UnlimitedTurns = $nxt
+												$W.UnlimitedTurnsDirty = $true
+												# STA: freeze/restore on shared MB bag (main runspace Sync also applies via Dirty)
+												try {
+													$cfg = 30
+													try { $cfg = [int]$W.MaxTurnsSetting } catch { $cfg = 30 }
+													if ($cfg -lt 1) { $cfg = 30 }
+													if ($cfg -gt 200) { $cfg = 200 }
+													if ($nxt) {
+														$snap = $cfg
+														try {
+															if ([bool]$W.TurnsInFlight) { $snap = [int]$W.TurnsLeft }
+															else { $snap = $cfg }
+														} catch { $snap = $cfg }
+														if ($snap -lt 0) { $snap = 0 }
+														if ($snap -gt $cfg) { $snap = $cfg }
+														$W.TurnsLeftFrozen = $snap
+														$W.TurnsLeft = $snap
+														try {
+															$script:MB.TurnsLeftFrozen = $snap
+															$script:MB.TurnsLeft = $snap
+															$script:MB.TurnsResumeTurn0 = $null
+															$script:MB.UnlimitedTurns = $true
+														} catch {}
+													} else {
+														$rest = $null
+														try { $rest = $W.TurnsLeftFrozen } catch { $rest = $null }
+														if ($null -eq $rest) {
+															try { $rest = $script:MB.TurnsLeftFrozen } catch { $rest = $null }
+														}
+														if ($null -eq $rest) { $rest = $cfg }
+														$rest = [int]$rest
+														if ($rest -lt 0) { $rest = 0 }
+														if ($rest -gt $cfg) { $rest = $cfg }
+														$W.TurnsLeft = $rest
+														try {
+															$script:MB.UnlimitedTurns = $false
+															$script:MB.TurnsLeft = $rest
+															$script:MB.TurnsLeftFrozen = $rest
+															if ([bool]$W.TurnsInFlight) {
+																$t0 = 0
+																try { $t0 = [int]$W.TurnsUsed } catch {
+																	try { $t0 = [int]$script:MB.TurnsUsed } catch { $t0 = 0 }
+																}
+																$script:MB.TurnsResumeTurn0 = $t0
+																$W.TurnsLeftFrozen = $rest
+															} else {
+																$script:MB.TurnsResumeTurn0 = $null
+																$script:MB.TurnsLeftFrozen = $null
+																$script:MB.TurnsLeft = $cfg
+																$W.TurnsLeft = $cfg
+																$W.TurnsLeftFrozen = $null
+																$rest = $cfg
+															}
+														} catch {}
+														try {
+															if ($W.AaTurnsNumTb) {
+																$W.AaTurnsNumTb.Text = [string]$rest
+															}
+														} catch {}
+													}
+												} catch {
+													try { $script:MB.UnlimitedTurns = $nxt } catch {}
+												}
+												try { & $applyUnlimitedTurnsLook $nxt } catch {}
+												try {
+													$cp = ''
+													if ($txt -match '(x\d+)') { $cp = $Matches[1] }
+													$ac = $true; try { $ac = [bool]$W.AutoCompactOn } catch {}
+													$aa = $false; try { $aa = [bool]$W.AutoApproveOn } catch {}
+													$W.LowerRightSig = ('{0}|ac={1}|aa={2}|ul={3}' -f $cp, $(if ($ac) { 'ON' } else { 'OFF' }), $(if ($aa) { 'ON' } else { 'OFF' }), $(if ($nxt) { '1' } else { '0' }))
+												} catch {}
+												try {
+													$msg = if ($nxt) {
+														"`n  Unlimited turns ON - tool-loop turn limit disabled (infinity).`n"
+													} else {
+														"`n  Unlimited turns OFF - tool-loop uses Turns[N] again.`n"
+													}
+													$col = if ($nxt) { 'Red' } else { 'DarkGray' }
+													if ($W.WriteQueue) {
+														$W.WriteQueue.Enqueue([pscustomobject]@{
+															Kind = 'text'; Text = $msg; Color = $col; NoNewline = $false
+															Brand = $(try { [string]$W.AgentName } catch { 'MiniBot' })
+														})
+													}
+												} catch {}
+											} catch {}
+										}.GetNewClosure()
+										$unlimTog = & $mkToggle $unlimOn $aaInfRedHex $aaOffHex $aaInfRedDimHex $activeBgCool `
+											'Unlimited turns ON - tool-loop turn limit disabled' `
+											'Unlimited turns OFF - use Turns[N] limit' $unlimClick
+										$W.AaUnlimOffSeg = $unlimTog.Off
+										$W.AaUnlimOnSeg = $unlimTog.On
+										$W.AaUnlimHit = $unlimTog.Hit
+										try { $unlimTog.Outer.Margin = New-Object System.Windows.Thickness(0, 0, 0, 0) } catch {}
+										[void]$aaUnlimRow.Children.Add($unlimTog.Outer)
+										[void]$aaPopupCol.Children.Add($aaUnlimRow)
+										[void]$aaPopupCol.Children.Add($aaTurnsRow)
+										$aaPopupShell.Child = $aaPopupCol
 										$aaPopup.Child = $aaPopupShell
 										$W.AaApprovePopup = $aaPopup
+										$W.ApplyUnlimitedTurnsLook = $applyUnlimitedTurnsLook
+										$W.StartAaPulse = $startPulse
+										$W.StopAaPulse = $stopPulse
 										$aaLabel.add_MouseLeftButtonUp({
 											param($s, $e)
 											try {
@@ -46328,17 +54322,26 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												$opening = -not [bool]$aaPopup.IsOpen
 												if ($opening) {
 													try {
-														$disp = 30
-														if ([bool]$W.TurnsInFlight) {
-															$disp = [int]$W.TurnsLeft
-														} else {
-															$disp = [int]$W.MaxTurnsSetting
+														if (-not [bool]$W.UnlimitedTurns) {
+															$disp = 30
+															if ([bool]$W.TurnsInFlight) {
+																$disp = [int]$W.TurnsLeft
+															} else {
+																$disp = [int]$W.MaxTurnsSetting
+															}
+															if ($disp -lt 0) { $disp = 0 }
+															if ($disp -gt 200) { $disp = [int]$W.MaxTurnsSetting }
+															if ($W.AaTurnsNumTb) { $W.AaTurnsNumTb.Text = [string]$disp }
 														}
-														if ($disp -lt 0) { $disp = 0 }
-														if ($W.AaTurnsNumTb) { $W.AaTurnsNumTb.Text = [string]$disp }
 													} catch {}
 													$W.AaPopupWantOpen = $true
 													$aaPopup.IsOpen = $true
+													# Restart pulse after popup is open (animations need live visual tree)
+													try {
+														if ([bool]$W.UnlimitedTurns -and $W.ApplyUnlimitedTurnsLook) {
+															& $W.ApplyUnlimitedTurnsLook $true
+														}
+													} catch {}
 												} else {
 													$W.AaPopupWantOpen = $false
 													$aaPopup.IsOpen = $false
@@ -46371,11 +54374,18 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 													& $applyToggleLook $W.AutoApproveOffSeg $W.AutoApproveOnSeg $W.AutoApproveToggleTip `
 														$nxt $W.AaOnFg $W.AaOffFg $W.AaOnBg $W.AaOffBg $W.AaTipOn $W.AaTipOff
 												} catch {}
+												# Re-apply unlimited red pulse on ON if needed
+												try {
+													if ([bool]$W.UnlimitedTurns -and $W.ApplyUnlimitedTurnsLook) {
+														& $W.ApplyUnlimitedTurnsLook $true
+													}
+												} catch {}
 												try {
 													$cp = ''
 													if ($txt -match '(x\d+)') { $cp = $Matches[1] }
 													$ac = $true; try { $ac = [bool]$W.AutoCompactOn } catch {}
-													$W.LowerRightSig = ('{0}|ac={1}|aa={2}' -f $cp, $(if ($ac) { 'ON' } else { 'OFF' }), $(if ($nxt) { 'ON' } else { 'OFF' }))
+													$ul = $false; try { $ul = [bool]$W.UnlimitedTurns } catch {}
+													$W.LowerRightSig = ('{0}|ac={1}|aa={2}|ul={3}' -f $cp, $(if ($ac) { 'ON' } else { 'OFF' }), $(if ($nxt) { 'ON' } else { 'OFF' }), $(if ($ul) { '1' } else { '0' }))
 												} catch {}
 												try {
 													$msg = if ($nxt) {
@@ -46400,6 +54410,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										$W.AutoApproveOnSeg = $aaTog.On
 										$W.AutoApproveToggleTip = $aaTog.Hit
 										[void]$lr.Children.Add($aaTog.Outer)
+										# Apply unlimited mid-section + AA ON pulse after AA segs exist
+										try { & $applyUnlimitedTurnsLook $unlimOn } catch {}
 										if ($toolsPart) {
 											& $addMuted ("  {0}  " -f $dot)
 											$toolsTb = New-Object System.Windows.Controls.TextBlock
@@ -46577,30 +54589,55 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$border = New-Object System.Windows.Controls.Border
 								$border.Background = $chipBg
 								$border.CornerRadius = New-Object System.Windows.CornerRadius(3)
-								$border.Padding = New-Object System.Windows.Thickness(5, 1, 5, 1)
-								$border.Margin = New-Object System.Windows.Thickness(0, 2, 4, 2)
+								$border.Padding = New-Object System.Windows.Thickness(4, 1, 4, 1)
+								$border.Margin = New-Object System.Windows.Thickness(1, 1, 1, 1)
 								$border.Cursor = [System.Windows.Input.Cursors]::Hand
 								$border.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+								$border.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
 								$border.SnapsToDevicePixels = $true
-								$tb = New-Object System.Windows.Controls.TextBlock
-								$tb.Text = [string]$g
-								$tb.FontSize = 11
-								$tb.Foreground = $(if ($on) { $limeB } else { $grayB })
-								$tb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
-								if ($mono) { try { $tb.FontFamily = $mono } catch {} }
+								try { $border.UseLayoutRounding = $true } catch {}
+								# Dual TextBlock shadow (not DropShadowEffect): effect is clipped unevenly on WrapPanel row 2+ and softens glyphs
+								$chipGrid = New-Object System.Windows.Controls.Grid
+								$chipGrid.SnapsToDevicePixels = $true
+								try { $chipGrid.ClipToBounds = $false } catch {}
+								$fgMain = $(if ($on) { $limeB } else { $grayB })
+								$fw = [System.Windows.FontWeights]::Normal
 								if ($on) {
-									try { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold } catch {}
+									try { $fw = [System.Windows.FontWeights]::SemiBold } catch {}
 								}
+								$mkChipTb = {
+									param([string]$txt, $fg, [System.Windows.Thickness]$m)
+									$t = New-Object System.Windows.Controls.TextBlock
+									$t.Text = $txt
+									$t.FontSize = 11
+									$t.Foreground = $fg
+									$t.FontWeight = $fw
+									$t.Margin = $m
+									$t.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+									$t.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
+									$t.TextAlignment = [System.Windows.TextAlignment]::Center
+									$t.SnapsToDevicePixels = $true
+									if ($mono) { try { $t.FontFamily = $mono } catch {} }
+									return $t
+								}.GetNewClosure()
+								$shadowBrush = $null
 								try {
-									$ds = New-Object System.Windows.Media.Effects.DropShadowEffect
-									$ds.Color = [System.Windows.Media.Colors]::Black
-									$ds.BlurRadius = 3.2
-									$ds.ShadowDepth = 1.15
-									$ds.Opacity = 0.9
-									$ds.Direction = 315
-									$tb.Effect = $ds
-								} catch {}
-								$border.Child = $tb
+									if (-not $W.BrushCache.ContainsKey('#CC000000')) {
+										$W.BrushCache['#CC000000'] = $conv.ConvertFromString('#CC000000')
+									}
+									$shadowBrush = $W.BrushCache['#CC000000']
+								} catch {
+									try { $shadowBrush = [System.Windows.Media.Brushes]::Black } catch {}
+								}
+								if ($shadowBrush) {
+									$tbSh = & $mkChipTb ([string]$g) $shadowBrush (New-Object System.Windows.Thickness(1, 1, 0, 0))
+									$tbSh.IsHitTestVisible = $false
+									try { $tbSh.Opacity = 0.85 } catch {}
+									[void]$chipGrid.Children.Add($tbSh)
+								}
+								$tb = & $mkChipTb ([string]$g) $fgMain (New-Object System.Windows.Thickness(0))
+								[void]$chipGrid.Children.Add($tb)
+								$border.Child = $chipGrid
 								$gTip = ''
 								try {
 									if ($groupTipsMap -is [hashtable] -and $groupTipsMap.ContainsKey([string]$g)) {
@@ -46828,8 +54865,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										} catch { $noDomain = $false }
 										$toolUnavailable = ($noVision -or $noGpo -or $noDomain)
 										if ($noVision) {
-											if ($tTip -notmatch '(?i)does not support vision|no ''vision'' in Abilities') {
-												$tTip = ("{0}`n`nUnavailable: current model does not support vision (no 'vision' in Abilities)." -f $tTip.TrimEnd())
+											if ($tTip -notmatch '(?i)cannot view images|does not support vision|Unavailable:.*vision') {
+												$tTip = ("{0}`n`nUnavailable: the connected model cannot view images or the screen." -f $tTip.TrimEnd())
 											}
 										}
 										if ($noGpo) {
@@ -46837,8 +54874,13 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												$tTip = ("{0}`n`nUnavailable: {1}" -f $tTip.TrimEnd(), $gpoBlockReason)
 											}
 										}
-										if ($noDomain -and $tTip -notmatch '(?i)Status: unavailable') {
-											$tTip = ("{0}`n`nStatus: unavailable (domain required)" -f $tTip.TrimEnd())
+										if ($noDomain -and $tTip -notmatch '(?i)Unavailable:.*domain|domain required|not domain') {
+											$domWhy = 'This PC or signed-in user is not on a domain.'
+											try {
+												$r = Get-MBRemoteCommandUnavailableReason
+												if ($r) { $domWhy = [string]$r }
+											} catch {}
+											$tTip = ("{0}`n`nUnavailable: {1}" -f $tTip.TrimEnd(), $domWhy)
 										}
 										$wasUsed = $false
 										try {
@@ -47818,7 +55860,12 @@ function Start-LocalAgent {
 			-IncludeNativeHelpers -IncludeTypeHint
 	} catch {
 		Show-MBBanner
-		Write-MBOk ("Connected ({0}, {1} ms)" -f $connTest.AuthType, $connTest.ElapsedMs)
+		try {
+			Write-MBConnectionTail -AuthType ([string]$connTest.AuthType) -ElapsedMs ([int]$connTest.ElapsedMs) `
+				-IncludeNativeHelpers -IncludeTypeHint
+		} catch {
+			Write-MBOk ("Connected ({0}, {1} ms)" -f $connTest.AuthType, $connTest.ElapsedMs)
+		}
 	}
 
 	$script:Messages = @(Sync-MBSystemMessages -Messages @())
@@ -47917,18 +55964,20 @@ function Start-LocalAgent {
 					}
 					if ($arg) {
 						$g = $arg.Trim().ToLowerInvariant()
-						if ($g -in @('core','senses','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','web','full','all')) {
+						$knownGroups = @(Get-MBToolGroupOrder) + @('full', 'all')
+						if ($g -in $knownGroups) {
 							$msg = Enable-MBToolGroup -Group $g
 							Write-MBOk $msg
 						} else {
-							Write-MBWarn "Usage: /tools [core|senses|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full|list]"
+							Write-MBWarn ("Usage: /tools [{0}|full|list]" -f ((@(Get-MBToolGroupOrder) -join '|')))
 						}
 						Write-Host ""
 						continue
 					}
 					Write-Host ("  Profile: {0}  |  Active groups: {1}" -f $script:MB.ToolProfile, ((@($script:MB.ActiveToolGroups) -join ', '))) -ForegroundColor DarkGray
 					Write-Host ""
-					foreach ($gKey in @($script:MBToolCatalog.Keys)) {
+					foreach ($gKey in @(Get-MBToolGroupOrder)) {
+						if (-not $script:MBToolCatalog.Contains($gKey)) { continue }
 						$meta = if ($script:MBToolGroupMeta -and $script:MBToolGroupMeta.Contains($gKey)) { $script:MBToolGroupMeta[$gKey] } else { $null }
 						$isOn = @($script:MB.ActiveToolGroups) -contains $gKey
 						$flag = if ($isOn) { 'ON ' } else { 'off' }
@@ -48013,7 +56062,7 @@ function Start-LocalAgent {
 						Write-Host "  Record      : hold Right-Ctrl to talk, release to stop (PTT)" -ForegroundColor Gray
 						Write-Host "  Typing      : works anytime Right-Ctrl is not held (Left-Ctrl+Enter still multi-line)" -ForegroundColor DarkGray
 						Write-Host "  Status shows on the input line (● REC ...). Esc cancels mid-PTT." -ForegroundColor Gray
-						Write-Host "  Model tool  : SpeakText (group senses; enabled with /speech on)" -ForegroundColor Gray
+						Write-Host "  Model tool  : SpeakText (group sound; enabled with /speech on)" -ForegroundColor Gray
 						if ($script:MB.SpeechInitError) {
 							Write-Host ("  Last error  : {0}" -f $script:MB.SpeechInitError) -ForegroundColor DarkYellow
 						}
@@ -48061,7 +56110,7 @@ function Start-LocalAgent {
 				'^/forget$' {
 					Clear-MBSticky
 					$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
-					Write-MBOk "Sticky notes, findings, and digest cleared."
+					Write-MBOk "Sticky notes, findings, digest, and TaskBoard cleared."
 					continue
 				}
 				'^/clear$|^/reset$' {
@@ -48229,15 +56278,28 @@ function Start-LocalAgent {
 		}
 
 		try { Reset-MBToolLoopGuard } catch {}
+		# Multi-step user asks → sticky + later TURN_HYGIENE TaskBoard nudge
+		try {
+			if (-not $isLoadResume) {
+				Register-MBMultiStepNudgeFromUser -Text ([string]$userInput)
+			}
+		} catch {}
 		Write-MBDebugLog -Step 'TURN_CONTEXT_MANAGE'
 		try {
+			# Sync/compact once at user-turn start, then freeze wire for the tool loop.
+			try { Thaw-MBWireState } catch {}
 			$script:Messages = @(Manage-MBContext -Messages $script:Messages)
+			try {
+				Freeze-MBWireState -Refresh
+				$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
+			} catch {}
 		} catch {
 			Write-MBWarn "Context manage failed: $($_.Exception.Message)"
 			try { $script:Messages = @(Optimize-MBHistory -Messages $script:Messages) } catch {}
+			try { Freeze-MBWireState -Refresh } catch {}
 		}
 		try { Update-MBWpfLiveChrome -Force } catch {}
-		Write-MBDebugLog -Step 'TURN_CONTEXT_OK' -Detail ("msgs={0}" -f @($script:Messages).Count)
+		Write-MBDebugLog -Step 'TURN_CONTEXT_OK' -Detail ("msgs={0} wireFrozen={1}" -f @($script:Messages).Count, $(try { [bool]$script:MB.WireStateFrozen } catch { $false }))
 
 		# Paint user turn and working state
 		try {
@@ -48260,6 +56322,7 @@ function Start-LocalAgent {
 
 		Reset-MBInterrupt
 		$turn = 0
+		try { $script:MB.TaskBoardNudgeThisUserTurn = $false } catch {}
 		try { Sync-MBMaxTurnsFromWpf } catch {}
 		$maxTurnsNow = Get-MBEffectiveMaxTurns
 		try { Update-MBTurnsCountdown -Idle } catch {}
@@ -48273,9 +56336,9 @@ function Start-LocalAgent {
 				try { Update-MBWpfLiveChrome } catch {}
 				Write-MBDebugLog -Step 'TURN_MODEL_ITER' -Detail ("turn={0}/{1} left={2}" -f $turn, $maxTurnsNow, $script:MB.TurnsLeft)
 
-				# Sync sticky state and budget before model call
+				# Append-only manage under wire freeze.
 				try {
-					$script:Messages = @(Manage-MBContext -Messages $script:Messages)
+					$script:Messages = @(Manage-MBContext -Messages $script:Messages -AppendOnly)
 				} catch {
 					$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
 				}
@@ -48335,6 +56398,38 @@ function Start-LocalAgent {
 						Write-MBWarn "Model returned no text and no tools (context may be too noisy). Try GetBSODInfo or a narrower question."
 						break
 					}
+
+					# Open TaskBoard items: finish cleanly or nudge once (do not abandon mid-plan).
+					try {
+						if (-not $isLoadResume -and (Test-MBTaskBoardHasOpen) -and $turn -lt $maxTurnsNow) {
+							$finalTextStr = [string]$finalText
+							# Model already asserted success (e.g. ALL PASSED) but left board open -> close board, do not re-loop
+							if (Test-MBReplySignalsTaskBoardDone -Text $finalTextStr) {
+								try {
+									$null = Complete-MBTaskBoard -ForceMarkDone -Reason 'reply-signaled-done'
+									Write-MBInfo 'Task board complete - sticky cleared.'
+								} catch {}
+							} elseif (-not $script:MB.TaskBoardNudgeThisUserTurn) {
+								$script:MB.TaskBoardNudgeThisUserTurn = $true
+								$nudge = @(
+									'SESSION: Task board still has open items (see SESSION STATE Task board).'
+									'Either finish remaining items (TaskBoard update status=done) then continue tools, or if the work is truly finished call TaskBoard action=clear.'
+									'Do not leave a half-open board after a final answer.'
+								) -join ' '
+								$script:Messages += @{ role = 'user'; content = $nudge }
+								try { $script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages) } catch {}
+								# ASCII hyphen - em-dash mojibakes under PS 5.1 / console code pages
+								Write-MBInfo 'Task board incomplete - continuing...'
+								continue
+							}
+						} elseif (-not $isLoadResume -and (Test-MBTaskBoardAllDone)) {
+							# All items done but board not cleared yet (e.g. model never called clear)
+							try {
+								$null = Complete-MBTaskBoard -Reason 'all-done-on-final'
+								Write-MBInfo 'Task board complete - sticky cleared.'
+							} catch {}
+						}
+					} catch {}
 
 					$fr = ''
 					try { $fr = [string](Get-MBProp $response 'finish_reason') } catch { $fr = '' }
@@ -48465,48 +56560,60 @@ function Start-LocalAgent {
 					}
 					if (-not $argsObj) { $argsObj = [pscustomobject]@{} }
 
-					Write-Host "  -> " -NoNewline -ForegroundColor DarkGreen
-					$fnLabel = Get-MBToolConsoleLabel -Name $fn -ArgsObj $argsObj
-					Write-Host $fnLabel -NoNewline -ForegroundColor Green
-					$hint = ""
-					if ($fn -eq 'EnableToolGroup') {
-						$eg = ''; $egs = $null
-						if (Test-MBHasProp $argsObj 'group') { $eg = [string](Get-MBProp $argsObj 'group') }
-						if (Test-MBHasProp $argsObj 'groups') { $egs = (Get-MBProp $argsObj 'groups') }
-						$etoks = @(Get-MBEnableToolGroupTokens -Group $eg -groups $egs)
-						if ($etoks.Count -gt 0) { $hint = "  $($etoks -join ', ')" }
+					# TaskBoard: silent in console/chat — flyout under chips is the operator UI
+					$quietTool = $false
+					try {
+						$fnRes = Resolve-MBToolName -Name $fn
+						if (-not $fnRes) { $fnRes = $fn }
+						if ($fnRes -eq 'TaskBoard' -or $fn -match '^(?i)TaskBoard$') { $quietTool = $true }
+					} catch {
+						if ($fn -match '^(?i)TaskBoard$') { $quietTool = $true }
 					}
-					elseif ($fn -eq 'ScanNetwork') {
-						$hint = '  (usually ~30s)'
+
+					if (-not $quietTool) {
+						Write-Host "  -> " -NoNewline -ForegroundColor DarkGreen
+						$fnLabel = Get-MBToolConsoleLabel -Name $fn -ArgsObj $argsObj
+						Write-Host $fnLabel -NoNewline -ForegroundColor Green
+						$hint = ""
+						if ($fn -eq 'EnableToolGroup') {
+							$eg = ''; $egs = $null
+							if (Test-MBHasProp $argsObj 'group') { $eg = [string](Get-MBProp $argsObj 'group') }
+							if (Test-MBHasProp $argsObj 'groups') { $egs = (Get-MBProp $argsObj 'groups') }
+							$etoks = @(Get-MBEnableToolGroupTokens -Group $eg -groups $egs)
+							if ($etoks.Count -gt 0) { $hint = "  $($etoks -join ', ')" }
+						}
+						elseif ($fn -eq 'ScanNetwork') {
+							$hint = '  (usually ~30s)'
+						}
+						elseif ($fn -eq 'FindShares') {
+							$hint = '  (port filter + map guess)'
+						}
+						elseif ($fn -eq 'PortProbe') {
+							$hint = '  (tcp ports)'
+						}
+						elseif ($fn -eq 'FindWebHosts') {
+							$hint = '  (http/https ports)'
+						}
+						elseif ($fn -eq 'FindRdp') {
+							$hint = '  (3389)'
+						}
+						elseif (Test-MBHasProp $argsObj 'path') { $hint = "  $(Get-MBProp $argsObj 'path')" }
+						elseif (Test-MBHasProp $argsObj 'name') { $hint = "  $(Get-MBProp $argsObj 'name')" }
+						elseif (Test-MBHasProp $argsObj 'piece') { $hint = "  piece=$(Get-MBProp $argsObj 'piece')" }
+						elseif (Test-MBHasProp $argsObj 'command') {
+							$c = [string](Get-MBProp $argsObj 'command')
+							if ($c.Length -gt 70) { $c = $c.Substring(0, 67) + "..." }
+							$hint = "  $c"
+						}
+						elseif (Test-MBHasProp $argsObj 'code') {
+							$c = [string](Get-MBProp $argsObj 'code')
+							if ($c.Length -gt 50) { $c = $c.Substring(0, 47) + "..." }
+							$hint = "  code=$c"
+						}
+						elseif (Test-MBHasProp $argsObj 'url') { $hint = "  $(Get-MBProp $argsObj 'url')" }
+						elseif (Test-MBHasProp $argsObj 'github_url') { $hint = "  $(Get-MBProp $argsObj 'github_url')" }
+						Write-Host $hint -ForegroundColor DarkGray
 					}
-					elseif ($fn -eq 'FindShares') {
-						$hint = '  (port filter + map guess)'
-					}
-					elseif ($fn -eq 'PortProbe') {
-						$hint = '  (tcp ports)'
-					}
-					elseif ($fn -eq 'FindWebHosts') {
-						$hint = '  (http/https ports)'
-					}
-					elseif ($fn -eq 'FindRdp') {
-						$hint = '  (3389)'
-					}
-					elseif (Test-MBHasProp $argsObj 'path') { $hint = "  $(Get-MBProp $argsObj 'path')" }
-					elseif (Test-MBHasProp $argsObj 'name') { $hint = "  $(Get-MBProp $argsObj 'name')" }
-					elseif (Test-MBHasProp $argsObj 'piece') { $hint = "  piece=$(Get-MBProp $argsObj 'piece')" }
-					elseif (Test-MBHasProp $argsObj 'command') {
-						$c = [string](Get-MBProp $argsObj 'command')
-						if ($c.Length -gt 70) { $c = $c.Substring(0, 67) + "..." }
-						$hint = "  $c"
-					}
-					elseif (Test-MBHasProp $argsObj 'code') {
-						$c = [string](Get-MBProp $argsObj 'code')
-						if ($c.Length -gt 50) { $c = $c.Substring(0, 47) + "..." }
-						$hint = "  code=$c"
-					}
-					elseif (Test-MBHasProp $argsObj 'url') { $hint = "  $(Get-MBProp $argsObj 'url')" }
-					elseif (Test-MBHasProp $argsObj 'github_url') { $hint = "  $(Get-MBProp $argsObj 'github_url')" }
-					Write-Host $hint -ForegroundColor DarkGray
 
 					$toolResult = ""
 					try {
@@ -48523,7 +56630,7 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 						}
 					} catch {
 						$toolResult = "ERROR: tool $fn threw: $($_.Exception.Message)"
-						Write-MBErr $toolResult
+						if (-not $quietTool) { Write-MBErr $toolResult }
 					}
 					if ($null -eq $toolResult) { $toolResult = "" }
 					$tr = [string]$toolResult
@@ -48535,11 +56642,13 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 						$toolResult = Sanitize-MBText -Text $tr
 					}
 
-					Write-Host "    ($($script:MB.LastToolMs) ms, $($toolResult.Length) chars)" -ForegroundColor DarkGray
-					try {
-						$toolSec = [double]([math]::Max(0, [int]$script:MB.LastToolMs) / 1000.0)
-						Write-MBWorkedStamp -Seconds $toolSec -NoSpeed
-					} catch {}
+					if (-not $quietTool) {
+						Write-Host "    ($($script:MB.LastToolMs) ms, $($toolResult.Length) chars)" -ForegroundColor DarkGray
+						try {
+							$toolSec = [double]([math]::Max(0, [int]$script:MB.LastToolMs) / 1000.0)
+							Write-MBWorkedStamp -Seconds $toolSec -NoSpeed
+						} catch {}
+					}
 
 					$tcId = Get-MBProp $tc 'id'
 					if (-not $tcId) { $tcId = "call_$([guid]::NewGuid().ToString('N').Substring(0,8))" }
@@ -48558,11 +56667,30 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 					break
 				}
 
+				# Post-tool: append tool results only (append-only wire under freeze).
 				try {
-					$script:Messages = @(Manage-MBContext -Messages $script:Messages)
+					$hint = Get-MBPostToolTurnHint -ForceFooter $true
+					if ($hint) { $script:MB.LastTurnHygiene = $hint }
+					# Strip legacy mid-history TURN_HYGIENE if present.
+					$hadLegacy = $false
+					foreach ($hm in @($script:Messages)) {
+						if (Test-MBIsTurnHygieneMessage $hm) { $hadLegacy = $true; break }
+					}
+					if ($hadLegacy) {
+						$clean = New-Object System.Collections.ArrayList
+						foreach ($hm in @($script:Messages)) {
+							if (Test-MBIsTurnHygieneMessage $hm) { continue }
+							[void]$clean.Add($hm)
+						}
+						$script:Messages = $clean.ToArray()
+					}
+				} catch {}
+
+				try {
+					$script:Messages = @(Manage-MBContext -Messages $script:Messages -AppendOnly)
 				} catch {
 					Write-MBWarn "History optimize failed: $($_.Exception.Message)"
-					try { $script:Messages = @(Optimize-MBHistory -Messages $script:Messages) } catch {}
+					try { $script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages) } catch {}
 				}
 				try { Update-MBWpfLiveChrome -Force } catch {}
 
@@ -48592,7 +56720,9 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 		try { Update-MBTurnsCountdown -Idle } catch {}
 		try { Update-MBWpfLiveChrome -Force } catch {}
 
+		# End of user turn: thaw wire freeze and refresh SESSION STATE.
 		try {
+			Thaw-MBWireState
 			$script:Messages = @(Sync-MBSystemMessages -Messages $script:Messages)
 		} catch {}
 
@@ -48606,6 +56736,7 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 			} catch {
 				Write-MBErr "Turn error: $($_.Exception.Message)"
 			}
+			try { Thaw-MBWireState } catch {}
 			try { Clear-MBWorkingState } catch {}
 		}
 	}
