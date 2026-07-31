@@ -1,6 +1,6 @@
 # MiniBot
 
-**v2.50.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
+**v2.51.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
@@ -415,3 +415,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
 ## License / deploy notes
 
 Single-file distribution: copy `MiniBot.ps1` (or rename to `.cmd`). Edit the param defaults and optional `$script:MBExtraApiBases` / keys near the top for your lab. Optional XAML icon assets beside the script are used when present.
+
+Made for IRM | IEX Deployment
+
+MIT
