@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.51.0 - Local AI agent host for Windows PowerShell 5.1
+	MiniBot v2.52.0 - Local AI agent host for Windows PowerShell 5.1
 .DESCRIPTION
 	OpenAI-compatible agent client (WPF UI + tools). Hybrid .CMD/.PS1 launcher; irm|iex friendly.
 .NOTES
@@ -17,7 +17,7 @@ param(
 	# Port stays in the URL (not a separate param) so multi-endpoint bases, HTTPS, and /v1 paths stay simple.
 	# Localhost placeholder: nothing listening -> Connect recovery popup to enter real endpoint (xAI, LAN, etc.).
 	# Leave empty ("") to open Connect immediately without a probe timeout.
-	[string]$BaseUrl = "", # e.g. http://127.0.0.1:8080/v1 - Hardcode here for direct connect without login popup
+	[string]$BaseUrl = "http://localhost:8080/v1", # e.g. http://127.0.0.1:8080/v1 - Hardcode here for direct connect without login popup
 	# Optional preferred model id. Leave empty to auto-pick from /models (single model)
 	# or the PoweredBy picker (multiple). Only used when set / -Model is passed.
 	# HF/Unsloth-style ids with a slash are OK: unsloth/Qwen3.5-4B-MTP-GGUF
@@ -38,7 +38,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.51.0",
+	[string]$Version = "2.52.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -540,13 +540,21 @@ $script:MB = @{
 	TokCacheTokens     = 0
 	TokCacheAt         = [datetime]::MinValue
 	LastServerPromptTokens     = 0
+	# Fingerprint of the messages array that produced LastServerPromptTokens (usage).
+	# Stale usage must not survive history rewrites (compact / full-replace).
+	LastUsageMsgFingerprint    = ''
 	LastServerCompletionTokens = 0
 	LastRequestMaxTokens = 0
 	LastFinishReason   = ''
 	CompactionCount    = 0
 	LastCompactReason  = ''
+	LastCompactOk      = $false
 	IsCompacting       = $false
 	CompactingDepth    = 0
+	# Full-replace reentrancy: nested Manage/Ensure must not re-run the 3-stage summarizer
+	FullReplaceBusy    = $false
+	FullReplaceGen     = 0
+	LastFullReplaceAt  = [datetime]::MinValue
 	LastBodyChars      = 0
 	PendingVision      = $null
 	LastVisionMeta     = $null
@@ -1782,7 +1790,7 @@ namespace MiniBot.Core {
 }
 $script:HasCredMan = [bool]("MiniBot.Core.CredMan" -as [type])
 
-# Fast folder-size walk (FindFirstFileEx + LARGE_FETCH); separate Add-Type
+# Fast folder-size walk: NTFS $MFT (preferred) + FindFirstFileEx LARGE_FETCH fallback
 if (-not ("MiniBot.Core.DiskWalk" -as [type])) {
 	$diskWalkCs = @'
 using System;
@@ -1790,6 +1798,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -1798,23 +1807,76 @@ namespace MiniBot.Core {
 		public string Path;
 		public long Bytes;
 		public int Files;
+		/// <summary>true = directory (size = recursive); false = file at this path.</summary>
+		public bool IsDirectory;
 		public bool TimedOut;
 		public bool Cancelled;
 		public long ElapsedMs;
 	}
 
+	/// <summary>One deleted (MFT not-in-use) candidate for ListDeletedFiles.</summary>
+	public sealed class DeletedFileInfo {
+		public long MftIndex;
+		public string Name;
+		public long ParentFrn;
+		public long SizeBytes;
+		public bool IsDirectory;
+		public bool Resident;
+		public bool HasDataRuns;
+		public string Note;
+	}
+
+	/// <summary>Result of RecoverDeletedFile (copy-out only; never writes source volume).</summary>
+	public sealed class RecoverResult {
+		public bool Ok;
+		public string Error;
+		public string OutputPath;
+		public long BytesWritten;
+		public long MftIndex;
+		public string Name;
+		public bool Partial;
+		public string Note;
+	}
+
 	/// <summary>
-	/// Directory size via FindFirstFileExW + FIND_FIRST_EX_LARGE_FETCH,
-	/// FindExInfoBasic (no short names), skip reparse points, parallel top-level walks.
+	/// Directory sizes via NTFS $MFT (WizTree-style) when elevated/local NTFS,
+	/// else FindFirstFileExW + FIND_FIRST_EX_LARGE_FETCH with parallel top-level walks.
+	/// Also list/recover deleted files (MFT not-in-use) via volume read + copy-out.
 	/// </summary>
 	public static class DiskWalk {
 		public static volatile bool CancelRequested = false;
+		/// <summary>Last engine used by TopFolders/Measure: mft | findfirstfileex_large_fetch | none</summary>
+		public static string LastScanEngine = "none";
+		public static long LastElapsedMs = 0;
+		/// <summary>Last MFT failure reason (also written to Desktop\\diskwalker.log)</summary>
+		public static string LastMftFailReason = "";
+		/// <summary>0=off, 1=errors+summary (default), 2=info, 3=verbose progress</summary>
+		public static int LogLevel = 1;
+		/// <summary>ListDeletedFiles: total matches before max cap</summary>
+		public static int LastListTotalMatched = 0;
+		public static bool LastListTruncated = false;
+
+		static readonly object LogLock = new object();
+		static string LogPathCache = null;
 
 		const int FIND_FIRST_EX_LARGE_FETCH = 2;
 		const int FindExInfoBasic = 1;
 		const int FindExSearchNameMatch = 0;
 		const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
 		const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+		const uint GENERIC_READ = 0x80000000;
+		const uint FILE_SHARE_READ = 0x1;
+		const uint FILE_SHARE_WRITE = 0x2;
+		const uint FILE_SHARE_DELETE = 0x4;
+		const uint OPEN_EXISTING = 3;
+		const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+		const uint FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
+		const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+		const uint TOKEN_QUERY = 0x0008;
+		const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+		// CTL_CODE(FILE_DEVICE_FILE_SYSTEM=9, 25, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0)
+		const uint FSCTL_GET_NTFS_VOLUME_DATA = 0x00090064;
+		const long MFT_INDEX_MASK = 0x0000FFFFFFFFFFFFL;
 		static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
 
 		[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -1833,14 +1895,55 @@ namespace MiniBot.Core {
 			public string cAlternateFileName;
 		}
 
+		[StructLayout(LayoutKind.Sequential)]
+		struct BY_HANDLE_FILE_INFORMATION {
+			public uint dwFileAttributes;
+			public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+			public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+			public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+			public uint dwVolumeSerialNumber;
+			public uint nFileSizeHigh;
+			public uint nFileSizeLow;
+			public uint nNumberOfLinks;
+			public uint nFileIndexHigh;
+			public uint nFileIndexLow;
+		}
+
+		[StructLayout(LayoutKind.Sequential)]
+		struct NTFS_VOLUME_DATA_BUFFER {
+			public long VolumeSerialNumber;
+			public long NumberSectors;
+			public long TotalClusters;
+			public long FreeClusters;
+			public long TotalReserved;
+			public uint BytesPerSector;
+			public uint BytesPerCluster;
+			public uint BytesPerFileRecordSegment;
+			public uint ClustersPerFileRecordSegment;
+			public long MftValidDataLength;
+			public long MftStartLcn;
+			public long Mft2StartLcn;
+			public long MftZoneStart;
+			public long MftZoneEnd;
+		}
+
+		[StructLayout(LayoutKind.Sequential)]
+		struct LUID {
+			public uint LowPart;
+			public int HighPart;
+		}
+
+		[StructLayout(LayoutKind.Sequential)]
+		struct TOKEN_PRIVILEGES {
+			public uint PrivilegeCount;
+			public LUID Luid;
+			public uint Attributes;
+		}
+
 		[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
 		static extern IntPtr FindFirstFileExW(
-			string lpFileName,
-			int fInfoLevelId,
-			out WIN32_FIND_DATAW lpFindFileData,
-			int fSearchOp,
-			IntPtr lpSearchFilter,
-			int dwAdditionalFlags);
+			string lpFileName, int fInfoLevelId, out WIN32_FIND_DATAW lpFindFileData,
+			int fSearchOp, IntPtr lpSearchFilter, int dwAdditionalFlags);
 
 		[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
 		static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATAW lpFindFileData);
@@ -1850,10 +1953,98 @@ namespace MiniBot.Core {
 
 		[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
 		static extern bool GetDiskFreeSpaceExW(
-			string lpDirectoryName,
-			out ulong lpFreeBytesAvailable,
-			out ulong lpTotalNumberOfBytes,
-			out ulong lpTotalNumberOfFreeBytes);
+			string lpDirectoryName, out ulong lpFreeBytesAvailable,
+			out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
+
+		[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+		static extern IntPtr CreateFileW(
+			string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes,
+			uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		static extern bool CloseHandle(IntPtr hObject);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		static extern bool DeviceIoControl(
+			IntPtr hDevice, uint dwIoControlCode, IntPtr lpInBuffer, uint nInBufferSize,
+			IntPtr lpOutBuffer, uint nOutBufferSize, out uint lpBytesReturned, IntPtr lpOverlapped);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		static extern bool GetFileInformationByHandle(IntPtr hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		static extern bool GetFileSizeEx(IntPtr hFile, out long lpFileSize);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToRead,
+			out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		static extern bool SetFilePointerEx(IntPtr hFile, long liDistanceToMove,
+			out long lpNewFilePointer, uint dwMoveMethod);
+
+		[DllImport("kernel32.dll")]
+		static extern IntPtr GetCurrentProcess();
+
+		[DllImport("kernel32.dll")]
+		static extern uint GetLastError();
+
+		[DllImport("advapi32.dll", SetLastError = true)]
+		static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+		[DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+		static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+
+		[DllImport("advapi32.dll", SetLastError = true)]
+		static extern bool AdjustTokenPrivileges(
+			IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState,
+			uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
+		// Hardcoded diagnostic log: %USERPROFILE%\\Desktop\\diskwalker.log
+		static string GetLogPath() {
+			if (LogPathCache != null) return LogPathCache;
+			try {
+				string desk = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+				if (string.IsNullOrEmpty(desk))
+					desk = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+				if (string.IsNullOrEmpty(desk))
+					desk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Desktop");
+				LogPathCache = Path.Combine(desk, "diskwalker.log");
+			} catch {
+				LogPathCache = Path.Combine(
+					Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) ?? ".",
+					"Desktop", "diskwalker.log");
+			}
+			return LogPathCache;
+		}
+
+		/// <summary>level: 1=error/summary, 2=info, 3=verbose</summary>
+		static void Log(string msg, int level) {
+			if (LogLevel <= 0 || level > LogLevel) return;
+			try {
+				string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + (msg ?? "") + Environment.NewLine;
+				lock (LogLock) {
+					File.AppendAllText(GetLogPath(), line);
+				}
+			} catch { }
+		}
+
+		static void Log(string msg) {
+			Log(msg, 2);
+		}
+
+		static void LogFail(string reason) {
+			LastMftFailReason = reason ?? "";
+			Log("FAIL: " + LastMftFailReason, 1);
+		}
+
+		/// <summary>Set log verbosity: 0=off, 1=errors+summary (default), 2=info, 3=verbose.</summary>
+		public static void SetLogLevel(int level) {
+			if (level < 0) level = 0;
+			if (level > 3) level = 3;
+			LogLevel = level;
+			Log("LogLevel set to " + LogLevel, 1);
+		}
 
 		static long FileSize(ref WIN32_FIND_DATAW d) {
 			return ((long)d.nFileSizeHigh << 32) | (long)(d.nFileSizeLow & 0xFFFFFFFF);
@@ -1868,60 +2059,157 @@ namespace MiniBot.Core {
 			return false;
 		}
 
+		static bool TryEnablePrivilege(string name) {
+			IntPtr hToken;
+			if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out hToken)) {
+				Log("  privilege OpenProcessToken failed for " + name + " win32=" + Marshal.GetLastWin32Error());
+				return false;
+			}
+			try {
+				LUID luid;
+				if (!LookupPrivilegeValue(null, name, out luid)) {
+					Log("  privilege LookupPrivilegeValue failed for " + name + " win32=" + Marshal.GetLastWin32Error());
+					return false;
+				}
+				TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+				tp.PrivilegeCount = 1;
+				tp.Luid = luid;
+				tp.Attributes = SE_PRIVILEGE_ENABLED;
+				if (!AdjustTokenPrivileges(hToken, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) {
+					Log("  privilege AdjustTokenPrivileges failed for " + name + " win32=" + Marshal.GetLastWin32Error());
+					return false;
+				}
+				int adjErr = Marshal.GetLastWin32Error();
+				// ERROR_NOT_ALL_ASSIGNED = 1300
+				if (adjErr == 1300) {
+					Log("  privilege " + name + " NOT assigned to process token (win32=1300)");
+					return false;
+				}
+				Log("  privilege " + name + " enabled ok (post-adjust win32=" + adjErr + ")");
+				return true;
+			} finally {
+				CloseHandle(hToken);
+			}
+		}
+
+		static void TryEnableBackupPrivileges() {
+			Log("enabling backup privileges...");
+			TryEnablePrivilege("SeBackupPrivilege");
+			TryEnablePrivilege("SeRestorePrivilege");
+		}
+
 		/// <summary>Sum file bytes under path. deep=false: immediate children files only.</summary>
 		public static FolderSizeInfo Measure(string path, bool deep, int timeoutMs) {
 			CancelRequested = false;
+			LastScanEngine = "none";
+			LastMftFailReason = "";
+			Log("==== Measure path=" + path + " deep=" + deep + " timeoutMs=" + timeoutMs + " log=" + GetLogPath());
 			var sw = Stopwatch.StartNew();
 			var info = new FolderSizeInfo { Path = path };
 			if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) {
+				Log("Measure: path missing/empty");
 				sw.Stop();
 				info.ElapsedMs = sw.ElapsedMilliseconds;
+				LastElapsedMs = info.ElapsedMs;
 				return info;
 			}
+			if (deep) {
+				long bytes;
+				int files;
+				if (TryMeasureFromMft(path, timeoutMs, out bytes, out files)) {
+					sw.Stop();
+					LastScanEngine = "mft";
+					info.Bytes = bytes;
+					info.Files = files;
+					info.ElapsedMs = sw.ElapsedMilliseconds;
+					LastElapsedMs = info.ElapsedMs;
+					Log("Measure: OK engine=mft bytes=" + bytes + " files=" + files + " ms=" + info.ElapsedMs);
+					return info;
+				}
+				Log("Measure: MFT failed -> FindFirstFileEx fallback (" + LastMftFailReason + ")");
+			} else {
+				Log("Measure: deep=false, skip MFT");
+			}
 			int deadline = timeoutMs > 0 ? Environment.TickCount + timeoutMs : 0;
-			int files = 0;
+			int fcount = 0;
 			bool timedOut = false, cancelled = false;
-			long bytes = 0;
+			long sum = 0;
 			try {
 				if (deep) {
-					bytes = WalkDir(path, ref files, deadline, ref timedOut, ref cancelled);
+					sum = WalkDir(path, ref fcount, deadline, ref timedOut, ref cancelled);
 				} else {
-					bytes = WalkOneLevel(path, ref files, deadline, ref timedOut, ref cancelled);
+					sum = WalkOneLevel(path, ref fcount, deadline, ref timedOut, ref cancelled);
 				}
-			} catch { }
+			} catch (Exception ex) {
+				Log("Measure FindFirstFileEx exception: " + ex.Message);
+			}
 			sw.Stop();
-			info.Bytes = bytes;
-			info.Files = files;
+			LastScanEngine = "findfirstfileex_large_fetch";
+			info.Bytes = sum;
+			info.Files = fcount;
 			info.TimedOut = timedOut;
 			info.Cancelled = cancelled || CancelRequested;
 			info.ElapsedMs = sw.ElapsedMilliseconds;
+			LastElapsedMs = info.ElapsedMs;
+			Log("Measure: OK engine=findfirstfileex_large_fetch bytes=" + sum + " files=" + fcount + " ms=" + info.ElapsedMs);
 			return info;
 		}
 
 		/// <summary>
-		/// Size each top-level subdirectory under root (parallel), return largest first.
+		/// Size each top-level subdirectory under root. Prefer NTFS $MFT when deep=true
+		/// on local NTFS; else parallel FindFirstFileEx walks. Largest first.
 		/// </summary>
 		public static FolderSizeInfo[] TopFolders(string root, int maxResults, bool deep, int timeoutMs, int maxChildren) {
 			CancelRequested = false;
+			LastScanEngine = "none";
+			LastElapsedMs = 0;
+			LastMftFailReason = "";
+			Log("==== TopFolders root=" + root + " maxResults=" + maxResults + " deep=" + deep
+				+ " timeoutMs=" + timeoutMs + " maxChildren=" + maxChildren
+				+ " log=" + GetLogPath()
+				+ " user=" + (Environment.UserName ?? "?")
+				+ " pid=" + Process.GetCurrentProcess().Id);
 			var sw = Stopwatch.StartNew();
 			if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) {
+				LogFail("TopFolders: root missing or does not exist: " + root);
 				return new FolderSizeInfo[0];
 			}
 			if (maxResults <= 0) maxResults = 10;
 			if (maxChildren <= 0) maxChildren = 64;
 
-			var children = new List<string>(64);
-			EnumerateTopDirs(root, children, maxChildren);
+			if (deep) {
+				FolderSizeInfo[] mftResult;
+				if (TryTopFoldersFromMft(root, maxResults, timeoutMs, out mftResult)) {
+					sw.Stop();
+					LastScanEngine = "mft";
+					LastElapsedMs = sw.ElapsedMilliseconds;
+					if (mftResult != null && mftResult.Length > 0)
+						mftResult[0].ElapsedMs = LastElapsedMs;
+					Log("TopFolders: OK engine=mft count=" + (mftResult == null ? 0 : mftResult.Length)
+						+ " ms=" + LastElapsedMs);
+					return mftResult ?? new FolderSizeInfo[0];
+				}
+				Log("TopFolders: MFT failed -> FindFirstFileEx fallback (" + LastMftFailReason + ")");
+			} else {
+				Log("TopFolders: deep=false, skip MFT");
+			}
+
+			// Top-level dirs + files (files at root e.g. pagefile.sys must appear if large)
+			var topDirs = new List<string>(64);
+			var topFiles = new List<FolderSizeInfo>(32);
+			EnumerateTopEntries(root, topDirs, topFiles, maxChildren);
+			Log("TopFolders FindFirstFileEx: top dirs=" + topDirs.Count + " top files=" + topFiles.Count);
 
 			int deadline = timeoutMs > 0 ? Environment.TickCount + timeoutMs : 0;
-			var bag = new FolderSizeInfo[children.Count];
+			var bag = new FolderSizeInfo[topDirs.Count];
 			int dop = Math.Max(1, Math.Min(Environment.ProcessorCount, 8));
 			var opts = new ParallelOptions { MaxDegreeOfParallelism = dop };
 
-			Parallel.For(0, children.Count, opts, i => {
+			Parallel.For(0, topDirs.Count, opts, i => {
 				if (IsStop(deadline)) {
 					bag[i] = new FolderSizeInfo {
-						Path = children[i],
+						Path = topDirs[i],
+						IsDirectory = true,
 						Cancelled = CancelRequested,
 						TimedOut = !CancelRequested && deadline != 0
 					};
@@ -1932,30 +2220,37 @@ namespace MiniBot.Core {
 				long bytes = 0;
 				try {
 					if (deep) {
-						bytes = WalkDir(children[i], ref files, deadline, ref timedOut, ref cancelled);
+						bytes = WalkDir(topDirs[i], ref files, deadline, ref timedOut, ref cancelled);
 					} else {
-						bytes = WalkOneLevel(children[i], ref files, deadline, ref timedOut, ref cancelled);
+						bytes = WalkOneLevel(topDirs[i], ref files, deadline, ref timedOut, ref cancelled);
 					}
 				} catch { }
 				bag[i] = new FolderSizeInfo {
-					Path = children[i],
+					Path = topDirs[i],
 					Bytes = bytes,
 					Files = files,
+					IsDirectory = true,
 					TimedOut = timedOut,
 					Cancelled = cancelled
 				};
 			});
 
-			var list = new List<FolderSizeInfo>(bag.Length);
+			var list = new List<FolderSizeInfo>(bag.Length + topFiles.Count);
 			foreach (var e in bag) {
 				if (e != null) list.Add(e);
+			}
+			foreach (var f in topFiles) {
+				if (f != null) list.Add(f);
 			}
 			list.Sort((a, b) => b.Bytes.CompareTo(a.Bytes));
 			if (list.Count > maxResults) {
 				list = list.GetRange(0, maxResults);
 			}
 			sw.Stop();
-			if (list.Count > 0) list[0].ElapsedMs = sw.ElapsedMilliseconds;
+			LastScanEngine = "findfirstfileex_large_fetch";
+			LastElapsedMs = sw.ElapsedMilliseconds;
+			if (list.Count > 0) list[0].ElapsedMs = LastElapsedMs;
+			Log("TopFolders: OK engine=findfirstfileex_large_fetch count=" + list.Count + " ms=" + LastElapsedMs);
 			return list.ToArray();
 		}
 
@@ -1972,28 +2267,1642 @@ namespace MiniBot.Core {
 			}
 		}
 
-		static void EnumerateTopDirs(string root, List<string> into, int maxChildren) {
+		// ─── NTFS $MFT scan (WizTree-style) ───────────────────────────────────
+
+		static bool IsLocalNtfsPath(string path) {
+			try {
+				string full = Path.GetFullPath(path);
+				string root = Path.GetPathRoot(full);
+				Log("IsLocalNtfsPath: full=" + full + " root=" + root);
+				if (string.IsNullOrEmpty(root) || root.StartsWith("\\\\")) {
+					LogFail("IsLocalNtfsPath: not a local drive root (UNC or empty)");
+					return false;
+				}
+				var di = new DriveInfo(root);
+				Log("IsLocalNtfsPath: DriveType=" + di.DriveType + " DriveFormat=" + (di.IsReady ? di.DriveFormat : "(not ready)"));
+				if (di.DriveType != DriveType.Fixed && di.DriveType != DriveType.Removable) {
+					LogFail("IsLocalNtfsPath: DriveType not Fixed/Removable: " + di.DriveType);
+					return false;
+				}
+				if (!string.Equals(di.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase)) {
+					LogFail("IsLocalNtfsPath: not NTFS (format=" + (di.IsReady ? di.DriveFormat : "?") + ")");
+					return false;
+				}
+				return true;
+			} catch (Exception ex) {
+				LogFail("IsLocalNtfsPath exception: " + ex.Message);
+				return false;
+			}
+		}
+
+		static bool TryGetFileReference(string path, out long frnIndex) {
+			frnIndex = 0;
+			Log("TryGetFileReference: " + path);
+			IntPtr h = CreateFileW(
+				path, GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+			if (h == INVALID_HANDLE_VALUE || h == IntPtr.Zero) {
+				LogFail("TryGetFileReference: CreateFileW failed win32=" + Marshal.GetLastWin32Error() + " path=" + path);
+				return false;
+			}
+			try {
+				BY_HANDLE_FILE_INFORMATION info;
+				if (!GetFileInformationByHandle(h, out info)) {
+					LogFail("TryGetFileReference: GetFileInformationByHandle failed win32=" + Marshal.GetLastWin32Error());
+					return false;
+				}
+				ulong full = ((ulong)info.nFileIndexHigh << 32) | (ulong)info.nFileIndexLow;
+				frnIndex = (long)(full & 0x0000FFFFFFFFFFFFUL);
+				Log("TryGetFileReference: frn=" + frnIndex + " rawIndexHigh=" + info.nFileIndexHigh + " rawIndexLow=" + info.nFileIndexLow);
+				return frnIndex >= 0;
+			} finally {
+				CloseHandle(h);
+			}
+		}
+
+		/// <summary>One NTFS data run for volume-mapped $MFT reads.</summary>
+		struct MftDataRun {
+			public long Vcn;      // start VCN within $MFT
+			public long Lcn;      // physical LCN, or -1 if sparse
+			public long Clusters;
+		}
+
+		/// <summary>
+		/// Sequential $MFT reader: either a direct $MFT file handle, or volume + data runs
+		/// (needed when CreateFile on $MFT returns ACCESS_DENIED / win32=5).
+		/// </summary>
+		sealed class MftStream {
+			public int RecordSize;
+			public long Length;
+			public string Mode; // file | volume_runs
+			IntPtr _h = INVALID_HANDLE_VALUE;
+			bool _volumeMode;
+			uint _bytesPerCluster;
+			List<MftDataRun> _runs;
+			long _pos;
+
+			public static MftStream FromFileHandle(IntPtr h, int recordSize, long length) {
+				var s = new MftStream();
+				s._h = h;
+				s._volumeMode = false;
+				s.RecordSize = recordSize;
+				s.Length = length;
+				s.Mode = "file";
+				s._pos = 0;
+				return s;
+			}
+
+			public static MftStream FromVolumeRuns(IntPtr hVol, int recordSize, long length,
+				uint bytesPerCluster, List<MftDataRun> runs) {
+				var s = new MftStream();
+				s._h = hVol;
+				s._volumeMode = true;
+				s.RecordSize = recordSize;
+				s.Length = length;
+				s.Mode = "volume_runs";
+				s._bytesPerCluster = bytesPerCluster;
+				s._runs = runs;
+				s._pos = 0;
+				return s;
+			}
+
+			public void Close() {
+				if (_h != INVALID_HANDLE_VALUE && _h != IntPtr.Zero) {
+					CloseHandle(_h);
+					_h = INVALID_HANDLE_VALUE;
+				}
+			}
+
+			public bool Read(byte[] buffer, int count, out int bytesRead) {
+				bytesRead = 0;
+				if (count <= 0 || buffer == null) return false;
+				if (_pos >= Length) return false;
+				int want = count;
+				if (_pos + want > Length) want = (int)(Length - _pos);
+				if (want <= 0) return false;
+
+				if (!_volumeMode) {
+					// Sequential file handle (pointer advances with ReadFile)
+					uint br;
+					if (!ReadFile(_h, buffer, (uint)want, out br, IntPtr.Zero) || br == 0)
+						return false;
+					bytesRead = (int)br;
+					_pos += bytesRead;
+					return bytesRead > 0;
+				}
+
+				// Volume + data runs: map $MFT file offset -> physical LCN
+				int done = 0;
+				while (done < want) {
+					long fileOff = _pos + done;
+					long vcn = fileOff / _bytesPerCluster;
+					int intoCluster = (int)(fileOff % _bytesPerCluster);
+					MftDataRun run;
+					if (!FindRun(vcn, out run)) {
+						Log("MftStream.Read: no data run for vcn=" + vcn + " fileOff=" + fileOff);
+						break;
+					}
+					long runEndVcn = run.Vcn + run.Clusters;
+					long clustersLeftInRun = runEndVcn - vcn;
+					long bytesLeftInRun = clustersLeftInRun * _bytesPerCluster - intoCluster;
+					int chunk = want - done;
+					if (chunk > bytesLeftInRun) chunk = (int)bytesLeftInRun;
+					if (chunk <= 0) break;
+
+					if (run.Lcn < 0) {
+						// Sparse: zeros
+						Array.Clear(buffer, done, chunk);
+					} else {
+						long phys = (run.Lcn + (vcn - run.Vcn)) * (long)_bytesPerCluster + intoCluster;
+						long newPtr;
+						if (!SetFilePointerEx(_h, phys, out newPtr, 0 /* FILE_BEGIN */)) {
+							Log("MftStream.Read: SetFilePointerEx failed win32=" + Marshal.GetLastWin32Error() + " phys=" + phys);
+							break;
+						}
+						// Read into a temp slice — ReadFile always fills from buffer[0]
+						byte[] tmp = buffer;
+						int tmpOff = done;
+						if (tmpOff != 0) {
+							tmp = new byte[chunk];
+						}
+						uint br;
+						if (!ReadFile(_h, tmp, (uint)chunk, out br, IntPtr.Zero) || br == 0) {
+							Log("MftStream.Read: ReadFile failed win32=" + Marshal.GetLastWin32Error()
+								+ " phys=" + phys + " chunk=" + chunk);
+							break;
+						}
+						if (tmpOff != 0) {
+							Buffer.BlockCopy(tmp, 0, buffer, tmpOff, (int)br);
+						}
+						chunk = (int)br;
+					}
+					done += chunk;
+				}
+				bytesRead = done;
+				_pos += done;
+				return done > 0;
+			}
+
+			bool FindRun(long vcn, out MftDataRun run) {
+				run = default(MftDataRun);
+				if (_runs == null) return false;
+				for (int i = 0; i < _runs.Count; i++) {
+					MftDataRun r = _runs[i];
+					if (vcn >= r.Vcn && vcn < r.Vcn + r.Clusters) {
+						run = r;
+						return true;
+					}
+				}
+				return false;
+			}
+		}
+
+		static long ReadLeSigned(byte[] buf, int offset, int size) {
+			long val = 0;
+			for (int i = 0; i < size; i++)
+				val |= ((long)buf[offset + i]) << (8 * i);
+			// sign-extend
+			int bits = size * 8;
+			if (size > 0 && size < 8 && ((val >> (bits - 1)) & 1) != 0)
+				val |= -1L << bits;
+			return val;
+		}
+
+		static long ReadLeUnsigned(byte[] buf, int offset, int size) {
+			long val = 0;
+			for (int i = 0; i < size; i++)
+				val |= ((long)buf[offset + i]) << (8 * i);
+			return val;
+		}
+
+		static bool ParseDataRuns(byte[] buf, int runsOff, int runsEnd, List<MftDataRun> runs) {
+			if (runsOff <= 0 || runsOff >= runsEnd) return false;
+			long vcn = 0;
+			long lcnCursor = 0;
+			int p = runsOff;
+			int guard = 0;
+			while (p < runsEnd && guard++ < 4096) {
+				byte header = buf[p++];
+				if (header == 0) break;
+				int lenSize = header & 0x0F;
+				int offSize = (header >> 4) & 0x0F;
+				if (lenSize == 0 || p + lenSize + offSize > runsEnd) return false;
+				long clusters = ReadLeUnsigned(buf, p, lenSize);
+				p += lenSize;
+				if (offSize == 0) {
+					// sparse
+					runs.Add(new MftDataRun { Vcn = vcn, Lcn = -1, Clusters = clusters });
+				} else {
+					long delta = ReadLeSigned(buf, p, offSize);
+					p += offSize;
+					lcnCursor += delta;
+					runs.Add(new MftDataRun { Vcn = vcn, Lcn = lcnCursor, Clusters = clusters });
+				}
+				vcn += clusters;
+			}
+			return runs.Count > 0;
+		}
+
+		/// <summary>Pull unnamed non-resident $DATA runs from one raw MFT record (after USA fixup).</summary>
+		static bool TryGetUnnamedDataRuns(byte[] rec, int recordSize, List<MftDataRun> runs, out long realSize) {
+			realSize = 0;
+			runs.Clear();
+			if (rec == null || rec.Length < recordSize) return false;
+			if (rec[0] != (byte)'F' || rec[1] != (byte)'I' || rec[2] != (byte)'L' || rec[3] != (byte)'E')
+				return false;
+			ApplyUsaFixup(rec, 0, recordSize);
+			ushort attrOff = BitConverter.ToUInt16(rec, 0x14);
+			if (attrOff < 0x30 || attrOff >= recordSize) return false;
+			int a = attrOff;
+			int guard = 0;
+			while (a + 16 <= recordSize && guard++ < 256) {
+				uint attrType = BitConverter.ToUInt32(rec, a);
+				if (attrType == 0xFFFFFFFF) break;
+				uint attrLen = BitConverter.ToUInt32(rec, a + 4);
+				if (attrLen < 16 || a + (int)attrLen > recordSize) break;
+				byte nonRes = rec[a + 8];
+				byte nameLen = rec[a + 9];
+				if (attrType == 0x80 && nameLen == 0 && nonRes != 0 && a + 0x40 <= a + (int)attrLen) {
+					realSize = BitConverter.ToInt64(rec, a + 0x30);
+					ushort runRel = BitConverter.ToUInt16(rec, a + 0x20);
+					int runAbs = a + runRel;
+					int runEnd = a + (int)attrLen;
+					if (runRel >= 0x40 && runAbs < runEnd) {
+						if (ParseDataRuns(rec, runAbs, runEnd, runs))
+							return true;
+					}
+				}
+				a += (int)attrLen;
+			}
+			return false;
+		}
+
+		static IntPtr TryCreateFileMft(string path) {
+			IntPtr h = CreateFileW(
+				path, GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				IntPtr.Zero, OPEN_EXISTING,
+				FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
+			int err = Marshal.GetLastWin32Error();
+			if (h == INVALID_HANDLE_VALUE || h == IntPtr.Zero) {
+				Log("  CreateFileW failed path=" + path + " win32=" + err);
+				return INVALID_HANDLE_VALUE;
+			}
+			Log("  CreateFileW OK path=" + path);
+			return h;
+		}
+
+		static bool TryOpenMftStream(string anyPath, out MftStream stream) {
+			stream = null;
+			Log("TryOpenMftStream: anyPath=" + anyPath);
+			TryEnableBackupPrivileges();
+
+			string full = Path.GetFullPath(anyPath);
+			string root = Path.GetPathRoot(full);
+			if (string.IsNullOrEmpty(root)) {
+				LogFail("TryOpenMftStream: GetPathRoot empty for " + full);
+				return false;
+			}
+			string vol = root.TrimEnd('\\'); // C:
+			if (vol.Length < 2) {
+				LogFail("TryOpenMftStream: bad volume string '" + vol + "'");
+				return false;
+			}
+			Log("TryOpenMftStream: volume=" + vol + " root=" + root);
+
+			int recordSize = 1024;
+			long mftLength = 0;
+			uint bytesPerCluster = 4096;
+			long mftStartLcn = 0;
+			bool haveVolData = false;
+
+			string volPath = @"\\.\" + vol;
+			IntPtr hVol = CreateFileW(
+				volPath, GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				IntPtr.Zero, OPEN_EXISTING,
+				FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
+			if (hVol == INVALID_HANDLE_VALUE || hVol == IntPtr.Zero) {
+				Log("TryOpenMftStream: open volume " + volPath + " failed win32=" + Marshal.GetLastWin32Error());
+				hVol = INVALID_HANDLE_VALUE;
+			} else {
+				Log("TryOpenMftStream: volume open OK " + volPath);
+				int cb = Marshal.SizeOf(typeof(NTFS_VOLUME_DATA_BUFFER));
+				IntPtr buf = Marshal.AllocHGlobal(cb);
+				try {
+					uint ret;
+					if (DeviceIoControl(hVol, FSCTL_GET_NTFS_VOLUME_DATA, IntPtr.Zero, 0, buf, (uint)cb, out ret, IntPtr.Zero)) {
+						NTFS_VOLUME_DATA_BUFFER vd = (NTFS_VOLUME_DATA_BUFFER)Marshal.PtrToStructure(buf, typeof(NTFS_VOLUME_DATA_BUFFER));
+						if (vd.BytesPerFileRecordSegment >= 512 && vd.BytesPerFileRecordSegment <= 4096)
+							recordSize = (int)vd.BytesPerFileRecordSegment;
+						if (vd.MftValidDataLength > 0)
+							mftLength = vd.MftValidDataLength;
+						if (vd.BytesPerCluster > 0)
+							bytesPerCluster = vd.BytesPerCluster;
+						mftStartLcn = vd.MftStartLcn;
+						haveVolData = true;
+						Log("TryOpenMftStream: NTFS_VOLUME_DATA recordSize=" + recordSize
+							+ " MftValidDataLength=" + mftLength
+							+ " BytesPerCluster=" + bytesPerCluster
+							+ " MftStartLcn=" + mftStartLcn
+							+ " BytesPerSector=" + vd.BytesPerSector);
+					} else {
+						Log("TryOpenMftStream: FSCTL_GET_NTFS_VOLUME_DATA failed win32=" + Marshal.GetLastWin32Error());
+					}
+				} finally {
+					Marshal.FreeHGlobal(buf);
+				}
+			}
+
+			// 1) Try opening $MFT as a file (often ACCESS_DENIED even as admin)
+			string[] mftPaths = new string[] {
+				@"\\.\" + vol + @"\$MFT",
+				@"\\?\" + vol + @"\$MFT",
+				vol + @"\$MFT"
+			};
+			for (int i = 0; i < mftPaths.Length; i++) {
+				IntPtr hMft = TryCreateFileMft(mftPaths[i]);
+				if (hMft == INVALID_HANDLE_VALUE || hMft == IntPtr.Zero) continue;
+				long sizeFromHandle;
+				if (GetFileSizeEx(hMft, out sizeFromHandle) && sizeFromHandle > 0)
+					mftLength = sizeFromHandle;
+				if (mftLength < recordSize) {
+					Log("TryOpenMftStream: $MFT size too small (" + mftLength + "), closing");
+					CloseHandle(hMft);
+					continue;
+				}
+				// volume handle not needed
+				if (hVol != INVALID_HANDLE_VALUE && hVol != IntPtr.Zero) {
+					CloseHandle(hVol);
+					hVol = INVALID_HANDLE_VALUE;
+				}
+				stream = MftStream.FromFileHandle(hMft, recordSize, mftLength);
+				Log("TryOpenMftStream: OK mode=file recordSize=" + recordSize + " length=" + mftLength);
+				return true;
+			}
+			Log("TryOpenMftStream: all $MFT file opens failed — trying volume data-run path");
+
+			// 2) Volume path: read $MFT via MftStartLcn + data runs from record 0
+			if (hVol == INVALID_HANDLE_VALUE || hVol == IntPtr.Zero || !haveVolData) {
+				LogFail("TryOpenMftStream: no volume handle/NTFS data for data-run path");
+				return false;
+			}
+			if (mftStartLcn <= 0 || bytesPerCluster == 0 || mftLength < recordSize) {
+				if (hVol != INVALID_HANDLE_VALUE) CloseHandle(hVol);
+				LogFail("TryOpenMftStream: invalid MftStartLcn=" + mftStartLcn
+					+ " bpc=" + bytesPerCluster + " mftLength=" + mftLength);
+				return false;
+			}
+
+			// Read first cluster(s) enough for MFT record 0
+			int bootRead = (int)Math.Max(bytesPerCluster, (uint)recordSize * 2);
+			if (bootRead < 4096) bootRead = 4096;
+			byte[] head = new byte[bootRead];
+			long phys0 = mftStartLcn * (long)bytesPerCluster;
+			long np;
+			if (!SetFilePointerEx(hVol, phys0, out np, 0)) {
+				int e = Marshal.GetLastWin32Error();
+				CloseHandle(hVol);
+				LogFail("TryOpenMftStream: seek MftStartLcn failed win32=" + e + " phys=" + phys0);
+				return false;
+			}
+			uint br0;
+			if (!ReadFile(hVol, head, (uint)bootRead, out br0, IntPtr.Zero) || br0 < (uint)recordSize) {
+				int e = Marshal.GetLastWin32Error();
+				CloseHandle(hVol);
+				LogFail("TryOpenMftStream: read MFT head failed win32=" + e + " br=" + br0);
+				return false;
+			}
+			Log("TryOpenMftStream: read MFT head " + br0 + " bytes at LCN " + mftStartLcn
+				+ " sig=" + (char)head[0] + (char)head[1] + (char)head[2] + (char)head[3]);
+
+			byte[] rec0 = new byte[recordSize];
+			Buffer.BlockCopy(head, 0, rec0, 0, recordSize);
+			var runs = new List<MftDataRun>(16);
+			long dataRealSize;
+			if (!TryGetUnnamedDataRuns(rec0, recordSize, runs, out dataRealSize)) {
+				CloseHandle(hVol);
+				LogFail("TryOpenMftStream: could not parse $DATA runs from MFT record 0");
+				return false;
+			}
+			if (dataRealSize > mftLength) mftLength = dataRealSize;
+			Log("TryOpenMftStream: parsed " + runs.Count + " data runs, dataRealSize=" + dataRealSize
+				+ " mftLength=" + mftLength);
+			for (int i = 0; i < runs.Count && i < 8; i++) {
+				Log("  run[" + i + "] vcn=" + runs[i].Vcn + " lcn=" + runs[i].Lcn + " clusters=" + runs[i].Clusters);
+			}
+			if (runs.Count > 8)
+				Log("  ... " + (runs.Count - 8) + " more runs");
+
+			stream = MftStream.FromVolumeRuns(hVol, recordSize, mftLength, bytesPerCluster, runs);
+			Log("TryOpenMftStream: OK mode=volume_runs recordSize=" + recordSize + " length=" + mftLength);
+			return true;
+		}
+
+		static void ApplyUsaFixup(byte[] buf, int offset, int recordSize) {
+			if (offset + 8 > buf.Length) return;
+			ushort usaOff = BitConverter.ToUInt16(buf, offset + 4);
+			ushort usaCount = BitConverter.ToUInt16(buf, offset + 6);
+			if (usaOff == 0 || usaCount < 2) return;
+			const int sector = 512;
+			for (int i = 1; i < usaCount; i++) {
+				int sectorLast = offset + (i * sector) - 2;
+				int usaIdx = offset + usaOff + (i * 2);
+				if (sectorLast < offset || sectorLast + 1 >= offset + recordSize) continue;
+				if (usaIdx + 1 >= offset + recordSize || usaIdx + 1 >= buf.Length) continue;
+				if (sectorLast + 1 >= buf.Length) continue;
+				buf[sectorLast] = buf[usaIdx];
+				buf[sectorLast + 1] = buf[usaIdx + 1];
+			}
+		}
+
+		struct MftName {
+			public long Parent;
+			public string Name;
+		}
+
+		static bool ParseMftRecord(
+			byte[] buf, int offset, int recordSize, long recordIndex,
+			out bool inUse, out bool isDir, out long dataSize, out List<MftName> names) {
+			inUse = false;
+			isDir = false;
+			dataSize = 0;
+			names = null;
+			if (offset + 0x30 > buf.Length) return false;
+			if (buf[offset] != (byte)'F' || buf[offset + 1] != (byte)'I' ||
+				buf[offset + 2] != (byte)'L' || buf[offset + 3] != (byte)'E')
+				return false;
+
+			ApplyUsaFixup(buf, offset, recordSize);
+
+			ushort flags = BitConverter.ToUInt16(buf, offset + 0x16);
+			if ((flags & 0x1) == 0) return false; // not in use
+			inUse = true;
+			isDir = (flags & 0x2) != 0;
+
+			// Skip extension records (attributes live on base)
+			long baseRef = BitConverter.ToInt64(buf, offset + 0x20) & MFT_INDEX_MASK;
+			if (baseRef != 0) {
+				inUse = false;
+				return false;
+			}
+
+			ushort attrOff = BitConverter.ToUInt16(buf, offset + 0x14);
+			if (attrOff < 0x30 || attrOff >= recordSize) return false;
+
+			names = new List<MftName>(2);
+			bool hasUnnamedData = false;
+			long bestNameRealSize = 0;
+			int a = offset + attrOff;
+			int end = offset + recordSize;
+			int guard = 0;
+			while (a + 16 <= end && a + 16 <= buf.Length && guard++ < 256) {
+				uint attrType = BitConverter.ToUInt32(buf, a);
+				if (attrType == 0xFFFFFFFF) break;
+				uint attrLen = BitConverter.ToUInt32(buf, a + 4);
+				if (attrLen < 16 || a + (int)attrLen > end || a + (int)attrLen > buf.Length) break;
+
+				byte nonRes = buf[a + 8];
+				byte nameLen = buf[a + 9];
+
+				if (attrType == 0x30 && nonRes == 0) {
+					// $FILE_NAME (resident)
+					uint valLen = BitConverter.ToUInt32(buf, a + 16);
+					ushort valOff = BitConverter.ToUInt16(buf, a + 20);
+					int v = a + valOff;
+					if (valOff >= 24 && v + 0x42 <= a + (int)attrLen && valLen >= 0x42) {
+						long parent = BitConverter.ToInt64(buf, v) & MFT_INDEX_MASK;
+						long realSz = BitConverter.ToInt64(buf, v + 0x30);
+						byte nlen = buf[v + 0x40];
+						byte ntype = buf[v + 0x41]; // 0=POSIX 1=WIN32 2=DOS 3=WIN32+DOS
+						if (ntype != 2 && nlen > 0 && v + 0x42 + nlen * 2 <= a + (int)attrLen) {
+							string nm = Encoding.Unicode.GetString(buf, v + 0x42, nlen * 2);
+							if (!string.IsNullOrEmpty(nm) && nm != "." && nm != "..") {
+								names.Add(new MftName { Parent = parent, Name = nm });
+								if (realSz > bestNameRealSize) bestNameRealSize = realSz;
+							}
+						}
+					}
+				} else if (attrType == 0x80 && nameLen == 0) {
+					// Unnamed $DATA
+					if (nonRes == 0) {
+						uint valLen = BitConverter.ToUInt32(buf, a + 16);
+						dataSize = valLen;
+						hasUnnamedData = true;
+					} else if (a + 0x38 <= a + (int)attrLen) {
+						// Non-resident RealSize at +0x30
+						dataSize = BitConverter.ToInt64(buf, a + 0x30);
+						if (dataSize < 0) dataSize = 0;
+						hasUnnamedData = true;
+					}
+				}
+
+				a += (int)attrLen;
+				// Attributes are 8-byte aligned; length already includes padding
+			}
+
+			if (!hasUnnamedData && !isDir)
+				dataSize = bestNameRealSize;
+			if (isDir)
+				dataSize = 0;
+			return inUse;
+		}
+
+		static bool TryScanMft(
+			string path, int timeoutMs,
+			out long targetFrn,
+			out long[] parentOf,
+			out long[] rollup,
+			out int[] fileCount,
+			out bool[] isDir,
+			out Dictionary<long, string> childNames,
+			out int recordCount) {
+			targetFrn = 0;
+			parentOf = null;
+			rollup = null;
+			fileCount = null;
+			isDir = null;
+			childNames = null;
+			recordCount = 0;
+
+			Log("TryScanMft: begin path=" + path + " timeoutMs=" + timeoutMs);
+			if (!IsLocalNtfsPath(path)) return false;
+			if (!TryGetFileReference(path, out targetFrn)) return false;
+
+			MftStream mft = null;
+			if (!TryOpenMftStream(path, out mft) || mft == null) return false;
+
+			try {
+				int recordSize = mft.RecordSize;
+				long mftLength = mft.Length;
+				recordCount = (int)Math.Min(int.MaxValue - 1, mftLength / recordSize);
+				Log("TryScanMft: mode=" + mft.Mode + " recordCount=" + recordCount
+					+ " (~" + (recordCount * (long)recordSize) + " bytes)");
+				if (recordCount < 16) {
+					LogFail("TryScanMft: recordCount too small: " + recordCount);
+					return false;
+				}
+
+				try {
+					parentOf = new long[recordCount];
+					rollup = new long[recordCount];
+					fileCount = new int[recordCount];
+					isDir = new bool[recordCount];
+				} catch (OutOfMemoryException) {
+					LogFail("TryScanMft: OutOfMemory allocating arrays for recordCount=" + recordCount);
+					return false;
+				}
+				var inUse = new bool[recordCount];
+				var fileBytes = new long[recordCount];
+				// Primary parent only (hardlinks: first WIN32 name wins for chain)
+				for (int i = 0; i < recordCount; i++) parentOf[i] = -1;
+
+				childNames = new Dictionary<long, string>(256);
+				int deadline = timeoutMs > 0 ? Environment.TickCount + timeoutMs : 0;
+
+				// Read $MFT sequentially in large chunks
+				int recordsPerChunk = Math.Max(1, (4 * 1024 * 1024) / recordSize);
+				int chunkBytes = recordsPerChunk * recordSize;
+				byte[] chunk = new byte[chunkBytes];
+				int rec = 0;
+				int parsedOk = 0;
+				int fileSig = 0;
+
+				Log("TryScanMft: reading $MFT chunkBytes=" + chunkBytes + " recordsPerChunk=" + recordsPerChunk);
+				while (rec < recordCount) {
+					if (IsStop(deadline)) {
+						LogFail("TryScanMft: timeout/cancel during read at rec=" + rec + "/" + recordCount
+							+ " cancel=" + CancelRequested);
+						return false;
+					}
+
+					int toReadRecords = Math.Min(recordsPerChunk, recordCount - rec);
+					int toReadBytes = toReadRecords * recordSize;
+
+					int bytesRead;
+					if (!mft.Read(chunk, toReadBytes, out bytesRead) || bytesRead < recordSize) {
+						Log("TryScanMft: stream Read stop at rec=" + rec
+							+ " bytesRead=" + bytesRead
+							+ " want=" + toReadBytes
+							+ " (breaking read loop)");
+						break;
+					}
+					int gotRecords = bytesRead / recordSize;
+
+					for (int i = 0; i < gotRecords; i++) {
+						if ((i & 0x3FF) == 0 && IsStop(deadline)) {
+							LogFail("TryScanMft: timeout/cancel during parse at rec=" + (rec + i));
+							return false;
+						}
+
+						int idx = rec + i;
+						if (idx >= recordCount) break;
+						int off = i * recordSize;
+
+						if (chunk[off] == (byte)'F' && chunk[off + 1] == (byte)'I')
+							fileSig++;
+
+						bool use, dir;
+						long dsize;
+						List<MftName> names;
+						if (!ParseMftRecord(chunk, off, recordSize, idx, out use, out dir, out dsize, out names))
+							continue;
+
+						parsedOk++;
+						inUse[idx] = true;
+						isDir[idx] = dir;
+						fileBytes[idx] = dsize;
+
+						if (names != null && names.Count > 0) {
+							// Prefer WIN32 names; first becomes primary parent
+							for (int n = 0; n < names.Count; n++) {
+								long p = names[n].Parent;
+								if (parentOf[idx] < 0) parentOf[idx] = p;
+								// Direct children of scan target
+								if (p == targetFrn && !string.IsNullOrEmpty(names[n].Name)) {
+									if (!childNames.ContainsKey(idx))
+										childNames[idx] = names[n].Name;
+								}
+							}
+						}
+					}
+
+					rec += gotRecords;
+					if (gotRecords < toReadRecords) break;
+					if ((rec % (recordsPerChunk * 4)) < gotRecords) {
+						Log("TryScanMft: progress rec=" + rec + "/" + recordCount + " parsedOk=" + parsedOk, 3);
+					}
+				}
+
+				Log("TryScanMft: read done rec=" + rec + " parsedOk=" + parsedOk
+					+ " fileSigSeen=" + fileSig
+					+ " childNames=" + childNames.Count
+					+ " targetFrn=" + targetFrn);
+
+				if (parsedOk == 0) {
+					LogFail("TryScanMft: zero records parsed (FILE sigs seen=" + fileSig
+						+ " rec read=" + rec + " recordSize=" + recordSize + " mode=" + mft.Mode + ")");
+					return false;
+				}
+
+				// Roll file sizes up the parent chain; also store size on the file record itself
+				// so root-level files can rank as top space consumers.
+				Log("TryScanMft: rolling up sizes...");
+				for (int i = 0; i < recordCount; i++) {
+					if ((i & 0x7FF) == 0 && IsStop(deadline)) {
+						LogFail("TryScanMft: timeout/cancel during rollup at i=" + i);
+						return false;
+					}
+					if (!inUse[i] || isDir[i]) continue;
+					long s = fileBytes[i];
+					if (s <= 0) continue;
+					rollup[i] = s; // leaf size for top-N when this file is a direct child of scan root
+
+					long p = parentOf[i];
+					int depth = 0;
+					while (p >= 0 && p < recordCount && depth++ < 128) {
+						rollup[p] += s;
+						fileCount[p]++;
+						long next = parentOf[p];
+						if (next == p || next < 0) break;
+						p = next;
+					}
+				}
+
+				Log("TryScanMft: OK mode=" + mft.Mode + " targetFrn=" + targetFrn
+					+ " rollup[target]=" + (targetFrn < recordCount ? rollup[targetFrn].ToString() : "n/a")
+					+ " children=" + childNames.Count);
+				return true;
+			} catch (Exception ex) {
+				LogFail("TryScanMft exception: " + ex.GetType().Name + ": " + ex.Message);
+				return false;
+			} finally {
+				if (mft != null) mft.Close();
+			}
+		}
+
+		static bool TryTopFoldersFromMft(string root, int maxResults, int timeoutMs, out FolderSizeInfo[] result) {
+			result = null;
+			try {
+				Log("TryTopFoldersFromMft: root=" + root + " maxResults=" + maxResults + " timeoutMs=" + timeoutMs);
+				long targetFrn;
+				long[] parentOf, rollup;
+				int[] fileCount;
+				bool[] isDir;
+				Dictionary<long, string> childNames;
+				int recordCount;
+				if (!TryScanMft(root, timeoutMs, out targetFrn, out parentOf, out rollup,
+						out fileCount, out isDir, out childNames, out recordCount))
+					return false;
+
+				// Largest space consumers among direct children: folders AND files (e.g. pagefile.sys on C:\)
+				string basePath = root.TrimEnd('\\', '/');
+				var list = new List<FolderSizeInfo>(childNames != null ? childNames.Count : 0);
+				int nDirs = 0, nFiles = 0;
+				if (childNames != null) {
+					foreach (var kv in childNames) {
+						long id = kv.Key;
+						if (id < 0 || id >= recordCount) continue;
+						string name = kv.Value;
+						if (string.IsNullOrEmpty(name)) continue;
+						bool dir = isDir[id];
+						long bytes = rollup[id];
+						if (!dir && bytes <= 0) continue; // empty/system zero-length — skip clutter
+						if (dir) nDirs++; else nFiles++;
+						list.Add(new FolderSizeInfo {
+							Path = basePath + "\\" + name,
+							Bytes = bytes,
+							Files = dir ? fileCount[id] : 1,
+							IsDirectory = dir,
+							TimedOut = false,
+							Cancelled = false
+						});
+					}
+				}
+
+				list.Sort((a, b) => b.Bytes.CompareTo(a.Bytes));
+				if (list.Count > maxResults)
+					list = list.GetRange(0, maxResults);
+				result = list.ToArray();
+				Log("TryTopFoldersFromMft: OK top=" + result.Length
+					+ " (from dirs=" + nDirs + " files=" + nFiles
+					+ " childNamesTotal=" + (childNames == null ? 0 : childNames.Count) + ")");
+				if (result.Length > 0) {
+					for (int i = 0; i < Math.Min(5, result.Length); i++)
+						Log("  top[" + i + "] " + result[i].Bytes + " B  "
+							+ (result[i].IsDirectory ? "[dir] " : "[file] ") + result[i].Path);
+				}
+				return true;
+			} catch (Exception ex) {
+				LogFail("TryTopFoldersFromMft exception: " + ex.GetType().Name + ": " + ex.Message);
+				result = null;
+				return false;
+			}
+		}
+
+		static bool TryMeasureFromMft(string path, int timeoutMs, out long bytes, out int files) {
+			bytes = 0;
+			files = 0;
+			try {
+				Log("TryMeasureFromMft: path=" + path);
+				long targetFrn;
+				long[] parentOf, rollup;
+				int[] fileCount;
+				bool[] isDir;
+				Dictionary<long, string> childNames;
+				int recordCount;
+				if (!TryScanMft(path, timeoutMs, out targetFrn, out parentOf, out rollup,
+						out fileCount, out isDir, out childNames, out recordCount))
+					return false;
+				if (targetFrn < 0 || targetFrn >= recordCount) {
+					LogFail("TryMeasureFromMft: targetFrn out of range " + targetFrn + " / " + recordCount);
+					return false;
+				}
+				bytes = rollup[targetFrn];
+				files = fileCount[targetFrn];
+				Log("TryMeasureFromMft: OK bytes=" + bytes + " files=" + files);
+				return true;
+			} catch (Exception ex) {
+				LogFail("TryMeasureFromMft exception: " + ex.GetType().Name + ": " + ex.Message);
+				return false;
+			}
+		}
+
+		// ─── Deleted files (MFT not-in-use list + copy-out recover) ───────────
+
+		/// <summary>
+		/// Parse a raw MFT record for deleted-file listing/recovery / parent map.
+		/// inUseMode: -1 = any, 0 = deleted only (not in use), 1 = in-use only.
+		/// </summary>
+		static bool TryParseDeletedCandidate(
+			byte[] buf, int offset, int recordSize, long recordIndex, int inUseMode,
+			out string name, out long parentFrn, out long dataSize, out bool isDir,
+			out bool resident, out bool hasRuns, out byte[] residentData, out List<MftDataRun> runs) {
+			name = null;
+			parentFrn = -1;
+			dataSize = 0;
+			isDir = false;
+			resident = false;
+			hasRuns = false;
+			residentData = null;
+			runs = null;
+			if (offset + 0x30 > buf.Length) return false;
+			if (buf[offset] != (byte)'F' || buf[offset + 1] != (byte)'I' ||
+				buf[offset + 2] != (byte)'L' || buf[offset + 3] != (byte)'E')
+				return false;
+
+			// Work on a private copy so USA fixup does not poison re-reads of the same chunk.
+			byte[] rec = new byte[recordSize];
+			Buffer.BlockCopy(buf, offset, rec, 0, recordSize);
+			ApplyUsaFixup(rec, 0, recordSize);
+
+			ushort flags = BitConverter.ToUInt16(rec, 0x16);
+			bool inUse = (flags & 0x1) != 0;
+			if (inUseMode == 0 && inUse) return false;      // deleted only
+			if (inUseMode == 1 && !inUse) return false;     // live only
+			isDir = (flags & 0x2) != 0;
+
+			long baseRef = BitConverter.ToInt64(rec, 0x20) & MFT_INDEX_MASK;
+			if (baseRef != 0) return false; // extension record
+
+			ushort attrOff = BitConverter.ToUInt16(rec, 0x14);
+			if (attrOff < 0x30 || attrOff >= recordSize) return false;
+
+			string bestName = null;
+			long bestParent = -1;
+			long bestNameSize = 0;
+			bool hasUnnamedData = false;
+			int a = attrOff;
+			int guard = 0;
+			while (a + 16 <= recordSize && guard++ < 256) {
+				uint attrType = BitConverter.ToUInt32(rec, a);
+				if (attrType == 0xFFFFFFFF) break;
+				uint attrLen = BitConverter.ToUInt32(rec, a + 4);
+				if (attrLen < 16 || a + (int)attrLen > recordSize) break;
+
+				byte nonRes = rec[a + 8];
+				byte nameLen = rec[a + 9];
+
+				if (attrType == 0x30 && nonRes == 0) {
+					uint valLen = BitConverter.ToUInt32(rec, a + 16);
+					ushort valOff = BitConverter.ToUInt16(rec, a + 20);
+					int v = a + valOff;
+					if (valOff >= 24 && v + 0x42 <= a + (int)attrLen && valLen >= 0x42) {
+						long parent = BitConverter.ToInt64(rec, v) & MFT_INDEX_MASK;
+						long realSz = BitConverter.ToInt64(rec, v + 0x30);
+						byte nlen = rec[v + 0x40];
+						byte ntype = rec[v + 0x41];
+						if (ntype != 2 && nlen > 0 && v + 0x42 + nlen * 2 <= a + (int)attrLen) {
+							string nm = Encoding.Unicode.GetString(rec, v + 0x42, nlen * 2);
+							if (!string.IsNullOrEmpty(nm) && nm != "." && nm != "..") {
+								if (bestName == null || ntype == 1 || ntype == 3) {
+									bestName = nm;
+									bestParent = parent;
+								}
+								if (realSz > bestNameSize) bestNameSize = realSz;
+							}
+						}
+					}
+				} else if (attrType == 0x80 && nameLen == 0) {
+					if (nonRes == 0) {
+						uint valLen = BitConverter.ToUInt32(rec, a + 16);
+						ushort valOff = BitConverter.ToUInt16(rec, a + 20);
+						dataSize = valLen;
+						hasUnnamedData = true;
+						resident = true;
+						if (valOff > 0 && a + valOff + (int)valLen <= a + (int)attrLen && valLen <= 65536) {
+							residentData = new byte[valLen];
+							Buffer.BlockCopy(rec, a + valOff, residentData, 0, (int)valLen);
+						}
+					} else if (a + 0x40 <= a + (int)attrLen) {
+						dataSize = BitConverter.ToInt64(rec, a + 0x30);
+						if (dataSize < 0) dataSize = 0;
+						hasUnnamedData = true;
+						resident = false;
+						ushort runRel = BitConverter.ToUInt16(rec, a + 0x20);
+						int runAbs = a + runRel;
+						int runEnd = a + (int)attrLen;
+						if (runRel >= 0x40 && runAbs < runEnd) {
+							var rlist = new List<MftDataRun>(8);
+							if (ParseDataRuns(rec, runAbs, runEnd, rlist)) {
+								runs = rlist;
+								hasRuns = rlist.Count > 0;
+							}
+						}
+					}
+				}
+				a += (int)attrLen;
+			}
+
+			if (string.IsNullOrEmpty(bestName)) return false;
+			name = bestName;
+			parentFrn = bestParent;
+			if (!hasUnnamedData && !isDir)
+				dataSize = bestNameSize;
+			if (isDir)
+				dataSize = 0;
+			return true;
+		}
+
+		/// <summary>Set by ListDeletedFiles for callers: volume | folder_direct | folder_recursive</summary>
+		public static string LastListScope = "volume";
+		public static long LastTargetFolderFrn = -1;
+		public static string LastTargetFolderPath = "";
+
+		/// <summary>Public FRN lookup (folder targeting).</summary>
+		public static bool TryGetPathFrn(string path, out long frnIndex) {
+			return TryGetFileReference(path, out frnIndex);
+		}
+
+		static bool IsUnderTargetFolder(long parentFrn, long targetFrn, long[] parentOf, int n, bool recursive) {
+			if (parentFrn == targetFrn) return true;
+			if (!recursive || targetFrn < 0) return false;
+			long p = parentFrn;
+			int guard = 0;
+			while (p >= 0 && p < n && guard++ < 256) {
+				if (p == targetFrn) return true;
+				long next = parentOf[p];
+				if (next < 0 || next == p) break;
+				p = next;
+			}
+			return false;
+		}
+
+		/// <summary>
+		/// List deleted (not-in-use) MFT file records on a local NTFS volume.
+		/// targetFolderFrn &gt;= 0 limits to that folder (direct or recursive via parent map).
+		/// Returns the full filtered list (up to maxResults) for operator choice before recover.
+		/// </summary>
+		public static DeletedFileInfo[] ListDeletedFiles(
+			string volumePath, string nameFilter, long minBytes, bool includeDirectories,
+			int maxResults, int timeoutMs, long targetFolderFrn, bool recursiveUnderFolder) {
+			CancelRequested = false;
+			LastMftFailReason = "";
+			LastListScope = "volume";
+			LastTargetFolderFrn = targetFolderFrn;
+			LastTargetFolderPath = volumePath ?? "";
+			var sw = Stopwatch.StartNew();
+			Log("==== ListDeletedFiles path=" + volumePath + " filter=" + (nameFilter ?? "")
+				+ " minBytes=" + minBytes + " includeDirs=" + includeDirectories
+				+ " max=" + maxResults + " timeoutMs=" + timeoutMs
+				+ " targetFrn=" + targetFolderFrn + " recursive=" + recursiveUnderFolder);
+
+			if (string.IsNullOrEmpty(volumePath)) {
+				LogFail("ListDeletedFiles: empty path");
+				return new DeletedFileInfo[0];
+			}
+			if (maxResults <= 0) maxResults = 5000;
+			if (maxResults > 50000) maxResults = 50000;
+			if (minBytes < 0) minBytes = 0;
+
+			string filter = string.IsNullOrEmpty(nameFilter) ? null : nameFilter.Trim();
+			bool filterWildcard = filter != null && (filter.IndexOf('*') >= 0 || filter.IndexOf('?') >= 0);
+			bool folderScope = targetFolderFrn >= 0;
+			if (folderScope)
+				LastListScope = recursiveUnderFolder ? "folder_recursive" : "folder_direct";
+
+			MftStream mft = null;
+			var hits = new List<DeletedFileInfo>(256);
+			try {
+				if (!IsLocalNtfsPath(volumePath)) {
+					LogFail("ListDeletedFiles: not local NTFS");
+					return new DeletedFileInfo[0];
+				}
+				if (!TryOpenMftStream(volumePath, out mft) || mft == null) {
+					LogFail("ListDeletedFiles: open MFT failed");
+					return new DeletedFileInfo[0];
+				}
+
+				int recordSize = mft.RecordSize;
+				int recordCount = (int)Math.Min(int.MaxValue - 1, mft.Length / recordSize);
+				int deadline = timeoutMs > 0 ? Environment.TickCount + timeoutMs : 0;
+				int recordsPerChunk = Math.Max(1, (4 * 1024 * 1024) / recordSize);
+				byte[] chunk = new byte[recordsPerChunk * recordSize];
+				int rec = 0;
+				int deletedSeen = 0;
+				int folderSkipped = 0;
+
+				// Parent map for live + deleted (recursive folder scope needs full map first —
+				// parent MFT indexes can be higher than the child, so filter after scan).
+				long[] parentOf = new long[recordCount];
+				for (int p = 0; p < recordCount; p++) parentOf[p] = -1;
+
+				// Pass 1: all deleted candidates (+ parent map). Folder filter applied after.
+				var pending = new List<DeletedFileInfo>(512);
+
+				Log("ListDeletedFiles: recordCount=" + recordCount + " mode=" + mft.Mode
+					+ " scope=" + LastListScope);
+				while (rec < recordCount) {
+					if (IsStop(deadline)) {
+						Log("ListDeletedFiles: timeout at rec=" + rec);
+						break;
+					}
+					int toReadRecords = Math.Min(recordsPerChunk, recordCount - rec);
+					int toReadBytes = toReadRecords * recordSize;
+					int bytesRead;
+					if (!mft.Read(chunk, toReadBytes, out bytesRead) || bytesRead < recordSize)
+						break;
+					int got = bytesRead / recordSize;
+					for (int i = 0; i < got; i++) {
+						int idx = rec + i;
+						int off = i * recordSize;
+						string name;
+						long parent, size;
+						bool isDir, resident, hasRuns;
+						byte[] resData;
+						List<MftDataRun> runs;
+
+						// Parent map: any record with a name (live or deleted)
+						if (TryParseDeletedCandidate(chunk, off, recordSize, idx, -1,
+								out name, out parent, out size, out isDir, out resident, out hasRuns,
+								out resData, out runs)) {
+							if (parent >= 0)
+								parentOf[idx] = parent;
+						}
+
+						// Deleted candidates only
+						if (!TryParseDeletedCandidate(chunk, off, recordSize, idx, 0,
+								out name, out parent, out size, out isDir, out resident, out hasRuns,
+								out resData, out runs))
+							continue;
+						deletedSeen++;
+						if (isDir && !includeDirectories) continue;
+						if (size < minBytes) continue;
+						if (filter != null) {
+							if (filterWildcard) {
+								if (!PathMatch(name, filter)) continue;
+							} else if (name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) {
+								continue;
+							}
+						}
+
+						string note;
+						if (isDir)
+							note = "Directory entry (content not recovered by RecoverDeletedFile).";
+						else if (resident)
+							note = "Resident data still in MFT record — recovery usually complete.";
+						else if (hasRuns)
+							note = "Non-resident; clusters may be partially overwritten (best effort).";
+						else
+							note = "No $DATA runs found — may not be recoverable.";
+
+						pending.Add(new DeletedFileInfo {
+							MftIndex = idx,
+							Name = name,
+							ParentFrn = parent,
+							SizeBytes = size,
+							IsDirectory = isDir,
+							Resident = resident,
+							HasDataRuns = hasRuns || resident,
+							Note = note
+						});
+					}
+					rec += got;
+					if (got < toReadRecords) break;
+				}
+
+				// Pass 2: folder scope filter (parent map is complete)
+				var scoped = pending;
+				if (folderScope) {
+					scoped = new List<DeletedFileInfo>(Math.Min(pending.Count, 256));
+					string tag = recursiveUnderFolder ? "[under target folder] " : "[in target folder] ";
+					for (int pi = 0; pi < pending.Count; pi++) {
+						DeletedFileInfo d = pending[pi];
+						if (!IsUnderTargetFolder(d.ParentFrn, targetFolderFrn, parentOf, recordCount, recursiveUnderFolder)) {
+							folderSkipped++;
+							continue;
+						}
+						d.Note = tag + d.Note;
+						scoped.Add(d);
+					}
+				}
+
+				// Largest first so operator sees biggest consumers up top
+				scoped.Sort(delegate(DeletedFileInfo a, DeletedFileInfo b) {
+					int c = b.SizeBytes.CompareTo(a.SizeBytes);
+					if (c != 0) return c;
+					return a.MftIndex.CompareTo(b.MftIndex);
+				});
+				LastListTotalMatched = scoped.Count;
+				LastListTruncated = scoped.Count > maxResults;
+				int take = scoped.Count;
+				if (take > maxResults) take = maxResults;
+				for (int h = 0; h < take; h++)
+					hits.Add(scoped[h]);
+				sw.Stop();
+				LastElapsedMs = sw.ElapsedMilliseconds;
+				Log("ListDeletedFiles: OK hits=" + hits.Count + " totalMatched=" + LastListTotalMatched
+					+ " truncated=" + LastListTruncated + " deletedSeen=" + deletedSeen
+					+ " folderSkipped=" + folderSkipped + " ms=" + LastElapsedMs, 1);
+				return hits.ToArray();
+			} catch (Exception ex) {
+				LogFail("ListDeletedFiles exception: " + ex.GetType().Name + ": " + ex.Message);
+				return hits.ToArray();
+			} finally {
+				if (mft != null) mft.Close();
+			}
+		}
+
+		/// <summary>
+		/// Largest live files under path (MFT), recursive. Path may be a folder or volume root.
+		/// </summary>
+		public static FolderSizeInfo[] TopFiles(string root, int maxResults, int timeoutMs) {
+			CancelRequested = false;
+			LastScanEngine = "none";
+			LastMftFailReason = "";
+			Log("==== TopFiles root=" + root + " max=" + maxResults + " timeoutMs=" + timeoutMs, 1);
+			if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
+				return new FolderSizeInfo[0];
+			if (maxResults <= 0) maxResults = 20;
+			if (maxResults > 200) maxResults = 200;
+
+			long targetFrn;
+			long[] parentOf;
+			bool[] isDir;
+			int recordCount;
+			// Dedicated MFT pass for live files (no folder rollup — sizes come from each record)
+			MftStream mft = null;
+			var sw = Stopwatch.StartNew();
+			try {
+				if (!IsLocalNtfsPath(root)) {
+					LogFail("TopFiles: not local NTFS");
+					return TopFilesFallback(root, maxResults, timeoutMs);
+				}
+				if (!TryGetFileReference(root, out targetFrn)) {
+					LogFail("TopFiles: FRN failed");
+					return TopFilesFallback(root, maxResults, timeoutMs);
+				}
+				if (!TryOpenMftStream(root, out mft) || mft == null)
+					return TopFilesFallback(root, maxResults, timeoutMs);
+
+				int recordSize = mft.RecordSize;
+				recordCount = (int)Math.Min(int.MaxValue - 1, mft.Length / recordSize);
+				parentOf = new long[recordCount];
+				var names = new string[recordCount];
+				var fileBytes = new long[recordCount];
+				isDir = new bool[recordCount];
+				var inUse = new bool[recordCount];
+				for (int i = 0; i < recordCount; i++) parentOf[i] = -1;
+
+				int deadline = timeoutMs > 0 ? Environment.TickCount + timeoutMs : 0;
+				int recordsPerChunk = Math.Max(1, (4 * 1024 * 1024) / recordSize);
+				byte[] chunk = new byte[recordsPerChunk * recordSize];
+				int rec = 0;
+				while (rec < recordCount) {
+					if (IsStop(deadline)) break;
+					int toReadRecords = Math.Min(recordsPerChunk, recordCount - rec);
+					int br;
+					if (!mft.Read(chunk, toReadRecords * recordSize, out br) || br < recordSize) break;
+					int got = br / recordSize;
+					for (int i = 0; i < got; i++) {
+						int idx = rec + i;
+						string name;
+						long parent, size;
+						bool dir, resident, hasRuns;
+						byte[] resData;
+						List<MftDataRun> runs;
+						// in-use only for live files
+						if (!TryParseDeletedCandidate(chunk, i * recordSize, recordSize, idx, 1,
+								out name, out parent, out size, out dir, out resident, out hasRuns,
+								out resData, out runs))
+							continue;
+						inUse[idx] = true;
+						isDir[idx] = dir;
+						parentOf[idx] = parent;
+						names[idx] = name;
+						if (!dir) fileBytes[idx] = size;
+					}
+					rec += got;
+					if (got < toReadRecords) break;
+				}
+
+				var list = new List<FolderSizeInfo>(256);
+				for (int i = 0; i < recordCount; i++) {
+					if (!inUse[i] || isDir[i]) continue;
+					if (fileBytes[i] <= 0) continue;
+					// Under target folder (direct or nested). Record itself is never the scan root file.
+					if (parentOf[i] != targetFrn
+						&& !IsUnderTargetFolder(parentOf[i], targetFrn, parentOf, recordCount, true))
+						continue;
+
+					string rel = names[i] ?? ("#" + i);
+					// Build short path: walk parents collecting names until target
+					var parts = new List<string>(8);
+					parts.Add(rel);
+					long p = parentOf[i];
+					int g = 0;
+					while (p >= 0 && p < recordCount && p != targetFrn && g++ < 64) {
+						if (!string.IsNullOrEmpty(names[p])) parts.Add(names[p]);
+						long n = parentOf[p];
+						if (n == p || n < 0) break;
+						p = n;
+					}
+					parts.Reverse();
+					string basePath = root.TrimEnd('\\', '/');
+					string full = basePath;
+					for (int k = 0; k < parts.Count; k++)
+						full = full + "\\" + parts[k];
+
+					list.Add(new FolderSizeInfo {
+						Path = full,
+						Bytes = fileBytes[i],
+						Files = 1,
+						IsDirectory = false
+					});
+				}
+				list.Sort(delegate(FolderSizeInfo a, FolderSizeInfo b) { return b.Bytes.CompareTo(a.Bytes); });
+				if (list.Count > maxResults) list = list.GetRange(0, maxResults);
+				sw.Stop();
+				LastElapsedMs = sw.ElapsedMilliseconds;
+				LastScanEngine = "mft";
+				Log("TopFiles: OK count=" + list.Count + " ms=" + LastElapsedMs, 1);
+				return list.ToArray();
+			} catch (Exception ex) {
+				LogFail("TopFiles: " + ex.Message);
+				return TopFilesFallback(root, maxResults, timeoutMs);
+			} finally {
+				if (mft != null) mft.Close();
+			}
+		}
+
+		static FolderSizeInfo[] TopFilesFallback(string root, int maxResults, int timeoutMs) {
+			LastScanEngine = "findfirstfileex_large_fetch";
+			var bag = new List<FolderSizeInfo>(maxResults * 2);
+			int deadline = timeoutMs > 0 ? Environment.TickCount + timeoutMs : 0;
+			try {
+				var stack = new Stack<string>();
+				stack.Push(root);
+				while (stack.Count > 0) {
+					if (IsStop(deadline)) break;
+					string dir = stack.Pop();
+					WIN32_FIND_DATAW data;
+					string pattern = dir.TrimEnd('\\', '/') + "\\*";
+					IntPtr h = FindFirstFileExW(pattern, FindExInfoBasic, out data, FindExSearchNameMatch, IntPtr.Zero, FIND_FIRST_EX_LARGE_FETCH);
+					if (h == INVALID_HANDLE_VALUE) continue;
+					try {
+						do {
+							if (IsStop(deadline)) break;
+							string name = data.cFileName;
+							if (name == "." || name == "..") continue;
+							if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
+							string full = Path.Combine(dir, name);
+							if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+								stack.Push(full);
+							} else {
+								long sz = FileSize(ref data);
+								if (sz <= 0) continue;
+								bag.Add(new FolderSizeInfo {
+									Path = full, Bytes = sz, Files = 1, IsDirectory = false
+								});
+							}
+						} while (FindNextFileW(h, out data));
+					} finally { FindClose(h); }
+				}
+			} catch { }
+			bag.Sort(delegate(FolderSizeInfo a, FolderSizeInfo b) { return b.Bytes.CompareTo(a.Bytes); });
+			if (bag.Count > maxResults) bag = bag.GetRange(0, maxResults);
+			return bag.ToArray();
+		}
+
+		static bool PathMatch(string name, string pattern) {
+			// Simple * and ? glob, case-insensitive
+			try {
+				string rx = "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
+					.Replace("\\*", ".*").Replace("\\?", ".") + "$";
+				return System.Text.RegularExpressions.Regex.IsMatch(
+					name ?? "", rx, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+			} catch {
+				return false;
+			}
+		}
+
+		static bool TryOpenVolumeHandle(string anyPath, out IntPtr hVol, out uint bytesPerCluster, out long totalClusters) {
+			hVol = INVALID_HANDLE_VALUE;
+			bytesPerCluster = 4096;
+			totalClusters = 0;
+			TryEnableBackupPrivileges();
+			string full = Path.GetFullPath(anyPath);
+			string root = Path.GetPathRoot(full);
+			if (string.IsNullOrEmpty(root)) return false;
+			string vol = root.TrimEnd('\\');
+			string volPath = @"\\.\" + vol;
+			hVol = CreateFileW(volPath, GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				IntPtr.Zero, OPEN_EXISTING,
+				FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
+			if (hVol == INVALID_HANDLE_VALUE || hVol == IntPtr.Zero) {
+				Log("TryOpenVolumeHandle failed win32=" + Marshal.GetLastWin32Error() + " " + volPath);
+				return false;
+			}
+			int cb = Marshal.SizeOf(typeof(NTFS_VOLUME_DATA_BUFFER));
+			IntPtr buf = Marshal.AllocHGlobal(cb);
+			try {
+				uint ret;
+				if (DeviceIoControl(hVol, FSCTL_GET_NTFS_VOLUME_DATA, IntPtr.Zero, 0, buf, (uint)cb, out ret, IntPtr.Zero)) {
+					NTFS_VOLUME_DATA_BUFFER vd = (NTFS_VOLUME_DATA_BUFFER)Marshal.PtrToStructure(buf, typeof(NTFS_VOLUME_DATA_BUFFER));
+					if (vd.BytesPerCluster > 0) bytesPerCluster = vd.BytesPerCluster;
+					totalClusters = vd.TotalClusters;
+				}
+			} finally {
+				Marshal.FreeHGlobal(buf);
+			}
+			return true;
+		}
+
+		/// <summary>
+		/// Recover one deleted file by MFT index. READS source volume only; WRITES only to outputPath
+		/// via CreateNew (never overwrites an existing file; never writes to source volume clusters).
+		/// </summary>
+		public static RecoverResult RecoverDeletedFile(
+			string volumePath, long mftIndex, string outputPath, int timeoutMs, long maxBytes) {
+			var result = new RecoverResult { MftIndex = mftIndex };
+			CancelRequested = false;
+			Log("==== RecoverDeletedFile volume=" + volumePath + " mftIndex=" + mftIndex
+				+ " output=" + outputPath + " maxBytes=" + maxBytes);
+
+			if (string.IsNullOrEmpty(volumePath) || string.IsNullOrEmpty(outputPath)) {
+				result.Error = "volumePath and outputPath are required";
+				LogFail("RecoverDeletedFile: " + result.Error);
+				return result;
+			}
+			if (mftIndex < 0) {
+				result.Error = "mftIndex must be >= 0";
+				return result;
+			}
+			if (maxBytes <= 0) maxBytes = 4L * 1024 * 1024 * 1024; // 4 GiB default cap
+			if (maxBytes > 32L * 1024 * 1024 * 1024) maxBytes = 32L * 1024 * 1024 * 1024;
+
+			// Refuse to use the source volume device path as output
+			string outFull;
+			try { outFull = Path.GetFullPath(outputPath); }
+			catch (Exception ex) {
+				result.Error = "Invalid outputPath: " + ex.Message;
+				return result;
+			}
+			if (outFull.StartsWith(@"\\.\", StringComparison.OrdinalIgnoreCase) ||
+				outFull.IndexOf(@"\$MFT", StringComparison.OrdinalIgnoreCase) >= 0) {
+				result.Error = "outputPath must be a normal file path, not a volume/$MFT device path";
+				LogFail("RecoverDeletedFile: " + result.Error);
+				return result;
+			}
+			if (File.Exists(outFull) || Directory.Exists(outFull)) {
+				result.Error = "Refusing to overwrite existing path: " + outFull
+					+ " (pick a new name; recovery never overwrites)";
+				LogFail("RecoverDeletedFile: " + result.Error);
+				return result;
+			}
+
+			MftStream mft = null;
+			IntPtr hVol = INVALID_HANDLE_VALUE;
+			FileStream outFs = null;
+			try {
+				if (!IsLocalNtfsPath(volumePath)) {
+					result.Error = "Not a local NTFS path: " + volumePath;
+					return result;
+				}
+				if (!TryOpenMftStream(volumePath, out mft) || mft == null) {
+					result.Error = "Could not open MFT: " + LastMftFailReason;
+					return result;
+				}
+				int recordSize = mft.RecordSize;
+				long mftLen = mft.Length;
+				int recordCount = (int)Math.Min(int.MaxValue - 1, mftLen / recordSize);
+				if (mftIndex >= recordCount) {
+					result.Error = "mftIndex " + mftIndex + " out of range (records=" + recordCount + ")";
+					return result;
+				}
+
+				// Sequential read to the target record (MftStream is forward-only).
+				// Read whole records only so volume_runs path stays aligned.
+				byte[] one = new byte[recordSize];
+				byte[] drain = new byte[Math.Max(recordSize, Math.Min(4 * 1024 * 1024, recordSize * 4096))];
+				long recordsToSkip = mftIndex;
+				while (recordsToSkip > 0) {
+					int batch = (int)Math.Min(recordsToSkip, drain.Length / recordSize);
+					if (batch < 1) batch = 1;
+					int want = batch * recordSize;
+					int br;
+					if (!mft.Read(drain, want, out br) || br < recordSize) {
+						result.Error = "Failed reading MFT up to index " + mftIndex
+							+ " (left=" + recordsToSkip + ")";
+						return result;
+					}
+					int gotRec = br / recordSize;
+					if (gotRec < 1) {
+						result.Error = "MFT read returned no full records while seeking";
+						return result;
+					}
+					recordsToSkip -= gotRec;
+				}
+				int obr;
+				if (!mft.Read(one, recordSize, out obr) || obr < recordSize) {
+					result.Error = "Could not read MFT record " + mftIndex;
+					return result;
+				}
+				// MFT stream no longer needed for body recovery
+				mft.Close();
+				mft = null;
+
+				string name;
+				long parent, size;
+				bool isDir, resident, hasRuns;
+				byte[] resData;
+				List<MftDataRun> runs;
+				if (!TryParseDeletedCandidate(one, 0, recordSize, mftIndex, 0,
+						out name, out parent, out size, out isDir, out resident, out hasRuns,
+						out resData, out runs)) {
+					// Also try if record was reused (in use) — refuse to avoid clobbering live files' clusters story
+					if (TryParseDeletedCandidate(one, 0, recordSize, mftIndex, 1,
+							out name, out parent, out size, out isDir, out resident, out hasRuns,
+							out resData, out runs)) {
+						result.Error = "MFT record " + mftIndex + " is currently IN USE (name=" + name
+							+ "). Not a deleted entry — recovery refused to avoid touching live data.";
+						result.Name = name;
+						return result;
+					}
+					result.Error = "MFT record " + mftIndex + " is not a recoverable deleted file entry";
+					return result;
+				}
+				result.Name = name;
+				if (isDir) {
+					result.Error = "Record is a directory; file content recovery not supported";
+					return result;
+				}
+				if (size > maxBytes) {
+					result.Error = "File size " + size + " exceeds maxBytes " + maxBytes;
+					return result;
+				}
+
+				string outDir = Path.GetDirectoryName(outFull);
+				if (!string.IsNullOrEmpty(outDir) && !Directory.Exists(outDir))
+					Directory.CreateDirectory(outDir);
+
+				// CreateNew: never overwrite existing recovered/live files
+				outFs = new FileStream(outFull, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+				long written = 0;
+
+				if (resident) {
+					if (resData == null) resData = new byte[0];
+					int take = resData.Length;
+					if (size > 0 && size < take) take = (int)size;
+					outFs.Write(resData, 0, take);
+					written = take;
+					result.Ok = true;
+					result.BytesWritten = written;
+					result.OutputPath = outFull;
+					result.Partial = false;
+					result.Note = "Recovered resident $DATA. Source volume was read-only; output is a new file.";
+					Log("RecoverDeletedFile: OK resident bytes=" + written + " -> " + outFull);
+					return result;
+				}
+
+				if (runs == null || runs.Count == 0) {
+					result.Error = "No data runs on deleted record; cannot recover body";
+					try { outFs.Close(); } catch { }
+					outFs = null;
+					try { File.Delete(outFull); } catch { }
+					return result;
+				}
+
+				uint bpc;
+				long totalClusters;
+				if (!TryOpenVolumeHandle(volumePath, out hVol, out bpc, out totalClusters)) {
+					result.Error = "Could not open volume for cluster read";
+					try { outFs.Close(); } catch { }
+					outFs = null;
+					try { File.Delete(outFull); } catch { }
+					return result;
+				}
+
+				long remain = size > 0 ? size : 0;
+				// If size unknown, sum run lengths
+				if (remain <= 0) {
+					long clusters = 0;
+					for (int i = 0; i < runs.Count; i++) clusters += runs[i].Clusters;
+					remain = clusters * bpc;
+					if (remain > maxBytes) remain = maxBytes;
+				}
+
+				byte[] block = new byte[Math.Min(1024 * 1024, (int)bpc * 64)];
+				bool partial = false;
+				for (int ri = 0; ri < runs.Count && remain > 0; ri++) {
+					if (CancelRequested) {
+						partial = true;
+						break;
+					}
+					MftDataRun run = runs[ri];
+					long runBytes = run.Clusters * (long)bpc;
+					long toCopy = Math.Min(runBytes, remain);
+					if (run.Lcn < 0) {
+						// sparse: write zeros
+						long left = toCopy;
+						while (left > 0) {
+							int n = (int)Math.Min(block.Length, left);
+							Array.Clear(block, 0, n);
+							outFs.Write(block, 0, n);
+							left -= n;
+							written += n;
+						}
+						remain -= toCopy;
+						continue;
+					}
+					if (totalClusters > 0 && run.Lcn + run.Clusters > totalClusters) {
+						Log("RecoverDeletedFile: run LCN out of range lcn=" + run.Lcn + " — truncating");
+						partial = true;
+						break;
+					}
+					long phys = run.Lcn * (long)bpc;
+					long newPtr;
+					if (!SetFilePointerEx(hVol, phys, out newPtr, 0)) {
+						result.Error = "SetFilePointerEx failed win32=" + Marshal.GetLastWin32Error();
+						partial = true;
+						break;
+					}
+					long left2 = toCopy;
+					while (left2 > 0) {
+						int n = (int)Math.Min(block.Length, left2);
+						uint br;
+						if (!ReadFile(hVol, block, (uint)n, out br, IntPtr.Zero) || br == 0) {
+							Log("RecoverDeletedFile: ReadFile short at phys run lcn=" + run.Lcn);
+							partial = true;
+							left2 = 0;
+							break;
+						}
+						int got = (int)br;
+						outFs.Write(block, 0, got);
+						written += got;
+						left2 -= got;
+						remain -= got;
+					}
+					if (partial) break;
+				}
+
+				outFs.Flush();
+				result.Ok = written > 0;
+				result.BytesWritten = written;
+				result.OutputPath = outFull;
+				result.Partial = partial || (size > 0 && written < size);
+				result.Note = result.Partial
+					? "Partial recovery (clusters missing/overwritten or read stopped). Source volume not written."
+					: "Recovery copy written. Source volume was read-only; clusters not modified.";
+				if (!result.Ok) {
+					result.Error = "No bytes recovered";
+					try { outFs.Close(); } catch { }
+					outFs = null;
+					try { File.Delete(outFull); } catch { }
+				} else {
+					Log("RecoverDeletedFile: OK written=" + written + " partial=" + result.Partial + " -> " + outFull);
+				}
+				return result;
+			} catch (IOException ioex) {
+				result.Error = "IO: " + ioex.Message;
+				LogFail("RecoverDeletedFile IO: " + ioex.Message);
+				try { if (outFs != null) { outFs.Close(); outFs = null; } } catch { }
+				try { if (File.Exists(outFull)) File.Delete(outFull); } catch { }
+				return result;
+			} catch (Exception ex) {
+				result.Error = ex.GetType().Name + ": " + ex.Message;
+				LogFail("RecoverDeletedFile: " + result.Error);
+				try { if (outFs != null) { outFs.Close(); outFs = null; } } catch { }
+				try { if (File.Exists(outFull)) File.Delete(outFull); } catch { }
+				return result;
+			} finally {
+				if (outFs != null) try { outFs.Close(); } catch { }
+				if (hVol != INVALID_HANDLE_VALUE && hVol != IntPtr.Zero) CloseHandle(hVol);
+				if (mft != null) mft.Close();
+			}
+		}
+
+		// ─── FindFirstFileEx walk (fallback / non-deep / non-NTFS) ────────────
+
+		/// <summary>List immediate children: directories into dirsOut; files (with size) into filesOut.</summary>
+		static void EnumerateTopEntries(string root, List<string> dirsOut, List<FolderSizeInfo> filesOut, int maxChildren) {
 			string pattern = root.TrimEnd('\\', '/') + "\\*";
 			WIN32_FIND_DATAW data;
 			IntPtr h = FindFirstFileExW(pattern, FindExInfoBasic, out data, FindExSearchNameMatch, IntPtr.Zero, FIND_FIRST_EX_LARGE_FETCH);
 			if (h == INVALID_HANDLE_VALUE) {
 				try {
 					foreach (var d in Directory.EnumerateDirectories(root)) {
-						into.Add(d);
-						if (into.Count >= maxChildren) break;
+						dirsOut.Add(d);
+						if (dirsOut.Count >= maxChildren) break;
+					}
+					foreach (var f in Directory.EnumerateFiles(root)) {
+						try {
+							var fi = new FileInfo(f);
+							filesOut.Add(new FolderSizeInfo {
+								Path = f,
+								Bytes = fi.Exists ? fi.Length : 0,
+								Files = 1,
+								IsDirectory = false
+							});
+						} catch { }
+						if (filesOut.Count >= maxChildren) break;
 					}
 				} catch { }
 				return;
 			}
 			try {
+				int dirCount = 0;
 				do {
 					if (IsStop(0) && CancelRequested) break;
 					string name = data.cFileName;
 					if (name == "." || name == "..") continue;
-					if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
 					if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
-					into.Add(Path.Combine(root, name));
-					if (into.Count >= maxChildren) break;
+					if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+						if (dirCount >= maxChildren) continue;
+						dirsOut.Add(Path.Combine(root, name));
+						dirCount++;
+					} else {
+						long sz = FileSize(ref data);
+						if (sz <= 0) continue;
+						filesOut.Add(new FolderSizeInfo {
+							Path = Path.Combine(root, name),
+							Bytes = sz,
+							Files = 1,
+							IsDirectory = false
+						});
+					}
 				} while (FindNextFileW(h, out data));
 			} finally {
 				FindClose(h);
@@ -2039,7 +3948,6 @@ namespace MiniBot.Core {
 					}
 					string name = data.cFileName;
 					if (name == "." || name == "..") continue;
-					// Skip junctions/symlinks (cycles + mount points)
 					if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
 					if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
 						sum += WalkDir(Path.Combine(dir, name), ref files, deadline, ref timedOut, ref cancelled);
@@ -4498,7 +6406,7 @@ function Show-MBHelp {
 		@{ c = "/status";          d = "Session stats + context budget" },
 		@{ c = "/context";         d = "Detailed context breakdown" },
 		@{ c = "/clear";           d = "Clear chat history (keeps sticky notes / pins)" },
-		@{ c = "/compact";         d = "Aggressively trim history to free context" },
+		@{ c = "/compact";         d = "Full-replace history with a summary (frees real context)" },
 		@{ c = "/note <text>";     d = "Pin a sticky note into session state" },
 		@{ c = "/find <text>";     d = "Pin a finding into session state" },
 		@{ c = "/forget";          d = "Clear sticky notes, findings, digest, pins, TaskBoard" },
@@ -4559,7 +6467,8 @@ function Show-MBHelp {
 	Write-MBRule -Label "core highlights"
 	Write-Host "  TaskBoard - ordered plan cursor (SESSION STATE); execute only now; set|update|status|clear" -ForegroundColor Gray
 	Write-Host "  Edit stack - EditFile / ApplyPatch / WriteFile (unified LCS diffs, path.bak default)" -ForegroundColor Gray
-	Write-Host "  Forensics group - HexView/HexEdit/HexSearch/StringsScan (EnableToolGroup group=forensics)" -ForegroundColor Gray
+	Write-Host "  Forensics group - PeInfo/HexView/HexEdit/FindHexPattern/StringExtract/ImportTableViewer/ResourceEditor/SectionManager" -ForegroundColor Gray
+	Write-Host "  Recovery group  - RecycleBin/MFT undelete/VSS/USN (live NTFS deleted data only; not formatted disks)" -ForegroundColor Gray
 	Write-Host "  Web - SearchWeb then BrowsePage; MakeHttpRequest for APIs; GitHub raw helpers" -ForegroundColor Gray
 	Write-Host "  Docs - Microsoft Learn + SS64 (EnableToolGroup group=docs)" -ForegroundColor Gray
 	Write-Host "  Loop hygiene - same tool+args blocked after retest; NEED_INPUT/TOOLS_DONE stops thrash" -ForegroundColor Gray
@@ -10169,7 +12078,8 @@ function New-MBChatRequestBody {
 $script:MBGroupQuickMap = [ordered]@{
 	vision = 'ReadImage/ReadPdf/ViewScreen'
 	sound = 'SpeakText/AudioVolume'
-	forensics = 'hex/PE/disasm/strings'
+	forensics = 'PE/hex/disasm/imports/resources/sections'
+	recovery = 'RecycleBin/MFT undelete/VSS (live NTFS deleted data)'
 	system = 'inventory+services+brightness'
 	network = 'LAN/PortProbe/Find*/RemoteCommand'
 	diag = 'BSOD/disk/events'; repair = 'sfc/dism/chkdsk'
@@ -10201,7 +12111,8 @@ ROUTER (intent->tool; enable group first if off; do not shell these):
  image|screenshot|look at screen|pdf vision -> EnableToolGroup group=vision then ReadImage/ViewScreen/ReadPdf
  service start/stop/restart -> EnableToolGroup group=system then ControlService
  kill process -> EnableToolGroup group=diag then StopProcess
- pe|exe|dll|hex|disasm|patch jump|iat|entropy|strings binary -> EnableToolGroup group=forensics then HexView/HexEdit/HexSearch/StringsScan
+ pe|exe|dll|hex|disasm|patch jump|iat|entropy|strings binary|imports|resources|sections pe -> EnableToolGroup group=forensics then ForensicsSummary/PeInfo/HexView/HexEdit/FindHexPattern/StringExtract/ImportTableViewer/ResourceEditor/SectionManager
+ undelete|recover deleted|deleted files|restore deleted|mft undelete|recycle bin|shadow copy|previous versions -> EnableToolGroup group=recovery then ListRecycleBin/ListDeletedFiles/RecoverDeletedFile/ListShadowCopies
  find shares/LAN -> EnableToolGroup group=network then FindShares/ScanNetwork
  find web servers/http hosts -> network then FindWebHosts (or PortProbe profile=web)
  find rdp/remote desktop hosts -> network then FindRdp (or PortProbe profile=rdp)
@@ -10216,7 +12127,7 @@ ROUTER (intent->tool; enable group first if off; do not shell these):
  NEVER RunCommand for volume/mute/speech COM — use sound group (AudioVolume/SpeakText). Brightness: system DisplayBrightness.
  NEVER raw reg.exe for policy keys if GroupPolicy tool available (setup group).
  NEVER shell bulk rename / dupe-scan first (Rename-Item loops, Get-FileHash|Group-Object, robocopy/fdupes style) — files BulkRename / FindDuplicates; RunCommand only after those tools error/fail.
-MAP: vision=ReadImage/ReadPdf/ViewScreen | sound=SpeakText/AudioVolume | forensics=HexView/HexEdit/HexSearch/StringsScan | system=inventory+services+DisplayBrightness | network=LAN+PortProbe+FindShares+FindWebHosts+FindRdp+RemoteCommand | diag=BSOD/disk/events/kill | repair=sfc/dism/chkdsk | setup=options/GroupPolicy/restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso/BulkRename/FindDuplicates | packages=PSGallery | registry | clipboard | docs=SearchMicrosoftLearn/ReadMicrosoftLearn/SearchSs64/ReadSs64 | web=HTTP/SearchWeb/BrowsePage
+MAP: vision=ReadImage/ReadPdf/ViewScreen | sound=SpeakText/AudioVolume | forensics=ForensicsSummary/PeInfo/HexView/HexEdit/FindHexPattern/StringExtract/ImportTableViewer/ResourceEditor/SectionManager | recovery=ListRecycleBin/ListDeletedFiles/RecoverDeletedFile/ListShadowCopies/ListUsnRecent | system=inventory+services+DisplayBrightness | network=LAN+PortProbe+FindShares+FindWebHosts+FindRdp+RemoteCommand | diag=BSOD/disk/events/space/kill | repair=sfc/dism/chkdsk | setup=options/GroupPolicy/restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso/BulkRename/FindDuplicates | packages=PSGallery | registry | clipboard | docs=SearchMicrosoftLearn/ReadMicrosoftLearn/SearchSs64/ReadSs64 | web=HTTP/SearchWeb/BrowsePage
 DOCS (group=docs): official Windows/PowerShell/cmd references when unsure of API/policy/syntax. Prefer SearchMicrosoftLearn + ReadMicrosoftLearn for MS docs; SearchSs64 + ReadSs64 for cmd/PowerShell/bash cheat sheets. EnableToolGroup group=docs first. Not for general web (use web group). Local Get-Help is version-accurate when available — still use Learn for product docs.
 FindFiles: multi-ext one call; truncated=normal (use rows); specific ask->narrow; vague play/show->pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice->tell operator. User text = results only.
 FINAL REPLY after tools (when no more tools): short DID: (what worked) and NEXT: (follow-up) or ASK: (operator input). Keep it tight for local models.
@@ -10224,7 +12135,7 @@ FINAL REPLY after tools (when no more tools): short DID: (what worked) and NEXT:
 
 $script:MBGroupPrompt = [ordered]@{
 	core = @"
-CORE: multi-step → TaskBoard first (one board call/turn; ordered plan; execute ONLY now; update id=now status=done epoch=<from last result>; never mark later steps early; blocked+note if stuck; after complete do not invent a new board). Text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; DiffText; RunCommand last resort; EnableToolGroup. Prefer specialized tools. ReadFile before Edit/ApplyPatch. Mutating file tools write path.bak by default. PE/binary: forensics. Images/PDF/screen: vision. MEDIA: ![label](absolute-path).
+CORE: multi-step → TaskBoard first (one board call/turn; ordered plan; execute ONLY now; update id=now status=done epoch=<from last result>; never mark later steps early; blocked+note if stuck; after complete do not invent a new board). Text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; DiffText; RunCommand last resort; EnableToolGroup. Prefer specialized tools. ReadFile before Edit/ApplyPatch. Mutating file tools write path.bak by default. PE/binary: forensics. Deleted files (live NTFS): recovery. Images/PDF/screen: vision. MEDIA: ![label](absolute-path).
 "@
 	vision = @"
 VISION: ReadImage (auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true -> show with ![label](path) inline, not external open). No ReadFile on images/PDF. SpeakText is sound group.
@@ -10233,7 +12144,10 @@ VISION: ReadImage (auto-downscale); ReadPdf page=1 first; ViewScreen look-only d
 SOUND: SpeakText (SAPI TTS); AudioVolume (get/set/mute/unmute, level=0-100). Prefer over shell COM / nircmd volume. Display brightness is system group.
 "@
 	forensics = @"
-FORENSICS: HexView (disasm + IAT/export labels, entropy, carve, hash, functions, rva/section/at_entry); HexEdit (preset=force_jcc|nop_range|ret0, path.bak); HexSearch (?? wildcards); StringsScan (filter=url|path|interesting). Prefer over ReadAllBytes/Format-Hex. Not for text source (use EditFile).
+FORENSICS: ForensicsSummary or PeInfo first (summary_only / large PE auto all=true). Forensics tools auto-enable the forensics group if still off. HexView (pe.sections; disasm/trace follow_calls; at_entry|section=.text|skip_mz_header). HexEdit (patch|replace_pattern|undo|history|export_history; presets force_jcc|invert_jcc|nop_range). FindHexPattern (multi-pattern with ; ; max=all; resolve_targets; hit.next). StringExtract (clean_urls; filter=data|url; next_steps). ImportTableViewer (all=true; by_ordinal_only; next_steps->HexView). ResourceEditor (get text_preview; replace source_text=). SectionManager (validate=true; list warnings). Prefer over ReadAllBytes. Not for text source (EditFile). Deleted-file undelete is the recovery group (not forensics).
+"@
+	recovery = @"
+RECOVERY (live NTFS only — NOT formatted/wiped disks; deleted data only): Prefer ListRecycleBin first (normal Delete-to-Bin). Then ListDeletedFiles (MFT not-in-use; path=C:\ or existing folder; recursive default). ALWAYS show MarkdownPreview + OperatorListPath / full Files before recover. RecoverDeletedFile mft_index= copy-out to NEW path. ExportRecycleBinItem / RestoreRecycleBinItem for Bin. ListShadowCopies = VSS; ListUsnRecent = USN sample; RecoverySmokeTest = self-check. Live free space / largest files = GetDiskSpace (diag group), not recovery. Formatting destroys MFT — lab tools for wiped disks. Prefer other drive for recovered output.
 "@
 	system = @"
 SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime; DisplayBrightness. Prefer over Get-ComputerInfo / shell COM. Services: ControlService not shell. Volume/mute: sound group AudioVolume.
@@ -10242,7 +12156,7 @@ SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime; Dis
 NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; PortProbe (TCP open/closed); FindShares (REQUIRED for shares — never net view loops); FindWebHosts; FindRdp; GetLocalShares/MappedDrives/Printers; RemoteCommand (domain-admin: domain-joined + domain user only; PortProbe first; orange off-domain). If remote_command_unavailable=1 or remote_port_closed=1 / TOOLS_DONE=1: STOP tools and tell operator. Do not RunCommand/Test-NetConnection thrash. NEED_INPUT when ports open but auth failed — DOMAIN\\DomainAdmin + password. Search=omit hosts; targeted=computer=/hosts=.
 "@
 	diag = @"
-DIAG: BSOD/events/disk/startup/tasks/drivers/StopProcess/RunQuickDiagnostics. Never dump .dmp bytes. Kill only if asked.
+DIAG: BSOD/events/disk/startup/tasks/drivers/StopProcess/RunQuickDiagnostics; GetDiskSpace (free space, top folders, optional largest_files= / mode=files|both for recursive biggest files). Never dump .dmp bytes. Kill only if asked. Deleted-file recovery is recovery group.
 "@
 	repair = @"
 REPAIR: RunRepairTool sfc|dism|chkdsk (prompt). Prefer diag first.
@@ -10298,7 +12212,7 @@ function Build-MBSystemPromptLive {
 	}
 	if (-not $activeSet.ContainsKey('core')) { $activeSet['core'] = $true }
 
-	$order = @('core','vision','sound','forensics','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','docs','web')
+	$order = @('core','vision','sound','forensics','recovery','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','docs','web')
 	$onList = New-Object System.Collections.ArrayList
 	$offBits = New-Object System.Collections.ArrayList
 	foreach ($g in $order) {
@@ -10342,10 +12256,25 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents under path."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" } }; required = @("path","pattern") } } },
 	@{ type = "function"; function = @{ name = "DiffText"; description = "Unified line diff (LCS-based) of two strings or files. Shows @@ hunks with context."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" }; context = @{ type = "integer"; description = "Context lines around changes (default 3)" }; maxLines = @{ type = "integer"; description = "Max output lines (default 200)" } }; required = @("left","right") } } },
-	@{ type = "function"; function = @{ name = "HexView"; description = "Binary/PE forensics: hex dump + PE labels; disasm=true x86/x64 with IAT/delay/export labels + uncertain resync; hash=true SHA256 file+sections; functions=true prologue scan; entropy/carve; at_entry/rva/section. Flags .NET managed. DIFF path2. Prefer over ReadAllBytes. HexEdit presets; HexSearch; StringsScan."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default false; use detail=full for tour)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" }; disasm = @{ type = "boolean"; description = "x86/x64 disassembly; IAT/export labels on indirect calls" }; trace = @{ type = "boolean"; description = "Walk control flow from offset (follow JMP; list JE/JNE both paths)" }; at_entry = @{ type = "boolean"; description = "Start at PE entry point file offset" }; rva = @{ type = "string"; description = "PE RVA (decimal/0x) -> map to file offset" }; section = @{ type = "string"; description = "PE section name (e.g. .text) -> start raw offset" }; max_insns = @{ type = "integer"; description = "Disasm instruction count (default 48, max 200)" }; max_steps = @{ type = "integer"; description = "Trace steps (default 32, max 80)" }; follow_calls = @{ type = "boolean"; description = "trace: step into CALL targets" }; prefer_branch = @{ type = "string"; description = "trace: fallthrough (default) or taken at Jcc" }; arch = @{ type = "string"; description = "auto|x86|x64 (default auto from PE)" }; dump_hex = @{ type = "boolean"; description = "Include hex dump (default true)" }; entropy = @{ type = "boolean"; description = "Shannon entropy map (high = packed/encrypted)" }; entropy_blocks = @{ type = "integer"; description = "Entropy windows (default 64)" }; carve = @{ type = "boolean"; description = "Find embedded MZ/PE images" }; hash = @{ type = "boolean"; description = "SHA256 of file + each PE section" }; functions = @{ type = "boolean"; description = "Heuristic function prologue scan in .text" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes at offset. hex= or bytes[] OR preset=force_jcc|nop_range|ret0|ret|int3 (length= for nop/int3 count). ALWAYS prompts with disasm before/after. Default backup=true path.bak."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; preset = @{ type = "string"; description = "force_jcc|nop_range|ret0|ret|int3" }; length = @{ type = "integer"; description = "Byte count for nop_range/int3 presets" }; extend = @{ type = "boolean" }; backup = @{ type = "boolean"; description = "Write path.bak before patch (default true)" } }; required = @("path","offset") } } },
-	@{ type = "function"; function = @{ name = "HexSearch"; description = "Search file for hex byte pattern with ?? wildcards (e.g. pattern='E8 ?? ?? ?? ??' or '4D 5A'). Returns file offsets. Follow with HexView offset=..."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string"; description = "Hex bytes with optional ?? wildcards" }; hex = @{ type = "string"; description = "Alias for pattern" }; offset = @{ type = "string"; description = "Start offset" }; maxResults = @{ type = "integer"; description = "Max hits (default 32)" }; max_scan = @{ type = "integer"; description = "Max bytes to scan from offset (0=to EOF)" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "StringsScan"; description = "Full-file ASCII/UTF-16LE string extraction. filter=path|url|ip|registry|email|interesting or substring. Prefer over dumping whole binary with ReadFile."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; minLen = @{ type = "integer"; description = "Minimum string length (default 4)" }; maxHits = @{ type = "integer"; description = "Max strings (default 80)" }; offset = @{ type = "string" }; max_scan = @{ type = "integer"; description = "Max bytes to scan (0=full file)" }; encoding = @{ type = "string"; description = "ascii|utf16|both (default both)" }; filter = @{ type = "string"; description = "path|url|ip|registry|email|interesting or free text" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexView"; description = "Binary/PE forensics: hex dump + PE labels; disasm=true x86/x64 with IAT/delay/export labels + uncertain resync; hash=true SHA256 file+sections; functions=true prologue scan; entropy/carve; at_entry/rva/section. Flags .NET managed. DIFF path2. Prefer over ReadAllBytes. HexEdit presets; FindHexPattern; StringExtract; PeInfo/ImportTableViewer/ResourceEditor/SectionManager."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default false; use detail=full for tour)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" }; disasm = @{ type = "boolean"; description = "x86/x64 disassembly; IAT/export labels on indirect calls" }; trace = @{ type = "boolean"; description = "Walk control flow from offset (follow JMP; list JE/JNE both paths)" }; at_entry = @{ type = "boolean"; description = "Start at PE entry point file offset" }; rva = @{ type = "string"; description = "PE RVA (decimal/0x) -> map to file offset" }; section = @{ type = "string"; description = "PE section name (e.g. .text) -> start raw offset" }; max_insns = @{ type = "integer"; description = "Disasm instruction count (default 48, max 200)" }; max_steps = @{ type = "integer"; description = "Trace steps (default 32, max 80)" }; follow_calls = @{ type = "boolean"; description = "trace: step into CALL targets" }; prefer_branch = @{ type = "string"; description = "trace: fallthrough (default) or taken at Jcc" }; arch = @{ type = "string"; description = "auto|x86|x64 (default auto from PE)" }; dump_hex = @{ type = "boolean"; description = "Include hex dump (default true)" }; entropy = @{ type = "boolean"; description = "Shannon entropy map (high = packed/encrypted)" }; entropy_blocks = @{ type = "integer"; description = "Entropy windows (default 64)" }; carve = @{ type = "boolean"; description = "Find embedded MZ/PE images" }; hash = @{ type = "boolean"; description = "SHA256 of file + each PE section" }; functions = @{ type = "boolean"; description = "Heuristic function prologue scan in .text" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes OR replace_pattern across file OR undo session patches. action=patch|replace_pattern|undo|undo_all|history|export_history. presets force_jcc|invert_jcc|nop_range|ret0. history lists all undo_ids. Session stack (export_history saves JSON). path.bak when backup=true. help=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Target file (optional for action=history; filter for undo_all)" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; preset = @{ type = "string"; description = "force_jcc|invert_jcc|nop_range|ret0|ret|int3" }; length = @{ type = "integer"; description = "Byte count for nop_range/int3 presets" }; extend = @{ type = "boolean" }; backup = @{ type = "boolean"; description = "Write path.bak before patch (default true)" }; action = @{ type = "string"; description = "patch|undo|undo_all|history" }; id = @{ type = "integer"; description = "undo id from prior patch undo_id" }; undo = @{ type = "boolean"; description = "true = action=undo (last or id=)" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "FindHexPattern"; description = "Hex pattern search with ?? wildcards. Multi-pattern separated by semicolon. Large PE auto-raises max. resolve_targets=true; each hit.next suggests HexView. all=true|max=all. help=true. Alias: HexSearch."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string"; description = "Hex bytes with optional ?? wildcards" }; hex = @{ type = "string"; description = "Alias for pattern" }; offset = @{ type = "string"; description = "Start offset" }; maxResults = @{ type = "integer"; description = "Max hits (default 32, max 9999)" }; max = @{ type = "string"; description = "Cap or 'all' (alias of maxResults; all=9999)" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = max 9999 hits" }; max_scan = @{ type = "integer"; description = "Max bytes to scan from offset (0=to EOF)" }; resolve_targets = @{ type = "boolean"; description = "Resolve relative CALL/JMP/Jcc targets and IAT/export labels (default false; CF kinds still get targets when decodable)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "StringExtract"; description = "ASCII/UTF-16 strings. clean_urls=true (default) strips cert junk before http://. filter=url|data|code|interesting. max=all. next_steps for BrowsePage/ReadRegistry/HexView. help=true. Alias: StringsScan."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; minLen = @{ type = "integer"; description = "Minimum string length (default 4, floor 3)" }; maxLen = @{ type = "integer"; description = "Maximum string length (0=no max)" }; maxHits = @{ type = "integer"; description = "Max strings (default 80, max 9999)" }; max = @{ type = "string"; description = "Cap or all (alias maxHits)" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = maxHits 9999" }; offset = @{ type = "string" }; max_scan = @{ type = "integer"; description = "Max bytes to scan (0=full file)" }; encoding = @{ type = "string"; description = "ascii|utf16|both (default both)" }; filter = @{ type = "string"; description = "path|url|ip|registry|email|interesting|data|code|clean or free text; data=non-EXEC sections, code=EXEC only" }; section = @{ type = "string"; description = "PE section name e.g. .rdata" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "PeInfo"; description = "PE overview: sections, dirs, timestamp, entry, imports/exports/resources. Large PE (>=10MB) auto-raises caps. summary_only=true for quick triage. all=true|max=all. section_name_warnings for non-standard names. help=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; imports = @{ type = "boolean"; description = "Include import DLL/func summary (default true)" }; exports = @{ type = "boolean"; description = "Include exports (default true)" }; resources = @{ type = "boolean"; description = "Include resource tree summary (default true)" }; max_import_dlls = @{ type = "integer" }; max_import_funcs = @{ type = "integer" }; max_exports = @{ type = "integer" }; max_resources = @{ type = "integer" }; max = @{ type = "string"; description = "Shared cap or 'all' for all list limits" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = high caps for large PEs" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ForensicsSummary"; description = "Quick PE triage in one call: PeInfo summary_only + StringExtract filter=interesting + next_steps (ImportTableViewer/HexView/FindHexPattern). Prefer first for unknown EXE/DLL."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxHits = @{ type = "integer"; description = "Max interesting strings (default 40)" }; help = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ListRecycleBin"; description = "LIVE system Recycle Bin list (normal Delete-to-Bin). Prefer BEFORE ListDeletedFiles when the user emptied a folder with Delete (not Shift+Delete). Returns Items + MarkdownPreview. Not for formatted disks. No approval."; parameters = @{ type = "object"; properties = @{ drive = @{ type = "string"; description = "Optional drive letter e.g. C: to scan that volume Recycle.Bin" }; max = @{ type = "integer"; description = "Max items (default 500)" }; name_filter = @{ type = "string" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "RestoreRecycleBinItem"; description = "Restore a Recycle Bin item to its original path via Shell. ALWAYS approval. index= from ListRecycleBin. May conflict if a file already exists at the original path. Prefer ExportRecycleBinItem for safer copy-out."; parameters = @{ type = "object"; properties = @{ index = @{ type = "integer" }; name = @{ type = "string" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ExportRecycleBinItem"; description = "Copy a Recycle Bin file to a NEW output folder (does not remove from Bin). ALWAYS approval. Prefer other drive for output_dir. index= or r_path= from ListRecycleBin."; parameters = @{ type = "object"; properties = @{ index = @{ type = "integer" }; name = @{ type = "string" }; output_dir = @{ type = "string" }; r_path = @{ type = "string"; description = "RPath from ListRecycleBin FS entries" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ListDeletedFiles"; description = "LIVE NTFS ONLY (recovery group). MFT not-in-use deleted files. Prefer ListRecycleBin first for normal Deletes. Does NOT work on formatted/wiped disks. ALWAYS show MarkdownPreview + OperatorListPath/Files to operator before recover. path= C:\\ or existing folder; recursive=true default. Returns Truncated/TotalMatched. No approval."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Drive root or existing folder" }; name_filter = @{ type = "string" }; min_bytes = @{ type = "integer" }; include_directories = @{ type = "boolean" }; recursive = @{ type = "boolean" }; max = @{ type = "integer" }; timeout_sec = @{ type = "integer" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "RecoverDeletedFile"; description = "LIVE NTFS ONLY. Recover one MFT-deleted file by mft_index from ListDeletedFiles. ALWAYS approval. Copy-out to NEW path only (never overwrite; never write source clusters). Prefer output_dir on another drive. Not for formatted disks."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; mft_index = @{ type = "integer" }; output_dir = @{ type = "string" }; output_path = @{ type = "string" }; file_name = @{ type = "string" }; max_bytes = @{ type = "integer" }; timeout_sec = @{ type = "integer" }; confirm_same_drive = @{ type = "boolean" } }; required = @("mft_index") } } },
+	@{ type = "function"; function = @{ name = "ListShadowCopies"; description = "List Volume Shadow Copies (VSS) on this live PC. Empty if VSS/restore points off. Not for formatted disks. Read-only."; parameters = @{ type = "object"; properties = @{} } } },
+	@{ type = "function"; function = @{ name = "ListUsnRecent"; description = "Best-effort recent USN journal sample on live NTFS (fsutil). May be empty. Not useful after format."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; max = @{ type = "integer" }; timeout_sec = @{ type = "integer" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "RecoverySmokeTest"; description = "Self-check recovery stack on live NTFS (DiskWalk, recycle shell, VSS, overwrite refuse). Read-mostly. verbose_log=true sets DiskWalk LogLevel=3."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; verbose_log = @{ type = "boolean" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "ImportTableViewer"; description = "List PE imports + delay-load (IAT offsets). Large PE auto all=true. by_ordinal_only=true. next_steps suggests HexView at iat_file_hex. all=true|max=all. help=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; dll = @{ type = "string"; description = "Filter DLL name substring e.g. KERNEL32" }; max_dlls = @{ type = "integer" }; max_funcs = @{ type = "integer" }; max = @{ type = "string"; description = "Shared cap or 'all'" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = high caps" }; include_delay = @{ type = "boolean"; description = "Include delay-load imports (default true)" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ResourceEditor"; description = "PE resource tree: action=list|get|extract|replace. Filter type=/name=/lang= or index=. replace requires hex=/bytes=/source_path= and size <= original (pads). ALWAYS prompts on replace. backup=.bak default."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; action = @{ type = "string"; description = "list|get|extract|replace" }; type = @{ type = "string"; description = "ICON|BITMAP|STRING|DIALOG|VERSION|MANIFEST|RCDATA|..." }; name = @{ type = "string" }; lang = @{ type = "string" }; index = @{ type = "integer" }; out_path = @{ type = "string"; description = "extract destination" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; source_path = @{ type = "string" }; backup = @{ type = "boolean" }; max = @{ type = "integer" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "SectionManager"; description = "PE sections: action=list|set_chars|add|remove. set_chars section=.text characteristics=0x... or flags=EXEC|READ|WRITE|CODE. add appends section (name/hex/source_path). remove last section only. ALWAYS prompts on mutate. backup default."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; action = @{ type = "string"; description = "list|set_chars|add|remove" }; section = @{ type = "string" }; index = @{ type = "integer" }; characteristics = @{ type = "string"; description = "0x hex or decimal characteristics" }; flags = @{ type = "string"; description = "EXEC|READ|WRITE|CODE|IDATA|UDATA|..." }; name = @{ type = "string"; description = "New section name (add), max 8 chars" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; source_path = @{ type = "string" }; raw_size = @{ type = "integer" }; virt_size = @{ type = "integer" }; backup = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexSearch"; description = "Alias of FindHexPattern. Prefer FindHexPattern."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; hex = @{ type = "string" }; offset = @{ type = "string" }; maxResults = @{ type = "integer" }; max = @{ type = "string" }; limit = @{ type = "string" }; all = @{ type = "boolean" }; max_scan = @{ type = "integer" }; resolve_targets = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "StringsScan"; description = "Alias of StringExtract. Prefer StringExtract. ASCII/UTF-16 string extraction with filters."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; minLen = @{ type = "integer" }; maxLen = @{ type = "integer" }; maxHits = @{ type = "integer" }; offset = @{ type = "string" }; max_scan = @{ type = "integer" }; encoding = @{ type = "string" }; filter = @{ type = "string" }; section = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "GetWorkingDirectory"; description = "Agent CWD."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "SetWorkingDirectory"; description = "Set agent CWD."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "GetEnvironment"; description = "Env vars / PATH summary."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string" } } } } },
@@ -10363,7 +12292,7 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "GetBSODInfo"; description = "Recent BSOD/minidump info + related events."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetEventLogs"; description = "Recent errors/warnings + disk I/O events. Collapses duplicate Id+Provider (e.g. DCOM 10016 spam) into Count. Default hours=72 max=40."; parameters = @{ type = "object"; properties = @{ hours = @{ type = "integer"; description = "Lookback hours (default 72, max 168)" }; max = @{ type = "integer"; description = "Max unique event rows (default 40)" } } } } },
 	@{ type = "function"; function = @{ name = "GetDiskHealth"; description = "Physical disk health + SMART counters."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "GetDiskSpace"; description = "Drive free/used + top folders under path. Recursive sizes use a fast Win32 FindFirstFileEx walk, not PowerShell Get-ChildItem -Recurse."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Folder whose top-level children are sized (default C:\\)" }; deep = @{ type = "boolean"; description = "true (default) = full recursive under each top-level child; false = immediate files only" }; top = @{ type = "integer"; description = "How many largest folders to return (default 10)" }; timeout_sec = @{ type = "integer"; description = "Scan budget seconds (default 45)" } } } } },
+	@{ type = "function"; function = @{ name = "GetDiskSpace"; description = "Drive free/used + space breakdown under path. mode=children (default): top-level folders/files (folder sizes recursive when deep=true). mode=files: largest individual files recursive under path. mode=both: TopLargeFolders + TopFiles. largest_files=N also requests recursive file list (implies both if mode was children). Local NTFS uses MFT when possible. Not for deleted-file recovery (use recovery group)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Folder or drive root (default C:\\)" }; deep = @{ type = "boolean"; description = "For mode=children/both: recursive folder sizes (default true)" }; top = @{ type = "integer"; description = "How many top-level consumers (default 10)" }; mode = @{ type = "string"; description = "children (default) | files | both" }; largest_files = @{ type = "integer"; description = "If >0, include top N recursive largest files (default 0). Implies mode=both when mode=children." }; timeout_sec = @{ type = "integer"; description = "Scan budget seconds (default 45)" } } } } },
 	@{ type = "function"; function = @{ name = "GetInstalledSoftware"; description = "Installed programs (Uninstall registry). Optional name filter; caps results for context."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Filter by display name or publisher (substring)" }; max = @{ type = "integer"; description = "Max rows (default 200, max 1000)" } } } } },
 	@{ type = "function"; function = @{ name = "GetDriverInfo"; description = "Query PnP drivers with filters."; parameters = @{ type = "object"; properties = @{ filter = @{ type = "string"; description = "unsigned, microsoft, realtek, nvidia, network, audio, storage, or free text" }; limit = @{ type = "integer" }; showAll = @{ type = "boolean" } } } } },
 	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services (capped; default max_services=25, system noise deprioritized)."; parameters = @{ type = "object"; properties = @{ max_services = @{ type = "integer"; description = "Max auto services to return (default 25)" }; include_all_services = @{ type = "boolean"; description = "true = dump all auto services up to max (default false prioritizes non-system)" } } } } },
@@ -10458,7 +12387,12 @@ $script:MBToolCatalog = [ordered]@{
 		'SpeakText','AudioVolume'
 	)
 	forensics = @(
-		'HexView','HexEdit','HexSearch','StringsScan'
+		'HexView','HexEdit','FindHexPattern','StringExtract','PeInfo','ForensicsSummary','ImportTableViewer','ResourceEditor','SectionManager','HexSearch','StringsScan'
+	)
+	recovery = @(
+		'ListRecycleBin','RestoreRecycleBinItem','ExportRecycleBinItem',
+		'ListDeletedFiles','RecoverDeletedFile',
+		'ListShadowCopies','ListUsnRecent','RecoverySmokeTest'
 	)
 	system = @(
 		'GetSystemInfo','GetProcessList','GetProcessTree','GetMemoryInfo','GetPowerInfo',
@@ -10513,7 +12447,11 @@ $script:MBToolGroupMeta = [ordered]@{
 	}
 	forensics = @{
 		Label       = 'Forensics'
-		Description = 'Inspect programs and binaries: hex view, search, strings, and careful byte edits.'
+		Description = 'PE/binary forensics: PeInfo, hex view/edit/search, strings, imports, resources, sections.'
+	}
+	recovery = @{
+		Label       = 'Recovery'
+		Description = 'Live NTFS only: Recycle Bin + MFT undelete + VSS/USN hints for deleted data. Not for formatted/wiped disks. Live free-space analysis is GetDiskSpace (diag). Prefer another drive for recovered output.'
 	}
 	system = @{
 		Label       = 'System'
@@ -10609,10 +12547,27 @@ $script:MBToolUserTips = [ordered]@{
 	AudioVolume           = 'Get or set system volume, or mute / unmute. Changes ask for approval.'
 
 	# forensics
-	HexView               = 'Inspect a binary or program: hex dump, PE layout, optional disassembly, hashes, and more.'
-	HexEdit               = 'Patch bytes at an offset (before/after shown in chat). You will be asked to approve.'
-	HexSearch             = 'Search a file for a hex pattern (supports ?? wildcards).'
-	StringsScan           = 'Extract readable strings from a binary (paths, URLs, registry keys, etc.).'
+	HexView               = 'Inspect a binary or program: hex dump, PE sections, optional disassembly, hashes, and more.'
+	HexEdit               = 'Patch bytes (disasm context) or undo session patches (action=undo|history). Approval required.'
+	FindHexPattern        = 'Search for hex patterns (?? wildcards). max=all; resolve_targets=true for CALL/JMP targets.'
+	StringExtract         = 'Extract readable strings from a binary (filter=data|code|url|interesting; section/maxLen; paths, URLs, registry keys, etc.).'
+	PeInfo                = 'PE overview: sections, imports/exports summary, resources, timestamps.'
+	ForensicsSummary      = 'Quick triage: PE summary + interesting strings + suggested follow-ups.'
+	ImportTableViewer     = 'List imported DLLs and functions (with IAT offsets).'
+	ResourceEditor        = 'List, extract, or replace PE resources (icons, strings, dialogs, manifest).'
+	SectionManager        = 'List or modify PE sections (permissions, add, remove last).'
+	HexSearch             = 'Alias of FindHexPattern.'
+	StringsScan           = 'Alias of StringExtract.'
+
+	# recovery (live NTFS only — not formatted disks)
+	ListRecycleBin        = 'Live system: list Recycle Bin (normal Delete). Prefer before MFT undelete. Not for formatted disks.'
+	RestoreRecycleBinItem = 'Restore a Recycle Bin item to its original path (Shell). ALWAYS approval.'
+	ExportRecycleBinItem  = 'Copy a Recycle Bin file out to a NEW folder (safer). ALWAYS approval.'
+	ListDeletedFiles      = 'Live NTFS only: list deleted files via MFT (volume or existing folder). Not for formatted disks. Show full list before recover.'
+	RecoverDeletedFile    = 'Live NTFS only: copy one deleted file out by MftIndex to a NEW path. ALWAYS approval. Not for formatted disks. Prefer another drive for output.'
+	ListShadowCopies      = 'List Volume Shadow Copies (VSS) on this live PC if any.'
+	ListUsnRecent         = 'Best-effort recent USN journal activity (live NTFS).'
+	RecoverySmokeTest     = 'Self-check recovery stack (read-mostly) on live NTFS.'
 
 	# system
 	GetSystemInfo         = 'Basic PC info: OS, CPU, RAM, and network addresses.'
@@ -10644,7 +12599,7 @@ $script:MBToolUserTips = [ordered]@{
 	GetBSODInfo           = 'Recent blue-screen / crash dump info and related events.'
 	GetEventLogs          = 'Recent error and warning events (and related disk I/O noise).'
 	GetDiskHealth         = 'Physical disk health and SMART-style counters.'
-	GetDiskSpace          = 'Free space on drives and large folders under a path.'
+	GetDiskSpace          = 'Drive free space, top folders, and optional largest files (mode=files|both or largest_files=N). Live data only — not undelete.'
 	GetStartupItems       = 'Programs and services that start with Windows.'
 	GetScheduledTasks     = 'Scheduled tasks (useful for diagnostics).'
 	GetDriverInfo         = 'Installed drivers with optional filters.'
@@ -10755,25 +12710,10 @@ function Sync-MBContextUiAfterWarm {
 		}
 		$pt = [int]$PromptTokens
 		if ($pt -gt 0) {
-			try { $script:MB.LastServerPromptTokens = $pt } catch {}
-			try { $script:MB.TokenCountSource = 'usage' } catch {}
-			$msgChars = 0
-			try {
-				foreach ($m in @($Messages)) {
-					if ($null -eq $m) { continue }
-					$msgChars += [int](Get-MBMessageCharCount -Message $m)
-				}
-			} catch {}
-			$toolsTok = 0
-			try { $toolsTok = [int]$script:MB.ToolsOverheadTok } catch { $toolsTok = 0 }
-			$wd = ''
-			try { $wd = [string]$script:MB.WorkingDir } catch { $wd = '' }
-			$cacheKey = '{0}|{1}|{2}|{3}' -f @($Messages).Count, $msgChars, $toolsTok, $wd
-			try {
-				$script:MB.TokCacheKey = $cacheKey
-				$script:MB.TokCacheTokens = $pt
-				$script:MB.TokCacheAt = Get-Date
-			} catch {}
+			try { Set-MBLastUsagePromptTokens -PromptTokens $pt -Messages $Messages } catch {
+				try { $script:MB.LastServerPromptTokens = $pt } catch {}
+				try { $script:MB.TokenCountSource = 'usage' } catch {}
+			}
 			try {
 				$usable = [int](Get-MBEffectivePromptBudget)
 				$pct = if ($usable -gt 0) { [math]::Min(3.0, $pt / [double]$usable) } else { 1.0 }
@@ -10893,7 +12833,7 @@ function Sync-MBPromptAfterToolGroups {
 }
 
 function Get-MBToolGroupOrder {
-	@('core','vision','sound','forensics','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','docs','web')
+	@('core','vision','sound','forensics','recovery','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','docs','web')
 }
 
 function Add-MBUsedToolName {
@@ -11220,6 +13160,10 @@ function Resolve-MBToolGroupName {
 		'forensic' = 'forensics'; 'forensics' = 'forensics'; 'binary' = 'forensics'; 'hex' = 'forensics'
 		'pe' = 'forensics'; 'disasm' = 'forensics'; 'hexview' = 'forensics'; 'hexedit' = 'forensics'
 		'hexsearch' = 'forensics'; 'strings' = 'forensics'; 'stringsscan' = 'forensics'
+		'findhexpattern' = 'forensics'; 'stringextract' = 'forensics'; 'peinfo' = 'forensics'; 'forensicssummary' = 'forensics'; 'triage' = 'forensics'
+		'importtableviewer' = 'forensics'; 'resourceeditor' = 'forensics'; 'sectionmanager' = 'forensics'
+		'recovery' = 'recovery'; 'undelete' = 'recovery'; 'recover' = 'recovery'; 'datarecovery' = 'recovery'
+		'data_recovery' = 'recovery'; 'ntfs_recovery' = 'recovery'; 'deleted' = 'recovery'
 		'investigate' = 'diag'
 		'bsod' = 'diag'; 'event' = 'diag'; 'events' = 'diag'; 'disk' = 'diag'
 		'startup' = 'diag'; 'scheduledtasks' = 'diag'; 'tasks' = 'diag'; 'driver' = 'diag'; 'drivers' = 'diag'
@@ -11283,8 +13227,26 @@ function Resolve-MBToolName {
 		'search' = 'SearchFiles'; 'grep' = 'SearchFiles'; 'find' = 'FindFiles'
 		'hex' = 'HexView'; 'hexview' = 'HexView'; 'hex_view' = 'HexView'; 'hexdump' = 'HexView'
 		'hexedit' = 'HexEdit'; 'hex_edit' = 'HexEdit'; 'hexpatch' = 'HexEdit'
-		'hexsearch' = 'HexSearch'; 'hex_search' = 'HexSearch'; 'findhex' = 'HexSearch'; 'find_hex' = 'HexSearch'
-		'strings' = 'StringsScan'; 'strings_scan' = 'StringsScan'; 'stringscan' = 'StringsScan'
+		'hexsearch' = 'FindHexPattern'; 'hex_search' = 'FindHexPattern'; 'findhex' = 'FindHexPattern'; 'find_hex' = 'FindHexPattern'
+		'findhexpattern' = 'FindHexPattern'; 'find_hex_pattern' = 'FindHexPattern'
+		'strings' = 'StringExtract'; 'strings_scan' = 'StringExtract'; 'stringscan' = 'StringExtract'
+		'stringextract' = 'StringExtract'; 'string_extract' = 'StringExtract'; 'findstrings' = 'StringExtract'
+		'peinfo' = 'PeInfo'; 'pe_info' = 'PeInfo'; 'pe' = 'PeInfo'
+		'forensicssummary' = 'ForensicsSummary'; 'forensics_summary' = 'ForensicsSummary'; 'triage' = 'ForensicsSummary'
+		'listdeletedfiles' = 'ListDeletedFiles'; 'list_deleted_files' = 'ListDeletedFiles'; 'undelete_list' = 'ListDeletedFiles'
+		'deleted_files' = 'ListDeletedFiles'; 'list_deleted' = 'ListDeletedFiles'; 'mft_undelete_list' = 'ListDeletedFiles'
+		'recoverdeletedfile' = 'RecoverDeletedFile'; 'recover_deleted_file' = 'RecoverDeletedFile'; 'undelete' = 'RecoverDeletedFile'
+		'undelete_file' = 'RecoverDeletedFile'; 'recover_deleted' = 'RecoverDeletedFile'; 'mft_undelete' = 'RecoverDeletedFile'
+		'listrecyclebin' = 'ListRecycleBin'; 'list_recycle_bin' = 'ListRecycleBin'; 'recycle_bin' = 'ListRecycleBin'
+		'restorerecyclebinitem' = 'RestoreRecycleBinItem'; 'restore_recycle' = 'RestoreRecycleBinItem'
+		'exportrecyclebinitem' = 'ExportRecycleBinItem'; 'export_recycle' = 'ExportRecycleBinItem'
+		'listlargestfiles' = 'GetDiskSpace'; 'list_largest_files' = 'GetDiskSpace'; 'largest_files' = 'GetDiskSpace'
+		'listshadowcopies' = 'ListShadowCopies'; 'list_shadow_copies' = 'ListShadowCopies'; 'vss' = 'ListShadowCopies'
+		'listusnrecent' = 'ListUsnRecent'; 'list_usn' = 'ListUsnRecent'; 'usn' = 'ListUsnRecent'
+		'recoverysmoketest' = 'RecoverySmokeTest'; 'recovery_smoke_test' = 'RecoverySmokeTest'
+		'imports' = 'ImportTableViewer'; 'import_table' = 'ImportTableViewer'; 'iat' = 'ImportTableViewer'
+		'resources' = 'ResourceEditor'; 'resource_editor' = 'ResourceEditor'; 'pe_resources' = 'ResourceEditor'
+		'sections' = 'SectionManager'; 'section_manager' = 'SectionManager'; 'pe_sections' = 'SectionManager'
 		'screenshot' = 'ViewScreen'; 'screen' = 'ViewScreen'; 'capture' = 'ViewScreen'
 		'image' = 'ReadImage'; 'pdf' = 'ReadPdf'; 'read_pdf' = 'ReadPdf'; 'read_image' = 'ReadImage'
 		'http' = 'MakeHttpRequest'; 'fetch' = 'BrowsePage'; 'browse' = 'BrowsePage'
@@ -11393,7 +13355,7 @@ function Get-MBToolEnableHint {
 	if ($grp -eq 'core') {
 		return "missing_tool=$resolved group=core (should already be available). Call $resolved directly - do not use RunCommand."
 	}
-	return "Call EnableToolGroup using MAP (vision|sound|forensics|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web) then the real tool name."
+	return "Call EnableToolGroup using MAP (vision|sound|forensics|recovery|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web) then the real tool name."
 }
 
 function Get-MBAbilityParts {
@@ -11919,7 +13881,7 @@ function Enable-MBToolGroup {
 	$tokens = @(Get-MBEnableToolGroupTokens -Group $Group -groups $groups)
 	if ($tokens.Count -eq 0) {
 		$map = ($script:MBGroupQuickMap.Keys | ForEach-Object { "$_=$($script:MBGroupQuickMap[$_])" }) -join '; '
-		return "ERROR: group or groups required. One or many: group=network,shares or groups=[network,shares]. Known: vision|sound|forensics|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full. MAP: $map"
+		return "ERROR: group or groups required. One or many: group=network,shares or groups=[network,shares]. Known: vision|sound|forensics|recovery|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full. MAP: $map"
 	}
 
 	# Resolve each token -> group name (or tool-name alias)
@@ -12077,7 +14039,7 @@ function Get-MBToolGroupsStatus {
 		activeToolCount = $nActive
 		activeTools   = @((Get-MBActiveToolNames | Sort-Object))
 		groups        = $groups
-		hint          = "EnableToolGroup group=network,shares or groups=[diag,repair] (multi ok) | vision|sound|forensics|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full - enable all needed in one call"
+		hint          = "EnableToolGroup group=network,shares or groups=[diag,repair] (multi ok) | vision|sound|forensics|recovery|system|network|diag|repair|setup|identity|shares|installers|sandbox|files|packages|registry|clipboard|web|full - enable all needed in one call"
 	}) -Depth 6
 }
 
@@ -17891,7 +19853,10 @@ function Invoke-GetDiskSpace {
 		[string]$path = "C:\",
 		[bool]$deep = $true,
 		[int]$timeout_sec = 45,
-		[int]$top = 10
+		[int]$top = 10,
+		# children = top-level consumers (default); files = recursive biggest files; both = both lists
+		[string]$mode = 'children',
+		[int]$largest_files = 0
 	)
 	try {
 		$path = Resolve-MBPath $path
@@ -17900,6 +19865,22 @@ function Invoke-GetDiskSpace {
 		if ($timeout_sec -le 0) { $timeout_sec = 45 }
 		$timeoutMs = $timeout_sec * 1000
 
+		$modeNorm = ([string]$mode).Trim().ToLowerInvariant()
+		if ($modeNorm -in @('file', 'files', 'largest', 'largest_files')) { $modeNorm = 'files' }
+		elseif ($modeNorm -in @('both', 'all', 'folders_and_files')) { $modeNorm = 'both' }
+		else { $modeNorm = 'children' }
+
+		# Alias: largest_files=N implies include recursive file list (both if also doing children)
+		$fileTop = 0
+		if ($largest_files -gt 0) {
+			$fileTop = [Math]::Min(200, [Math]::Max(1, $largest_files))
+			if ($modeNorm -eq 'children') { $modeNorm = 'both' }
+		} elseif ($modeNorm -in @('files', 'both')) {
+			$fileTop = [Math]::Min(200, [Math]::Max($top, 15))
+		}
+		$doChildren = ($modeNorm -in @('children', 'both'))
+		$doFiles = ($modeNorm -in @('files', 'both'))
+
 		$drives = Get-Volume -ErrorAction SilentlyContinue | Where-Object DriveLetter |
 			Select-Object DriveLetter, FileSystemLabel, HealthStatus,
 				@{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,1)}},
@@ -17907,91 +19888,1106 @@ function Invoke-GetDiskSpace {
 				@{N='UsedPct';E={ if ($_.Size -gt 0) { [math]::Round((1 - $_.SizeRemaining/$_.Size)*100,1) } else { 0 } }}
 
 		$topFolders = @()
+		$topFiles = @()
 		$scanMode = 'none'
 		$scanEngine = 'none'
+		$fileScanEngine = 'none'
 		$scanMs = 0L
+		$fileScanMs = 0L
 		$scanTimedOut = $false
 		$scanCancelled = $false
 
 		if (Test-Path -LiteralPath $path) {
 			if ($script:HasDiskWalk) {
-				# FindFirstFileExW + LARGE_FETCH; parallel top-level walks
 				try { [MiniBot.Core.DiskWalk]::CancelRequested = $false } catch {}
-				$sw = [System.Diagnostics.Stopwatch]::StartNew()
-				$entries = [MiniBot.Core.DiskWalk]::TopFolders($path, [int]$top, [bool]$deep, [int]$timeoutMs, 64)
-				$sw.Stop()
-				$scanMs = $sw.ElapsedMilliseconds
-				$scanEngine = 'findfirstfileex_large_fetch'
-				$scanMode = if ($deep) { 'recursive_top_parallel' } else { 'one_level_top_parallel' }
-				$topFolders = New-Object System.Collections.ArrayList
-				foreach ($e in @($entries)) {
-					if ($null -eq $e) { continue }
-					if ($e.TimedOut) { $scanTimedOut = $true }
-					if ($e.Cancelled) { $scanCancelled = $true }
-					[void]$topFolders.Add([pscustomobject]@{
-						Folder    = [string]$e.Path
-						SizeGB    = [math]::Round(([int64]$e.Bytes) / 1GB, 2)
-						SizeBytes = [int64]$e.Bytes
-						Files     = [int]$e.Files
-						TimedOut  = [bool]$e.TimedOut
-					})
+
+				if ($doChildren) {
+					# Prefer NTFS $MFT (deep + local NTFS); else FindFirstFileExW + LARGE_FETCH
+					$sw = [System.Diagnostics.Stopwatch]::StartNew()
+					$entries = [MiniBot.Core.DiskWalk]::TopFolders($path, [int]$top, [bool]$deep, [int]$timeoutMs, 64)
+					$sw.Stop()
+					$scanMs = $sw.ElapsedMilliseconds
+					try {
+						$scanEngine = [string][MiniBot.Core.DiskWalk]::LastScanEngine
+						if ([int64][MiniBot.Core.DiskWalk]::LastElapsedMs -gt 0) {
+							$scanMs = [int64][MiniBot.Core.DiskWalk]::LastElapsedMs
+						}
+					} catch { $scanEngine = 'findfirstfileex_large_fetch' }
+					if ([string]::IsNullOrWhiteSpace($scanEngine) -or $scanEngine -eq 'none') {
+						$scanEngine = 'findfirstfileex_large_fetch'
+					}
+					$scanMode = if ($scanEngine -eq 'mft') {
+						'mft_volume_rollup'
+					} elseif ($deep) {
+						'recursive_top_parallel'
+					} else {
+						'one_level_top_parallel'
+					}
+					$topFolders = New-Object System.Collections.ArrayList
+					foreach ($e in @($entries)) {
+						if ($null -eq $e) { continue }
+						if ($e.TimedOut) { $scanTimedOut = $true }
+						if ($e.Cancelled) { $scanCancelled = $true }
+						$isDir = $true
+						try { $isDir = [bool]$e.IsDirectory } catch { $isDir = $true }
+						[void]$topFolders.Add([pscustomobject]@{
+							Path        = [string]$e.Path
+							Folder      = [string]$e.Path   # alias for older prompt wording
+							SizeGB      = [math]::Round(([int64]$e.Bytes) / 1GB, 2)
+							SizeBytes   = [int64]$e.Bytes
+							Files       = [int]$e.Files
+							IsDirectory = $isDir
+							Type        = $(if ($isDir) { 'folder' } else { 'file' })
+							TimedOut    = [bool]$e.TimedOut
+						})
+					}
+					$topFolders = @($topFolders)
+					if ($entries -and $entries.Count -gt 0 -and $entries[0].ElapsedMs -gt 0) {
+						$scanMs = [int64]$entries[0].ElapsedMs
+					}
 				}
-				$topFolders = @($topFolders)
-				if ($entries -and $entries.Count -gt 0 -and $entries[0].ElapsedMs -gt 0) {
-					$scanMs = [int64]$entries[0].ElapsedMs
+
+				if ($doFiles) {
+					try { [MiniBot.Core.DiskWalk]::CancelRequested = $false } catch {}
+					$swF = [System.Diagnostics.Stopwatch]::StartNew()
+					$fEntries = [MiniBot.Core.DiskWalk]::TopFiles($path, [int]$fileTop, [int]$timeoutMs)
+					$swF.Stop()
+					$fileScanMs = $swF.ElapsedMilliseconds
+					try {
+						$fileScanEngine = [string][MiniBot.Core.DiskWalk]::LastScanEngine
+						if ([int64][MiniBot.Core.DiskWalk]::LastElapsedMs -gt 0) {
+							$fileScanMs = [int64][MiniBot.Core.DiskWalk]::LastElapsedMs
+						}
+					} catch { $fileScanEngine = 'findfirstfileex_large_fetch' }
+					$tf = New-Object System.Collections.ArrayList
+					foreach ($e in @($fEntries)) {
+						if ($null -eq $e) { continue }
+						[void]$tf.Add([pscustomobject]@{
+							Path        = [string]$e.Path
+							SizeGB      = [math]::Round(([int64]$e.Bytes) / 1GB, 3)
+							SizeBytes   = [int64]$e.Bytes
+							IsDirectory = $false
+							Type        = 'file'
+						})
+					}
+					$topFiles = @($tf)
+					if (-not $doChildren) {
+						$scanEngine = $fileScanEngine
+						$scanMs = $fileScanMs
+						$scanMode = 'largest_files_recursive'
+					}
 				}
-			} else {
+			} elseif ($doChildren) {
 				$dirs = @(Get-ChildItem -LiteralPath $path -Directory -Force -ErrorAction SilentlyContinue | Select-Object -First 40)
+				$rootFiles = @(Get-ChildItem -LiteralPath $path -File -Force -ErrorAction SilentlyContinue)
 				$scanMode = if ($deep) { 'recursive_top_ps' } else { 'one_level_top_ps' }
 				$scanEngine = 'powershell'
 				$sw = [System.Diagnostics.Stopwatch]::StartNew()
-				$topFolders = @(
-					$dirs | ForEach-Object {
-						if ((Test-MBInterrupt)) { return }
-						$sum = 0L
-						try {
-							if ($deep) {
-								$sum = [int64]((Get-ChildItem -LiteralPath $_.FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
-									Measure-Object -Property Length -Sum).Sum)
-							} else {
-								$sum = [int64]((Get-ChildItem -LiteralPath $_.FullName -File -Force -ErrorAction SilentlyContinue |
-									Measure-Object -Property Length -Sum).Sum)
-							}
-						} catch { $sum = 0L }
-						[pscustomobject]@{
-							Folder    = $_.FullName
-							SizeGB    = [math]::Round(($sum / 1GB), 2)
-							SizeBytes = $sum
+				$entriesPs = New-Object System.Collections.ArrayList
+				foreach ($d in $dirs) {
+					if ((Test-MBInterrupt)) { break }
+					$sum = 0L
+					try {
+						if ($deep) {
+							$sum = [int64]((Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
+								Measure-Object -Property Length -Sum).Sum)
+						} else {
+							$sum = [int64]((Get-ChildItem -LiteralPath $d.FullName -File -Force -ErrorAction SilentlyContinue |
+								Measure-Object -Property Length -Sum).Sum)
 						}
-					} | Sort-Object SizeBytes -Descending | Select-Object -First $top
-				)
+					} catch { $sum = 0L }
+					[void]$entriesPs.Add([pscustomobject]@{
+						Path = $d.FullName; Folder = $d.FullName
+						SizeGB = [math]::Round(($sum / 1GB), 2); SizeBytes = $sum
+						Files = 0; IsDirectory = $true; Type = 'folder'; TimedOut = $false
+					})
+				}
+				foreach ($f in $rootFiles) {
+					if ($null -eq $f) { continue }
+					$len = 0L
+					try { $len = [int64]$f.Length } catch { $len = 0L }
+					if ($len -le 0) { continue }
+					[void]$entriesPs.Add([pscustomobject]@{
+						Path = $f.FullName; Folder = $f.FullName
+						SizeGB = [math]::Round(($len / 1GB), 2); SizeBytes = $len
+						Files = 1; IsDirectory = $false; Type = 'file'; TimedOut = $false
+					})
+				}
+				$topFolders = @($entriesPs | Sort-Object SizeBytes -Descending | Select-Object -First $top)
 				$sw.Stop()
 				$scanMs = $sw.ElapsedMilliseconds
 			}
+			# PowerShell fallback for recursive largest files when DiskWalk missing
+			if ($doFiles -and -not $script:HasDiskWalk) {
+				$swF = [System.Diagnostics.Stopwatch]::StartNew()
+				try {
+					$topFiles = @(
+						Get-ChildItem -LiteralPath $path -Recurse -File -Force -ErrorAction SilentlyContinue |
+							Sort-Object Length -Descending |
+							Select-Object -First $fileTop |
+							ForEach-Object {
+								[pscustomobject]@{
+									Path = $_.FullName
+									SizeGB = [math]::Round($_.Length / 1GB, 3)
+									SizeBytes = [int64]$_.Length
+									IsDirectory = $false
+									Type = 'file'
+								}
+							}
+					)
+				} catch { $topFiles = @() }
+				$swF.Stop()
+				$fileScanMs = $swF.ElapsedMilliseconds
+				$fileScanEngine = 'powershell'
+				if (-not $doChildren) {
+					$scanEngine = 'powershell'
+					$scanMs = $fileScanMs
+					$scanMode = 'largest_files_recursive_ps'
+				}
+			}
 		}
 
-		$note = if ($scanEngine -eq 'findfirstfileex_large_fetch') {
-			if ($deep) {
-				'Top folders sized with Win32 FindFirstFileEx (LARGE_FETCH); parallel walks; reparse points skipped.'
+		# Keep Note markdown-safe: no underscores (they italicize mid-sentence and eat parens).
+		$noteParts = New-Object System.Collections.ArrayList
+		if ($doChildren) {
+			if ($scanEngine -eq 'mft') {
+				[void]$noteParts.Add('TopLargeFolders: immediate children (folders + files at this level); folder sizes recursive via NTFS MFT.')
+			} elseif ($scanEngine -eq 'findfirstfileex_large_fetch') {
+				[void]$noteParts.Add('TopLargeFolders: immediate children via FindFirstFileEx LARGE FETCH.')
 			} else {
-				'One-level file sizes via FindFirstFileEx. Pass deep=true for full recursive under each top-level folder.'
+				[void]$noteParts.Add('TopLargeFolders: PowerShell enumeration (slower).')
 			}
-		} else {
-			'DiskWalk C# helper unavailable; PowerShell enumeration used (slower).'
+		}
+		if ($doFiles) {
+			[void]$noteParts.Add(('TopFiles: largest individual files under path recursive (engine={0}).' -f $fileScanEngine))
+		}
+		if (-not $doChildren -and -not $doFiles) {
+			[void]$noteParts.Add('No folder or file scan requested.')
+		}
+		$note = ($noteParts -join ' ')
+
+		$mftFail = ''
+		$diskLog = ''
+		if ($script:HasDiskWalk) {
+			try { $mftFail = [string][MiniBot.Core.DiskWalk]::LastMftFailReason } catch {}
+			try {
+				$desk = [Environment]::GetFolderPath('DesktopDirectory')
+				if (-not $desk) { $desk = [Environment]::GetFolderPath('Desktop') }
+				$diskLog = Join-Path $desk 'diskwalker.log'
+			} catch { $diskLog = 'Desktop\diskwalker.log' }
 		}
 
 		ConvertTo-MBJson @{
 			Drives          = @($drives)
 			TopLargeFolders = @($topFolders)
+			TopFiles        = @($topFiles)
+			Mode            = $modeNorm
 			ScannedPath     = $path
 			FolderScanMode  = $scanMode
 			ScanEngine      = $scanEngine
+			FileScanEngine  = $fileScanEngine
 			ScanMs          = $scanMs
+			FileScanMs      = $fileScanMs
 			Deep            = [bool]$deep
 			TimedOut        = [bool]$scanTimedOut
 			Cancelled       = [bool]$scanCancelled
+			MftFailReason   = $mftFail
+			DiskWalkLog     = $diskLog
 			Note            = $note
 		} -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Get-MBRecoveryVolumeAdvice {
+	param([string]$SourcePath)
+	$srcRoot = ''
+	try { $srcRoot = [System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $SourcePath -ErrorAction SilentlyContinue).Path) } catch {}
+	if (-not $srcRoot) {
+		try { $srcRoot = [System.IO.Path]::GetPathRoot($SourcePath) } catch { $srcRoot = '' }
+	}
+	$srcLetter = if ($srcRoot) { $srcRoot.Substring(0, 1).ToUpperInvariant() } else { '' }
+	$others = New-Object System.Collections.ArrayList
+	try {
+		Get-Volume -ErrorAction SilentlyContinue | Where-Object {
+			$_.DriveLetter -and $_.SizeRemaining -gt 50MB -and
+			($_.FileSystem -eq 'NTFS' -or $_.FileSystem -eq 'ReFS' -or $_.FileSystem -eq 'FAT32' -or $_.FileSystem -eq 'exFAT')
+		} | ForEach-Object {
+			$L = [string]$_.DriveLetter
+			if ($srcLetter -and $L.ToUpperInvariant() -eq $srcLetter) { return }
+			[void]$others.Add([ordered]@{
+				Drive       = ($L + ':')
+				FreeGB      = [math]::Round($_.SizeRemaining / 1GB, 2)
+				Label       = [string]$_.FileSystemLabel
+				FileSystem  = [string]$_.FileSystem
+			})
+		}
+	} catch {}
+	$sameDriveWarning = @(
+		'SAME-DRIVE RECOVERY WARNING: Writing recovered files onto the volume you are recovering FROM can allocate free clusters that still hold other deleted data.',
+		'After any write to that drive, another ListDeletedFiles scan may NOT show the same candidates — this list may be your only chance to recover what is shown.',
+		'Prefer output_dir on a different drive or USB when possible. Same-drive recovery is allowed if you accept that risk.'
+	) -join ' '
+	return [ordered]@{
+		SourceRoot           = $srcRoot
+		AlternateDrives      = @($others)
+		SameDriveWarning     = $sameDriveWarning
+		RecommendOtherDrive  = [bool]($others.Count -gt 0)
+	}
+}
+
+function Get-MBDefaultRecoveryDir {
+	param([string]$PreferredRoot)
+	$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+	$base = $null
+	if ($PreferredRoot -and (Test-Path -LiteralPath $PreferredRoot -PathType Container)) {
+		$base = $PreferredRoot
+	} else {
+		try {
+			$base = [Environment]::GetFolderPath('DesktopDirectory')
+			if (-not $base) { $base = [Environment]::GetFolderPath('Desktop') }
+		} catch { $base = $env:USERPROFILE }
+		if (-not $base) { $base = 'C:\Users\Public' }
+	}
+	return (Join-Path $base ("MiniBot-Recovered\" + $stamp))
+}
+
+function Invoke-ListDeletedFiles {
+	param(
+		[string]$path = 'C:\',
+		[string]$name_filter = '',
+		[long]$min_bytes = 0,
+		[bool]$include_directories = $false,
+		[int]$max = 5000,
+		[int]$timeout_sec = 120,
+		[object]$recursive = $null,
+		[object]$folder_only = $null
+	)
+	try {
+		if (-not $script:HasDiskWalk) {
+			return (ConvertTo-MBJson @{
+				Ok = $false
+				Error = 'DiskWalk helper not loaded (MFT tools unavailable).'
+			} -Depth 3)
+		}
+		$path = Resolve-MBPath $path
+		if ($max -le 0) { $max = 5000 }
+		if ($max -gt 50000) { $max = 50000 }
+		if ($timeout_sec -le 0) { $timeout_sec = 120 }
+		$timeoutMs = $timeout_sec * 1000
+		try { [MiniBot.Core.DiskWalk]::CancelRequested = $false } catch {}
+
+		# Folder targeting: if path is a real folder (not volume root), filter deleted children under it.
+		# recursive=true (default for folders): that folder + subfolders. recursive=false: direct children only.
+		# path=C:\ or D:\ => whole volume (no folder filter) unless folder_only forces something invalid.
+		$targetFrn = -1L
+		$folderPath = ''
+		$scope = 'volume'
+		$doRecursive = $true
+		if ($null -ne $recursive) {
+			if ($recursive -is [bool]) { $doRecursive = [bool]$recursive }
+			elseif ([string]$recursive -match '^(?i)0|false|no|off$') { $doRecursive = $false }
+			elseif ([string]$recursive -match '^(?i)1|true|yes|on$') { $doRecursive = $true }
+		}
+
+		$volRoot = ''
+		try { $volRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($path)) } catch { $volRoot = '' }
+		$fullPath = $path
+		try { $fullPath = [System.IO.Path]::GetFullPath($path) } catch {}
+		$isVolRoot = $false
+		if ($volRoot) {
+			$a = $volRoot.TrimEnd('\', '/').ToUpperInvariant()
+			$b = $fullPath.TrimEnd('\', '/').ToUpperInvariant()
+			$isVolRoot = ($a -eq $b)
+		}
+
+		if (-not $isVolRoot) {
+			$probe = $fullPath
+			if (Test-Path -LiteralPath $probe -PathType Leaf) {
+				# If they pointed at a file path, use its parent folder as the target
+				$probe = [System.IO.Path]::GetDirectoryName($probe)
+			}
+			if ($probe -and (Test-Path -LiteralPath $probe -PathType Container)) {
+				$frn = 0L
+				$okFrn = $false
+				try { $okFrn = [MiniBot.Core.DiskWalk]::TryGetPathFrn($probe, [ref]$frn) } catch { $okFrn = $false }
+				if ($okFrn -and $frn -ge 0) {
+					$targetFrn = [int64]$frn
+					$folderPath = $probe
+					$scope = $(if ($doRecursive) { 'folder_recursive' } else { 'folder_direct' })
+				} else {
+					return (ConvertTo-MBJson @{
+						Ok = $false
+						Error = "Could not resolve folder FRN for path (need existing folder on local NTFS): $probe"
+						Hint = 'Folder targeting requires the target folder to still exist. Use path=C:\ for whole-volume deleted list, or name_filter if you know part of the name.'
+					} -Depth 4)
+				}
+			} elseif ($folder_only -or -not $isVolRoot) {
+				# Path doesn't exist — cannot target missing folder (no FRN)
+				return (ConvertTo-MBJson @{
+					Ok = $false
+					Error = "Target folder does not exist (or is not a directory): $path"
+					Hint = 'Folder filter needs a live directory path so we can match deleted files by parent MFT id. If the whole folder was deleted, scan the volume root (path=C:\) or its parent.'
+				} -Depth 4)
+			}
+		}
+
+		# Volume open path: always use volume root for MFT; folder is filter only
+		$mftPath = if ($volRoot) { $volRoot } else { $path }
+
+		$sw = [System.Diagnostics.Stopwatch]::StartNew()
+		$raw = [MiniBot.Core.DiskWalk]::ListDeletedFiles(
+			$mftPath,
+			[string]$name_filter,
+			[int64]$min_bytes,
+			[bool]$include_directories,
+			[int]$max,
+			[int]$timeoutMs,
+			[int64]$targetFrn,
+			[bool]$doRecursive
+		)
+		$sw.Stop()
+
+		$files = New-Object System.Collections.ArrayList
+		foreach ($e in @($raw)) {
+			if ($null -eq $e) { continue }
+			[void]$files.Add([ordered]@{
+				MftIndex     = [int64]$e.MftIndex
+				Name         = [string]$e.Name
+				ParentFrn    = [int64]$e.ParentFrn
+				SizeBytes    = [int64]$e.SizeBytes
+				SizeGB       = [math]::Round(([int64]$e.SizeBytes) / 1GB, 4)
+				IsDirectory  = [bool]$e.IsDirectory
+				Resident     = [bool]$e.Resident
+				HasDataRuns  = [bool]$e.HasDataRuns
+				Note         = [string]$e.Note
+			})
+		}
+
+		$advice = Get-MBRecoveryVolumeAdvice -SourcePath $mftPath
+		$fail = ''
+		$listScope = $scope
+		$totalMatched = $files.Count
+		$truncated = $false
+		try { $fail = [string][MiniBot.Core.DiskWalk]::LastMftFailReason } catch {}
+		try { $listScope = [string][MiniBot.Core.DiskWalk]::LastListScope } catch {}
+		try { $totalMatched = [int][MiniBot.Core.DiskWalk]::LastListTotalMatched } catch {}
+		try { $truncated = [bool][MiniBot.Core.DiskWalk]::LastListTruncated } catch {}
+
+		# Save full returned list to Desktop so operator can scroll outside chat
+		$operatorListPath = ''
+		try {
+			$desk = [Environment]::GetFolderPath('DesktopDirectory')
+			if (-not $desk) { $desk = [Environment]::GetFolderPath('Desktop') }
+			if ($desk) {
+				$operatorListPath = Join-Path $desk ("MiniBot-DeletedList-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+				$lines = New-Object System.Collections.ArrayList
+				[void]$lines.Add("MiniBot deleted-file list (LIVE NTFS MFT — not for formatted disks)")
+				[void]$lines.Add("Scanned: $path  Scope: $listScope  When: $(Get-Date -Format o)")
+				[void]$lines.Add("Shown: $($files.Count)  TotalMatched: $totalMatched  Truncated: $truncated  Max: $max")
+				[void]$lines.Add("MftIndex`tSizeBytes`tName`tParentFrn`tNote")
+				foreach ($row in $files) {
+					[void]$lines.Add(("{0}`t{1}`t{2}`t{3}`t{4}" -f $row.MftIndex, $row.SizeBytes, $row.Name, $row.ParentFrn, $row.Note))
+				}
+				$lines -join "`r`n" | Set-Content -LiteralPath $operatorListPath -Encoding UTF8
+			}
+		} catch { $operatorListPath = '' }
+
+		# Cache full list for this session so recover can warn if list was large
+		$script:MBLastDeletedList = @{
+			Path       = $path
+			FolderPath = $folderPath
+			Scope      = $listScope
+			When       = (Get-Date).ToString('o')
+			Count      = $files.Count
+			TotalMatched = $totalMatched
+			Truncated  = $truncated
+			Files      = @($files)
+			OperatorListPath = $operatorListPath
+		}
+
+		$scopeNote = if ($listScope -eq 'folder_recursive') {
+			"Deleted files whose parent chain leads to folder FRN $targetFrn ($folderPath), including subfolders. Parent folders that were also deleted may drop some hits from the chain."
+		} elseif ($listScope -eq 'folder_direct') {
+			"Deleted files that were direct children of $folderPath only (recursive=false)."
+		} else {
+			'Whole-volume deleted list (path was drive root, or no folder filter).'
+		}
+
+		$truncNote = if ($truncated) {
+			"TRUNCATED: $totalMatched matches exceeded max=$max; only top $max by size are listed. Raise max= or narrow path/name_filter/min_bytes. Full shown set also on Desktop if OperatorListPath is set."
+		} else { '' }
+
+		# Compact markdown table for chat (first 40 rows) — full data in Files + Desktop file
+		$mdLines = New-Object System.Collections.ArrayList
+		[void]$mdLines.Add('| MftIndex | Size | Name |')
+		[void]$mdLines.Add('|---:|---:|---|')
+		$showN = [Math]::Min(40, $files.Count)
+		for ($i = 0; $i -lt $showN; $i++) {
+			$r = $files[$i]
+			$sz = if ($r.SizeBytes -ge 1GB) { '{0:N2} GB' -f ($r.SizeBytes / 1GB) }
+				elseif ($r.SizeBytes -ge 1MB) { '{0:N1} MB' -f ($r.SizeBytes / 1MB) }
+				else { '{0:N0} B' -f $r.SizeBytes }
+			$nm = ([string]$r.Name) -replace '\|', '/'
+			[void]$mdLines.Add(("| {0} | {1} | {2} |" -f $r.MftIndex, $sz, $nm))
+		}
+		if ($files.Count -gt $showN) {
+			[void]$mdLines.Add(("| ... | ... | ({0} more in Files / OperatorListPath) |" -f ($files.Count - $showN)))
+		}
+
+		ConvertTo-MBJson @{
+			Ok                   = $true
+			LiveNtfsOnly         = $true
+			FormattedDisks       = 'Not supported — formatting replaces the MFT. Use lab imaging tools for wiped disks.'
+			ScannedPath          = $path
+			MftVolumePath        = $mftPath
+			TargetFolder         = $folderPath
+			TargetFolderFrn      = $targetFrn
+			Scope                = $listScope
+			Recursive            = [bool]$doRecursive
+			ScopeNote            = $scopeNote
+			Count                = $files.Count
+			TotalMatched         = $totalMatched
+			Truncated            = $truncated
+			TruncatedNote        = $truncNote
+			Max                  = $max
+			Files                = @($files)
+			MarkdownPreview      = ($mdLines -join "`n")
+			OperatorListPath     = $operatorListPath
+			NameFilter           = $name_filter
+			MinBytes             = $min_bytes
+			IncludeDirectories   = [bool]$include_directories
+			ScanMs               = $sw.ElapsedMilliseconds
+			MftFailReason        = $fail
+			SourceRoot           = $advice.SourceRoot
+			AlternateDrives      = $advice.AlternateDrives
+			RecommendOtherDrive  = $advice.RecommendOtherDrive
+			SameDriveWarning     = $advice.SameDriveWarning
+			HowToRecover         = 'Show MarkdownPreview (and OperatorListPath) to the operator. They choose MftIndex values. Prefer ListRecycleBin first for normal Deletes. Then RecoverDeletedFile. Prefer another drive for output.'
+			Note                 = "LIVE NTFS MFT scan only. $scopeNote $truncNote SSD TRIM / reused clusters limit recovery. Prefer ListRecycleBin when the user used Delete (not Shift+Delete)."
+		} -Depth 6
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-RecoverDeletedFile {
+	param(
+		[string]$path = 'C:\',
+		[object]$mft_index = $null,
+		[string]$output_dir = '',
+		[string]$output_path = '',
+		[string]$file_name = '',
+		[long]$max_bytes = 0,
+		[int]$timeout_sec = 120,
+		[bool]$confirm_same_drive = $false
+	)
+	try {
+		if (-not $script:HasDiskWalk) {
+			return (ConvertTo-MBJson @{ Ok = $false; Error = 'DiskWalk helper not loaded.' } -Depth 3)
+		}
+		$path = Resolve-MBPath $path
+		if ($null -eq $mft_index -or [string]$mft_index -eq '') {
+			return (ConvertTo-MBJson @{
+				Ok = $false
+				Error = 'mft_index is required (from ListDeletedFiles). List first, show the full list, then recover only chosen rows.'
+			} -Depth 3)
+		}
+		$idx = 0L
+		try { $idx = [int64]$mft_index } catch {
+			return (ConvertTo-MBJson @{ Ok = $false; Error = "Invalid mft_index: $mft_index" } -Depth 3)
+		}
+		if ($idx -lt 0) {
+			return (ConvertTo-MBJson @{ Ok = $false; Error = 'mft_index must be >= 0' } -Depth 3)
+		}
+
+		$advice = Get-MBRecoveryVolumeAdvice -SourcePath $path
+		$srcRoot = [string]$advice.SourceRoot
+
+		# Resolve output: never default to overwriting originals; always a NEW file under recovery folder or explicit path.
+		$outPath = ''
+		if ($output_path) {
+			$outPath = $output_path
+			if (-not [System.IO.Path]::IsPathRooted($outPath)) {
+				$outPath = Join-Path (Get-Location).Path $outPath
+			}
+		} else {
+			$dir = $output_dir
+			if (-not $dir) {
+				# Prefer first alternate drive if present; else Desktop recovery folder (may be same drive)
+				if ($advice.AlternateDrives -and $advice.AlternateDrives.Count -gt 0) {
+					$alt = $advice.AlternateDrives[0].Drive
+					$dir = Join-Path $alt 'MiniBot-Recovered'
+				} else {
+					$dir = Get-MBDefaultRecoveryDir
+				}
+			}
+			if (-not [System.IO.Path]::IsPathRooted($dir)) {
+				$dir = Join-Path (Get-Location).Path $dir
+			}
+			# Ensure unique session subfolder
+			if ($dir -notmatch 'MiniBot-Recovered') {
+				$dir = Join-Path $dir ('MiniBot-Recovered\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+			} elseif ($dir -match 'MiniBot-Recovered$' -or $dir -match 'MiniBot-Recovered\\?$') {
+				$dir = Join-Path $dir (Get-Date -Format 'yyyyMMdd-HHmmss')
+			}
+			$fn = $file_name
+			if (-not $fn) { $fn = ("mft_{0}.recovered" -f $idx) }
+			# Sanitize filename
+			foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) {
+				$fn = $fn.Replace([string]$c, '_')
+			}
+			if ($fn -match '^(?i)(CON|PRN|AUX|NUL|COM\d|LPT\d)(\.|$)') { $fn = "recovered_$fn" }
+			$outPath = Join-Path $dir $fn
+		}
+
+		# If exists, auto-suffix — never overwrite
+		if (Test-Path -LiteralPath $outPath) {
+			$base = [System.IO.Path]::GetFileNameWithoutExtension($outPath)
+			$ext = [System.IO.Path]::GetExtension($outPath)
+			$parent = [System.IO.Path]::GetDirectoryName($outPath)
+			$n = 1
+			do {
+				$outPath = Join-Path $parent ("{0}_{1}{2}" -f $base, $n, $ext)
+				$n++
+			} while ((Test-Path -LiteralPath $outPath) -and $n -lt 1000)
+		}
+
+		$outRoot = ''
+		try { $outRoot = [System.IO.Path]::GetPathRoot(( [System.IO.Path]::GetFullPath($outPath) )) } catch {}
+		$sameDrive = $false
+		if ($srcRoot -and $outRoot) {
+			$sameDrive = ($srcRoot.TrimEnd('\') -ieq $outRoot.TrimEnd('\'))
+		}
+
+		$altText = ''
+		if ($advice.AlternateDrives -and $advice.AlternateDrives.Count -gt 0) {
+			$altText = ($advice.AlternateDrives | ForEach-Object {
+				'{0} free {1} GB' -f $_.Drive, $_.FreeGB
+			}) -join '; '
+		} else {
+			$altText = '(no other local volumes with free space detected)'
+		}
+
+		$details = @"
+Recover deleted file from NTFS MFT (copy-out only — source volume is READ ONLY).
+
+  Source volume : $path  ($srcRoot)
+  MftIndex      : $idx
+  Output file   : $outPath
+  Same drive    : $sameDrive
+
+$($advice.SameDriveWarning)
+
+Alternate drives available: $altText
+
+Safety:
+  - Does NOT write to free clusters on the source as the recovery method (reads source, writes only the output file).
+  - Does NOT overwrite an existing file at the output path.
+  - Does NOT reactivate/in-place restore the original path.
+  - If Same drive = True: writing this recovered file may reduce what later scans can find. Prefer recovering ALL chosen files from the current list before other heavy disk writes.
+
+Operator: approve only after the full ListDeletedFiles list was reviewed and this index was chosen.
+"@
+
+		if (-not (Request-Confirmation -Title 'RecoverDeletedFile requires approval' -Details $details)) {
+			return 'BLOCKED BY USER: RecoverDeletedFile denied by operator.'
+		}
+
+		if ($sameDrive -and -not $confirm_same_drive) {
+			# Second explicit beat in the same dialog is enough; still set flag in result.
+			# Model should pass confirm_same_drive=true when operator accepted same-drive risk.
+		}
+
+		if ($timeout_sec -le 0) { $timeout_sec = 120 }
+		if ($max_bytes -le 0) { $max_bytes = 4L * 1024L * 1024L * 1024L }
+		try { [MiniBot.Core.DiskWalk]::CancelRequested = $false } catch {}
+
+		$sw = [System.Diagnostics.Stopwatch]::StartNew()
+		$r = [MiniBot.Core.DiskWalk]::RecoverDeletedFile(
+			$path,
+			[int64]$idx,
+			[string]$outPath,
+			[int]($timeout_sec * 1000),
+			[int64]$max_bytes
+		)
+		$sw.Stop()
+
+		ConvertTo-MBJson @{
+			Ok              = [bool]$r.Ok
+			Error           = [string]$r.Error
+			MftIndex        = [int64]$r.MftIndex
+			Name            = [string]$r.Name
+			OutputPath      = [string]$r.OutputPath
+			BytesWritten    = [int64]$r.BytesWritten
+			Partial         = [bool]$r.Partial
+			Note            = [string]$r.Note
+			SameDriveOutput = $sameDrive
+			SourceRoot      = $srcRoot
+			OutputRoot      = $outRoot
+			AlternateDrives = $advice.AlternateDrives
+			SameDriveWarning = $(if ($sameDrive) { $advice.SameDriveWarning } else { '' })
+			ElapsedMs       = $sw.ElapsedMilliseconds
+			Safety          = 'Source volume clusters were not written. Output used CreateNew (no overwrite of existing files). Live NTFS only — not for formatted disks.'
+			LiveNtfsOnly    = $true
+		} -Depth 5
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+# ─── Recovery: Recycle Bin, MFT undelete, VSS, USN, smoke (deleted data only) ───
+
+function Parse-MBRecycleIFile {
+	param([string]$IPath)
+	try {
+		$bytes = [System.IO.File]::ReadAllBytes($IPath)
+		if ($bytes.Length -lt 28) { return $null }
+		$ver = [BitConverter]::ToInt64($bytes, 0)
+		$size = [BitConverter]::ToInt64($bytes, 8)
+		$ft = [BitConverter]::ToInt64($bytes, 16)
+		$deleted = $null
+		try { $deleted = [DateTime]::FromFileTimeUtc($ft).ToLocalTime().ToString('o') } catch {}
+		$orig = ''
+		if ($ver -ge 2 -and $bytes.Length -ge 28) {
+			$nameLen = [BitConverter]::ToInt32($bytes, 24)
+			if ($nameLen -gt 0 -and (24 + 4 + $nameLen) -le $bytes.Length) {
+				$orig = [System.Text.Encoding]::Unicode.GetString($bytes, 28, $nameLen).TrimEnd([char]0)
+			}
+		} else {
+			# v1: null-terminated unicode path after header
+			$orig = [System.Text.Encoding]::Unicode.GetString($bytes, 24, $bytes.Length - 24).TrimEnd([char]0)
+		}
+		return [ordered]@{
+			SizeBytes   = $size
+			DeletedUtc  = $deleted
+			OriginalPath = $orig
+			Version     = $ver
+		}
+	} catch { return $null }
+}
+
+function Invoke-ListRecycleBin {
+	param(
+		[string]$drive = '',
+		[int]$max = 500,
+		[string]$name_filter = ''
+	)
+	try {
+		if ($max -le 0) { $max = 500 }
+		if ($max -gt 5000) { $max = 5000 }
+		$items = New-Object System.Collections.ArrayList
+		$roots = New-Object System.Collections.ArrayList
+
+		# Prefer Shell.Application (handles current user view)
+		try {
+			$shell = New-Object -ComObject Shell.Application
+			$ns = $shell.NameSpace(0xa) # ssfBITBUCKET
+			if ($ns) {
+				$idx = 0
+				foreach ($it in @($ns.Items())) {
+					if ($items.Count -ge $max) { break }
+					$nm = [string]$it.Name
+					if ($name_filter -and $nm -notlike "*$name_filter*") { continue }
+					$orig = ''
+					$sizeStr = ''
+					$delStr = ''
+					try { $orig = [string]$ns.GetDetailsOf($it, 1) } catch {}
+					try { $delStr = [string]$ns.GetDetailsOf($it, 2) } catch {}
+					try { $sizeStr = [string]$ns.GetDetailsOf($it, 3) } catch {}
+					[void]$items.Add([ordered]@{
+						Index        = $idx
+						Name         = $nm
+						OriginalPath = $orig
+						DateDeleted  = $delStr
+						SizeDisplay  = $sizeStr
+						ShellPath    = [string]$it.Path
+						Source       = 'shell'
+					})
+					$idx++
+				}
+			}
+		} catch {}
+
+		# Also enumerate $Recycle.Bin on drives (catches items shell view may hide)
+		$driveList = @()
+		if ($drive) {
+			$d = $drive.Trim().TrimEnd('\').TrimEnd(':')
+			$driveList = @(($d + ':\'))
+		} else {
+			try {
+				$driveList = @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
+					Where-Object { $_.Used -ne $null } |
+					ForEach-Object { $_.Root })
+			} catch { $driveList = @('C:\') }
+		}
+		foreach ($root in $driveList) {
+			$rb = Join-Path $root '$Recycle.Bin'
+			if (-not (Test-Path -LiteralPath $rb)) { continue }
+			[void]$roots.Add($rb)
+			try {
+				Get-ChildItem -LiteralPath $rb -Force -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+					$sidDir = $_.FullName
+					Get-ChildItem -LiteralPath $sidDir -Force -File -ErrorAction SilentlyContinue |
+						Where-Object { $_.Name -like '$I*' } |
+						ForEach-Object {
+							if ($items.Count -ge $max) { return }
+							$meta = Parse-MBRecycleIFile -IPath $_.FullName
+							if (-not $meta) { return }
+							$suffix = if ($_.Name.Length -gt 2) { $_.Name.Substring(2) } else { $_.Name }
+							$rPath = Join-Path $sidDir ('$R' + $suffix)
+							if (-not (Test-Path -LiteralPath $rPath -PathType Leaf)) { $rPath = '' }
+							$dispName = if ($meta.OriginalPath) { [System.IO.Path]::GetFileName($meta.OriginalPath) } else { $_.Name }
+							if ($name_filter -and $dispName -notlike "*$name_filter*" -and ($meta.OriginalPath -notlike "*$name_filter*")) { return }
+							# skip if already in shell list with same original path
+							$dup = $false
+							foreach ($ex in $items) {
+								if ($ex.OriginalPath -and $meta.OriginalPath -and ($ex.OriginalPath -eq $meta.OriginalPath)) { $dup = $true; break }
+							}
+							if ($dup) { return }
+							[void]$items.Add([ordered]@{
+								Index         = $items.Count
+								Name          = $dispName
+								OriginalPath  = [string]$meta.OriginalPath
+								DateDeleted   = [string]$meta.DeletedUtc
+								SizeBytes     = [int64]$meta.SizeBytes
+								SizeDisplay   = ('{0:N0} B' -f $meta.SizeBytes)
+								IPath         = $_.FullName
+								RPath         = $rPath
+								Source        = 'recycle_bin_fs'
+							})
+						}
+				}
+			} catch {}
+		}
+
+		$script:MBLastRecycleItems = @($items)
+
+		$md = New-Object System.Collections.ArrayList
+		[void]$md.Add('| # | Name | Original | Deleted |')
+		[void]$md.Add('|---:|---|---|---|')
+		$nShow = [Math]::Min(40, $items.Count)
+		for ($i = 0; $i -lt $nShow; $i++) {
+			$r = $items[$i]
+			[void]$md.Add(('| {0} | {1} | {2} | {3} |' -f $r.Index, ($r.Name -replace '\|','/'), (($r.OriginalPath -replace '\|','/') ), $r.DateDeleted))
+		}
+
+		ConvertTo-MBJson @{
+			Ok              = $true
+			LiveNtfsOnly    = $true
+			Note            = 'Recycle Bin = normal Delete (to Bin). Prefer this before ListDeletedFiles (Shift+Delete / emptied bin / MFT). LIVE system only. Formatted disks: empty.'
+			Count           = $items.Count
+			Items           = @($items)
+			MarkdownPreview = ($md -join "`n")
+			HowToRecover    = 'Operator picks Index. RestoreRecycleBinItem index= restores to original path (Shell). ExportRecycleBinItem copies to a NEW folder (safer). ALWAYS approval on restore/export.'
+			RecycleRoots    = @($roots)
+		} -Depth 6
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-RestoreRecycleBinItem {
+	param(
+		[object]$index = $null,
+		[string]$name = ''
+	)
+	try {
+		$shell = New-Object -ComObject Shell.Application
+		$ns = $shell.NameSpace(0xa)
+		if (-not $ns) { return (ConvertTo-MBJson @{ Ok = $false; Error = 'Shell Recycle Bin unavailable' } -Depth 3) }
+		$all = @($ns.Items())
+		$target = $null
+		if ($null -ne $index -and "$index" -ne '') {
+			$i = [int]$index
+			if ($i -ge 0 -and $i -lt $all.Count) { $target = $all[$i] }
+		}
+		if (-not $target -and $name) {
+			$target = $all | Where-Object { $_.Name -like "*$name*" } | Select-Object -First 1
+		}
+		if (-not $target) {
+			return (ConvertTo-MBJson @{ Ok = $false; Error = 'Item not found. Call ListRecycleBin first and use Index.' } -Depth 3)
+		}
+		$details = "Restore from Recycle Bin to ORIGINAL location:`n  Name: $($target.Name)`n  Path: $($target.Path)`n`nThis uses the Windows Shell restore verb (may overwrite if a file already exists at the original path)."
+		if (-not (Request-Confirmation -Title 'RestoreRecycleBinItem requires approval' -Details $details)) {
+			return 'BLOCKED BY USER: RestoreRecycleBinItem denied by operator.'
+		}
+		# Prefer restore verb (English); fall back to first matching restore-like verb
+		$restored = $false
+		foreach ($verb in @('restore', 'wiederherstellen', 'restaurer', 'restablecer')) {
+			try {
+				$target.InvokeVerb($verb)
+				$restored = $true
+				break
+			} catch {}
+		}
+		if (-not $restored) {
+			try {
+				$v = $target.Verbs() | Where-Object { $_.Name -replace '&','' -match '(?i)restore|wiederher|restaur' } | Select-Object -First 1
+				if ($v) { $v.DoIt(); $restored = $true }
+			} catch {}
+		}
+		ConvertTo-MBJson @{
+			Ok      = $restored
+			Name    = [string]$target.Name
+			Note    = $(if ($restored) { 'Shell restore invoked. Verify original path.' } else { 'Could not invoke restore verb (locale?). Use ExportRecycleBinItem to copy out.' })
+		} -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-ExportRecycleBinItem {
+	param(
+		[object]$index = $null,
+		[string]$name = '',
+		[string]$output_dir = '',
+		[string]$r_path = ''
+	)
+	try {
+		$src = $r_path
+		$disp = $name
+		if (-not $src) {
+			# From shell list
+			try {
+				$shell = New-Object -ComObject Shell.Application
+				$ns = $shell.NameSpace(0xa)
+				$all = @($ns.Items())
+				$t = $null
+				if ($null -ne $index -and "$index" -ne '') {
+					$i = [int]$index
+					if ($i -ge 0 -and $i -lt $all.Count) { $t = $all[$i] }
+				}
+				if (-not $t -and $name) { $t = $all | Where-Object { $_.Name -like "*$name*" } | Select-Object -First 1 }
+				if ($t) {
+					$src = [string]$t.Path
+					$disp = [string]$t.Name
+				}
+			} catch {}
+		}
+		# From last recycle FS scan: match index into session cache if we stored it
+		if (-not $src -and $script:MBLastRecycleItems -and $null -ne $index) {
+			$i = [int]$index
+			$hit = @($script:MBLastRecycleItems) | Where-Object { $_.Index -eq $i } | Select-Object -First 1
+			if ($hit -and $hit.RPath) { $src = [string]$hit.RPath; $disp = [string]$hit.Name }
+		}
+		if (-not $src -or -not (Test-Path -LiteralPath $src -PathType Leaf)) {
+			return (ConvertTo-MBJson @{
+				Ok = $false
+				Error = 'Could not resolve recycle content path. Pass r_path= from ListRecycleBin (RPath) or use shell Index after ListRecycleBin.'
+			} -Depth 3)
+		}
+		$dir = $output_dir
+		if (-not $dir) { $dir = Get-MBDefaultRecoveryDir }
+		if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+		if (-not $disp) { $disp = [System.IO.Path]::GetFileName($src) }
+		foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) { $disp = $disp.Replace([string]$c, '_') }
+		$dest = Join-Path $dir $disp
+		if (Test-Path -LiteralPath $dest) {
+			$dest = Join-Path $dir ('{0}_{1}{2}' -f ([IO.Path]::GetFileNameWithoutExtension($disp)), (Get-Date -Format 'HHmmss'), ([IO.Path]::GetExtension($disp)))
+		}
+		$details = "Export Recycle Bin item to a NEW file (copy-out, does not remove from Bin):`n  From: $src`n  To:   $dest"
+		if (-not (Request-Confirmation -Title 'ExportRecycleBinItem requires approval' -Details $details)) {
+			return 'BLOCKED BY USER: ExportRecycleBinItem denied by operator.'
+		}
+		Copy-Item -LiteralPath $src -Destination $dest -Force
+		ConvertTo-MBJson @{
+			Ok         = $true
+			Source     = $src
+			OutputPath = $dest
+			Note       = 'Copied out of Recycle Bin. Original bin entry left intact. Prefer other drive for output_dir when recovering many files.'
+		} -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-ListShadowCopies {
+	param()
+	try {
+		$rows = New-Object System.Collections.ArrayList
+		try {
+			Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction Stop | ForEach-Object {
+				[void]$rows.Add([ordered]@{
+					Id           = [string]$_.ID
+					DeviceObject = [string]$_.DeviceObject
+					VolumeName   = [string]$_.VolumeName
+					InstallDate  = [string]$_.InstallDate
+					Count        = $_.Count
+				})
+			}
+		} catch {
+			try {
+				Get-WmiObject Win32_ShadowCopy -ErrorAction Stop | ForEach-Object {
+					[void]$rows.Add([ordered]@{
+						Id           = [string]$_.ID
+						DeviceObject = [string]$_.DeviceObject
+						VolumeName   = [string]$_.VolumeName
+						InstallDate  = [string]$_.InstallDate
+					})
+				}
+			} catch {}
+		}
+		ConvertTo-MBJson @{
+			Ok      = $true
+			Count   = $rows.Count
+			Shadows = @($rows)
+			Note    = 'Volume Shadow Copies on this live system (if VSS enabled). Not a formatted-disk recovery tool. Browse DeviceObject paths carefully; restoring files is manual/copy-out.'
+			Hint    = 'If empty: System Restore/VSS may be off, or no snapshots. Previous Versions in Explorer uses these.'
+		} -Depth 5
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-ListUsnRecent {
+	param(
+		[string]$path = 'C:\',
+		[int]$max = 80,
+		[int]$timeout_sec = 30
+	)
+	try {
+		# Live NTFS USN via fsutil (best-effort text parse). Not available / useful after format.
+		$path = Resolve-MBPath $path
+		$root = [IO.Path]::GetPathRoot($path)
+		$letter = $root.TrimEnd('\').TrimEnd(':')
+		if ($max -le 0) { $max = 80 }
+		if ($max -gt 500) { $max = 500 }
+		$fsutil = Join-Path $env:SystemRoot 'System32\fsutil.exe'
+		if (-not (Test-Path -LiteralPath $fsutil)) {
+			return (ConvertTo-MBJson @{ Ok = $false; Error = 'fsutil.exe not found' } -Depth 3)
+		}
+		$q = & $fsutil usn queryjournal "${letter}:" 2>&1 | Out-String
+		# enumdata can be huge; use readjournal with limited lines via powershell job timeout
+		$raw = ''
+		try {
+			$job = Start-Job -ScriptBlock {
+				param($fs, $let, $n)
+				& $fs usn readjournal "${let}:" 2>&1 | Select-Object -First ($n * 20)
+			} -ArgumentList $fsutil, $letter, $max
+			$null = Wait-Job $job -Timeout ([Math]::Max(5, $timeout_sec))
+			if ($job.State -eq 'Running') { Stop-Job $job -Force; Remove-Job $job -Force; $raw = '' }
+			else { $raw = (Receive-Job $job | Out-String); Remove-Job $job -Force }
+		} catch { $raw = '' }
+
+		$events = New-Object System.Collections.ArrayList
+		# Heuristic parse: File name lines / reason lines from fsutil output vary by OS
+		$lines = @($raw -split "`r?`n")
+		$cur = $null
+		foreach ($ln in $lines) {
+			if ($ln -match '(?i)File\s*name\s*:\s*(.+)$') {
+				if ($cur) { [void]$events.Add($cur) }
+				$cur = [ordered]@{ FileName = $Matches[1].Trim(); Reason = ''; Usn = '' }
+				if ($events.Count -ge $max) { break }
+			} elseif ($cur -and $ln -match '(?i)Reason\s*:\s*(.+)$') {
+				$cur.Reason = $Matches[1].Trim()
+			} elseif ($cur -and $ln -match '(?i)USN\s*:\s*(.+)$') {
+				$cur.Usn = $Matches[1].Trim()
+			}
+		}
+		if ($cur -and $events.Count -lt $max) { [void]$events.Add($cur) }
+
+		ConvertTo-MBJson @{
+			Ok          = $true
+			LiveNtfsOnly = $true
+			Volume      = "${letter}:"
+			QueryJournal = $q.Substring(0, [Math]::Min(800, $q.Length))
+			Count       = $events.Count
+			Events      = @($events)
+			Note        = 'Best-effort USN journal sample (live NTFS). Empty/partial on some SKUs or if journal disabled. After FORMAT the old journal is gone. Prefer ListRecycleBin / ListDeletedFiles for recovery.'
+		} -Depth 5
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-RecoverySmokeTest {
+	param(
+		[string]$path = 'C:\',
+		[bool]$verbose_log = $false
+	)
+	try {
+		$steps = New-Object System.Collections.ArrayList
+		$add = {
+			param($name, $ok, $detail)
+			[void]$steps.Add([ordered]@{ Step = $name; Ok = [bool]$ok; Detail = [string]$detail })
+		}
+		if ($script:HasDiskWalk -and $verbose_log) {
+			try { [MiniBot.Core.DiskWalk]::SetLogLevel(3) } catch {}
+		} elseif ($script:HasDiskWalk) {
+			try { [MiniBot.Core.DiskWalk]::SetLogLevel(1) } catch {}
+		}
+
+		& $add 'DiskWalkLoaded' $script:HasDiskWalk $(if ($script:HasDiskWalk) { 'MiniBot.Core.DiskWalk present' } else { 'missing' })
+
+		$ntfs = $false
+		try {
+			$root = [IO.Path]::GetPathRoot((Resolve-MBPath $path))
+			$di = New-Object System.IO.DriveInfo ($root)
+			$ntfs = ($di.DriveFormat -eq 'NTFS')
+			& $add 'VolumeIsNtfs' $ntfs ("{0} format={1}" -f $root, $di.DriveFormat)
+		} catch { & $add 'VolumeIsNtfs' $false $_.Exception.Message }
+
+		if ($script:HasDiskWalk -and $ntfs) {
+			try {
+				$frn = 0L
+				$ok = [MiniBot.Core.DiskWalk]::TryGetPathFrn((Resolve-MBPath $path), [ref]$frn)
+				& $add 'TryGetPathFrn' $ok ("frn=$frn")
+			} catch { & $add 'TryGetPathFrn' $false $_.Exception.Message }
+
+			try {
+				$t0 = [Diagnostics.Stopwatch]::StartNew()
+				$del = [MiniBot.Core.DiskWalk]::ListDeletedFiles((Resolve-MBPath $path), '', 0, $false, 5, 60000, -1, $true)
+				$t0.Stop()
+				& $add 'ListDeletedFiles_sample' ($null -ne $del) ("count=$($del.Count) ms=$($t0.ElapsedMilliseconds) truncated=$([MiniBot.Core.DiskWalk]::LastListTruncated)")
+			} catch { & $add 'ListDeletedFiles_sample' $false $_.Exception.Message }
+
+			try {
+				$tf = [MiniBot.Core.DiskWalk]::TopFiles((Resolve-MBPath $path), 3, 60000)
+				& $add 'TopFiles_sample' ($null -ne $tf -and $tf.Count -ge 0) ("count=$($tf.Count) engine=$([MiniBot.Core.DiskWalk]::LastScanEngine)")
+			} catch { & $add 'TopFiles_sample' $false $_.Exception.Message }
+		}
+
+		# Recycle bin shell
+		try {
+			$shell = New-Object -ComObject Shell.Application
+			$ns = $shell.NameSpace(0xa)
+			$c = 0
+			if ($ns) { $c = @($ns.Items()).Count }
+			& $add 'RecycleBinShell' $true ("items_visible=$c")
+		} catch { & $add 'RecycleBinShell' $false $_.Exception.Message }
+
+		# VSS
+		try {
+			$sc = @(Get-CimInstance Win32_ShadowCopy -ErrorAction Stop)
+			& $add 'ShadowCopies' $true ("count=$($sc.Count)")
+		} catch {
+			try {
+				$sc = @(Get-WmiObject Win32_ShadowCopy -ErrorAction Stop)
+				& $add 'ShadowCopies' $true ("count=$($sc.Count) wmi")
+			} catch { & $add 'ShadowCopies' $false $_.Exception.Message }
+		}
+
+		# Refuse-overwrite sanity: create temp path that exists
+		if ($script:HasDiskWalk -and $ntfs) {
+			try {
+				$tmp = Join-Path $env:TEMP 'minibot_recover_refuse_test.bin'
+				[IO.File]::WriteAllText($tmp, 'x')
+				$rr = [MiniBot.Core.DiskWalk]::RecoverDeletedFile((Resolve-MBPath $path), 0, $tmp, 5000, 1024)
+				$refused = (-not $rr.Ok) -and ([string]$rr.Error -match 'overwrite|Refusing')
+				& $add 'RecoverRefusesOverwrite' $refused ([string]$rr.Error)
+				Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+			} catch { & $add 'RecoverRefusesOverwrite' $false $_.Exception.Message }
+		}
+
+		$pass = @($steps | Where-Object { -not $_.Ok }).Count -eq 0
+		ConvertTo-MBJson @{
+			Ok    = $true
+			AllPassed = $pass
+			Steps = @($steps)
+			Note  = 'Read-mostly smoke test for recovery stack on LIVE NTFS. Does not prove full undelete quality. Formatted disks will fail NTFS steps.'
+		} -Depth 6
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -22930,6 +25926,35 @@ function Find-MBNextByteDiff {
 	}
 }
 
+function Get-MBPeOrdinalFlag {
+	# IMAGE_ORDINAL_FLAG64 is 0x8000000000000000 — PowerShell parses that hex as Int64.MinValue
+	# and [uint64] cast throws. Always build via Convert.ToUInt64(hex, 16).
+	param([bool]$Is64 = $false)
+	if ($Is64) {
+		if ($null -eq $script:MB_PE_ORDINAL_FLAG64) {
+			$script:MB_PE_ORDINAL_FLAG64 = [Convert]::ToUInt64('8000000000000000', 16)
+		}
+		return [uint64]$script:MB_PE_ORDINAL_FLAG64
+	}
+	return [uint64]0x80000000
+}
+
+function Test-MBPeImportByOrdinal {
+	param([uint64]$ThunkVal, [bool]$Is64 = $false)
+	$mask = Get-MBPeOrdinalFlag -Is64 $Is64
+	return (($ThunkVal -band $mask) -ne [uint64]0)
+}
+
+function Get-MBPeImportNameRva {
+	# Clear ordinal flag; import-by-name thunk holds an RVA (32-bit).
+	param([uint64]$ThunkVal, [bool]$Is64 = $false)
+	if ($Is64) {
+		$mask = [Convert]::ToUInt64('7FFFFFFFFFFFFFFF', 16)
+		return [uint32]($ThunkVal -band $mask)
+	}
+	return [uint32]($ThunkVal -band [uint64]0x7FFFFFFF)
+}
+
 function Convert-MBPeRvaToOffset {
 	param(
 		[System.Collections.IEnumerable]$Sections,
@@ -23106,7 +26131,7 @@ function Get-MBPeSymbolMap {
 				$dllCount = 0
 				$descOff = [long]$impFile
 				$thunkSize = if ($is64) { 8 } else { 4 }
-				$ordMask = if ($is64) { [uint64]0x8000000000000000 } else { [uint64]0x80000000 }
+				$ordMask = Get-MBPeOrdinalFlag -Is64 $is64
 				while ($dllCount -lt $MaxDlls) {
 					if (($descOff + 20) -gt $fs.Length) { break }
 					[void]$fs.Seek($descOff, [System.IO.SeekOrigin]::Begin)
@@ -23152,12 +26177,12 @@ function Get-MBPeSymbolMap {
 						}
 						if ($thunkVal -eq 0) { break }
 						$label = ''
-						if (($thunkVal -band $ordMask) -ne 0) {
+						if (Test-MBPeImportByOrdinal -ThunkVal $thunkVal -Is64 $is64) {
 							$ord = [int]($thunkVal -band 0xFFFF)
 							$label = ('{0}!#{1}' -f $dllName, $ord)
 						} else {
 							# Hint/Name RVA (lower 31/32 bits; PE RVAs fit in 32-bit)
-							$ibnRva = [uint32]($thunkVal -band [uint64]0x7FFFFFFF)
+							$ibnRva = Get-MBPeImportNameRva -ThunkVal $thunkVal -Is64 $is64
 							$ibnOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $ibnRva
 							if ($null -ne $ibnOff) {
 								$fn = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$ibnOff + 2) -MaxLen 192
@@ -23266,7 +26291,7 @@ function Get-MBPeSymbolMap {
 					$descOff = [long]$dFile
 					$dCount = 0
 					$thunkSize = if ($is64) { 8 } else { 4 }
-					$ordMask = if ($is64) { [uint64]0x8000000000000000 } else { [uint64]0x80000000 }
+					$ordMask = Get-MBPeOrdinalFlag -Is64 $is64
 					while ($dCount -lt $MaxDlls) {
 						if (($descOff + 32) -gt $fs.Length) { break }
 						[void]$fs.Seek($descOff, [System.IO.SeekOrigin]::Begin)
@@ -23302,10 +26327,10 @@ function Get-MBPeSymbolMap {
 									$thunkVal = if ($is64) { [BitConverter]::ToUInt64($tb, 0) } else { [uint64][BitConverter]::ToUInt32($tb, 0) }
 									if ($thunkVal -eq 0) { break }
 									$label = ''
-									if (($thunkVal -band $ordMask) -ne 0) {
+									if (Test-MBPeImportByOrdinal -ThunkVal $thunkVal -Is64 $is64) {
 										$label = ('{0}!#{1} (delay)' -f $dllName, [int]($thunkVal -band 0xFFFF))
 									} else {
-										$ibnRva = [uint32]($thunkVal -band [uint64]0x7FFFFFFF)
+										$ibnRva = Get-MBPeImportNameRva -ThunkVal $thunkVal -Is64 $is64
 										$ibnOff = Convert-MBPeRvaToOffset -Sections $map.Sections -Rva $ibnRva
 										if ($null -ne $ibnOff) {
 											$fn = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$ibnOff + 2) -MaxLen 192
@@ -23441,9 +26466,21 @@ function Get-MBPeIdentity {
 			if ($SymbolMap.BoundImportNote) {
 				$out.bound_import = $SymbolMap.BoundImportNote
 			}
-			if ($SectionHashes -and $SymbolMap.Sections) {
+			# Section list/hashes prefer SymbolMap sections; fall back to header layout
+			$secSrc = $null
+			if ($SectionHashes) {
+				if ($SymbolMap.Sections -and @($SymbolMap.Sections).Count -gt 0) {
+					$secSrc = @($SymbolMap.Sections)
+				} else {
+					try {
+						$peLay = Get-MBPeHeaderLayout -Path $Path
+						if ($peLay.Ok) { $secSrc = @($peLay.Sections) }
+					} catch { $secSrc = $null }
+				}
+			}
+			if ($SectionHashes -and $secSrc) {
 				$secOut = New-Object System.Collections.ArrayList
-				foreach ($s in @($SymbolMap.Sections)) {
+				foreach ($s in @($secSrc)) {
 					$rptr = [long][uint32]$s.raw_ptr
 					$rsz = [long][uint32]$s.raw_size
 					$h = $null
@@ -23465,8 +26502,36 @@ function Get-MBPeIdentity {
 				$out.sections = @($secOut)
 			}
 		} elseif ($SectionHashes) {
-			# Non-PE: still have whole-file hash
-			$out.sections = @()
+			# Symbol map failed — still try PE header layout for section hashes
+			try {
+				$peLay = Get-MBPeHeaderLayout -Path $Path
+				if ($peLay.Ok -and $peLay.Sections) {
+					$secOut = New-Object System.Collections.ArrayList
+					foreach ($s in @($peLay.Sections)) {
+						$rptr = [long][uint32]$s.raw_ptr
+						$rsz = [long][uint32]$s.raw_size
+						$h = $null
+						if ($rsz -gt 0 -and $rptr -ge 0) {
+							$take = $rsz
+							if ($take -gt 64MB) { $take = 64MB }
+							$h = Get-MBFileSha256Hex -Path $Path -Offset $rptr -Length $take
+						}
+						[void]$secOut.Add([ordered]@{
+							name = [string]$s.name
+							raw_ptr = $rptr
+							raw_ptr_hex = ('0x{0:X}' -f $rptr)
+							raw_size = $rsz
+							sha256 = $h
+							sha256_truncated = ($rsz -gt 64MB)
+						})
+					}
+					$out.sections = @($secOut)
+				} else {
+					$out.sections = @()
+				}
+			} catch {
+				$out.sections = @()
+			}
 		}
 		$out.Ok = ($null -ne $out.sha256)
 		if (-not $out.Ok -and -not $out.Error) { $out.Error = 'hash_failed' }
@@ -23705,7 +26770,7 @@ function Get-MBFileEntropyMap {
 		$result.max_entropy = [Math]::Round($maxE, 3)
 		$result.min_entropy = if ($blocks.Count -gt 0) { [Math]::Round($minE, 3) } else { 0.0 }
 		$result.Ok = $true
-		$result['hint'] = 'entropy near 8.0 suggests encrypted/compressed; low (~1-5) code/text. Use HexView offset= on high blocks or StringsScan.'
+		$result['hint'] = 'entropy near 8.0 suggests encrypted/compressed; low (~1-5) code/text. Use HexView offset= on high blocks or StringExtract.'
 	} catch {
 		$result.Error = $_.Exception.Message
 	} finally {
@@ -23873,6 +26938,511 @@ function Convert-MBHexPatternToBytesAndMask {
 	return @{ Bytes = $bytes; Mask = $mask; Length = $tokens.Count }
 }
 
+function Resolve-MBForensicsLimit {
+	# Normalize max/limit/all for forensics tools.
+	# - all|full|unlimited|*|true  -> HardMax
+	# - 0 or negative               -> HardMax (treat as "no cap" within HardMax)
+	# - omitted/null                -> Default
+	param(
+		$Value = $null,
+		[int]$Default = 32,
+		[int]$HardMax = 9999,
+		$All = $false
+	)
+	$wantAll = $false
+	try {
+		if ($All -is [bool] -and $All) { $wantAll = $true }
+		elseif ($null -ne $All -and [string]$All -ne '' -and [string]$All -notmatch '^(?i)0|false|no|off$') {
+			if ([string]$All -match '^(?i)1|true|yes|on|all|full$') { $wantAll = $true }
+		}
+	} catch {}
+	if ($wantAll) {
+		if ($HardMax -lt 1) { $HardMax = 9999 }
+		return [int]$HardMax
+	}
+	if ($null -eq $Value -or ([string]$Value).Trim() -eq '') {
+		return [int]$Default
+	}
+	$s = ([string]$Value).Trim()
+	if ($s -match '^(?i)all|full|unlimited|\*|max$') {
+		if ($HardMax -lt 1) { $HardMax = 9999 }
+		return [int]$HardMax
+	}
+	$n = 0
+	if (-not [int]::TryParse($s, [ref]$n)) {
+		return [int]$Default
+	}
+	if ($n -le 0) {
+		if ($HardMax -lt 1) { $HardMax = 9999 }
+		return [int]$HardMax
+	}
+	if ($HardMax -gt 0 -and $n -gt $HardMax) { return [int]$HardMax }
+	return [int]$n
+}
+
+function Get-MBForensicsFileMeta {
+	# Size + large-PE hint for auto caps / warnings.
+	param([string]$Path)
+	$meta = [ordered]@{
+		Ok = $false
+		file_size = 0L
+		large = $false
+		very_large = $false
+		ms_start = [datetime]::UtcNow
+	}
+	try {
+		if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $meta }
+		$fi = Get-Item -LiteralPath $Path
+		$meta.file_size = [long]$fi.Length
+		$meta.large = ($fi.Length -ge 10MB)
+		$meta.very_large = ($fi.Length -ge 50MB)
+		$meta.Ok = $true
+	} catch {}
+	return $meta
+}
+
+function Get-MBForensicsElapsedMs {
+	param($StartUtc)
+	try {
+		if ($null -eq $StartUtc) { return $null }
+		return [int]([datetime]::UtcNow - [datetime]$StartUtc).TotalMilliseconds
+	} catch { return $null }
+}
+
+function Add-MBForensicsTruncationNote {
+	# Clear operator-facing TRUNCATED hint when caps bite.
+	param(
+		[bool]$Truncated = $false,
+		[string]$Tool = '',
+		[int]$Count = 0,
+		[int]$Cap = 0
+	)
+	if (-not $Truncated) { return $null }
+	$t = if ($Tool) { $Tool } else { 'results' }
+	$extra = ''
+	if ($Cap -gt 0) { $extra = (" (cap={0}, returned={1})" -f $Cap, $Count) }
+	return ("TRUNCATED: {0} hit the default/list cap{1}. Use all=true or max=all (or max=9999) to see full results." -f $t, $extra)
+}
+
+function Test-MBPeStandardSectionName {
+	param([string]$Name)
+	$n = ([string]$Name).Trim().ToLowerInvariant()
+	if ([string]::IsNullOrWhiteSpace($n)) { return $false }
+	$std = @('.text','.rdata','.data','.pdata','.rsrc','.reloc','.edata','.idata','.bss','.tls','.debug','.didat','.gfids','.00cfg','.gehcont','.xdata','.CRT','.crt','.ndata','.idata2','.gfids','.voltbl')
+	foreach ($s in $std) {
+		if ($n -eq $s.ToLowerInvariant()) { return $true }
+		if ($n -eq $s.TrimStart('.').ToLowerInvariant()) { return $true }
+	}
+	# numeric / known patterns
+	if ($n -match '^\.(text|data|rdata|rsrc|reloc|pdata|bss|tls|debug)') { return $true }
+	return $false
+}
+
+function Get-MBPeSectionNameWarnings {
+	param($Sections)
+	$warn = New-Object System.Collections.ArrayList
+	foreach ($s in @($Sections)) {
+		try {
+			$nm = [string]$s.name
+			if (-not (Test-MBPeStandardSectionName -Name $nm)) {
+				[void]$warn.Add([ordered]@{
+					section = $nm
+					warning = ('Non-standard section name "{0}" (not .text/.rdata/.data/.rsrc/.reloc/…). Common in packers, protectors, or custom toolchains.' -f $nm)
+				})
+			}
+		} catch {}
+	}
+	return @($warn)
+}
+
+function Convert-MBResourceBytesToText {
+	# Best-effort decode for STRING/MANIFEST/VERSION/RCDATA previews.
+	param([byte[]]$Bytes, [string]$TypeHint = '')
+	if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+		return @{ text = $null; encoding = $null }
+	}
+	$t = ([string]$TypeHint).ToUpperInvariant()
+	# UTF-16LE BOM
+	if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
+		$s = [System.Text.Encoding]::Unicode.GetString($Bytes, 2, $Bytes.Length - 2)
+		return @{ text = $s; encoding = 'utf16le_bom' }
+	}
+	# Heuristic: many zero high-bytes => UTF-16LE
+	$zeroHi = 0; $sample = [Math]::Min($Bytes.Length, 64)
+	for ($i = 1; $i -lt $sample; $i += 2) { if ($Bytes[$i] -eq 0) { $zeroHi++ } }
+	$pairs = [Math]::Max(1, [int]($sample / 2))
+	if ($t -eq 'STRING' -or ($zeroHi -ge ($pairs * 0.6))) {
+		$s = [System.Text.Encoding]::Unicode.GetString($Bytes)
+		# PE string tables are length-prefixed WCHAR runs; strip NULs for display
+		$s = ($s -replace '\x00+', "`n").Trim()
+		return @{ text = $s; encoding = 'utf16le' }
+	}
+	# UTF-8 / ASCII
+	$s2 = [System.Text.Encoding]::UTF8.GetString($Bytes) -replace '[\x00-\x08\x0b\x0c\x0e-\x1f]', ''
+	return @{ text = $s2; encoding = 'utf8' }
+}
+
+function Clean-MBUrlString {
+	# Strip garbage prefix before http(s):// (e.g. DER cert "Ehttp://...")
+	param([string]$S)
+	if ([string]::IsNullOrEmpty($S)) { return $S }
+	if ($S -match '(?i)(https?://\S+)') {
+		$url = $Matches[1]
+		# trim trailing junk common in cert/binary blobs
+		$url = $url -replace '[^\w\-\./:%?&=+#@~]+$', ''
+		return $url
+	}
+	if ($S -match '(?i)(ftp://\S+)') {
+		return ($Matches[1] -replace '[^\w\-\./:%?&=+#@~]+$', '')
+	}
+	return $S
+}
+
+function Initialize-MBHexEditStack {
+	if ($null -eq $script:MB) { return }
+	if ($null -eq $script:MB.HexEditStack -or -not ($script:MB.HexEditStack -is [System.Collections.IList])) {
+		$script:MB.HexEditStack = New-Object System.Collections.ArrayList
+	}
+	if ($null -eq $script:MB.HexEditStackSeq) { $script:MB.HexEditStackSeq = 0 }
+}
+
+function Add-MBHexEditUndoEntry {
+	param(
+		[string]$Path,
+		[long]$Offset,
+		[byte[]]$BeforeBytes,
+		[byte[]]$AfterBytes,
+		[string]$Preset = '',
+		[string]$BackupPath = $null
+	)
+	try {
+		Initialize-MBHexEditStack
+		if ($null -eq $BeforeBytes -or $BeforeBytes.Length -eq 0) { return $null }
+		$script:MB.HexEditStackSeq = [int]$script:MB.HexEditStackSeq + 1
+		$id = [int]$script:MB.HexEditStackSeq
+		$entry = [ordered]@{
+			id = $id
+			path = $Path
+			offset = $Offset
+			offset_hex = ('0x{0:X}' -f $Offset)
+			length = $BeforeBytes.Length
+			before_hex = (($BeforeBytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
+			after_hex = $(if ($AfterBytes) { (($AfterBytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') } else { $null })
+			preset = $(if ($Preset) { $Preset } else { $null })
+			backup = $BackupPath
+			time_utc = [datetime]::UtcNow.ToString('o')
+			# store raw bytes for exact revert
+			_before = $BeforeBytes
+		}
+		[void]$script:MB.HexEditStack.Add($entry)
+		# cap stack (keep newest 64)
+		while ($script:MB.HexEditStack.Count -gt 64) {
+			[void]$script:MB.HexEditStack.RemoveAt(0)
+		}
+		return $id
+	} catch {
+		return $null
+	}
+}
+
+function Get-MBHexEditUndoHistory {
+	Initialize-MBHexEditStack
+	$items = New-Object System.Collections.ArrayList
+	foreach ($e in @($script:MB.HexEditStack)) {
+		[void]$items.Add([ordered]@{
+			id = $e.id
+			path = $e.path
+			offset_hex = $e.offset_hex
+			length = $e.length
+			before_hex = $e.before_hex
+			after_hex = $e.after_hex
+			preset = $e.preset
+			backup = $e.backup
+			time_utc = $e.time_utc
+		})
+	}
+	return @($items)
+}
+
+function Invoke-MBHexEditUndo {
+	param(
+		[string]$Path = '',
+		$id = $null,
+		[bool]$All = $false,
+		[bool]$Prompt = $true
+	)
+	Initialize-MBHexEditStack
+	$stack = $script:MB.HexEditStack
+	if ($null -eq $stack -or $stack.Count -eq 0) {
+		return ConvertTo-MBJson ([ordered]@{
+			status = 'ok'
+			undone = 0
+			note = 'HexEdit undo stack is empty (no patches this session, or already fully reverted)'
+			history = @()
+		}) -Depth 6
+	}
+	$targets = New-Object System.Collections.ArrayList
+	if ($All) {
+		$pathFilter = if ($Path) { (Resolve-MBPath -Path $Path) } else { '' }
+		# undo newest-first
+		for ($i = $stack.Count - 1; $i -ge 0; $i--) {
+			$e = $stack[$i]
+			if ($pathFilter -and -not [string]::Equals([string]$e.path, $pathFilter, [StringComparison]::OrdinalIgnoreCase)) { continue }
+			[void]$targets.Add($e)
+		}
+	} elseif ($null -ne $id -and [string]$id -ne '') {
+		$want = 0
+		if (-not [int]::TryParse(([string]$id), [ref]$want)) {
+			return "ERROR: invalid undo id=$id"
+		}
+		$found = $null
+		foreach ($e in @($stack)) {
+			if ([int]$e.id -eq $want) { $found = $e; break }
+		}
+		if (-not $found) { return "ERROR: undo id $want not found (use action=history)" }
+		[void]$targets.Add($found)
+	} else {
+		# last entry, optionally for path
+		$pathFilter = if ($Path) { (Resolve-MBPath -Path $Path) } else { '' }
+		for ($i = $stack.Count - 1; $i -ge 0; $i--) {
+			$e = $stack[$i]
+			if ($pathFilter -and -not [string]::Equals([string]$e.path, $pathFilter, [StringComparison]::OrdinalIgnoreCase)) { continue }
+			[void]$targets.Add($e)
+			break
+		}
+		if ($targets.Count -eq 0) {
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'ok'
+				undone = 0
+				note = $(if ($pathFilter) { "No undo entries for path: $pathFilter" } else { 'Stack empty' })
+				history = @(Get-MBHexEditUndoHistory)
+			}) -Depth 8
+		}
+	}
+	$summary = New-Object System.Collections.ArrayList
+	foreach ($e in $targets) {
+		[void]$summary.Add(('{0}: {1} @ {2} len={3} preset={4}' -f $e.id, $e.path, $e.offset_hex, $e.length, $(if ($e.preset) { $e.preset } else { '-' })))
+	}
+	$details = "Revert HexEdit patch(es):`n" + ($summary -join "`n")
+	if ($Prompt) {
+		if (-not (Request-Confirmation -Title 'HexEdit undo requires approval' -Details $details -Code ($summary -join "`n") -CodeLang 'text')) {
+			return 'BLOCKED BY USER: HexEdit undo denied by operator.'
+		}
+	}
+	$undone = New-Object System.Collections.ArrayList
+	$errors = New-Object System.Collections.ArrayList
+	foreach ($e in $targets) {
+		try {
+			$p = [string]$e.path
+			$off = [long]$e.offset
+			$before = $e._before
+			if ($null -eq $before -or $before.Length -eq 0) {
+				# rebuild from before_hex
+				if ($e.before_hex) {
+					$before = Convert-MBHexStringToBytes -Hex ([string]$e.before_hex)
+				}
+			}
+			if ($null -eq $before -or $before.Length -eq 0) {
+				[void]$errors.Add(('id {0}: no before-bytes stored' -f $e.id))
+				continue
+			}
+			if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+				[void]$errors.Add(('id {0}: file missing {1}' -f $e.id, $p))
+				continue
+			}
+			$fs = $null
+			try {
+				$fs = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+				if (($off + $before.Length) -gt $fs.Length) {
+					# allow shrink? only write what fits / extend
+					$need = $off + $before.Length
+					$fs.SetLength($need)
+				}
+				[void]$fs.Seek($off, [System.IO.SeekOrigin]::Begin)
+				$fs.Write($before, 0, $before.Length)
+				$fs.Flush()
+			} finally {
+				if ($fs) { try { $fs.Dispose() } catch {} }
+			}
+			[void]$undone.Add([ordered]@{
+				id = $e.id
+				path = $p
+				offset_hex = $e.offset_hex
+				restored_bytes = $before.Length
+				restored_hex = $e.before_hex
+			})
+			# remove from stack
+			for ($i = $stack.Count - 1; $i -ge 0; $i--) {
+				if ([int]$stack[$i].id -eq [int]$e.id) {
+					[void]$stack.RemoveAt($i)
+					break
+				}
+			}
+		} catch {
+			[void]$errors.Add(('id {0}: {1}' -f $e.id, $_.Exception.Message))
+		}
+	}
+	return ConvertTo-MBJson ([ordered]@{
+		status = $(if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' })
+		undone = $undone.Count
+		entries = @($undone)
+		errors = $(if ($errors.Count -gt 0) { @($errors) } else { @() })
+		remaining_stack = @(Get-MBHexEditUndoHistory)
+		hint = 'action=history lists stack; action=undo undoes last; action=undo id=N; action=undo_all path= optional filter.'
+	}) -Depth 8
+}
+
+function Resolve-MBHexPatternTargets {
+	# Resolve relative CALL/JMP/Jcc targets + optional IAT/export labels for FindHexPattern hits.
+	param(
+		[string]$Path,
+		[long]$Offset,
+		[string]$Kind = '',
+		$Sections = $null,
+		$SymbolMap = $null,
+		[bool]$Is64 = $false
+	)
+	$out = [ordered]@{
+		target = $null
+		target_hex = $null
+		fallthrough = $null
+		fallthrough_hex = $null
+		target_section = $null
+		target_symbol = $null
+		mnemonic = $null
+		resolved = $false
+	}
+	try {
+		$rb = Read-MBFileBytes -Path $Path -Offset $Offset -Length 16
+		if (-not $rb.Ok -or $rb.Bytes.Length -lt 2) { return $out }
+		$dec = Read-MBX86Instruction -Bytes $rb.Bytes -Index 0 -FileOffset $Offset -Is64 $Is64
+		if (-not $dec.Ok) { return $out }
+		$out.mnemonic = $dec.mnemonic
+		if ($dec.is_control_flow -and $null -ne $dec.target) {
+			$out.target = [long]$dec.target
+			$out.target_hex = $dec.target_hex
+			$out.fallthrough = $dec.fallthrough
+			$out.fallthrough_hex = $dec.fallthrough_hex
+			$out.resolved = $true
+			$out.target_section = Get-MBPeSectionForOffset -Sections $Sections -FileOffset ([long]$dec.target)
+			if ($SymbolMap -and $SymbolMap.Ok) {
+				try {
+					$tk = [string][long]$dec.target
+					if ($SymbolMap.ExportByFileOffset -and $SymbolMap.ExportByFileOffset.ContainsKey($tk)) {
+						$out.target_symbol = [string]$SymbolMap.ExportByFileOffset[$tk]
+					}
+				} catch {}
+			}
+		}
+		# Indirect call/jmp via IAT
+		if ($dec.is_indirect -or ($dec.mnemonic -in @('call','jmp') -and $dec.operands -match 'rip|r/m')) {
+			try {
+				if ($SymbolMap -and $SymbolMap.Ok) {
+					$decor = Resolve-MBDisasmSymbols -Instruction $dec -SymbolMap $SymbolMap -Is64 $Is64
+					if ($decor -and $decor.symbol) {
+						$out.target_symbol = [string]$decor.symbol
+						$out.resolved = $true
+					}
+					if ($dec.uses_rip_rel -and $null -ne $dec.rip_rel_disp) {
+						$mem = [long]$dec.fallthrough + [int]$dec.rip_rel_disp
+						$out.target = $mem
+						$out.target_hex = ('0x{0:X}' -f $mem)
+						$mk = [string]$mem
+						if ($SymbolMap.IatByFileOffset -and $SymbolMap.IatByFileOffset.ContainsKey($mk)) {
+							$out.target_symbol = [string]$SymbolMap.IatByFileOffset[$mk]
+						}
+						$out.resolved = $true
+					}
+				}
+			} catch {}
+		}
+	} catch {}
+	return $out
+}
+
+function Get-MBStringNextSteps {
+	# Suggest follow-up tools for interesting string hits.
+	param([System.Collections.IEnumerable]$Hits, [string]$Path, [int]$MaxHints = 12)
+	$hints = New-Object System.Collections.ArrayList
+	$seen = @{}
+	$n = 0
+	foreach ($h in @($Hits)) {
+		if ($n -ge $MaxHints) { break }
+		try {
+			$t = [string]$h.text
+			$off = $h.offset_hex
+			if ([string]::IsNullOrWhiteSpace($t)) { continue }
+			$step = $null
+			if ($t -match '(?i)https?://|ftp://|www\.') {
+				$url = $t
+				if ($url -match '(?i)(https?://[^\s\"<>]+)') { $url = $Matches[1] }
+				$step = [ordered]@{
+					kind = 'url'
+					text = $t
+					offset_hex = $off
+					suggest = ('BrowsePage url={0}  (or MakeHttpRequest)' -f $url)
+					tool = 'BrowsePage'
+				}
+			} elseif ($t -match '(?i)HKEY_|HKLM|HKCU|HKCR|HKU\\|SOFTWARE\\|SYSTEM\\') {
+				$reg = $t -replace '/', '\'
+				if ($reg -match '(?i)(HK[A-Z][A-Z0-9_]*:\\[^\s\"]+|HKEY_[A-Z_]+\\[^\s\"]+|SOFTWARE\\[^\s\"]+|SYSTEM\\[^\s\"]+)') {
+					$reg = $Matches[1]
+				}
+				if ($reg -match '^(?i)SOFTWARE\\') { $reg = 'HKLM:\' + $reg }
+				elseif ($reg -match '^(?i)SYSTEM\\') { $reg = 'HKLM:\' + $reg }
+				elseif ($reg -match '^(?i)HKEY_LOCAL_MACHINE\\') { $reg = ($reg -replace '(?i)^HKEY_LOCAL_MACHINE','HKLM:') }
+				elseif ($reg -match '^(?i)HKEY_CURRENT_USER\\') { $reg = ($reg -replace '(?i)^HKEY_CURRENT_USER','HKCU:') }
+				$step = [ordered]@{
+					kind = 'registry'
+					text = $t
+					offset_hex = $off
+					suggest = ('ReadRegistry path={0}' -f $reg)
+					tool = 'ReadRegistry'
+				}
+			} elseif ($t -match '(?i)[A-Za-z]:\\[^\s\"]+') {
+				$p = $Matches[0]
+				$step = [ordered]@{
+					kind = 'path'
+					text = $t
+					offset_hex = $off
+					suggest = ('ListDirectory path={0}  (or FindFiles / ReadFile if text)' -f $p)
+					tool = 'ListDirectory'
+				}
+			} elseif ($t -match '(?i)\\\\[a-z0-9._-]+\\') {
+				$step = [ordered]@{
+					kind = 'unc'
+					text = $t
+					offset_hex = $off
+					suggest = 'FindShares or MapNetworkDrive (network/setup groups)'
+					tool = 'FindShares'
+				}
+			}
+			if ($step) {
+				$key = [string]$step.kind + '|' + [string]$step.suggest
+				if (-not $seen.ContainsKey($key)) {
+					$seen[$key] = $true
+					[void]$hints.Add($step)
+					$n++
+				}
+			}
+		} catch {}
+	}
+	# Always offer hex follow-up if we have offsets
+	if ($Hits -and @($Hits).Count -gt 0) {
+		try {
+			$first = @($Hits)[0]
+			[void]$hints.Add([ordered]@{
+				kind = 'hex'
+				text = $first.text
+				offset_hex = $first.offset_hex
+				suggest = ('HexView path={0} offset={1} disasm=true  (or section= from hit.section)' -f $Path, $first.offset_hex)
+				tool = 'HexView'
+			})
+		} catch {}
+	}
+	return @($hints)
+}
+
 function Find-MBHexPattern {
 	param(
 		[string]$Path,
@@ -23897,7 +27467,7 @@ function Find-MBHexPattern {
 		$scanEnd = $len
 		if ($MaxScan -gt 0) { $scanEnd = [Math]::Min($len, $Offset + $MaxScan) }
 		if ($MaxResults -le 0) { $MaxResults = 32 }
-		if ($MaxResults -gt 500) { $MaxResults = 500 }
+		if ($MaxResults -gt 9999) { $MaxResults = 9999 }
 		# Stream with overlap
 		$chunk = 1024 * 1024
 		$overlap = $patLen - 1
@@ -23957,39 +27527,127 @@ function Get-MBFileStrings {
 	param(
 		[string]$Path,
 		[int]$MinLen = 4,
+		[int]$MaxLen = 0,
 		[int]$MaxHits = 80,
 		[long]$Offset = 0,
 		[long]$MaxScan = 0,
 		[string]$Encoding = 'both', # ascii | utf16 | both
-		[string]$Filter = ''        # path|url|ip|registry|email|all or free substring
+		[string]$Filter = '',       # path|url|ip|registry|email|interesting|data|code|clean or free substring
+		[string]$Section = ''       # PE section name filter e.g. .rdata
 	)
 	if ($MinLen -lt 3) { $MinLen = 3 }
 	if ($MinLen -gt 64) { $MinLen = 64 }
+	if ($MaxLen -lt 0) { $MaxLen = 0 }
+	if ($MaxLen -gt 0 -and $MaxLen -lt $MinLen) { $MaxLen = $MinLen }
 	if ($MaxHits -le 0) { $MaxHits = 80 }
-	if ($MaxHits -gt 500) { $MaxHits = 500 }
+	if ($MaxHits -gt 9999) { $MaxHits = 9999 }
 	$encMode = ([string]$Encoding).ToLowerInvariant()
 	if ($encMode -notin @('ascii', 'utf16', 'utf16le', 'both', 'all')) { $encMode = 'both' }
 	if ($encMode -eq 'all') { $encMode = 'both' }
 	if ($encMode -eq 'utf16le') { $encMode = 'utf16' }
 	$filt = ([string]$Filter).Trim().ToLowerInvariant()
-	$useClass = $filt -in @('path', 'url', 'ip', 'registry', 'email', 'all', 'interesting')
+	$secFilter = ([string]$Section).Trim()
+	# data|code|clean are section-class / noise filters (not content regex alone)
+	$secClassFilter = $null
+	$contentFilt = $filt
+	if ($filt -in @('data', 'rdata', 'noncode')) { $secClassFilter = 'data'; $contentFilt = '' }
+	elseif ($filt -in @('code', 'text', 'exec')) { $secClassFilter = 'code'; $contentFilt = '' }
+	elseif ($filt -eq 'clean') { $secClassFilter = 'data'; $contentFilt = 'interesting' }
+	elseif ($filt -match '^(data|code)\+') {
+		$parts = $filt -split '\+', 2
+		$secClassFilter = $parts[0]
+		$contentFilt = if ($parts.Count -gt 1) { $parts[1] } else { '' }
+	}
+	$peSecs = $null
+	$execSections = @{}
+	try {
+		$peLay = Get-MBPeHeaderLayout -Path $Path
+		if ($peLay.Ok) {
+			$peSecs = $peLay.Sections
+			foreach ($s in @($peSecs)) {
+				$isExec = $false
+				try {
+					$ch = [uint32]0
+					if ($s.PSObject.Properties['characteristics']) { $ch = [uint32]$s.characteristics }
+					elseif ($s.characteristics_hex) {
+						$hx = [string]$s.characteristics_hex
+						if ($hx -match '^0x') { $ch = [Convert]::ToUInt32($hx, 16) }
+					}
+					if ($ch -band 0x20000000) { $isExec = $true }
+					$fl = [string]$s.flags
+					if ($fl -match 'EXEC|CODE') { $isExec = $true }
+				} catch {}
+				$execSections[[string]$s.name] = $isExec
+			}
+		}
+	} catch { $peSecs = $null }
+	if ($secFilter -and $peSecs) {
+		$want = $null
+		foreach ($s in @($peSecs)) {
+			if ([string]::Equals([string]$s.name, $secFilter, [StringComparison]::OrdinalIgnoreCase)) { $want = $s; break }
+			if ($s.name.TrimStart('.') -eq $secFilter.TrimStart('.')) { $want = $s; break }
+		}
+		if ($want -and [uint32]$want.raw_ptr -gt 0 -and [uint32]$want.raw_size -gt 0) {
+			$Offset = [long][uint32]$want.raw_ptr
+			$MaxScan = [long][uint32]$want.raw_size
+		}
+	}
+	$testCompilerNoise = {
+		param([string]$S)
+		if ([string]::IsNullOrEmpty($S)) { return $true }
+		# MSVC stack cookies / frame symbols: D$@A, T$0H, A$B etc.
+		if ($S -match '^[A-Za-z]\$[@0-9A-Za-z]{1,6}$') { return $true }
+		if ($S -match '^[A-Z]\$[0-9A-F@]+$') { return $true }
+		# Mostly punctuation / no vowels short runs
+		if ($S.Length -le 6 -and $S -match '^[\W_0-9]+$') { return $true }
+		if ($S.Length -le 8 -and $S -match '^[A-Za-z0-9]{1,2}\$[A-Za-z0-9@]+$') { return $true }
+		return $false
+	}
 	$testInteresting = {
 		param([string]$S)
 		if ([string]::IsNullOrEmpty($S)) { return $false }
-		if ($filt -eq '' -or $filt -eq 'all' -or $filt -eq 'interesting') {
+		if ($contentFilt -eq '' -or $contentFilt -eq 'all') { return $true }
+		if ($contentFilt -eq 'interesting') {
+			if (& $testCompilerNoise $S) { return $false }
 			if ($S -match '(?i)https?://|\\\\[a-z0-9]|[A-Za-z]:\\|/bin/|cmd\.exe|powershell|CreateFile|VirtualAlloc|LoadLibrary|GetProcAddress|HKEY_|SOFTWARE\\') { return $true }
 			if ($S -match '\b\d{1,3}(\.\d{1,3}){3}\b') { return $true }
 			if ($S -match '(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}') { return $true }
 			return $false
 		}
-		switch ($filt) {
+		switch ($contentFilt) {
 			'path' { return ($S -match '(?i)[A-Za-z]:\\|\\\\|/usr/|/etc/|\.dll|\.exe|\.sys') }
 			'url' { return ($S -match '(?i)https?://|ftp://|www\.') }
 			'ip' { return ($S -match '\b\d{1,3}(\.\d{1,3}){3}\b') }
 			'registry' { return ($S -match '(?i)HKEY_|HKLM|HKCU|SOFTWARE\\|SYSTEM\\') }
 			'email' { return ($S -match '(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}') }
-			default { return ($S.ToLowerInvariant().Contains($filt)) }
+			default { return ($S.ToLowerInvariant().Contains($contentFilt)) }
 		}
+	}
+	$acceptHit = {
+		param([string]$S, [long]$Off)
+		if ($MaxLen -gt 0 -and $S.Length -gt $MaxLen) { return $false }
+		$secName = Get-MBPeSectionForOffset -Sections $peSecs -FileOffset $Off
+		if ($secClassFilter -eq 'data' -or $secClassFilter -eq 'code') {
+			$isExec = $false
+			if ($secName -and $execSections.ContainsKey($secName)) {
+				$isExec = [bool]$execSections[$secName]
+			} elseif (-not $secName) {
+				# headers / unmapped: treat as data for data-filter, skip for code-filter
+				$isExec = $false
+			}
+			if ($secClassFilter -eq 'data' -and $isExec) { return $false }
+			if ($secClassFilter -eq 'code' -and -not $isExec) { return $false }
+		}
+		# Auto-drop compiler noise in executable sections when no content filter (raw dump still noisy)
+		if ($contentFilt -eq '' -or $contentFilt -eq 'all') {
+			$isExec2 = $false
+			if ($secName -and $execSections.ContainsKey($secName)) { $isExec2 = [bool]$execSections[$secName] }
+			if ($isExec2 -and (& $testCompilerNoise $S)) { return $false }
+		}
+		if ($contentFilt) {
+			if (-not (& $testInteresting $S)) { return $false }
+		}
+		return $true
 	}
 	$hits = New-Object System.Collections.ArrayList
 	$fs = $null
@@ -24019,15 +27677,16 @@ function Get-MBFileStrings {
 					} else {
 						if ($run.Count -ge $MinLen) {
 							$s = [System.Text.Encoding]::ASCII.GetString($run.ToArray())
-							$pass = if ($filt) { & $testInteresting $s } else { $true }
-							if ($pass) {
+							if (& $acceptHit $s $runStart) {
 								$show = $s
 								if ($show.Length -gt 160) { $show = $show.Substring(0, 157) + '...' }
+								$secName = Get-MBPeSectionForOffset -Sections $peSecs -FileOffset $runStart
 								[void]$hits.Add([ordered]@{
 									offset = $runStart
 									offset_hex = ('0x{0:X}' -f $runStart)
 									encoding = 'ascii'
 									length = $run.Count
+									section = $secName
 									text = $show
 								})
 							}
@@ -24040,15 +27699,16 @@ function Get-MBFileStrings {
 			}
 			if ($run.Count -ge $MinLen -and $hits.Count -lt $MaxHits) {
 				$s = [System.Text.Encoding]::ASCII.GetString($run.ToArray())
-				$pass = if ($filt) { & $testInteresting $s } else { $true }
-				if ($pass) {
+				if (& $acceptHit $s $runStart) {
 					$show = $s
 					if ($show.Length -gt 160) { $show = $show.Substring(0, 157) + '...' }
+					$secName = Get-MBPeSectionForOffset -Sections $peSecs -FileOffset $runStart
 					[void]$hits.Add([ordered]@{
 						offset = $runStart
 						offset_hex = ('0x{0:X}' -f $runStart)
 						encoding = 'ascii'
 						length = $run.Count
+						section = $secName
 						text = $show
 					})
 				}
@@ -24078,15 +27738,16 @@ function Get-MBFileStrings {
 					} else {
 						if ($chars.Count -ge $MinLen) {
 							$s = -join $chars
-							$pass = if ($filt) { & $testInteresting $s } else { $true }
-							if ($pass) {
+							if (& $acceptHit $s $runStart) {
 								$show = $s
 								if ($show.Length -gt 160) { $show = $show.Substring(0, 157) + '...' }
+								$secName = Get-MBPeSectionForOffset -Sections $peSecs -FileOffset $runStart
 								[void]$hits.Add([ordered]@{
 									offset = $runStart
 									offset_hex = ('0x{0:X}' -f $runStart)
 									encoding = 'utf16le'
 									length = $chars.Count
+									section = $secName
 									text = $show
 								})
 							}
@@ -24097,11 +27758,30 @@ function Get-MBFileStrings {
 				}
 				$pos += $n
 			}
+			if ($chars.Count -ge $MinLen -and $hits.Count -lt $MaxHits) {
+				$s = -join $chars
+				if (& $acceptHit $s $runStart) {
+					$show = $s
+					if ($show.Length -gt 160) { $show = $show.Substring(0, 157) + '...' }
+					$secName = Get-MBPeSectionForOffset -Sections $peSecs -FileOffset $runStart
+					[void]$hits.Add([ordered]@{
+						offset = $runStart
+						offset_hex = ('0x{0:X}' -f $runStart)
+						encoding = 'utf16le'
+						length = $chars.Count
+						section = $secName
+						text = $show
+					})
+				}
+			}
 		}
 		return @{
 			Ok = $true
 			path = $Path
 			min_len = $MinLen
+			max_len = $(if ($MaxLen -gt 0) { $MaxLen } else { $null })
+			section = $(if ($secFilter) { $secFilter } else { $null })
+			section_class = $secClassFilter
 			filter = $(if ($filt) { $filt } else { $null })
 			encoding = $encMode
 			count = $hits.Count
@@ -24703,6 +28383,1817 @@ function Get-MBByteClassSummary {
 }
 
 
+# ===== Enhanced PE forensics helpers (PeInfo / imports / resources / sections) =====
+
+function Format-MBPeSectionFlags {
+	param([uint32]$Chars)
+	$flags = New-Object System.Collections.ArrayList
+	if ($Chars -band 0x20) { [void]$flags.Add('CODE') }
+	if ($Chars -band 0x40) { [void]$flags.Add('IDATA') }
+	if ($Chars -band 0x80) { [void]$flags.Add('UDATA') }
+	if ($Chars -band 0x20000000) { [void]$flags.Add('EXEC') }
+	if ($Chars -band 0x40000000) { [void]$flags.Add('READ') }
+	if ($Chars -band 0x80000000) { [void]$flags.Add('WRITE') }
+	if ($Chars -band 0x10000000) { [void]$flags.Add('SHARED') }
+	if ($Chars -band 0x01000000) { [void]$flags.Add('DISCARDABLE') }
+	if ($flags.Count -eq 0) { return ('0x{0:X}' -f $Chars) }
+	return ($flags -join '|')
+}
+
+function Get-MBPeSectionForOffset {
+	param($Sections, [long]$FileOffset)
+	if ($null -eq $Sections -or $FileOffset -lt 0) { return $null }
+	foreach ($s in @($Sections)) {
+		try {
+			$rptr = [long][uint32]$s.raw_ptr
+			$rsz = [long][uint32]$s.raw_size
+			if ($rsz -le 0) { continue }
+			if ($FileOffset -ge $rptr -and $FileOffset -lt ($rptr + $rsz)) {
+				return [string]$s.name
+			}
+		} catch {}
+	}
+	return $null
+}
+
+function Get-MBX86DisasmListing {
+	# Compact disasm listing over a byte window (for HexEdit context).
+	param(
+		[byte[]]$Bytes,
+		[long]$BaseOffset = 0,
+		[bool]$Is64 = $false,
+		[int]$MaxInsns = 16,
+		[long]$MarkStart = -1,
+		[long]$MarkEnd = -1
+	)
+	$lines = New-Object System.Collections.ArrayList
+	if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+		return @{ Ok = $false; Error = 'empty'; listing = ''; count = 0; lines = @() }
+	}
+	if ($MaxInsns -le 0) { $MaxInsns = 16 }
+	if ($MaxInsns -gt 48) { $MaxInsns = 48 }
+	$ix = 0
+	$nIns = 0
+	$err = $null
+	try {
+		while ($ix -lt $Bytes.Length -and $nIns -lt $MaxInsns) {
+			$dec = Read-MBX86Instruction -Bytes $Bytes -Index $ix -FileOffset $BaseOffset -Is64 $Is64
+			if (-not $dec.Ok) {
+				if (-not $err) { $err = [string]$dec.Error }
+				break
+			}
+			$fo = [long]$dec.offset
+			$mark = ' '
+			if ($MarkStart -ge 0 -and $fo -ge $MarkStart -and $fo -lt $MarkEnd) { $mark = '>' }
+			elseif ($MarkStart -ge 0 -and $fo -lt $MarkStart -and ([long]$dec.offset + [int]$dec.length) -gt $MarkStart) { $mark = '>' }
+			$tline = ('{0}{1}  {2,-18}  {3,-10} {4}' -f $mark, $dec.offset_hex, $dec.bytes, $dec.mnemonic, $dec.operands)
+			[void]$lines.Add($tline)
+			$ix = [int]$dec.next_index
+			if ($ix -le 0 -or $ix -le ($fo - $BaseOffset) ) {
+				# safety: always advance at least 1
+				$ix = ($fo - $BaseOffset) + [Math]::Max(1, [int]$dec.length)
+			}
+			$nIns++
+		}
+	} catch {
+		$err = $_.Exception.Message
+	}
+	return @{
+		Ok = ($lines.Count -gt 0)
+		Error = $err
+		listing = ($lines -join "`n")
+		count = $lines.Count
+		lines = @($lines)
+	}
+}
+
+function Get-MBPeHeaderLayout {
+	# Low-level PE header map used by PeInfo / SectionManager / ResourceEditor.
+	param([string]$Path)
+	$out = [ordered]@{
+		Ok = $false
+		Error = $null
+		Path = $Path
+		FileSize = 0L
+		Is64 = $false
+		Machine = ''
+		MachineCode = [uint16]0
+		Characteristics = [uint16]0
+		TimeDateStamp = [uint32]0
+		TimeDateUtc = $null
+		NumberOfSections = 0
+		SizeOfOptionalHeader = 0
+		E_lfanew = 0
+		PeOffset = 0
+		OptionalOffset = 0
+		SectionTableOffset = 0
+		EntryRva = [uint32]0
+		EntryFile = $null
+		ImageBase = [uint64]0
+		SectionAlignment = [uint32]0
+		FileAlignment = [uint32]0
+		SizeOfImage = [uint32]0
+		SizeOfHeaders = [uint32]0
+		Subsystem = [uint16]0
+		SubsystemName = ''
+		DllCharacteristics = [uint16]0
+		DataDirectories = @()
+		Sections = @()
+	}
+	$fs = $null
+	try {
+		if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+			$out.Error = 'not_found'; return $out
+		}
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$out.FileSize = [long]$fs.Length
+		if ($fs.Length -lt 64) { $out.Error = 'too_small'; return $out }
+		$hdr = New-Object byte[] 64
+		[void]$fs.Read($hdr, 0, 64)
+		if ($hdr[0] -ne 0x4D -or $hdr[1] -ne 0x5A) { $out.Error = 'not_mz'; return $out }
+		$e_lfanew = [BitConverter]::ToInt32($hdr, 0x3C)
+		$out.E_lfanew = $e_lfanew
+		if ($e_lfanew -le 0 -or ($e_lfanew + 24) -gt $fs.Length) { $out.Error = 'bad_lfanew'; return $out }
+		[void]$fs.Seek([long]$e_lfanew, [System.IO.SeekOrigin]::Begin)
+		$peSig = New-Object byte[] 4
+		[void]$fs.Read($peSig, 0, 4)
+		if ($peSig[0] -ne 0x50 -or $peSig[1] -ne 0x45 -or $peSig[2] -ne 0 -or $peSig[3] -ne 0) {
+			$out.Error = 'not_pe'; return $out
+		}
+		$out.PeOffset = $e_lfanew
+		$coff = New-Object byte[] 20
+		[void]$fs.Read($coff, 0, 20)
+		$machine = [BitConverter]::ToUInt16($coff, 0)
+		$numSec = [BitConverter]::ToUInt16($coff, 2)
+		$timedate = [BitConverter]::ToUInt32($coff, 4)
+		$optSize = [BitConverter]::ToUInt16($coff, 16)
+		$chars = [BitConverter]::ToUInt16($coff, 18)
+		$out.MachineCode = $machine
+		$out.Machine = switch ($machine) {
+			0x14c { 'i386' }
+			0x8664 { 'AMD64' }
+			0xAA64 { 'ARM64' }
+			0x1c0 { 'ARM' }
+			0x1c4 { 'ARMv7' }
+			default { ('0x{0:X}' -f $machine) }
+		}
+		$out.NumberOfSections = [int]$numSec
+		$out.SizeOfOptionalHeader = [int]$optSize
+		$out.Characteristics = $chars
+		$out.TimeDateStamp = $timedate
+		if ($timedate -gt 0) {
+			try {
+				$out.TimeDateUtc = [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).AddSeconds([double]$timedate).ToString('yyyy-MM-dd HH:mm:ss') + 'Z'
+			} catch {}
+		}
+		$optOff = $e_lfanew + 24
+		$out.OptionalOffset = $optOff
+		$dataDirOff = 0
+		$numRvaSizes = 0
+		if ($optSize -ge 2 -and ($optOff + $optSize) -le $fs.Length) {
+			[void]$fs.Seek([long]$optOff, [System.IO.SeekOrigin]::Begin)
+			$opt = New-Object byte[] ([Math]::Min([int]$optSize, 384))
+			[void]$fs.Read($opt, 0, $opt.Length)
+			$magic = [BitConverter]::ToUInt16($opt, 0)
+			$is64 = ($magic -eq 0x20B)
+			$out.Is64 = $is64
+			if ($magic -eq 0x10B -or $magic -eq 0x20B) {
+				$out.EntryRva = [BitConverter]::ToUInt32($opt, 16)
+				if ($is64 -and $opt.Length -ge 32) {
+					$out.ImageBase = [BitConverter]::ToUInt64($opt, 24)
+					if ($opt.Length -ge 40) {
+						$out.SectionAlignment = [BitConverter]::ToUInt32($opt, 32)
+						$out.FileAlignment = [BitConverter]::ToUInt32($opt, 36)
+					}
+					if ($opt.Length -ge 60) { $out.SizeOfImage = [BitConverter]::ToUInt32($opt, 56) }
+					if ($opt.Length -ge 64) { $out.SizeOfHeaders = [BitConverter]::ToUInt32($opt, 60) }
+					if ($opt.Length -ge 72) { $out.Subsystem = [BitConverter]::ToUInt16($opt, 68) }
+					if ($opt.Length -ge 74) { $out.DllCharacteristics = [BitConverter]::ToUInt16($opt, 70) }
+					$dataDirOff = $optOff + 112
+					if ($opt.Length -ge 110) { $numRvaSizes = [BitConverter]::ToInt32($opt, 108) }
+				} elseif ($opt.Length -ge 32) {
+					$out.ImageBase = [uint64][BitConverter]::ToUInt32($opt, 28)
+					if ($opt.Length -ge 40) {
+						$out.SectionAlignment = [BitConverter]::ToUInt32($opt, 32)
+						$out.FileAlignment = [BitConverter]::ToUInt32($opt, 36)
+					}
+					if ($opt.Length -ge 60) { $out.SizeOfImage = [BitConverter]::ToUInt32($opt, 56) }
+					if ($opt.Length -ge 64) { $out.SizeOfHeaders = [BitConverter]::ToUInt32($opt, 60) }
+					if ($opt.Length -ge 72) { $out.Subsystem = [BitConverter]::ToUInt16($opt, 68) }
+					if ($opt.Length -ge 74) { $out.DllCharacteristics = [BitConverter]::ToUInt16($opt, 70) }
+					$dataDirOff = $optOff + 96
+					if ($opt.Length -ge 96) { $numRvaSizes = [BitConverter]::ToInt32($opt, 92) }
+				}
+			} else {
+				$out.Error = 'bad_optional'; return $out
+			}
+		}
+		$out.SubsystemName = switch ([int]$out.Subsystem) {
+			1 { 'Native' }
+			2 { 'Windows GUI' }
+			3 { 'Windows CUI' }
+			5 { 'OS/2 CUI' }
+			7 { 'POSIX CUI' }
+			9 { 'Windows CE' }
+			10 { 'EFI app' }
+			11 { 'EFI boot driver' }
+			12 { 'EFI runtime driver' }
+			14 { 'Xbox' }
+			16 { 'Windows boot app' }
+			default { ('0x{0:X}' -f $out.Subsystem) }
+		}
+		$secOff = $e_lfanew + 24 + $optSize
+		$out.SectionTableOffset = $secOff
+		$secs = New-Object System.Collections.ArrayList
+		$maxSec = [Math]::Min([int]$numSec, 96)
+		for ($s = 0; $s -lt $maxSec; $s++) {
+			$so = $secOff + ($s * 40)
+			if (($so + 40) -gt $fs.Length) { break }
+			[void]$fs.Seek([long]$so, [System.IO.SeekOrigin]::Begin)
+			$sec = New-Object byte[] 40
+			[void]$fs.Read($sec, 0, 40)
+			$nb = New-Object byte[] 8
+			[Array]::Copy($sec, 0, $nb, 0, 8)
+			$name = [System.Text.Encoding]::ASCII.GetString($nb).TrimEnd([char]0)
+			$vsize = [BitConverter]::ToUInt32($sec, 8)
+			$vrva = [BitConverter]::ToUInt32($sec, 12)
+			$rsize = [BitConverter]::ToUInt32($sec, 16)
+			$rptr = [BitConverter]::ToUInt32($sec, 20)
+			$schars = [BitConverter]::ToUInt32($sec, 36)
+			[void]$secs.Add([ordered]@{
+				index = $s
+				name = $name
+				header_offset = [long]$so
+				header_offset_hex = ('0x{0:X}' -f $so)
+				virt_rva = $vrva
+				virt_rva_hex = ('0x{0:X}' -f $vrva)
+				virt_size = $vsize
+				raw_ptr = $rptr
+				raw_ptr_hex = ('0x{0:X}' -f $rptr)
+				raw_size = $rsize
+				characteristics = $schars
+				characteristics_hex = ('0x{0:X}' -f $schars)
+				flags = (Format-MBPeSectionFlags -Chars $schars)
+			})
+		}
+		$out.Sections = @($secs)
+		if ($out.EntryRva -gt 0) {
+			$out.EntryFile = Convert-MBPeRvaToOffset -Sections $out.Sections -Rva $out.EntryRva
+		}
+		$dirNames = @(
+			'Export','Import','Resource','Exception','Security','BaseReloc','Debug','Architecture',
+			'GlobalPtr','TLS','LoadConfig','BoundImport','IAT','DelayImport','CLR','Reserved'
+		)
+		if ($numRvaSizes -le 0) { $numRvaSizes = 16 }
+		if ($numRvaSizes -gt 16) { $numRvaSizes = 16 }
+		$dirs = New-Object System.Collections.ArrayList
+		if ($dataDirOff -gt 0) {
+			for ($d = 0; $d -lt $numRvaSizes; $d++) {
+				$do = $dataDirOff + ($d * 8)
+				if (($do + 8) -gt $fs.Length) { break }
+				[void]$fs.Seek([long]$do, [System.IO.SeekOrigin]::Begin)
+				$db = New-Object byte[] 8
+				[void]$fs.Read($db, 0, 8)
+				$drva = [BitConverter]::ToUInt32($db, 0)
+				$dsz = [BitConverter]::ToUInt32($db, 4)
+				if ($drva -eq 0 -and $dsz -eq 0) { continue }
+				$dname = if ($d -lt $dirNames.Count) { $dirNames[$d] } else { ("Dir{0}" -f $d) }
+				$fo = Convert-MBPeRvaToOffset -Sections $out.Sections -Rva $drva
+				[void]$dirs.Add([ordered]@{
+					index = $d
+					name = $dname
+					rva = $drva
+					rva_hex = ('0x{0:X}' -f $drva)
+					size = $dsz
+					file_offset = $fo
+					file_offset_hex = $(if ($null -ne $fo) { ('0x{0:X}' -f [long]$fo) } else { $null })
+				})
+			}
+		}
+		$out.DataDirectories = @($dirs)
+		$out.Ok = $true
+	} catch {
+		$out.Error = $_.Exception.Message
+		$out.Ok = $false
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	return $out
+}
+
+function Get-MBPeImportTableDetailed {
+	param(
+		[string]$Path,
+		[int]$MaxDlls = 64,
+		[int]$MaxFuncsPerDll = 512,
+		[string]$DllFilter = ''
+	)
+	$out = [ordered]@{
+		Ok = $false
+		Error = $null
+		path = $Path
+		is64 = $false
+		import_dlls = @()
+		delay_dlls = @()
+		import_dll_count = 0
+		delay_dll_count = 0
+		total_functions = 0
+		truncated = $false
+		note = $null
+		has_import_dir = $false
+		has_delay_dir = $false
+	}
+	$layout = Get-MBPeHeaderLayout -Path $Path
+	if (-not $layout.Ok) {
+		$out.Error = $layout.Error
+		$out.note = 'PE header parse failed'
+		$out.Ok = $true  # structured empty result for operators
+		return $out
+	}
+	$out.is64 = [bool]$layout.Is64
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$is64 = [bool]$layout.Is64
+		$thunkSize = if ($is64) { 8 } else { 4 }
+		$ordMask = Get-MBPeOrdinalFlag -Is64 $is64
+		$filt = ([string]$DllFilter).Trim().ToLowerInvariant()
+		$readImportsAt = {
+			param([long]$DescStart, [bool]$IsDelay, [int]$DescStride)
+			$list = New-Object System.Collections.ArrayList
+			$descOff = $DescStart
+			$dllCount = 0
+			$totalFn = 0
+			$trunc = $false
+			while ($dllCount -lt $MaxDlls) {
+				if (($descOff + $DescStride) -gt $fs.Length) { break }
+				[void]$fs.Seek($descOff, [System.IO.SeekOrigin]::Begin)
+				$desc = New-Object byte[] $DescStride
+				[void]$fs.Read($desc, 0, $DescStride)
+				if ($IsDelay) {
+					$attrs = [BitConverter]::ToUInt32($desc, 0)
+					$nameRva = [BitConverter]::ToUInt32($desc, 4)
+					$iatRva = [BitConverter]::ToUInt32($desc, 12)
+					$intRva = [BitConverter]::ToUInt32($desc, 16)
+					if ($attrs -eq 0 -and $nameRva -eq 0 -and $iatRva -eq 0 -and $intRva -eq 0) { break }
+				} else {
+					$oft = [BitConverter]::ToUInt32($desc, 0)
+					$nameRva = [BitConverter]::ToUInt32($desc, 12)
+					$ft = [BitConverter]::ToUInt32($desc, 16)
+					if ($oft -eq 0 -and $nameRva -eq 0 -and $ft -eq 0) { break }
+					$intRva = if ($oft -ne 0) { $oft } else { $ft }
+					$iatRva = $ft
+				}
+				$dllName = ''
+				$nOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $nameRva
+				if ($null -ne $nOff) { $dllName = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$nOff) -MaxLen 128 }
+				if (-not $dllName) { $dllName = ('dll_{0}' -f $dllCount) }
+				if ($filt -and ($dllName.ToLowerInvariant() -notlike "*$filt*")) {
+					$dllCount++; $descOff += $DescStride; continue
+				}
+				$funcs = New-Object System.Collections.ArrayList
+				$nameTableRva = if ($intRva -ne 0) { $intRva } else { $iatRva }
+				$iatTableRva = $iatRva
+				$fnCount = 0
+				if ($nameTableRva -ne 0) {
+					$ntOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $nameTableRva
+					$iatOff = if ($iatTableRva -ne 0) { Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $iatTableRva } else { $null }
+					if ($null -ne $ntOff) {
+						$fi = 0
+						while ($fi -lt $MaxFuncsPerDll) {
+							$slotN = [long]$ntOff + ($fi * $thunkSize)
+							if (($slotN + $thunkSize) -gt $fs.Length) { break }
+							[void]$fs.Seek($slotN, [System.IO.SeekOrigin]::Begin)
+							$tb = New-Object byte[] $thunkSize
+							[void]$fs.Read($tb, 0, $thunkSize)
+							$thunkVal = if ($is64) { [BitConverter]::ToUInt64($tb, 0) } else { [uint64][BitConverter]::ToUInt32($tb, 0) }
+							if ($thunkVal -eq 0) { break }
+							$byOrd = Test-MBPeImportByOrdinal -ThunkVal $thunkVal -Is64 $is64
+							$fname = ''
+							$hint = $null
+							$ord = $null
+							if ($byOrd) {
+								$ord = [int]($thunkVal -band 0xFFFF)
+								$fname = ('#{0}' -f $ord)
+							} else {
+								$ibnRva = Get-MBPeImportNameRva -ThunkVal $thunkVal -Is64 $is64
+								$ibnOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $ibnRva
+								if ($null -ne $ibnOff) {
+									[void]$fs.Seek([long]$ibnOff, [System.IO.SeekOrigin]::Begin)
+									$hb = New-Object byte[] 2
+									[void]$fs.Read($hb, 0, 2)
+									$hint = [int][BitConverter]::ToUInt16($hb, 0)
+									$fname = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$ibnOff + 2) -MaxLen 192
+								}
+								if (-not $fname) { $fname = '?' }
+							}
+							$iatSlot = if ($null -ne $iatOff) { [long]$iatOff + ($fi * $thunkSize) } else { $null }
+							[void]$funcs.Add([ordered]@{
+								name = $fname
+								ordinal = $ord
+								hint = $hint
+								by_ordinal = $byOrd
+								iat_file = $iatSlot
+								iat_file_hex = $(if ($null -ne $iatSlot) { ('0x{0:X}' -f $iatSlot) } else { $null })
+								label = ('{0}!{1}{2}' -f $dllName, $fname, $(if ($IsDelay) { ' (delay)' } else { '' }))
+							})
+							$fi++
+							$fnCount++
+						}
+						if ($fi -ge $MaxFuncsPerDll) { $trunc = $true }
+					}
+				}
+				[void]$list.Add([ordered]@{
+					dll = $dllName
+					function_count = $fnCount
+					functions = @($funcs)
+					delay = $IsDelay
+				})
+				$totalFn += $fnCount
+				$dllCount++
+				$descOff += $DescStride
+			}
+			return @{ list = @($list); count = $list.Count; total = $totalFn; truncated = $trunc }
+		}
+		$impDir = @($layout.DataDirectories | Where-Object { $_.name -eq 'Import' } | Select-Object -First 1)
+		if ($impDir -and $impDir.Count -gt 0) {
+			$out.has_import_dir = $true
+			$ifo = $impDir[0].file_offset
+			$irva = 0
+			try { $irva = [uint32]$impDir[0].rva } catch { $irva = 0 }
+			if ($irva -eq 0 -or $null -eq $ifo) {
+				$out.note = 'Import data directory present but RVA is zero or not mapped to a file offset'
+			} else {
+				try {
+					$r = & $readImportsAt -DescStart ([long]$ifo) -IsDelay $false -DescStride 20
+					$out.import_dlls = $r.list
+					$out.import_dll_count = $r.count
+					$out.total_functions += $r.total
+					if ($r.truncated) { $out.truncated = $true }
+					if ($r.count -eq 0) {
+						$out.note = 'Import directory mapped but no DLL descriptors found (empty or bound-only)'
+					}
+				} catch {
+					$out.note = ('Import parse skipped: {0}' -f $_.Exception.Message)
+				}
+			}
+		} else {
+			$out.note = 'No valid import directory found'
+		}
+		$delayDir = @($layout.DataDirectories | Where-Object { $_.name -eq 'DelayImport' } | Select-Object -First 1)
+		if ($delayDir -and $delayDir.Count -gt 0) {
+			$out.has_delay_dir = $true
+			$dfo = $delayDir[0].file_offset
+			if ($null -ne $dfo) {
+				try {
+					$r2 = & $readImportsAt -DescStart ([long]$dfo) -IsDelay $true -DescStride 32
+					$out.delay_dlls = $r2.list
+					$out.delay_dll_count = $r2.count
+					$out.total_functions += $r2.total
+					if ($r2.truncated) { $out.truncated = $true }
+				} catch {
+					$dn = ('Delay-import parse skipped: {0}' -f $_.Exception.Message)
+					$out.note = if ($out.note) { ($out.note + '; ' + $dn) } else { $dn }
+				}
+			}
+		}
+		$out.Ok = $true
+		$out.Error = $null
+	} catch {
+		# Never hard-fail the tool: return structured empty imports + error note
+		$out.Error = $_.Exception.Message
+		$out.note = ('Import analysis error (returning empty lists): {0}' -f $_.Exception.Message)
+		$out.import_dlls = @()
+		$out.delay_dlls = @()
+		$out.import_dll_count = 0
+		$out.delay_dll_count = 0
+		$out.total_functions = 0
+		$out.Ok = $true
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	return $out
+}
+
+function Get-MBPeExportTableDetailed {
+	param(
+		[string]$Path,
+		[int]$MaxExports = 512
+	)
+	$out = [ordered]@{
+		Ok = $false
+		Error = $null
+		path = $Path
+		module = ''
+		exports = @()
+		count = 0
+		truncated = $false
+	}
+	$layout = Get-MBPeHeaderLayout -Path $Path
+	if (-not $layout.Ok) { $out.Error = $layout.Error; return $out }
+	$expDir = @($layout.DataDirectories | Where-Object { $_.name -eq 'Export' } | Select-Object -First 1)
+	if (-not $expDir -or $expDir.Count -eq 0 -or $null -eq $expDir[0].file_offset) {
+		$out.Ok = $true
+		$out.Error = $null
+		return $out
+	}
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$expFile = [long]$expDir[0].file_offset
+		$expRva = [uint32]$expDir[0].rva
+		$expSize = [uint32]$expDir[0].size
+		if ($expSize -lt 40) { $out.Ok = $true; return $out }
+		[void]$fs.Seek($expFile, [System.IO.SeekOrigin]::Begin)
+		$ed = New-Object byte[] 40
+		[void]$fs.Read($ed, 0, 40)
+		$nameRvaE = [BitConverter]::ToUInt32($ed, 12)
+		$ordBase = [BitConverter]::ToUInt32($ed, 16)
+		$numFuncs = [BitConverter]::ToUInt32($ed, 20)
+		$numNames = [BitConverter]::ToUInt32($ed, 24)
+		$funcsRva = [BitConverter]::ToUInt32($ed, 28)
+		$namesRva = [BitConverter]::ToUInt32($ed, 32)
+		$ordsRva = [BitConverter]::ToUInt32($ed, 36)
+		$modOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $nameRvaE
+		if ($null -ne $modOff) { $out.module = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$modOff) -MaxLen 128 }
+		$funcsOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $funcsRva
+		$namesOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $namesRva
+		$ordsOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $ordsRva
+		$nameByOrdIndex = @{}
+		if ($null -ne $namesOff -and $null -ne $ordsOff -and $numNames -gt 0) {
+			$takeN = [Math]::Min([int]$numNames, $MaxExports)
+			for ($ni = 0; $ni -lt $takeN; $ni++) {
+				[void]$fs.Seek([long]($namesOff + ($ni * 4)), [System.IO.SeekOrigin]::Begin)
+				$nb4 = New-Object byte[] 4
+				[void]$fs.Read($nb4, 0, 4)
+				$nrva = [BitConverter]::ToUInt32($nb4, 0)
+				[void]$fs.Seek([long]($ordsOff + ($ni * 2)), [System.IO.SeekOrigin]::Begin)
+				$ob = New-Object byte[] 2
+				[void]$fs.Read($ob, 0, 2)
+				$ordIdx = [int][BitConverter]::ToUInt16($ob, 0)
+				$nOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $nrva
+				$en = if ($null -ne $nOff) { Read-MBPeAsciiZ -Stream $fs -Offset ([long]$nOff) -MaxLen 128 } else { '' }
+				if ($en) { $nameByOrdIndex[$ordIdx] = $en }
+			}
+			if ([int]$numNames -gt $MaxExports) { $out.truncated = $true }
+		}
+		$exports = New-Object System.Collections.ArrayList
+		if ($null -ne $funcsOff -and $numFuncs -gt 0) {
+			$takeF = [Math]::Min([int]$numFuncs, $MaxExports)
+			for ($fi = 0; $fi -lt $takeF; $fi++) {
+				[void]$fs.Seek([long]($funcsOff + ($fi * 4)), [System.IO.SeekOrigin]::Begin)
+				$fb = New-Object byte[] 4
+				[void]$fs.Read($fb, 0, 4)
+				$frva = [BitConverter]::ToUInt32($fb, 0)
+				if ($frva -eq 0) { continue }
+				$isFwd = ($frva -ge $expRva -and $frva -lt ($expRva + $expSize))
+				$en = if ($nameByOrdIndex.ContainsKey($fi)) { [string]$nameByOrdIndex[$fi] } else { $null }
+				$ord = [int]($ordBase + $fi)
+				$fOff = if (-not $isFwd) { Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $frva } else { $null }
+				$fwd = $null
+				if ($isFwd) {
+					$fwdOff = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $frva
+					if ($null -ne $fwdOff) { $fwd = Read-MBPeAsciiZ -Stream $fs -Offset ([long]$fwdOff) -MaxLen 192 }
+				}
+				[void]$exports.Add([ordered]@{
+					name = $en
+					ordinal = $ord
+					rva = $frva
+					rva_hex = ('0x{0:X}' -f $frva)
+					file_offset = $fOff
+					file_offset_hex = $(if ($null -ne $fOff) { ('0x{0:X}' -f [long]$fOff) } else { $null })
+					forwarder = $fwd
+				})
+			}
+			if ([int]$numFuncs -gt $MaxExports) { $out.truncated = $true }
+		}
+		$out.exports = @($exports)
+		$out.count = $exports.Count
+		$out.Ok = $true
+	} catch {
+		$out.Error = $_.Exception.Message
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	return $out
+}
+
+function Get-MBPeResourceTypeName {
+	param([int]$Id)
+	switch ($Id) {
+		1 { return 'CURSOR' }
+		2 { return 'BITMAP' }
+		3 { return 'ICON' }
+		4 { return 'MENU' }
+		5 { return 'DIALOG' }
+		6 { return 'STRING' }
+		7 { return 'FONTDIR' }
+		8 { return 'FONT' }
+		9 { return 'ACCELERATOR' }
+		10 { return 'RCDATA' }
+		11 { return 'MESSAGETABLE' }
+		12 { return 'GROUP_CURSOR' }
+		14 { return 'GROUP_ICON' }
+		16 { return 'VERSION' }
+		24 { return 'MANIFEST' }
+		default { return ('ID_{0}' -f $Id) }
+	}
+}
+
+function Get-MBPeResourceTree {
+	param(
+		[string]$Path,
+		[int]$MaxEntries = 200
+	)
+	$out = [ordered]@{
+		Ok = $false
+		Error = $null
+		path = $Path
+		resources = @()
+		count = 0
+		truncated = $false
+	}
+	$layout = Get-MBPeHeaderLayout -Path $Path
+	if (-not $layout.Ok) { $out.Error = $layout.Error; return $out }
+	$resDir = @($layout.DataDirectories | Where-Object { $_.name -eq 'Resource' } | Select-Object -First 1)
+	if (-not $resDir -or $resDir.Count -eq 0 -or $null -eq $resDir[0].file_offset) {
+		$out.Ok = $true
+		return $out
+	}
+	$resRootFile = [long]$resDir[0].file_offset
+	$resRootRva = [uint32]$resDir[0].rva
+	$fs = $null
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$entries = New-Object System.Collections.ArrayList
+		$readName = {
+			param([uint32]$NameField)
+			# high bit set => name is string at offset
+			if (($NameField -band 0x80000000) -ne 0) {
+				$off = $resRootFile + ($NameField -band 0x7FFFFFFF)
+				if (($off + 2) -gt $fs.Length) { return '?' }
+				[void]$fs.Seek($off, [System.IO.SeekOrigin]::Begin)
+				$lenB = New-Object byte[] 2
+				[void]$fs.Read($lenB, 0, 2)
+				$nchars = [int][BitConverter]::ToUInt16($lenB, 0)
+				if ($nchars -le 0 -or $nchars -gt 260) { return '?' }
+				$wb = New-Object byte[] ($nchars * 2)
+				[void]$fs.Read($wb, 0, $wb.Length)
+				return [System.Text.Encoding]::Unicode.GetString($wb)
+			}
+			return $null
+		}
+		$walk = $null
+		$walk = {
+			param([long]$DirFileOff, [int]$Level, [string]$TypeName, [string]$NameName, [int]$TypeId, [int]$NameId)
+			if ($entries.Count -ge $MaxEntries) { $out.truncated = $true; return }
+			if (($DirFileOff + 16) -gt $fs.Length) { return }
+			[void]$fs.Seek($DirFileOff, [System.IO.SeekOrigin]::Begin)
+			$dir = New-Object byte[] 16
+			[void]$fs.Read($dir, 0, 16)
+			$numNamed = [int][BitConverter]::ToUInt16($dir, 12)
+			$numId = [int][BitConverter]::ToUInt16($dir, 14)
+			$total = $numNamed + $numId
+			if ($total -le 0 -or $total -gt 4096) { return }
+			for ($i = 0; $i -lt $total; $i++) {
+				if ($entries.Count -ge $MaxEntries) { $out.truncated = $true; return }
+				$entOff = $DirFileOff + 16 + ($i * 8)
+				if (($entOff + 8) -gt $fs.Length) { break }
+				[void]$fs.Seek($entOff, [System.IO.SeekOrigin]::Begin)
+				$eb = New-Object byte[] 8
+				[void]$fs.Read($eb, 0, 8)
+				$nameField = [BitConverter]::ToUInt32($eb, 0)
+				$offsetField = [BitConverter]::ToUInt32($eb, 4)
+				$isDir = (($offsetField -band 0x80000000) -ne 0)
+				$nextOff = $resRootFile + ($offsetField -band 0x7FFFFFFF)
+				$idOrName = $null
+				$strName = & $readName $nameField
+				if ($null -ne $strName) { $idOrName = $strName }
+				else { $idOrName = [int]($nameField -band 0xFFFF) }
+				$tName = $TypeName
+				$nName = $NameName
+				$tId = $TypeId
+				$nId = $NameId
+				if ($Level -eq 0) {
+					if ($strName) { $tName = $strName; $tId = -1 }
+					else { $tId = [int]$idOrName; $tName = Get-MBPeResourceTypeName -Id $tId }
+				} elseif ($Level -eq 1) {
+					if ($strName) { $nName = $strName; $nId = -1 }
+					else { $nId = [int]$idOrName; $nName = [string]$idOrName }
+				}
+				if ($isDir) {
+					if ($Level -ge 2) { continue }
+					& $walk $nextOff ($Level + 1) $tName $nName $tId $nId
+				} else {
+					# leaf data entry
+					if (($nextOff + 16) -gt $fs.Length) { continue }
+					[void]$fs.Seek($nextOff, [System.IO.SeekOrigin]::Begin)
+					$de = New-Object byte[] 16
+					[void]$fs.Read($de, 0, 16)
+					$dataRva = [BitConverter]::ToUInt32($de, 0)
+					$dataSize = [BitConverter]::ToUInt32($de, 4)
+					$codePage = [BitConverter]::ToUInt32($de, 8)
+					$lang = if ($Level -ge 2) {
+						if ($strName) { $strName } else { [string]([int]$idOrName) }
+					} else { '0' }
+					$dataFile = Convert-MBPeRvaToOffset -Sections $layout.Sections -Rva $dataRva
+					[void]$entries.Add([ordered]@{
+						type = $tName
+						type_id = $tId
+						name = $nName
+						name_id = $nId
+						lang = $lang
+						data_rva = $dataRva
+						data_rva_hex = ('0x{0:X}' -f $dataRva)
+						data_size = $dataSize
+						data_file = $dataFile
+						data_file_hex = $(if ($null -ne $dataFile) { ('0x{0:X}' -f [long]$dataFile) } else { $null })
+						codepage = $codePage
+						data_entry_file = $nextOff
+						data_entry_file_hex = ('0x{0:X}' -f $nextOff)
+					})
+				}
+			}
+		}
+		& $walk $resRootFile 0 '' '' -1 -1
+		$out.resources = @($entries)
+		$out.count = $entries.Count
+		$out.Ok = $true
+	} catch {
+		$out.Error = $_.Exception.Message
+	} finally {
+		if ($fs) { try { $fs.Dispose() } catch {} }
+	}
+	return $out
+}
+
+function Get-MBPeInfoBundle {
+	param(
+		[string]$Path,
+		[bool]$IncludeImports = $true,
+		[bool]$IncludeExports = $true,
+		[bool]$IncludeResources = $true,
+		[int]$MaxImportDlls = 48,
+		[int]$MaxImportFuncs = 64,
+		[int]$MaxExports = 64,
+		[int]$MaxResources = 80
+	)
+	$layout = Get-MBPeHeaderLayout -Path $Path
+	if (-not $layout.Ok) {
+		return [ordered]@{ Ok = $false; Error = $layout.Error; path = $Path }
+	}
+	$payload = [ordered]@{
+		Ok = $true
+		path = $Path
+		file_size = $layout.FileSize
+		machine = $layout.Machine
+		is64 = $layout.Is64
+		timestamp = $layout.TimeDateStamp
+		timestamp_utc = $layout.TimeDateUtc
+		characteristics = ('0x{0:X}' -f $layout.Characteristics)
+		subsystem = $layout.SubsystemName
+		image_base = ('0x{0:X}' -f [uint64]$layout.ImageBase)
+		entry_rva = ('0x{0:X}' -f [uint32]$layout.EntryRva)
+		entry_file = $layout.EntryFile
+		entry_file_hex = $(if ($null -ne $layout.EntryFile) { ('0x{0:X}' -f [long]$layout.EntryFile) } else { $null })
+		section_alignment = ('0x{0:X}' -f [uint32]$layout.SectionAlignment)
+		file_alignment = ('0x{0:X}' -f [uint32]$layout.FileAlignment)
+		size_of_image = ('0x{0:X}' -f [uint32]$layout.SizeOfImage)
+		size_of_headers = ('0x{0:X}' -f [uint32]$layout.SizeOfHeaders)
+		number_of_sections = $layout.NumberOfSections
+		sections = @($layout.Sections)
+		data_directories = @($layout.DataDirectories)
+	}
+	# .NET / CLR
+	$clr = @($layout.DataDirectories | Where-Object { $_.name -eq 'CLR' } | Select-Object -First 1)
+	$payload['is_dotnet'] = ($clr -and $clr.Count -gt 0)
+	if ($IncludeImports) {
+		try {
+			$imp = Get-MBPeImportTableDetailed -Path $Path -MaxDlls $MaxImportDlls -MaxFuncsPerDll $MaxImportFuncs
+			$compact = New-Object System.Collections.ArrayList
+			if ($imp -and $imp.Ok) {
+				foreach ($d in @($imp.import_dlls)) {
+					$names = @($d.functions | ForEach-Object { $_.name } | Select-Object -First ([Math]::Max(24, [Math]::Min([int]$MaxImportFuncs, 512))))
+					[void]$compact.Add([ordered]@{
+						dll = $d.dll
+						function_count = $d.function_count
+						functions = $names
+						delay = $false
+					})
+				}
+				foreach ($d in @($imp.delay_dlls)) {
+					$names = @($d.functions | ForEach-Object { $_.name } | Select-Object -First ([Math]::Max(24, [Math]::Min([int]$MaxImportFuncs, 512))))
+					[void]$compact.Add([ordered]@{
+						dll = $d.dll
+						function_count = $d.function_count
+						functions = $names
+						delay = $true
+					})
+				}
+			}
+			$payload['imports'] = [ordered]@{
+				dll_count = $(if ($imp) { [int]$imp.import_dll_count } else { 0 })
+				delay_dll_count = $(if ($imp) { [int]$imp.delay_dll_count } else { 0 })
+				total_functions = $(if ($imp) { [int]$imp.total_functions } else { 0 })
+				truncated = $(if ($imp) { [bool]$imp.truncated } else { $false })
+				has_import_dir = $(if ($imp) { [bool]$imp.has_import_dir } else { $false })
+				has_delay_dir = $(if ($imp) { [bool]$imp.has_delay_dir } else { $false })
+				note = $(if ($imp -and $imp.note) { [string]$imp.note } elseif ($imp -and $imp.Error) { [string]$imp.Error } elseif ($compact.Count -eq 0) { 'No imports listed' } else { $null })
+				dlls = @($compact)
+			}
+		} catch {
+			$payload['imports'] = [ordered]@{
+				dll_count = 0
+				delay_dll_count = 0
+				total_functions = 0
+				truncated = $false
+				has_import_dir = $false
+				has_delay_dir = $false
+				note = ('Import analysis error: {0}' -f $_.Exception.Message)
+				dlls = @()
+			}
+		}
+	}
+	if ($IncludeExports) {
+		$exp = Get-MBPeExportTableDetailed -Path $Path -MaxExports $MaxExports
+		if ($exp.Ok) {
+			$payload['exports'] = [ordered]@{
+				module = $exp.module
+				count = $exp.count
+				truncated = $exp.truncated
+				list = @($exp.exports | Select-Object -First $MaxExports)
+			}
+		} else {
+			$payload['exports_error'] = $exp.Error
+		}
+	}
+	if ($IncludeResources) {
+		$res = Get-MBPeResourceTree -Path $Path -MaxEntries $MaxResources
+		if ($res.Ok) {
+			$payload['resources'] = [ordered]@{
+				count = $res.count
+				truncated = $res.truncated
+				list = @($res.resources)
+			}
+		} else {
+			$payload['resources_error'] = $res.Error
+		}
+	}
+	$payload['hint'] = 'PeInfo=overview. ImportTableViewer for full IAT. ResourceEditor action=list|get|replace. SectionManager action=list|set_chars|add|remove. HexView section=.text / at_entry=true.'
+	return $payload
+}
+
+function Invoke-PeInfo {
+	param(
+		[string]$path,
+		[bool]$imports = $true,
+		[bool]$exports = $true,
+		[bool]$resources = $true,
+		$max_import_dlls = 48,
+		$max_import_funcs = 64,
+		$max_exports = 64,
+		$max_resources = 80,
+		$max = $null,
+		$limit = $null,
+		[bool]$all = $false,
+		[bool]$summary_only = $false,
+		[bool]$help = $false
+	)
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{
+			tool = 'PeInfo'
+			description = 'PE overview: sections, dirs, imports/exports/resources, timestamp'
+			defaults = @{ max_import_dlls = 48; max_import_funcs = 64; max_exports = 64; max_resources = 80 }
+			options = @('all=true|max=all|9999', 'summary_only=true', 'imports/exports/resources=false', 'max_import_funcs=9999')
+			examples = @('PeInfo path=app.exe', 'PeInfo path=explorer.exe all=true', 'PeInfo path=app.exe summary_only=true')
+		}) -Depth 6
+	}
+	$path = Resolve-MBPath -Path $path -MustExist
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+	$fmeta = Get-MBForensicsFileMeta -Path $path
+	$t0 = $fmeta.ms_start
+	$autoRaised = $false
+	# Large PE auto-raise (unless user already asked for summary_only)
+	if (-not $summary_only -and -not $all -and ($null -eq $max -or [string]$max -eq '') -and ($null -eq $limit -or [string]$limit -eq '')) {
+		if ($fmeta.large) {
+			$all = $true
+			$autoRaised = $true
+		}
+	}
+	if ($summary_only) {
+		$imports = $false
+		$exports = $false
+		$resources = $false
+	}
+	if ($all -or ($null -ne $max -and [string]$max -ne '') -or ($null -ne $limit -and [string]$limit -ne '')) {
+		$shared = if ($null -ne $max -and [string]$max -ne '') { $max } elseif ($null -ne $limit -and [string]$limit -ne '') { $limit } else { 'all' }
+		$max_import_dlls = Resolve-MBForensicsLimit -Value $shared -Default 48 -HardMax 512 -All $all
+		$max_import_funcs = Resolve-MBForensicsLimit -Value $shared -Default 64 -HardMax 9999 -All $all
+		$max_exports = Resolve-MBForensicsLimit -Value $shared -Default 64 -HardMax 9999 -All $all
+		$max_resources = Resolve-MBForensicsLimit -Value $shared -Default 80 -HardMax 9999 -All $all
+	} else {
+		$max_import_dlls = Resolve-MBForensicsLimit -Value $max_import_dlls -Default 48 -HardMax 512
+		$max_import_funcs = Resolve-MBForensicsLimit -Value $max_import_funcs -Default 64 -HardMax 9999
+		$max_exports = Resolve-MBForensicsLimit -Value $max_exports -Default 64 -HardMax 9999
+		$max_resources = Resolve-MBForensicsLimit -Value $max_resources -Default 80 -HardMax 9999
+	}
+	try {
+		$r = Get-MBPeInfoBundle -Path $path -IncludeImports $imports -IncludeExports $exports -IncludeResources $resources `
+			-MaxImportDlls ([int]$max_import_dlls) -MaxImportFuncs ([int]$max_import_funcs) -MaxExports ([int]$max_exports) -MaxResources ([int]$max_resources)
+		if (-not $r.Ok) { return "ERROR: $($r.Error)" }
+		if ($r -is [System.Collections.IDictionary]) {
+			$trunc = $false
+			try {
+				if ($r.imports -and $r.imports.truncated) { $trunc = $true }
+				if ($r.exports -and $r.exports.truncated) { $trunc = $true }
+				if ($r.resources -and $r.resources.truncated) { $trunc = $true }
+			} catch {}
+			$secWarn = @()
+			try { $secWarn = @(Get-MBPeSectionNameWarnings -Sections $r.sections) } catch {}
+			if ($summary_only) {
+				$r = [ordered]@{
+					Ok = $true
+					summary_only = $true
+					path = $r.path
+					file_size = $r.file_size
+					machine = $r.machine
+					is64 = $r.is64
+					subsystem = $r.subsystem
+					image_base = $r.image_base
+					entry_rva = $r.entry_rva
+					entry_file_hex = $r.entry_file_hex
+					timestamp_utc = $r.timestamp_utc
+					number_of_sections = $r.number_of_sections
+					section_names = @($r.sections | ForEach-Object { $_.name })
+					data_directory_names = @($r.data_directories | ForEach-Object { $_.name })
+					is_dotnet = $r.is_dotnet
+					section_name_warnings = $secWarn
+					hint = 'summary_only: use summary_only=false (default) for imports/exports/resources detail; all=true for large PEs.'
+				}
+			} else {
+				$r['limits'] = [ordered]@{
+					max_import_dlls = [int]$max_import_dlls
+					max_import_funcs = [int]$max_import_funcs
+					max_exports = [int]$max_exports
+					max_resources = [int]$max_resources
+					auto_raised_for_large_pe = $autoRaised
+					hint = 'all=true or max=all|9999 for large PEs. summary_only=true for quick triage.'
+				}
+				$r['section_name_warnings'] = $secWarn
+				$note = Add-MBForensicsTruncationNote -Truncated $trunc -Tool 'PeInfo lists' -Count 0 -Cap ([int]$max_import_funcs)
+				if ($note) { $r['truncation_hint'] = $note }
+			}
+			if ($fmeta.very_large -or $fmeta.large) {
+				$r['elapsed_ms'] = Get-MBForensicsElapsedMs -StartUtc $t0
+				$r['file_size'] = $fmeta.file_size
+			}
+			if ($autoRaised) {
+				$r['note_large_pe'] = ('File >= 10MB ({0} bytes): caps auto-raised as if all=true. Pass all=false and explicit max_* to keep small defaults.' -f $fmeta.file_size)
+			}
+		}
+		return ConvertTo-MBJson $r -Depth 12
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-ForensicsSummary {
+	param(
+		[string]$path,
+		[int]$maxHits = 40,
+		[bool]$help = $false
+	)
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{ tool = 'ForensicsSummary'; description = 'Quick PE triage: PeInfo summary_only + StringExtract interesting'; examples = @('ForensicsSummary path=app.exe') }) -Depth 4
+	}
+	$path = Resolve-MBPath -Path $path -MustExist
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+	$t0 = [datetime]::UtcNow
+	$peJson = $null
+	$stJson = $null
+	try { $peJson = [string](Invoke-PeInfo -path $path -summary_only $true) } catch { $peJson = ('ERROR: {0}' -f $_.Exception.Message) }
+	try { $stJson = [string](Invoke-StringExtract -path $path -filter 'interesting' -maxHits $maxHits -clean_urls $true) } catch { $stJson = ('ERROR: {0}' -f $_.Exception.Message) }
+	$ns1 = [ordered]@{ tool = 'ImportTableViewer'; suggest = ('ImportTableViewer path={0} all=true' -f $path) }
+	$ns2 = [ordered]@{ tool = 'HexView'; suggest = ('HexView path={0} at_entry=true disasm=true' -f $path) }
+	$ns3 = [ordered]@{ tool = 'FindHexPattern'; suggest = ('FindHexPattern path={0} pattern=E8 ?? ?? ?? ?? resolve_targets=true' -f $path) }
+	return ConvertTo-MBJson ([ordered]@{
+		status = 'ok'
+		path = $path
+		elapsed_ms = [int]([datetime]::UtcNow - $t0).TotalMilliseconds
+		pe_json = $peJson
+		strings_json = $stJson
+		next_steps = @($ns1, $ns2, $ns3)
+		hint = 'Triage bundle (pe_json + strings_json). Deep dive: PeInfo full, ImportTableViewer, HexView at_entry.'
+	}) -Depth 10
+}
+
+function Invoke-ImportTableViewer {
+	param(
+		[string]$path,
+		[string]$dll = '',
+		$max_dlls = 64,
+		$max_funcs = 256,
+		$max = $null,
+		$limit = $null,
+		[bool]$all = $false,
+		[bool]$include_delay = $true,
+		[bool]$by_ordinal_only = $false,
+		[bool]$help = $false
+	)
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{
+			tool = 'ImportTableViewer'
+			options = @('all=true|max=all', 'dll=KERNEL32', 'by_ordinal_only=true', 'include_delay=false')
+			examples = @('ImportTableViewer path=app.exe all=true', 'ImportTableViewer path=app.exe dll=kernel32')
+		}) -Depth 5
+	}
+	$path = Resolve-MBPath -Path $path -MustExist
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+	$fmeta = Get-MBForensicsFileMeta -Path $path
+	$t0 = $fmeta.ms_start
+	$autoRaised = $false
+	if (-not $all -and ($null -eq $max -or [string]$max -eq '') -and ($null -eq $limit -or [string]$limit -eq '') -and $fmeta.large) {
+		$all = $true
+		$autoRaised = $true
+	}
+	if ($all -or ($null -ne $max -and [string]$max -ne '') -or ($null -ne $limit -and [string]$limit -ne '')) {
+		$shared = if ($null -ne $max -and [string]$max -ne '') { $max } elseif ($null -ne $limit -and [string]$limit -ne '') { $limit } else { 'all' }
+		$max_dlls = Resolve-MBForensicsLimit -Value $shared -Default 64 -HardMax 512 -All $all
+		$max_funcs = Resolve-MBForensicsLimit -Value $shared -Default 256 -HardMax 9999 -All $all
+	} else {
+		$max_dlls = Resolve-MBForensicsLimit -Value $max_dlls -Default 64 -HardMax 512
+		$max_funcs = Resolve-MBForensicsLimit -Value $max_funcs -Default 256 -HardMax 9999
+	}
+	try {
+		$imp = Get-MBPeImportTableDetailed -Path $path -MaxDlls ([int]$max_dlls) -MaxFuncsPerDll ([int]$max_funcs) -DllFilter $dll
+		$imports = if ($imp) { @($imp.import_dlls) } else { @() }
+		$delay = if ($imp) { @($imp.delay_dlls) } else { @() }
+		if ($by_ordinal_only) {
+			$filterOrd = {
+				param($dlls)
+				$out = New-Object System.Collections.ArrayList
+				foreach ($d in @($dlls)) {
+					$fns = @($d.functions | Where-Object { $_.by_ordinal -eq $true -or [string]$_.name -match '^#' })
+					if ($fns.Count -gt 0) {
+						[void]$out.Add([ordered]@{
+							dll = $d.dll
+							function_count = $fns.Count
+							functions = $fns
+							delay = $d.delay
+						})
+					}
+				}
+				return @($out)
+			}
+			$imports = & $filterOrd $imports
+			$delay = & $filterOrd $delay
+		}
+		# next_steps: first few IAT slots -> HexView
+		$next = New-Object System.Collections.ArrayList
+		try {
+			$n = 0
+			foreach ($d in @($imports)) {
+				foreach ($f in @($d.functions)) {
+					if ($n -ge 8) { break }
+					if ($f.iat_file_hex) {
+						[void]$next.Add([ordered]@{
+							kind = 'iat'
+							label = $f.label
+							suggest = ('HexView path={0} offset={1} disasm=true' -f $path, $f.iat_file_hex)
+							tool = 'HexView'
+						})
+						$n++
+					}
+				}
+				if ($n -ge 8) { break }
+			}
+		} catch {}
+		$trunc = $(if ($imp) { [bool]$imp.truncated } else { $false })
+		$payload = [ordered]@{
+			status = 'ok'
+			path = $path
+			is64 = $(if ($imp) { [bool]$imp.is64 } else { $false })
+			import_dll_count = $(if ($by_ordinal_only) { @($imports).Count } elseif ($imp) { [int]$imp.import_dll_count } else { 0 })
+			delay_dll_count = $(if ($include_delay) { if ($by_ordinal_only) { @($delay).Count } elseif ($imp) { [int]$imp.delay_dll_count } else { 0 } } else { 0 })
+			total_functions = $(if ($imp) { [int]$imp.total_functions } else { 0 })
+			truncated = $trunc
+			truncation_hint = (Add-MBForensicsTruncationNote -Truncated $trunc -Tool 'ImportTableViewer' -Count 0 -Cap ([int]$max_funcs))
+			has_import_dir = $(if ($imp) { [bool]$imp.has_import_dir } else { $false })
+			has_delay_dir = $(if ($imp) { [bool]$imp.has_delay_dir } else { $false })
+			filter_dll = $(if ($dll) { $dll } else { $null })
+			by_ordinal_only = $by_ordinal_only
+			note = $(if ($imp -and $imp.note) { [string]$imp.note } elseif ($imp -and $imp.Error) { [string]$imp.Error } else { $null })
+			imports = $imports
+			max_dlls = [int]$max_dlls
+			max_funcs = [int]$max_funcs
+			auto_raised_for_large_pe = $autoRaised
+			next_steps = @($next)
+			hint = 'all=true|max=all for large PEs. by_ordinal_only=true lists ordinal imports only. next_steps -> HexView at iat_file_hex.'
+		}
+		if ($include_delay) { $payload['delay_imports'] = $delay }
+		if ($fmeta.large) { $payload['elapsed_ms'] = Get-MBForensicsElapsedMs -StartUtc $t0 }
+		return ConvertTo-MBJson $payload -Depth 10
+	} catch {
+		return ConvertTo-MBJson ([ordered]@{
+			status = 'ok'
+			path = $path
+			import_dll_count = 0
+			delay_dll_count = 0
+			total_functions = 0
+			imports = @()
+			delay_imports = @()
+			note = ('Import analysis error: {0}' -f $_.Exception.Message)
+			hint = 'Structured empty result — PE may be damaged or not a PE. Try PeInfo first.'
+		}) -Depth 6
+	}
+}
+
+function Invoke-ResourceEditor {
+	param(
+		[string]$path,
+		[string]$action = 'list',
+		[string]$type = '',
+		[string]$name = '',
+		[string]$lang = '',
+		[int]$index = -1,
+		[string]$out_path = '',
+		[string]$hex = '',
+		$bytes = $null,
+		[string]$source_path = '',
+		[bool]$backup = $true,
+		[int]$max = 200
+	)
+	$path = Resolve-MBPath -Path $path -MustExist
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+	$act = ([string]$action).Trim().ToLowerInvariant()
+	if ($act -in @('ls', 'tree', 'view')) { $act = 'list' }
+	if ($act -in @('read', 'dump', 'show')) { $act = 'get' }
+	if ($act -in @('get_text', 'text', 'read_text')) { $act = 'get_text' }
+	if ($act -in @('extract', 'save')) { $act = 'extract' }
+	if ($act -in @('swap', 'write', 'set', 'patch')) { $act = 'replace' }
+	try {
+		$tree = Get-MBPeResourceTree -Path $path -MaxEntries $max
+		if (-not $tree.Ok) { return "ERROR: $($tree.Error)" }
+		$res = @($tree.resources)
+		if ($type) {
+			$t = $type.Trim()
+			$res = @($res | Where-Object {
+				[string]$_.type -eq $t -or [string]$_.type_id -eq $t -or
+				([string]$_.type).Equals($t, [StringComparison]::OrdinalIgnoreCase)
+			})
+		}
+		if ($name) {
+			$n = $name.Trim()
+			$res = @($res | Where-Object {
+				[string]$_.name -eq $n -or [string]$_.name_id -eq $n
+			})
+		}
+		if ($lang) {
+			$l = $lang.Trim()
+			$res = @($res | Where-Object { [string]$_.lang -eq $l })
+		}
+		if ($act -eq 'list') {
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'ok'
+				path = $path
+				count = $res.Count
+				truncated = $tree.truncated
+				resources = @($res)
+				hint = 'action=get|extract|replace with type=/name=/lang= or index=. Types: ICON, BITMAP, STRING, DIALOG, VERSION, MANIFEST, RCDATA, ...'
+			}) -Depth 10
+		}
+		$item = $null
+		if ($index -ge 0) {
+			if ($index -ge $res.Count) { return "ERROR: index $index out of range (0..$($res.Count-1))" }
+			$item = $res[$index]
+		} elseif ($res.Count -eq 1) {
+			$item = $res[0]
+		} elseif ($res.Count -eq 0) {
+			return 'ERROR: no matching resource (try action=list)'
+		} else {
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'need_index'
+				error = 'Multiple resources match; pass index= or tighter type/name/lang filters'
+				count = $res.Count
+				resources = @($res | Select-Object -First 24)
+			}) -Depth 8
+		}
+		if ($null -eq $item.data_file) { return 'ERROR: resource data not mapped to a file offset' }
+		$dataOff = [long]$item.data_file
+		$dataSize = [int][Math]::Min([long]$item.data_size, 16MB)
+		if ($dataSize -lt 0) { $dataSize = 0 }
+		if ($act -eq 'get_text') {
+			$full = Read-MBFileBytes -Path $path -Offset $dataOff -Length ([Math]::Min($dataSize, 65536))
+			if (-not $full.Ok) { return "ERROR: $($full.Error)" }
+			$dec = Convert-MBResourceBytesToText -Bytes $full.Bytes -TypeHint ([string]$item.type)
+			$txt = [string]$dec.text
+			if ([string]::IsNullOrWhiteSpace($txt)) {
+				return ConvertTo-MBJson ([ordered]@{
+					status = 'ok'
+					path = $path
+					resource = $item
+					text = $null
+					note = 'No decodable text (binary resource). Use action=get for hex dump or extract for raw bytes.'
+				}) -Depth 8
+			}
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'ok'
+				path = $path
+				resource = $item
+				text = $txt
+				text_encoding = $dec.encoding
+				data_size = $dataSize
+				hint = 'Text-only view. action=get for hex+text; action=extract to save.'
+			}) -Depth 8
+		}
+		if ($act -eq 'get') {
+			$rb = Read-MBFileBytes -Path $path -Offset $dataOff -Length ([Math]::Min($dataSize, 4096))
+			if (-not $rb.Ok) { return "ERROR: $($rb.Error)" }
+			$dump = Format-MBHexDump -Bytes $rb.Bytes -BaseOffset $dataOff -Width 16 -ShowAscii $true
+			$preview = $null
+			$text_encoding_detected = $null
+			try {
+				$take = [Math]::Min($dataSize, 16384)
+				$full = Read-MBFileBytes -Path $path -Offset $dataOff -Length $take
+				if ($full.Ok) {
+					$dec = Convert-MBResourceBytesToText -Bytes $full.Bytes -TypeHint ([string]$item.type)
+					if ($dec.text) {
+						$txt = [string]$dec.text
+						if ($txt.Length -gt 2000) { $txt = $txt.Substring(0, 1997) + '...' }
+						$preview = $txt
+						$text_encoding_detected = $dec.encoding
+					}
+				}
+			} catch {}
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'ok'
+				path = $path
+				resource = $item
+				dump = $dump
+				text_preview = $preview
+				text_encoding = $text_encoding_detected
+				truncated_dump = ($dataSize -gt 4096)
+				hint = 'STRING/MANIFEST auto-decoded in text_preview. extract out_path=; replace source_text= (or hex=/source_path=). Same-or-smaller size only.'
+			}) -Depth 10
+		}
+		if ($act -eq 'extract') {
+			if ([string]::IsNullOrWhiteSpace($out_path)) {
+				$safeType = ([string]$item.type) -replace '[^\w\-]', '_'
+				$safeName = ([string]$item.name) -replace '[^\w\-]', '_'
+				$out_path = Join-Path ([System.IO.Path]::GetDirectoryName($path)) ("{0}_{1}_{2}_{3}.bin" -f ([System.IO.Path]::GetFileNameWithoutExtension($path)), $safeType, $safeName, $item.lang)
+			}
+			$out_path = Resolve-MBPath -Path $out_path
+			$full = Read-MBFileBytes -Path $path -Offset $dataOff -Length $dataSize
+			if (-not $full.Ok) { return "ERROR: $($full.Error)" }
+			$parent = [System.IO.Path]::GetDirectoryName($out_path)
+			if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+				[void][System.IO.Directory]::CreateDirectory($parent)
+			}
+			$encDet = $null
+			try {
+				$dec = Convert-MBResourceBytesToText -Bytes $full.Bytes -TypeHint ([string]$item.type)
+				$encDet = $dec.encoding
+				# If user asked for .txt or type is STRING/MANIFEST, also write a text sibling
+				if ($out_path -match '(?i)\.txt$' -and $dec.text) {
+					[System.IO.File]::WriteAllText($out_path, [string]$dec.text)
+				} else {
+					[System.IO.File]::WriteAllBytes($out_path, $full.Bytes)
+					if ($item.type -in @('STRING', 'MANIFEST', 'VERSION') -and $dec.text -and $out_path -notmatch '(?i)\.txt$') {
+						$txtPath = $out_path + '.txt'
+						try { [System.IO.File]::WriteAllText($txtPath, [string]$dec.text) } catch {}
+					}
+				}
+			} catch {
+				[System.IO.File]::WriteAllBytes($out_path, $full.Bytes)
+			}
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'ok'
+				path = $path
+				resource = $item
+				out_path = $out_path
+				written = $full.Bytes.Length
+				encoding_detected = $encDet
+				hint = 'Binary written to out_path; STRING/MANIFEST also get out_path.txt when decoded.'
+			}) -Depth 8
+		}
+		if ($act -eq 'replace') {
+			$newBytes = $null
+			if (-not [string]::IsNullOrWhiteSpace($source_path)) {
+				$sp = Resolve-MBPath -Path $source_path -MustExist
+				if (-not (Test-Path -LiteralPath $sp -PathType Leaf)) { return "ERROR: source_path not found: $sp" }
+				$newBytes = [System.IO.File]::ReadAllBytes($sp)
+			} elseif ($null -ne $bytes) {
+				$list = New-Object System.Collections.Generic.List[byte]
+				foreach ($b in @(Convert-MBForceArray $bytes)) {
+					$n = 0
+					if (-not [int]::TryParse(([string]$b), [ref]$n)) { return "ERROR: invalid byte: $b" }
+					if ($n -lt 0 -or $n -gt 255) { return "ERROR: byte out of range: $n" }
+					$list.Add([byte]$n)
+				}
+				$newBytes = $list.ToArray()
+			} elseif (-not [string]::IsNullOrWhiteSpace($hex)) {
+				$newBytes = Convert-MBHexStringToBytes -Hex $hex
+			} elseif (-not [string]::IsNullOrWhiteSpace($source_text)) {
+				$te = ([string]$text_encoding).Trim().ToLowerInvariant()
+				if ($te -in @('utf16', 'utf16le', 'unicode')) {
+					$newBytes = [System.Text.Encoding]::Unicode.GetBytes($source_text)
+				} elseif ($te -in @('ascii', 'us-ascii')) {
+					$newBytes = [System.Text.Encoding]::ASCII.GetBytes($source_text)
+				} else {
+					$newBytes = [System.Text.Encoding]::UTF8.GetBytes($source_text)
+				}
+			} else {
+				return 'ERROR: replace requires hex=, bytes=[], source_path=, or source_text='
+			}
+			if ($null -eq $newBytes -or $newBytes.Length -eq 0) { return 'ERROR: empty replacement data' }
+			$origSize = [int]$item.data_size
+			if ($newBytes.Length -gt $origSize) {
+				return ConvertTo-MBJson ([ordered]@{
+					status = 'error'
+					error = 'replacement_too_large'
+					path = $path
+					resource = $item
+					original_size = $origSize
+					new_size = $newBytes.Length
+					overflow_bytes = ($newBytes.Length - $origSize)
+					hint = 'Slot cannot grow. Use a smaller payload, pad-down (new_size <= original_size), or a PE resource editor offline.'
+				}) -Depth 8
+			}
+			# Size validation feedback (also in approval details)
+			$sizeNote = ('Size OK: {0} -> {1} bytes (pad {2})' -f $newBytes.Length, $origSize, ($origSize - $newBytes.Length))
+			# pad to original size so resource directory Size field stays valid
+			$writeBuf = New-Object byte[] $origSize
+			[Array]::Copy($newBytes, 0, $writeBuf, 0, $newBytes.Length)
+			$details = @"
+Path: $path
+Resource: type=$($item.type) name=$($item.name) lang=$($item.lang)
+Data file offset: 0x$('{0:X}' -f $dataOff)
+Original size: $origSize
+New payload: $($newBytes.Length) (padded to $origSize)
+$sizeNote
+Backup: $backup
+"@
+			$codeShow = Format-MBHexDump -Bytes ($writeBuf | Select-Object -First 64) -BaseOffset $dataOff -Width 16 -ShowAscii $true
+			if (-not (Request-Confirmation -Title 'ResourceEditor replace requires approval' -Details $details -Code $codeShow -CodeLang 'text')) {
+				return 'BLOCKED BY USER: ResourceEditor replace denied by operator.'
+			}
+			$bakPath = $null
+			if ($backup) { $bakPath = Backup-MBFile -Path $path -Enabled $true }
+			$fs = $null
+			try {
+				$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+				[void]$fs.Seek($dataOff, [System.IO.SeekOrigin]::Begin)
+				$fs.Write($writeBuf, 0, $writeBuf.Length)
+				$fs.Flush()
+			} finally {
+				if ($fs) { try { $fs.Dispose() } catch {} }
+			}
+			return ConvertTo-MBJson ([ordered]@{
+				status = $(if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' })
+				path = $path
+				resource = $item
+				written = $writeBuf.Length
+				payload_bytes = $newBytes.Length
+				padded = ($newBytes.Length -lt $origSize)
+				backup = $bakPath
+			}) -Depth 8
+		}
+		return "ERROR: unknown action '$action' (use list|get|get_text|extract|replace)"
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
+}
+
+function Invoke-SectionManager {
+	param(
+		[string]$path,
+		[string]$action = 'list',
+		[string]$section = '',
+		[int]$index = -1,
+		[string]$characteristics = '',
+		[string]$flags = '',
+		[string]$name = '',
+		[string]$hex = '',
+		$bytes = $null,
+		[string]$source_path = '',
+		[long]$raw_size = 0,
+		[long]$virt_size = 0,
+		[bool]$backup = $true,
+		[bool]$validate = $true,
+		[bool]$dry_run = $false,
+		[bool]$help = $false
+	)
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{
+			tool = 'SectionManager'
+			actions = @('list', 'get_section', 'set_chars', 'add', 'remove')
+			options = @('validate=true', 'dry_run=true previews without writing', 'flags=EXEC|READ|WRITE|CODE', 'remove only last section')
+		}) -Depth 5
+	}
+	$path = Resolve-MBPath -Path $path -MustExist
+	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+	$act = ([string]$action).Trim().ToLowerInvariant()
+	if ($act -in @('ls', 'show')) { $act = 'list' }
+	if ($act -in @('set', 'set_permissions', 'perms', 'chmod')) { $act = 'set_chars' }
+	if ($act -in @('append', 'new')) { $act = 'add' }
+	if ($act -in @('del', 'delete')) { $act = 'remove' }
+	$layout = Get-MBPeHeaderLayout -Path $path
+	if (-not $layout.Ok) {
+		$errMap = @{
+			'too_small' = 'Not a valid PE file (file too small for PE headers)'
+			'not_mz' = 'Not a valid PE file (missing MZ DOS header)'
+			'not_pe' = 'Not a valid PE file (MZ present but PE signature missing)'
+			'bad_lfanew' = 'Not a valid PE file (invalid e_lfanew / PE header offset)'
+			'bad_optional' = 'Not a valid PE file (optional header magic not PE32/PE32+)'
+			'not_found' = 'File not found'
+		}
+		$code = [string]$layout.Error
+		$human = if ($errMap.ContainsKey($code)) { $errMap[$code] } else { "PE parse failed: $code" }
+		return "ERROR: $human"
+	}
+	if ($act -in @('get', 'get_section', 'show_section')) {
+		$sec = $null
+		if ($index -ge 0) {
+			if ($index -lt $layout.Sections.Count) { $sec = $layout.Sections[$index] }
+		} elseif ($section) {
+			$want = $section.Trim()
+			foreach ($s in @($layout.Sections)) {
+				if ([string]::Equals([string]$s.name, $want, [StringComparison]::OrdinalIgnoreCase)) { $sec = $s; break }
+				if ($s.name.TrimStart('.') -eq $want.TrimStart('.')) { $sec = $s; break }
+			}
+		}
+		if (-not $sec) { return 'ERROR: section not found (use section=.text or index=0)' }
+		return ConvertTo-MBJson ([ordered]@{
+			status = 'ok'
+			path = $path
+			section = $sec
+			nonstandard_name = (-not (Test-MBPeStandardSectionName -Name ([string]$sec.name)))
+			hint = 'action=set_chars / add / remove for mutations (dry_run=true to preview).'
+		}) -Depth 8
+	}
+	if ($act -eq 'list') {
+		return ConvertTo-MBJson ([ordered]@{
+			status = 'ok'
+			path = $path
+			number_of_sections = $layout.NumberOfSections
+			section_table_offset = ('0x{0:X}' -f [long]$layout.SectionTableOffset)
+			file_alignment = ('0x{0:X}' -f [uint32]$layout.FileAlignment)
+			section_alignment = ('0x{0:X}' -f [uint32]$layout.SectionAlignment)
+			size_of_image = ('0x{0:X}' -f [uint32]$layout.SizeOfImage)
+			sections = @($layout.Sections)
+			section_name_warnings = @(Get-MBPeSectionNameWarnings -Sections $layout.Sections)
+			hint = 'action=set_chars section=.text flags=EXEC|READ|CODE validate=true. action=add name=.new hex=/. action=remove last section (or index= last only).'
+		}) -Depth 10
+	}
+	$findSec = {
+		param([string]$Want, [int]$Idx)
+		if ($Idx -ge 0) {
+			if ($Idx -ge $layout.Sections.Count) { return $null }
+			return $layout.Sections[$Idx]
+		}
+		if ([string]::IsNullOrWhiteSpace($Want)) { return $null }
+		$w = $Want.Trim()
+		foreach ($s in @($layout.Sections)) {
+			if ([string]::Equals([string]$s.name, $w, [StringComparison]::OrdinalIgnoreCase)) { return $s }
+			if ($s.name.TrimStart('.') -eq $w.TrimStart('.')) { return $s }
+		}
+		return $null
+	}
+	$parseChars = {
+		param([string]$Ch, [string]$Fl)
+		if (-not [string]::IsNullOrWhiteSpace($Ch)) {
+			$c = $Ch.Trim()
+			if ($c -match '^0x') { return [Convert]::ToUInt32($c, 16) }
+			return [Convert]::ToUInt32($c, 10)
+		}
+		if ([string]::IsNullOrWhiteSpace($Fl)) { return $null }
+		$val = [uint32]0
+		foreach ($part in ($Fl.ToUpperInvariant() -split '[|,\s]+')) {
+			if ([string]::IsNullOrWhiteSpace($part)) { continue }
+			switch ($part) {
+				'CODE' { $val = $val -bor 0x20 }
+				'IDATA' { $val = $val -bor 0x40 }
+				'INITIALIZED' { $val = $val -bor 0x40 }
+				'UDATA' { $val = $val -bor 0x80 }
+				'UNINITIALIZED' { $val = $val -bor 0x80 }
+				'EXEC' { $val = $val -bor 0x20000000 }
+				'EXECUTE' { $val = $val -bor 0x20000000 }
+				'READ' { $val = $val -bor 0x40000000 }
+				'WRITE' { $val = $val -bor 0x80000000 }
+				'SHARED' { $val = $val -bor 0x10000000 }
+				'DISCARDABLE' { $val = $val -bor 0x01000000 }
+				default {
+					if ($part -match '^0x') { $val = $val -bor [Convert]::ToUInt32($part, 16) }
+				}
+			}
+		}
+		return $val
+	}
+	if ($act -eq 'set_chars') {
+		$sec = & $findSec $section $index
+		if (-not $sec) { return 'ERROR: section not found (use section=.text or index=0)' }
+		$newChars = & $parseChars $characteristics $flags
+		if ($null -eq $newChars) { return 'ERROR: provide characteristics=0x... or flags=EXEC|READ|WRITE|CODE' }
+		$valNotes = New-Object System.Collections.ArrayList
+		if ($validate) {
+			$nf = Format-MBPeSectionFlags -Chars $newChars
+			$sn = [string]$sec.name
+			if ($sn -match '(?i)text' -and ($nf -notmatch 'EXEC')) {
+				[void]$valNotes.Add('WARNING: .text-like section without EXEC — may break code execution')
+			}
+			if ($sn -match '(?i)text' -and ($nf -match 'WRITE')) {
+				[void]$valNotes.Add('WARNING: executable section is WRITE — unusual (self-modifying/packer style)')
+			}
+			if ($sn -match '(?i)rdata' -and ($nf -match 'WRITE')) {
+				[void]$valNotes.Add('WARNING: .rdata typically READ-only; WRITE is atypical')
+			}
+			if ($nf -match 'EXEC' -and $nf -match 'WRITE') {
+				[void]$valNotes.Add('WARNING: EXEC|WRITE (W+X) is often blocked by modern mitigations / looks packed')
+			}
+			if (-not (Test-MBPeStandardSectionName -Name $sn)) {
+				[void]$valNotes.Add(('NOTE: non-standard section name "{0}"' -f $sn))
+			}
+		}
+		$details = @"
+Path: $path
+Section: $($sec.name) (index $($sec.index))
+Header @ $($sec.header_offset_hex)
+Old characteristics: $($sec.characteristics_hex) [$($sec.flags)]
+New characteristics: 0x$('{0:X}' -f $newChars) [$(Format-MBPeSectionFlags -Chars $newChars)]
+Validation: $(if ($valNotes.Count) { $valNotes -join '; ' } else { 'ok' })
+Backup: $backup
+"@
+		if ($dry_run) {
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'preview'
+				dry_run = $true
+				path = $path
+				section = $sec.name
+				index = $sec.index
+				old_characteristics = $sec.characteristics_hex
+				new_characteristics = ('0x{0:X}' -f $newChars)
+				new_flags = (Format-MBPeSectionFlags -Chars $newChars)
+				validation = @($valNotes)
+				hint = 'dry_run only — re-call without dry_run=true to apply (requires approval).'
+			}) -Depth 6
+		}
+		if (-not (Request-Confirmation -Title 'SectionManager set_chars requires approval' -Details $details -Code $details -CodeLang 'text')) {
+			return 'BLOCKED BY USER: SectionManager set_chars denied by operator.'
+		}
+		$bakPath = $null
+		if ($backup) { $bakPath = Backup-MBFile -Path $path -Enabled $true }
+		$fs = $null
+		try {
+			$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+			$charOff = [long]$sec.header_offset + 36
+			[void]$fs.Seek($charOff, [System.IO.SeekOrigin]::Begin)
+			$bw = [BitConverter]::GetBytes([uint32]$newChars)
+			$fs.Write($bw, 0, 4)
+			$fs.Flush()
+		} finally {
+			if ($fs) { try { $fs.Dispose() } catch {} }
+		}
+		return ConvertTo-MBJson ([ordered]@{
+			status = $(if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' })
+			path = $path
+			section = $sec.name
+			index = $sec.index
+			old_characteristics = $sec.characteristics_hex
+			new_characteristics = ('0x{0:X}' -f $newChars)
+			new_flags = (Format-MBPeSectionFlags -Chars $newChars)
+			validation = @($valNotes)
+			backup = $bakPath
+		}) -Depth 6
+	}
+	if ($act -eq 'add') {
+		$secName = if ($name) { $name.Trim() } else { '.new' }
+		if ($secName.Length -gt 8) { return 'ERROR: section name max 8 characters' }
+		$payload = $null
+		if (-not [string]::IsNullOrWhiteSpace($source_path)) {
+			$sp = Resolve-MBPath -Path $source_path -MustExist
+			$payload = [System.IO.File]::ReadAllBytes($sp)
+		} elseif ($null -ne $bytes) {
+			$list = New-Object System.Collections.Generic.List[byte]
+			foreach ($b in @(Convert-MBForceArray $bytes)) {
+				$n = 0
+				if (-not [int]::TryParse(([string]$b), [ref]$n)) { return "ERROR: invalid byte: $b" }
+				$list.Add([byte]$n)
+			}
+			$payload = $list.ToArray()
+		} elseif (-not [string]::IsNullOrWhiteSpace($hex)) {
+			$payload = Convert-MBHexStringToBytes -Hex $hex
+		} elseif ($raw_size -gt 0) {
+			$payload = New-Object byte[] ([int][Math]::Min($raw_size, 16MB))
+		} else {
+			return 'ERROR: add requires hex=, bytes=[], source_path=, or raw_size='
+		}
+		if ($payload.Length -gt 16MB) { return 'ERROR: section raw data too large (max 16MB)' }
+		$fileAlign = [uint32]$layout.FileAlignment
+		if ($fileAlign -lt 0x200) { $fileAlign = 0x200 }
+		$secAlign = [uint32]$layout.SectionAlignment
+		if ($secAlign -lt 0x1000) { $secAlign = 0x1000 }
+		$alignUp = {
+			param([long]$V, [long]$A)
+			if ($A -le 0) { return $V }
+			return [long](([long](($V + $A - 1) / $A)) * $A)
+		}
+		$rawSizeAligned = [uint32](& $alignUp ([long]$payload.Length) ([long]$fileAlign))
+		$vSize = if ($virt_size -gt 0) { [uint32]$virt_size } else { [uint32][Math]::Max($payload.Length, 1) }
+		$vSizeAligned = [uint32](& $alignUp ([long]$vSize) ([long]$secAlign))
+		# next VA
+		$nextVa = [uint32]$secAlign
+		$lastRawEnd = [long]$layout.SizeOfHeaders
+		if ($layout.Sections.Count -gt 0) {
+			$last = $layout.Sections[$layout.Sections.Count - 1]
+			$vaEnd = [long][uint32]$last.virt_rva + [long][Math]::Max([uint32]$last.virt_size, 1)
+			$nextVa = [uint32](& $alignUp $vaEnd ([long]$secAlign))
+			$rawEnd = [long][uint32]$last.raw_ptr + [long][uint32]$last.raw_size
+			if ($rawEnd -gt $lastRawEnd) { $lastRawEnd = $rawEnd }
+		}
+		$newRawPtr = [uint32](& $alignUp $lastRawEnd ([long]$fileAlign))
+		$newChars = & $parseChars $characteristics $flags
+		if ($null -eq $newChars) { $newChars = [uint32]0x40000040 } # READ|IDATA default
+		# room for section header?
+		$newHdrOff = [long]$layout.SectionTableOffset + ([long]$layout.NumberOfSections * 40)
+		$headerRoomEnd = [long]$layout.SizeOfHeaders
+		if ($layout.Sections.Count -gt 0) {
+			$firstRaw = [long][uint32]$layout.Sections[0].raw_ptr
+			if ($firstRaw -gt 0 -and $firstRaw -lt $headerRoomEnd) { $headerRoomEnd = $firstRaw }
+		}
+		if (($newHdrOff + 40) -gt $headerRoomEnd) {
+			return ("ERROR: no room in PE headers for another section header (need 40 bytes at 0x{0:X}, headers end ~0x{1:X}). Remove a section or rebuild headers offline." -f $newHdrOff, $headerRoomEnd)
+		}
+		$newSizeOfImage = [uint32](& $alignUp ([long]$nextVa + [long]$vSizeAligned) ([long]$secAlign))
+		$details = @"
+Path: $path
+Add section: $secName
+VA: 0x$('{0:X}' -f $nextVa)  VSize: 0x$('{0:X}' -f $vSize) (aligned 0x$('{0:X}' -f $vSizeAligned))
+RawPtr: 0x$('{0:X}' -f $newRawPtr)  RawSize: 0x$('{0:X}' -f $rawSizeAligned)
+Chars: 0x$('{0:X}' -f $newChars) [$(Format-MBPeSectionFlags -Chars $newChars)]
+Payload: $($payload.Length) bytes
+New SizeOfImage: 0x$('{0:X}' -f $newSizeOfImage)
+Backup: $backup
+"@
+		if ($dry_run) {
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'preview'
+				dry_run = $true
+				path = $path
+				would_add = $secName
+				virt_rva_hex = ('0x{0:X}' -f $nextVa)
+				raw_ptr_hex = ('0x{0:X}' -f $newRawPtr)
+				raw_size = $rawSizeAligned
+				characteristics_hex = ('0x{0:X}' -f $newChars)
+				size_of_image_hex = ('0x{0:X}' -f $newSizeOfImage)
+				hint = 'dry_run only — re-call without dry_run=true to apply.'
+			}) -Depth 6
+		}
+		if (-not (Request-Confirmation -Title 'SectionManager add requires approval' -Details $details -Code $details -CodeLang 'text')) {
+			return 'BLOCKED BY USER: SectionManager add denied by operator.'
+		}
+		$bakPath = $null
+		if ($backup) { $bakPath = Backup-MBFile -Path $path -Enabled $true }
+		$fs = $null
+		try {
+			$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+			# write section header
+			$hdr = New-Object byte[] 40
+			$nameBytes = [System.Text.Encoding]::ASCII.GetBytes($secName)
+			[Array]::Copy($nameBytes, 0, $hdr, 0, [Math]::Min(8, $nameBytes.Length))
+			[BitConverter]::GetBytes([uint32]$vSize).CopyTo($hdr, 8)
+			[BitConverter]::GetBytes([uint32]$nextVa).CopyTo($hdr, 12)
+			[BitConverter]::GetBytes([uint32]$rawSizeAligned).CopyTo($hdr, 16)
+			[BitConverter]::GetBytes([uint32]$newRawPtr).CopyTo($hdr, 20)
+			[BitConverter]::GetBytes([uint32]$newChars).CopyTo($hdr, 36)
+			[void]$fs.Seek($newHdrOff, [System.IO.SeekOrigin]::Begin)
+			$fs.Write($hdr, 0, 40)
+			# NumberOfSections++
+			$numOff = [long]$layout.PeOffset + 4 + 2
+			[void]$fs.Seek($numOff, [System.IO.SeekOrigin]::Begin)
+			$nb = [BitConverter]::GetBytes([uint16]($layout.NumberOfSections + 1))
+			$fs.Write($nb, 0, 2)
+			# SizeOfImage in optional header
+			$sizeOfImageOff = if ($layout.Is64) { [long]$layout.OptionalOffset + 56 } else { [long]$layout.OptionalOffset + 56 }
+			[void]$fs.Seek($sizeOfImageOff, [System.IO.SeekOrigin]::Begin)
+			$fs.Write([BitConverter]::GetBytes([uint32]$newSizeOfImage), 0, 4)
+			# append raw data (pad to alignment)
+			$needLen = [long]$newRawPtr + [long]$rawSizeAligned
+			if ($needLen -gt $fs.Length) { $fs.SetLength($needLen) }
+			[void]$fs.Seek([long]$newRawPtr, [System.IO.SeekOrigin]::Begin)
+			$fs.Write($payload, 0, $payload.Length)
+			$pad = [int]($rawSizeAligned - $payload.Length)
+			if ($pad -gt 0) {
+				$z = New-Object byte[] $pad
+				$fs.Write($z, 0, $pad)
+			}
+			$fs.Flush()
+			return ConvertTo-MBJson ([ordered]@{
+				status = $(if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' })
+				path = $path
+				section = $secName
+				virt_rva_hex = ('0x{0:X}' -f $nextVa)
+				raw_ptr_hex = ('0x{0:X}' -f $newRawPtr)
+				raw_size = $rawSizeAligned
+				characteristics_hex = ('0x{0:X}' -f $newChars)
+				size_of_image_hex = ('0x{0:X}' -f $newSizeOfImage)
+				backup = $bakPath
+				note = 'Section appended. Relocs/code references not auto-updated. Verify with PeInfo/SectionManager list.'
+			}) -Depth 6
+		} finally {
+			if ($fs) { try { $fs.Dispose() } catch {} }
+		}
+	}
+	if ($act -eq 'remove') {
+		if ($layout.NumberOfSections -le 1) { return 'ERROR: cannot remove the only section' }
+		$sec = $null
+		if ($index -ge 0 -or $section) {
+			$sec = & $findSec $section $index
+			if (-not $sec) { return 'ERROR: section not found' }
+			if ([int]$sec.index -ne ($layout.NumberOfSections - 1)) {
+				return 'ERROR: only the last section can be removed safely (to avoid shifting VA/raw layout). Reorder offline or remove trailing sections first.'
+			}
+		} else {
+			$sec = $layout.Sections[$layout.NumberOfSections - 1]
+		}
+		$newNum = $layout.NumberOfSections - 1
+		$newSizeOfImage = [uint32]$layout.SizeOfImage
+		if ($newNum -gt 0) {
+			$prev = $layout.Sections[$newNum - 1]
+			$secAlign = [uint32]$layout.SectionAlignment
+			if ($secAlign -lt 0x1000) { $secAlign = 0x1000 }
+			$vaEnd = [long][uint32]$prev.virt_rva + [long][Math]::Max([uint32]$prev.virt_size, 1)
+			$newSizeOfImage = [uint32]([long](([long](($vaEnd + $secAlign - 1) / $secAlign)) * $secAlign))
+		}
+		$truncateTo = [long]$sec.raw_ptr
+		$details = @"
+Path: $path
+Remove LAST section: $($sec.name) (index $($sec.index))
+Raw range: $($sec.raw_ptr_hex) size=$($sec.raw_size)
+Truncate file to: 0x$('{0:X}' -f $truncateTo) (if raw data is at EOF)
+New NumberOfSections: $newNum
+New SizeOfImage: 0x$('{0:X}' -f $newSizeOfImage)
+Backup: $backup
+"@
+		if ($dry_run) {
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'preview'
+				dry_run = $true
+				path = $path
+				would_remove = $sec.name
+				index = $sec.index
+				number_of_sections_after = $newNum
+				size_of_image_hex = ('0x{0:X}' -f $newSizeOfImage)
+				hint = 'dry_run only — re-call without dry_run=true to apply.'
+			}) -Depth 6
+		}
+		if (-not (Request-Confirmation -Title 'SectionManager remove requires approval' -Details $details -Code $details -CodeLang 'text')) {
+			return 'BLOCKED BY USER: SectionManager remove denied by operator.'
+		}
+		$bakPath = $null
+		if ($backup) { $bakPath = Backup-MBFile -Path $path -Enabled $true }
+		$fs = $null
+		try {
+			$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+			# zero section header
+			[void]$fs.Seek([long]$sec.header_offset, [System.IO.SeekOrigin]::Begin)
+			$z40 = New-Object byte[] 40
+			$fs.Write($z40, 0, 40)
+			# NumberOfSections
+			$numOff = [long]$layout.PeOffset + 4 + 2
+			[void]$fs.Seek($numOff, [System.IO.SeekOrigin]::Begin)
+			$fs.Write([BitConverter]::GetBytes([uint16]$newNum), 0, 2)
+			# SizeOfImage
+			$sizeOfImageOff = [long]$layout.OptionalOffset + 56
+			[void]$fs.Seek($sizeOfImageOff, [System.IO.SeekOrigin]::Begin)
+			$fs.Write([BitConverter]::GetBytes([uint32]$newSizeOfImage), 0, 4)
+			# truncate if section raw was at end
+			if ($truncateTo -gt 0 -and ([long]$sec.raw_ptr + [long]$sec.raw_size) -ge $fs.Length) {
+				$fs.SetLength($truncateTo)
+			}
+			$fs.Flush()
+			return ConvertTo-MBJson ([ordered]@{
+				status = $(if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' })
+				path = $path
+				removed = $sec.name
+				index = $sec.index
+				number_of_sections = $newNum
+				size_of_image_hex = ('0x{0:X}' -f $newSizeOfImage)
+				backup = $bakPath
+			}) -Depth 6
+		} finally {
+			if ($fs) { try { $fs.Dispose() } catch {} }
+		}
+	}
+	return "ERROR: unknown action '$action' (use list|get_section|set_chars|add|remove)"
+}
+
+
+
 function Get-MBPeDisasmContext {
 	# Compact PE map for disasm/trace: arch, entry file offset, sections.
 	param([string]$Path)
@@ -24770,12 +30261,18 @@ function Get-MBPeDisasmContext {
 			$nb = New-Object byte[] 8
 			[Array]::Copy($sec, 0, $nb, 0, 8)
 			$name = [System.Text.Encoding]::ASCII.GetString($nb).TrimEnd([char]0)
+			$schars = [BitConverter]::ToUInt32($sec, 36)
 			[void]$secs.Add([ordered]@{
 				name = $name
 				virt_rva = [BitConverter]::ToUInt32($sec, 12)
 				virt_size = [BitConverter]::ToUInt32($sec, 8)
 				raw_ptr = [BitConverter]::ToUInt32($sec, 20)
 				raw_size = [BitConverter]::ToUInt32($sec, 16)
+				characteristics = $schars
+				characteristics_hex = ('0x{0:X}' -f $schars)
+				flags = (Format-MBPeSectionFlags -Chars $schars)
+				raw_ptr_hex = ('0x{0:X}' -f [BitConverter]::ToUInt32($sec, 20))
+				virt_rva_hex = ('0x{0:X}' -f [BitConverter]::ToUInt32($sec, 12))
 			})
 		}
 		$ctx.Sections = @($secs)
@@ -25518,8 +31015,18 @@ function Invoke-HexView {
 		[bool]$functions = $false,
 		$rva = $null,
 		[string]$section = '',
-		[int]$entropy_blocks = 64
+		[int]$entropy_blocks = 64,
+		[bool]$skip_mz_header = $false,
+		[bool]$ignore_mz_header = $false,
+		[bool]$help = $false
 	)
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{
+			tool = 'HexView'
+			options = @('disasm=true', 'trace=true follow_calls=true', 'at_entry=true', 'section=.text', 'skip_mz_header=true', 'hash/functions/entropy/carve')
+			examples = @('HexView path=a.exe at_entry=true disasm=true', 'HexView path=a.exe offset=0 skip_mz_header=true disasm=true', 'HexView path=a.exe section=.text trace=true follow_calls=true')
+		}) -Depth 5
+	}
 	$path = Resolve-MBPath -Path $path -MustExist
 	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
 	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
@@ -25545,6 +31052,23 @@ function Invoke-HexView {
 	if ($arch -eq 'x64') { $is64 = $true }
 	elseif ($arch -eq 'x86') { $is64 = $false }
 	elseif ($peCtx -and $peCtx.Ok) { $is64 = [bool]$peCtx.Is64 }
+
+	# skip DOS/MZ header noise when starting at 0 (beginners often hit db soup)
+	if (($skip_mz_header -or $ignore_mz_header) -and $off -eq 0 -and -not $at_entry -and [string]::IsNullOrWhiteSpace($section) -and ($null -eq $rva -or [string]$rva -eq '')) {
+		if ($peCtx -and $peCtx.Ok) {
+			if ($null -ne $peCtx.EntryFile) {
+				$off = [long]$peCtx.EntryFile
+			} else {
+				foreach ($s in @($peCtx.Sections)) {
+					$sn = [string]$s.name
+					if ($sn -match '(?i)^\.?text$' -and [uint32]$s.raw_ptr -gt 0) {
+						$off = [long][uint32]$s.raw_ptr
+						break
+					}
+				}
+			}
+		}
+	}
 
 	# section= name -> start of raw data
 	if (-not [string]::IsNullOrWhiteSpace($section)) {
@@ -25763,7 +31287,7 @@ function Invoke-HexView {
 		disasm = $disasm
 		trace = $trace
 		arch = $(if ($is64) { 'x64' } else { 'x86' })
-		legend = 'disasm=true: x86/x64 + IAT/delay/export labels; uncertain db runs resync. hash=true SHA256 file+sections. functions=true prologue scan. entropy/carve/rva/section/at_entry. HexSearch ?? patterns; StringsScan; HexEdit preset=force_jcc|nop_range|ret0.'
+		legend = 'pe.sections always listed. disasm=true: x86/x64 + IAT/delay/export labels. hash=true SHA256 file+sections. functions/entropy/carve/rva/section/at_entry. PeInfo/ImportTableViewer/ResourceEditor/SectionManager. FindHexPattern ??; StringExtract; HexEdit disasm context + presets.'
 	}
 	if ($dump) { $payload['dump'] = $dump }
 	try { $payload['byte_classes'] = Get-MBByteClassSummary -Bytes $ra.Bytes } catch {}
@@ -25771,13 +31295,31 @@ function Invoke-HexView {
 		$payload['annotations'] = @($annotations)
 	}
 	if ($peCtx -and $peCtx.Ok) {
+		$secList = New-Object System.Collections.ArrayList
+		foreach ($s in @($peCtx.Sections)) {
+			[void]$secList.Add([ordered]@{
+				name = [string]$s.name
+				virt_rva = $s.virt_rva
+				virt_rva_hex = $(if ($s.PSObject.Properties['virt_rva_hex']) { $s.virt_rva_hex } else { ('0x{0:X}' -f [uint32]$s.virt_rva) })
+				virt_size = $s.virt_size
+				raw_ptr = $s.raw_ptr
+				raw_ptr_hex = $(if ($s.PSObject.Properties['raw_ptr_hex']) { $s.raw_ptr_hex } else { ('0x{0:X}' -f [uint32]$s.raw_ptr) })
+				raw_size = $s.raw_size
+				characteristics_hex = $(if ($s.PSObject.Properties['characteristics_hex']) { $s.characteristics_hex } else { $null })
+				flags = $(if ($s.PSObject.Properties['flags']) { $s.flags } else { $null })
+			})
+		}
 		$payload['pe'] = [ordered]@{
 			machine = $peCtx.Machine
 			is64 = [bool]$peCtx.Is64
 			entry_rva = $peCtx.EntryRva
+			entry_rva_hex = ('0x{0:X}' -f [uint32]$peCtx.EntryRva)
 			entry_file = $peCtx.EntryFile
 			entry_file_hex = $(if ($null -ne $peCtx.EntryFile) { ('0x{0:X}' -f [long]$peCtx.EntryFile) } else { $null })
 			image_base = ('0x{0:X}' -f [uint64]$peCtx.ImageBase)
+			section_count = @($peCtx.Sections).Count
+			sections = @($secList)
+			section_name_warnings = @(Get-MBPeSectionNameWarnings -Sections $peCtx.Sections)
 		}
 		# file offset -> RVA for current window start
 		try {
@@ -25786,6 +31328,8 @@ function Invoke-HexView {
 				$payload['pe']['view_rva'] = $curRva
 				$payload['pe']['view_rva_hex'] = ('0x{0:X}' -f [uint32]$curRva)
 				$payload['pe']['view_va_hex'] = ('0x{0:X}' -f ([uint64]$peCtx.ImageBase + [uint32]$curRva))
+				$viewSec = Get-MBPeSectionForOffset -Sections $peCtx.Sections -FileOffset $off
+				if ($viewSec) { $payload['pe']['view_section'] = $viewSec }
 			}
 		} catch {}
 	}
@@ -25982,81 +31526,287 @@ function Invoke-HexView {
 	return ConvertTo-MBJson $payload -Depth 12
 }
 
-function Invoke-HexSearch {
+function Invoke-FindHexPattern {
 	param(
 		[string]$path,
 		[string]$pattern = '',
 		[string]$hex = '',
 		$offset = 0,
-		[int]$maxResults = 32,
-		$max_scan = 0
+		$maxResults = 32,
+		$max = $null,
+		$limit = $null,
+		[bool]$all = $false,
+		$max_scan = 0,
+		[bool]$resolve_targets = $false,
+		[bool]$help = $false
 	)
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{
+			tool = 'FindHexPattern'
+			description = 'Hex pattern search with ?? wildcards; multi-pattern with ; separator'
+			options = @('pattern="E8 ?? ?? ?? ??"', 'pattern="E8 ?? ?? ?? ??;E9 ?? ?? ?? ??"', 'all=true|max=all', 'resolve_targets=true', 'max_scan=')
+			examples = @('FindHexPattern path=a.exe pattern="4D 5A"', 'FindHexPattern path=a.exe pattern="E8 ?? ?? ?? ??;E9 ?? ?? ?? ??" resolve_targets=true all=true')
+		}) -Depth 5
+	}
 	$path = Resolve-MBPath -Path $path
 	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
 	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
-	$pat = $pattern
-	if ([string]::IsNullOrWhiteSpace($pat)) { $pat = $hex }
-	if ([string]::IsNullOrWhiteSpace($pat)) {
-		return 'ERROR: Provide pattern= or hex= (e.g. "4D 5A ?? 00" or "E8 ?? ?? ?? ??")'
+	$patRaw = $pattern
+	if ([string]::IsNullOrWhiteSpace($patRaw)) { $patRaw = $hex }
+	if ([string]::IsNullOrWhiteSpace($patRaw)) {
+		return 'ERROR: Provide pattern= or hex= (e.g. "4D 5A ?? 00" or multi "E8 ?? ?? ?? ??;E9 ?? ?? ?? ??")'
 	}
+	# Multi-pattern: split on ; or | (not inside ?? which has no ;)
+	$patterns = @()
+	foreach ($piece in ($patRaw -split '[;|]')) {
+		$p = $piece.Trim()
+		if ($p) { $patterns += $p }
+	}
+	if ($patterns.Count -eq 0) { return 'ERROR: empty pattern after split' }
+
+	$fmeta = Get-MBForensicsFileMeta -Path $path
+	$t0 = $fmeta.ms_start
+	$autoRaised = $false
+	if (-not $all -and ($null -eq $max -or [string]$max -eq '') -and ($null -eq $limit -or [string]$limit -eq '') -and $fmeta.large) {
+		$all = $true
+		$autoRaised = $true
+	}
+	$capSrc = $maxResults
+	if ($null -ne $limit -and [string]$limit -ne '') { $capSrc = $limit }
+	if ($null -ne $max -and [string]$max -ne '') { $capSrc = $max }
+	$maxResults = Resolve-MBForensicsLimit -Value $capSrc -Default 32 -HardMax 9999 -All $all
 	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
 	$ms = 0L
 	if ($null -ne $max_scan -and [string]$max_scan -ne '') {
 		try { $ms = [long]$max_scan } catch { $ms = 0 }
 	}
 	try {
-		$r = Find-MBHexPattern -Path $path -Pattern $pat -Offset $off -MaxResults $maxResults -MaxScan $ms
-		if (-not $r.Ok) { return "ERROR: $($r.Error)" }
+		$peSecs = $null
+		$is64 = $false
+		$symMap = $null
+		try {
+			$lay = Get-MBPeHeaderLayout -Path $path
+			if ($lay.Ok) {
+				$peSecs = $lay.Sections
+				$is64 = [bool]$lay.Is64
+			}
+		} catch {}
+		if ($resolve_targets) {
+			try { $symMap = Get-MBPeSymbolMap -Path $path } catch { $symMap = $null }
+		}
+		$allHits = New-Object System.Collections.ArrayList
+		$anyTrunc = $false
+		$patIdx = 0
+		foreach ($pat in $patterns) {
+			$r = Find-MBHexPattern -Path $path -Pattern $pat -Offset $off -MaxResults $maxResults -MaxScan $ms
+			if (-not $r.Ok) { return "ERROR: pattern[$patIdx] $($r.Error)" }
+			if ($r.truncated) { $anyTrunc = $true }
+			foreach ($h in @($r.hits)) {
+				$abs = [long]$h.offset
+				$sec = Get-MBPeSectionForOffset -Sections $peSecs -FileOffset $abs
+				$bytes = [string]$h.bytes
+				$kind = 'match'
+				if ($bytes -match '^(?i)4D 5A') { $kind = 'mz_header' }
+				elseif ($bytes -match '^(?i)50 45 00 00') { $kind = 'pe_signature' }
+				elseif ($bytes -match '^(?i)E8 ') { $kind = 'call_rel32' }
+				elseif ($bytes -match '^(?i)E9 ') { $kind = 'jmp_rel32' }
+				elseif ($bytes -match '^(?i)EB ') { $kind = 'jmp_short' }
+				elseif ($bytes -match '^(?i)(70|71|72|73|74|75|76|77|78|79|7A|7B|7C|7D|7E|7F) ') { $kind = 'jcc_short' }
+				elseif ($bytes -match '^(?i)0F (8[0-9A-F]) ') { $kind = 'jcc_near' }
+				elseif ($bytes -match '^(?i)FF (15|25) ') { $kind = 'call_or_jmp_indirect' }
+				elseif ($bytes -match '^(?i)90') { $kind = 'nop_like' }
+				elseif ($bytes -match '^(?i)CC') { $kind = 'int3_like' }
+				$hit = [ordered]@{
+					pattern_index = $patIdx
+					pattern = $pat
+					offset = $abs
+					offset_hex = $h.offset_hex
+					bytes = $bytes
+					section = $sec
+					kind = $kind
+				}
+				$doRes = $resolve_targets -or ($kind -match 'call|jmp|jcc')
+				if ($doRes -and $kind -ne 'match' -and $kind -ne 'mz_header' -and $kind -ne 'pe_signature') {
+					$tr = Resolve-MBHexPatternTargets -Path $path -Offset $abs -Kind $kind -Sections $peSecs -SymbolMap $symMap -Is64 $is64
+					if ($tr.resolved -or $tr.target_hex) {
+						$hit['target'] = $tr.target
+						$hit['target_hex'] = $tr.target_hex
+						$hit['fallthrough_hex'] = $tr.fallthrough_hex
+						$hit['target_section'] = $tr.target_section
+						$hit['target_symbol'] = $tr.target_symbol
+						$hit['mnemonic'] = $tr.mnemonic
+						$hit['next'] = $(if ($tr.target_hex) {
+							('HexView path={0} offset={1} disasm=true' -f $path, $tr.target_hex)
+						} else { $null })
+					}
+				}
+				if (-not $hit['next']) {
+					$hit['next'] = ('HexView path={0} offset={1} disasm=true' -f $path, $h.offset_hex)
+				}
+				[void]$allHits.Add($hit)
+			}
+			$patIdx++
+		}
+		# Sort by offset for multi-pattern
+		try {
+			$sorted = @($allHits | Sort-Object { [long]$_.offset })
+		} catch { $sorted = @($allHits) }
+		$truncNote = Add-MBForensicsTruncationNote -Truncated $anyTrunc -Tool 'FindHexPattern' -Count $sorted.Count -Cap $maxResults
 		return ConvertTo-MBJson ([ordered]@{
 			status      = 'ok'
 			path        = $path
-			pattern     = $pat
-			pattern_len = $r.pattern_len
-			count       = $r.count
-			truncated   = $r.truncated
-			hits        = $r.hits
-			hint        = 'Use HexView offset=<hit.offset_hex> disasm=true or dump. ?? = wildcard byte.'
+			patterns    = $patterns
+			pattern_count = $patterns.Count
+			count       = $sorted.Count
+			truncated   = $anyTrunc
+			truncation_hint = $truncNote
+			max_results = $maxResults
+			max_scan    = $ms
+			resolve_targets = [bool]$resolve_targets
+			auto_raised_for_large_pe = $autoRaised
+			elapsed_ms  = $(if ($fmeta.large) { Get-MBForensicsElapsedMs -StartUtc $t0 } else { $null })
+			hits        = $sorted
+			hint        = 'Multi-pattern: pattern="E8 ?? ?? ?? ??;E9 ?? ?? ?? ??". all=true|max=all for large PEs. resolve_targets=true for CALL/JMP labels. Each hit.next suggests HexView.'
 		}) -Depth 8
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
 }
 
-function Invoke-StringsScan {
+function Invoke-HexSearch {
+	param(
+		[string]$path,
+		[string]$pattern = '',
+		[string]$hex = '',
+		$offset = 0,
+		$maxResults = 32,
+		$max = $null,
+		$limit = $null,
+		[bool]$all = $false,
+		$max_scan = 0,
+		[bool]$resolve_targets = $false,
+		[bool]$help = $false
+	)
+	return Invoke-FindHexPattern -path $path -pattern $pattern -hex $hex -offset $offset -maxResults $maxResults -max $max -limit $limit -all $all -max_scan $max_scan -resolve_targets $resolve_targets -help $help
+}
+
+function Invoke-StringExtract {
 	param(
 		[string]$path,
 		[int]$minLen = 4,
-		[int]$maxHits = 80,
+		[int]$maxLen = 0,
+		$maxHits = 80,
+		$max = $null,
+		$limit = $null,
+		[bool]$all = $false,
 		$offset = 0,
 		$max_scan = 0,
 		[string]$encoding = 'both',
-		[string]$filter = ''
+		[string]$filter = '',
+		[string]$section = '',
+		[bool]$clean_urls = $true,
+		[bool]$help = $false
 	)
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{
+			tool = 'StringExtract'
+			options = @('filter=url|data|code|interesting', 'clean_urls=true (default)', 'all=true|max=all', 'minLen=', 'section=.rdata')
+			examples = @('StringExtract path=a.exe filter=url', 'StringExtract path=a.exe filter=data all=true')
+		}) -Depth 5
+	}
 	$path = Resolve-MBPath -Path $path
 	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
 	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
+	$fmeta = Get-MBForensicsFileMeta -Path $path
+	$t0 = $fmeta.ms_start
+	$autoRaised = $false
+	if (-not $all -and ($null -eq $max -or [string]$max -eq '') -and ($null -eq $limit -or [string]$limit -eq '') -and $fmeta.large) {
+		$all = $true
+		$autoRaised = $true
+	}
+	$capSrc = $maxHits
+	if ($null -ne $limit -and [string]$limit -ne '') { $capSrc = $limit }
+	if ($null -ne $max -and [string]$max -ne '') { $capSrc = $max }
+	$maxHits = Resolve-MBForensicsLimit -Value $capSrc -Default 80 -HardMax 9999 -All $all
 	$off = Convert-MBOffsetToInt64 -Value $offset -Default 0
 	$ms = 0L
 	if ($null -ne $max_scan -and [string]$max_scan -ne '') {
 		try { $ms = [long]$max_scan } catch { $ms = 0 }
 	}
 	try {
-		$r = Get-MBFileStrings -Path $path -MinLen $minLen -MaxHits $maxHits -Offset $off -MaxScan $ms -Encoding $encoding -Filter $filter
+		$r = Get-MBFileStrings -Path $path -MinLen $minLen -MaxLen $maxLen -MaxHits $maxHits -Offset $off -MaxScan $ms -Encoding $encoding -Filter $filter -Section $section
 		if (-not $r.Ok) { return "ERROR: $($r.Error)" }
+		$hits = @($r.hits)
+		if ($clean_urls) {
+			$cleaned = New-Object System.Collections.ArrayList
+			foreach ($h in $hits) {
+				try {
+					$t = [string]$h.text
+					if ($t -match '(?i)https?://|ftp://') {
+						$ct = Clean-MBUrlString -S $t
+						$nh = [ordered]@{
+							offset = $h.offset
+							offset_hex = $h.offset_hex
+							encoding = $h.encoding
+							length = $(if ($ct) { $ct.Length } else { $h.length })
+							section = $h.section
+							text = $ct
+							text_raw = $(if ($ct -ne $t) { $t } else { $null })
+						}
+						[void]$cleaned.Add($nh)
+					} else {
+						[void]$cleaned.Add($h)
+					}
+				} catch { [void]$cleaned.Add($h) }
+			}
+			$hits = @($cleaned)
+		}
+		$next = @()
+		try { $next = @(Get-MBStringNextSteps -Hits $hits -Path $path -MaxHints 12) } catch { $next = @() }
+		$truncNote = Add-MBForensicsTruncationNote -Truncated ([bool]$r.truncated) -Tool 'StringExtract' -Count $hits.Count -Cap $maxHits
 		return ConvertTo-MBJson ([ordered]@{
 			status    = 'ok'
 			path      = $path
 			min_len   = $r.min_len
+			max_len   = $r.max_len
+			section   = $r.section
 			encoding  = $r.encoding
 			filter    = $r.filter
-			count     = $r.count
+			clean_urls = $clean_urls
+			count     = $hits.Count
 			truncated = $r.truncated
-			hits      = $r.hits
-			hint      = 'filter=path|url|ip|registry|email|interesting or free text. encoding=ascii|utf16|both. HexView offset=hit.offset_hex to inspect.'
+			truncation_hint = $truncNote
+			max_hits  = $maxHits
+			auto_raised_for_large_pe = $autoRaised
+			elapsed_ms = $(if ($fmeta.large) { Get-MBForensicsElapsedMs -StartUtc $t0 } else { $null })
+			hits      = $hits
+			next_steps = $next
+			hint      = 'clean_urls=true (default) strips cert junk before http://. max=all for large dumps. filter=data|code|url. next_steps -> BrowsePage/ReadRegistry/HexView.'
 		}) -Depth 8
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
+}
+
+# Back-compat alias
+function Invoke-StringsScan {
+	param(
+		[string]$path,
+		[int]$minLen = 4,
+		[int]$maxLen = 0,
+		$maxHits = 80,
+		$max = $null,
+		$limit = $null,
+		[bool]$all = $false,
+		$offset = 0,
+		$max_scan = 0,
+		[string]$encoding = 'both',
+		[string]$filter = '',
+		[string]$section = '',
+		[bool]$clean_urls = $true,
+		[bool]$help = $false
+	)
+	return Invoke-StringExtract -path $path -minLen $minLen -maxLen $maxLen -maxHits $maxHits -max $max -limit $limit -all $all -offset $offset -max_scan $max_scan -encoding $encoding -filter $filter -section $section -clean_urls $clean_urls -help $help
 }
 
 function Resolve-MBHexEditPreset {
@@ -26081,6 +31831,8 @@ function Resolve-MBHexEditPreset {
 		'ret_0' { $p = 'ret0' }
 		'return0' { $p = 'ret0' }
 		'xor_ret' { $p = 'ret0' }
+		'swap_jz' { $p = 'invert_jcc' }
+		'flip_jcc' { $p = 'invert_jcc' }
 	}
 	try {
 		switch ($p) {
@@ -26128,6 +31880,31 @@ function Resolve-MBHexEditPreset {
 				$patch = [byte[]](0xC3)
 				return @{ Ok = $true; Patch = $patch; Note = 'ret: C3' }
 			}
+			'invert_jcc' {
+				# Flip short/near Jcc polarity (JZ<->JNZ, etc.) for semantic patching
+				$br = Read-MBFileBytes -Path $Path -Offset $Offset -Length 6
+				if (-not $br.Ok -or $br.Bytes.Length -lt 2) {
+					return @{ Ok = $false; Error = 'cannot read bytes at offset for invert_jcc' }
+				}
+				$b0 = [int]$br.Bytes[0]
+				if ($b0 -ge 0x70 -and $b0 -le 0x7F) {
+					$nb = $b0 -bxor 0x01
+					$patch = [byte[]]($nb, $br.Bytes[1])
+					return @{ Ok = $true; Patch = $patch; Note = ('invert_jcc: short {0:X2}->{1:X2}' -f $b0, $nb) }
+				}
+				if ($b0 -eq 0x0F -and $br.Bytes.Length -ge 6) {
+					$b1 = [int]$br.Bytes[1]
+					if ($b1 -ge 0x80 -and $b1 -le 0x8F) {
+						$nb1 = $b1 -bxor 0x01
+						$patch = [byte[]](0x0F, $nb1, $br.Bytes[2], $br.Bytes[3], $br.Bytes[4], $br.Bytes[5])
+						return @{ Ok = $true; Patch = $patch; Note = ('invert_jcc: near 0F {0:X2}->0F {1:X2}' -f $b1, $nb1) }
+					}
+				}
+				return @{ Ok = $false; Error = ('invert_jcc: byte at offset is 0x{0:X2} (need 7x short Jcc or 0F 8x near Jcc)' -f $b0) }
+			}
+			'swap_jcc' {
+				return (Resolve-MBHexEditPreset -Preset 'invert_jcc' -Path $Path -Offset $Offset -Length $Length)
+			}
 			'int3' {
 				$len = $Length
 				if ($len -le 0) { $len = 1 }
@@ -26147,17 +31924,192 @@ function Resolve-MBHexEditPreset {
 
 function Invoke-HexEdit {
 	param(
-		[string]$path,
+		[string]$path = '',
 		$offset = 0,
 		[string]$hex = '',
 		$bytes = $null,
 		[bool]$extend = $true,
 		[bool]$backup = $true,
 		[string]$preset = '',
-		[int]$length = 0
+		[int]$length = 0,
+		[string]$action = 'patch',
+		$id = $null,
+		[bool]$undo = $false,
+		[string]$pattern = '',
+		[string]$replace_hex = '',
+		[string]$replace = '',
+		$max = 32,
+		[bool]$preview = $false,
+		[bool]$dry_run = $false,
+		[bool]$help = $false
 	)
+	$act = ([string]$action).Trim().ToLowerInvariant()
+	if ($undo) { $act = 'undo' }
+	if ($preview) { $dry_run = $true }
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{
+			tool = 'HexEdit'
+			actions = @('patch (default)', 'replace_pattern', 'undo', 'undo_all', 'history', 'export_history')
+			presets = @('force_jcc', 'invert_jcc', 'nop_range', 'ret0', 'ret', 'int3')
+			options = @('preview=true|dry_run=true shows before/after without writing', 'bytes=[] or hex= for raw patch')
+			examples = @(
+				'HexEdit path=a.exe offset=0x1000 preset=nop_range length=8',
+				'HexEdit path=a.exe action=replace_pattern pattern="74 ??" replace_hex="EB ??" max=32',
+				'HexEdit action=history',
+				'HexEdit action=undo id=3'
+			)
+			note = 'Session undo stack is per MiniBot session (not persisted across restarts). path.bak still written when backup=true.'
+		}) -Depth 6
+	}
+	if ($act -in @('history', 'stack', 'list_undo', 'undo_history')) {
+		Initialize-MBHexEditStack
+		$hist = @(Get-MBHexEditUndoHistory)
+		return ConvertTo-MBJson ([ordered]@{
+			status = 'ok'
+			count = $hist.Count
+			history = $hist
+			undo_ids = @($hist | ForEach-Object { $_.id })
+			hint = 'Full edit stack listed (all undo_id values). action=undo id=N reverts one; undo_all reverts newest-first. Session-only unless export_history.'
+		}) -Depth 8
+	}
+	if ($act -in @('export_history', 'save_history')) {
+		Initialize-MBHexEditStack
+		$hist = @(Get-MBHexEditUndoHistory)
+		$outp = $path
+		if ([string]::IsNullOrWhiteSpace($outp)) {
+			$outp = Join-Path $env:TEMP ('MiniBot-HexEdit-history-{0:yyyyMMdd-HHmmss}.json' -f [datetime]::UtcNow)
+		} else {
+			$outp = Resolve-MBPath -Path $outp
+		}
+		$json = ConvertTo-MBJson ([ordered]@{
+			exported_utc = [datetime]::UtcNow.ToString('o')
+			count = $hist.Count
+			history = $hist
+			note = 'Replay: for each entry HexEdit path= offset= hex=before_hex is NOT auto; use action=undo while session live, or manually write before_hex.'
+		}) -Depth 10
+		try {
+			$parent = [System.IO.Path]::GetDirectoryName($outp)
+			if ($parent -and -not (Test-Path -LiteralPath $parent)) { [void][System.IO.Directory]::CreateDirectory($parent) }
+			[System.IO.File]::WriteAllText($outp, $json)
+		} catch {
+			return "ERROR: export_history failed: $($_.Exception.Message)"
+		}
+		return ConvertTo-MBJson ([ordered]@{ status = 'ok'; path = $outp; count = $hist.Count; undo_ids = @($hist | ForEach-Object { $_.id }) }) -Depth 6
+	}
+	if ($act -in @('undo', 'revert', 'undo_last')) {
+		return Invoke-MBHexEditUndo -Path $path -id $id -All $false -Prompt $true
+	}
+	if ($act -in @('undo_all', 'revert_all')) {
+		return Invoke-MBHexEditUndo -Path $path -All $true -Prompt $true
+	}
+	if ($act -in @('replace_pattern', 'replace', 'find_replace')) {
+		# handled below after path resolve
+	}
+	elseif ($act -notin @('patch', 'edit', 'write', '')) {
+		return "ERROR: unknown HexEdit action='$action' (use patch|replace_pattern|undo|undo_all|history|export_history)"
+	}
+
 	$path = Resolve-MBPath -Path $path
-	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
+	if ([string]::IsNullOrWhiteSpace($path) -and $act -notin @('history', 'export_history')) {
+		return 'ERROR: Empty or invalid path (required for patch/replace_pattern)'
+	}
+
+	# --- replace_pattern: find pattern (?? ok) and replace across file ---
+	if ($act -in @('replace_pattern', 'replace', 'find_replace')) {
+		if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+			return "ERROR: replace_pattern requires existing path="
+		}
+		$pat = $pattern
+		if ([string]::IsNullOrWhiteSpace($pat)) { $pat = $hex }
+		if ([string]::IsNullOrWhiteSpace($pat)) { return 'ERROR: replace_pattern requires pattern= (hex with optional ??)' }
+		$repHex = $replace_hex
+		if ([string]::IsNullOrWhiteSpace($repHex)) { $repHex = $replace }
+		if ([string]::IsNullOrWhiteSpace($repHex) -and -not [string]::IsNullOrWhiteSpace($preset)) {
+			# allow preset to build replacement only for fixed-size presets without reading file at each hit
+			return 'ERROR: replace_pattern needs replace_hex= (preset not supported for multi-hit replace; use offset patch)'
+		}
+		if ([string]::IsNullOrWhiteSpace($repHex)) { return 'ERROR: replace_pattern requires replace_hex= or replace=' }
+		# Wildcard in replacement: copy from original where ??
+		$pm = Convert-MBHexPatternToBytesAndMask -Pattern $pat
+		$repTokens = @()
+		$rh = $repHex.Trim() -replace '[,\-:]', ' ' -replace '\s+', ' '
+		foreach ($tok in ($rh -split ' ')) {
+			if ([string]::IsNullOrWhiteSpace($tok)) { continue }
+			$repTokens += $tok.ToUpperInvariant()
+		}
+		if ($repTokens.Count -eq 0) { return 'ERROR: empty replace_hex' }
+		if ($repTokens.Count -ne $pm.Length) {
+			return ("ERROR: replace_hex length ({0}) must match pattern length ({1}) for in-place replace" -f $repTokens.Count, $pm.Length)
+		}
+		$maxHits = Resolve-MBForensicsLimit -Value $max -Default 32 -HardMax 9999
+		$found = Find-MBHexPattern -Path $path -Pattern $pat -Offset 0 -MaxResults $maxHits -MaxScan 0
+		if (-not $found.Ok) { return "ERROR: $($found.Error)" }
+		if ($found.count -eq 0) {
+			return ConvertTo-MBJson ([ordered]@{ status = 'ok'; path = $path; pattern = $pat; replaced = 0; note = 'no matches' }) -Depth 5
+		}
+		$details = "replace_pattern`nPath: $path`nPattern: $pat`nReplace: $repHex`nHits: $($found.count)$(if ($found.truncated) { ' (TRUNCATED — raise max=)' } else { '' })"
+		if ($dry_run) {
+			$hitList = @($found.hits | Select-Object -First 24 | ForEach-Object { $_.offset_hex })
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'preview'
+				dry_run = $true
+				path = $path
+				pattern = $pat
+				replace_hex = $repHex
+				would_replace = $found.count
+				truncated_search = [bool]$found.truncated
+				sample_offsets = $hitList
+				hint = 'dry_run only — no writes. Re-call without dry_run=true to apply.'
+			}) -Depth 6
+		}
+		if (-not (Request-Confirmation -Title 'HexEdit replace_pattern requires approval' -Details $details -Code $details -CodeLang 'text')) {
+			return 'BLOCKED BY USER: HexEdit replace_pattern denied by operator.'
+		}
+		$bakPath = $null
+		if ($backup) { $bakPath = Backup-MBFile -Path $path -Enabled $true }
+		$fs = $null
+		$undoIds = New-Object System.Collections.ArrayList
+		$nRep = 0
+		try {
+			$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+			foreach ($h in @($found.hits)) {
+				$abs = [long]$h.offset
+				$before = New-Object byte[] $pm.Length
+				[void]$fs.Seek($abs, [System.IO.SeekOrigin]::Begin)
+				$rn = $fs.Read($before, 0, $pm.Length)
+				if ($rn -lt $pm.Length) { continue }
+				$after = New-Object byte[] $pm.Length
+				for ($i = 0; $i -lt $pm.Length; $i++) {
+					if ($repTokens[$i] -eq '??' -or $repTokens[$i] -eq '?') {
+						$after[$i] = $before[$i]
+					} else {
+						$after[$i] = [Convert]::ToByte($repTokens[$i], 16)
+					}
+				}
+				[void]$fs.Seek($abs, [System.IO.SeekOrigin]::Begin)
+				$fs.Write($after, 0, $after.Length)
+				$uid = Add-MBHexEditUndoEntry -Path $path -Offset $abs -BeforeBytes $before -AfterBytes $after -Preset 'replace_pattern' -BackupPath $bakPath
+				if ($null -ne $uid) { [void]$undoIds.Add($uid) }
+				$nRep++
+			}
+			$fs.Flush()
+		} finally {
+			if ($fs) { try { $fs.Dispose() } catch {} }
+		}
+		return ConvertTo-MBJson ([ordered]@{
+			status = $(if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' })
+			path = $path
+			action = 'replace_pattern'
+			pattern = $pat
+			replace_hex = $repHex
+			replaced = $nRep
+			truncated_search = [bool]$found.truncated
+			truncation_hint = (Add-MBForensicsTruncationNote -Truncated ([bool]$found.truncated) -Tool 'HexEdit replace_pattern search' -Count $nRep -Cap $maxHits)
+			backup = $bakPath
+			undo_ids = @($undoIds)
+			hint = 'All replacements stacked for undo (newest ids last). action=history lists full stack; action=undo_all reverts.'
+		}) -Depth 8
+	}
 
 	$off = Convert-MBOffsetToInt64 -Value $offset -Default -1
 	if ($off -lt 0) { return 'ERROR: invalid offset (use decimal or 0xHEX)' }
@@ -26188,7 +32140,7 @@ function Invoke-HexEdit {
 		} elseif (-not [string]::IsNullOrWhiteSpace($hex)) {
 			$patch = Convert-MBHexStringToBytes -Hex $hex
 		} else {
-			return 'ERROR: provide hex=, bytes=[], or preset=force_jcc|nop_range|ret0|ret|int3'
+			return 'ERROR: provide hex=, bytes=[], or preset=force_jcc|invert_jcc|nop_range|ret0|ret|int3'
 		}
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
@@ -26217,38 +32169,69 @@ function Invoke-HexEdit {
 			}
 		} catch { $beforeDump = '' }
 	}
-	# Disasm before/after preview (best-effort)
+	# Disasm before/after with surrounding context (critical for RE patching)
 	$disasmBefore = ''
 	$disasmAfter = ''
+	$disasmError = $null
+	$ctxBytesBefore = 32
+	$ctxBytesAfter = 32
 	try {
 		$peCtx = $null
 		try { $peCtx = Get-MBPeDisasmContext -Path $path } catch {}
 		$is64 = $false
 		if ($peCtx -and $peCtx.Ok) { $is64 = [bool]$peCtx.Is64 }
-		if ($exists -and $null -ne $beforeBytes -and $beforeBytes.Length -gt 0) {
-			$linesB = New-Object System.Collections.ArrayList
-			$ix = 0; $nIns = 0
-			while ($ix -lt $beforeBytes.Length -and $nIns -lt 6) {
-				$dec = Read-MBX86Instruction -Bytes $beforeBytes -Index $ix -FileOffset $off -Is64 $is64
-				if (-not $dec.Ok) { break }
-				[void]$linesB.Add(('{0}  {1,-16}  {2} {3}' -f $dec.offset_hex, $dec.bytes, $dec.mnemonic, $dec.operands))
-				$ix = [int]$dec.next_index
-				$nIns++
+		$markEnd = $off + $patch.Length
+		# BEFORE: read window [off-ctx, off+patch+ctx) from file
+		if ($exists) {
+			$winStart = [Math]::Max(0L, $off - $ctxBytesBefore)
+			$winEnd = [Math]::Min($curSize, $markEnd + $ctxBytesAfter)
+			$winLen = [int][Math]::Max(0L, $winEnd - $winStart)
+			if ($winLen -gt 0) {
+				$wbr = Read-MBFileBytes -Path $path -Offset $winStart -Length $winLen
+				if ($wbr.Ok -and $wbr.Bytes.Length -gt 0) {
+					$dBefore = Get-MBX86DisasmListing -Bytes $wbr.Bytes -BaseOffset $winStart -Is64 $is64 -MaxInsns 20 -MarkStart $off -MarkEnd $markEnd
+					if ($dBefore.Ok) { $disasmBefore = $dBefore.listing }
+					elseif ($dBefore.Error) { $disasmError = [string]$dBefore.Error }
+				} else {
+					$disasmError = $(if ($wbr.Error) { [string]$wbr.Error } else { 'before window read failed' })
+				}
 			}
-			if ($linesB.Count -gt 0) { $disasmBefore = $linesB -join "`n" }
 		}
-		# after: patch bytes as if written
-		$linesA = New-Object System.Collections.ArrayList
-		$ix = 0; $nIns = 0
-		while ($ix -lt $patch.Length -and $nIns -lt 6) {
-			$dec = Read-MBX86Instruction -Bytes $patch -Index $ix -FileOffset $off -Is64 $is64
-			if (-not $dec.Ok) { break }
-			[void]$linesA.Add(('{0}  {1,-16}  {2} {3}' -f $dec.offset_hex, $dec.bytes, $dec.mnemonic, $dec.operands))
-			$ix = [int]$dec.next_index
-			$nIns++
+		# AFTER: same window with patch applied in-memory
+		$winStart2 = [Math]::Max(0L, $off - $ctxBytesBefore)
+		$afterEndNeed = $markEnd + $ctxBytesAfter
+		$synthLen = [int]($afterEndNeed - $winStart2)
+		if ($synthLen -lt $patch.Length) { $synthLen = $patch.Length + $ctxBytesBefore + $ctxBytesAfter }
+		if ($synthLen -gt 0 -and $synthLen -le 8192) {
+			$synth = New-Object byte[] $synthLen
+			# fill from file where possible
+			if ($exists -and $curSize -gt $winStart2) {
+				$fillLen = [int][Math]::Min([long]$synthLen, $curSize - $winStart2)
+				if ($fillLen -gt 0) {
+					$fr = Read-MBFileBytes -Path $path -Offset $winStart2 -Length $fillLen
+					if ($fr.Ok) { [Array]::Copy($fr.Bytes, 0, $synth, 0, $fr.Bytes.Length) }
+				}
+			}
+			$rel = [int]($off - $winStart2)
+			if ($rel -ge 0 -and ($rel + $patch.Length) -le $synth.Length) {
+				[Array]::Copy($patch, 0, $synth, $rel, $patch.Length)
+			}
+			$dAfter = Get-MBX86DisasmListing -Bytes $synth -BaseOffset $winStart2 -Is64 $is64 -MaxInsns 20 -MarkStart $off -MarkEnd $markEnd
+			if ($dAfter.Ok) { $disasmAfter = $dAfter.listing }
+			elseif (-not $disasmError -and $dAfter.Error) { $disasmError = [string]$dAfter.Error }
 		}
-		if ($linesA.Count -gt 0) { $disasmAfter = $linesA -join "`n" }
-	} catch {}
+		# Fallback: disasm patch bytes alone
+		if (-not $disasmAfter -and $patch.Length -gt 0) {
+			$dPatch = Get-MBX86DisasmListing -Bytes $patch -BaseOffset $off -Is64 $is64 -MaxInsns 12 -MarkStart $off -MarkEnd $markEnd
+			if ($dPatch.Ok) { $disasmAfter = $dPatch.listing }
+		}
+		if (-not $disasmBefore -and $null -ne $beforeBytes -and $beforeBytes.Length -gt 0) {
+			$dB2 = Get-MBX86DisasmListing -Bytes $beforeBytes -BaseOffset $off -Is64 $is64 -MaxInsns 12 -MarkStart $off -MarkEnd $markEnd
+			if ($dB2.Ok) { $disasmBefore = $dB2.listing }
+		}
+	} catch {
+		$disasmError = $_.Exception.Message
+	}
 
 	$details = @"
 Path: $path
@@ -26262,13 +32245,30 @@ End after write: $end
 
 $(if ($beforeDump) { "Before (existing bytes):`n$beforeDump`n`n" } else { '' })After (patch to write):
 $previewDump
-$(if ($disasmBefore) { "`nDisasm BEFORE:`n$disasmBefore`n" } else { '' })$(if ($disasmAfter) { "`nDisasm AFTER:`n$disasmAfter`n" } else { '' })
+$(if ($disasmBefore) { "`nDisasm BEFORE ( > = patch range ):`n$disasmBefore`n" } else { '' })$(if ($disasmAfter) { "`nDisasm AFTER ( > = patch range ):`n$disasmAfter`n" } else { '' })$(if ($disasmError) { "`nDisasm note: $disasmError`n" } else { '' })
 "@
 	$codeShow = if ($disasmBefore -or $disasmAfter) {
 		"$(if ($disasmBefore) { "BEFORE:`n$disasmBefore`n`n" } else { '' })AFTER:`n$disasmAfter`n`nHEX AFTER:`n$previewDump"
 	} elseif ($beforeDump) {
 		"BEFORE:`n$beforeDump`n`nAFTER:`n$previewDump"
 	} else { $previewDump }
+	if ($dry_run) {
+		return ConvertTo-MBJson ([ordered]@{
+			status = 'preview'
+			dry_run = $true
+			path = $path
+			offset = $off
+			offset_hex = ('0x{0:X}' -f $off)
+			would_write = $patch.Length
+			preset = $(if ($preset) { $preset } else { $null })
+			preset_note = $(if ($presetNote) { $presetNote } else { $null })
+			before_dump = $(if ($beforeDump) { $beforeDump } else { $null })
+			after_dump = $previewDump
+			disasm_before = $(if ($disasmBefore) { $disasmBefore } else { $null })
+			disasm_after = $(if ($disasmAfter) { $disasmAfter } else { $null })
+			hint = 'dry_run/preview only — no bytes written. Re-call without dry_run=true to apply (approval required). Presets: force_jcc|invert_jcc|nop_range|ret0|ret|int3; or hex=/bytes=[].'
+		}) -Depth 8
+	}
 	if (-not (Request-Confirmation -Title 'HexEdit requires approval' -Details $details -Code $codeShow -CodeLang 'text')) {
 		return 'BLOCKED BY USER: HexEdit denied by operator.'
 	}
@@ -26305,6 +32305,12 @@ $(if ($disasmBefore) { "`nDisasm BEFORE:`n$disasmBefore`n" } else { '' })$(if ($
 			elseif ($preset) { $sum = $sum + "  |  preset=$preset" }
 			Write-MBHexDiffInline -Title ("HexEdit  {0}" -f $path) -Before $beforeShow -After $afterShow -Summary $sum -MaxLines 48
 		} catch {}
+		$undoId = $null
+		try {
+			if ($null -ne $beforeBytes -and $beforeBytes.Length -gt 0) {
+				$undoId = Add-MBHexEditUndoEntry -Path $path -Offset $off -BeforeBytes $beforeBytes -AfterBytes $patch -Preset $preset -BackupPath $bakPath
+			}
+		} catch { $undoId = $null }
 		return ConvertTo-MBJson @{
 			status     = $tag
 			path       = $path
@@ -26315,8 +32321,12 @@ $(if ($disasmBefore) { "`nDisasm BEFORE:`n$disasmBefore`n" } else { '' })$(if ($
 			backup     = $bakPath
 			preset     = $(if ($preset) { $preset } else { $null })
 			preset_note = $(if ($presetNote) { $presetNote } else { $null })
+			undo_id    = $undoId
+			undo_hint  = $(if ($null -ne $undoId) { ('HexEdit action=undo id={0}  (or action=history / undo_all)' -f $undoId) } else { 'No undo entry (missing before-bytes); use path.bak if backup=true' })
 			disasm_before = $(if ($disasmBefore) { $disasmBefore } else { $null })
 			disasm_after  = $(if ($disasmAfter) { $disasmAfter } else { $null })
+			disasm_error  = $(if ($disasmError) { $disasmError } else { $null })
+			disasm_mark   = 'Lines prefixed with > are inside the patched byte range'
 			dump       = $previewDump
 		}
 	} catch {
@@ -28751,10 +34761,15 @@ function Invoke-ModelStreaming {
 					$pt = Get-MBProp $usage 'prompt_tokens'
 					$ct = Get-MBProp $usage 'completion_tokens'
 					if ($null -ne $pt) {
-						$script:MB.LastServerPromptTokens = [int]$pt
-						$script:MB.TokenCountSource = 'usage'
-						$script:MB.TokCacheKey = ''
-						$script:MB.LastCtxTokens = [int]$pt
+						# Bind usage to current session history fingerprint (not bare global).
+						try {
+							Set-MBLastUsagePromptTokens -PromptTokens ([int]$pt) -Messages $script:Messages
+						} catch {
+							$script:MB.LastServerPromptTokens = [int]$pt
+							$script:MB.TokenCountSource = 'usage'
+							$script:MB.TokCacheKey = ''
+							$script:MB.LastCtxTokens = [int]$pt
+						}
 						try { Set-MBContextBarReady } catch {}
 					}
 					if ($null -ne $ct) {
@@ -28997,19 +35012,27 @@ function Invoke-ModelStreaming {
 				$looksLikeOom = ($lastError -match 'HTTP 500\b|ggml|memory pool|GGML_ASSERT|out of memory|OOM|not enough space')
 				if ((-not $isUtf8Poison -and ($isPayload -or $looksLikeOom -or ($lastError -match 'HTTP 500\b'))) -or ($isUtf8Poison -and $attempt -gt 1)) {
 					$didHardCompact = $true
-					Write-MBWarn "Server error - trimming context and retrying..."
+					Write-MBWarn "Server error - full-replacing context and retrying..."
 					try {
-						$workMessages = @(Ensure-MBPromptBudget -Messages $workMessages -TargetPct 0.45 -MaxPasses 8)
-						$workMessages = @(Manage-MBContext -Messages $workMessages -ForceCompact)
-						$workMessages = @(Ensure-MBPromptBudget -Messages $workMessages -TargetPct 0.50 -MaxPasses 4)
+						try { Thaw-MBWireState -Force } catch {}
+						$workMessages = @(FullReplace-MBHistory -Messages $workMessages)
+						# Tool/tail shrink only — FullReplace already ran (no nested 3-stage ladder)
+						$workMessages = @(Ensure-MBPromptBudget -Messages $workMessages -TargetPct 0.45 -MaxPasses 6)
 						$workMessages = @(Repair-MBMessagesEncoding -Messages $workMessages)
 						$script:Messages = $workMessages
+						try { Reset-MBTokenEstimateCache -ClearUsage } catch {}
 					} catch {
 						try {
-							$workMessages = @(Compact-MBHistory -Messages $workMessages -Aggressive)
+							$workMessages = @(FullReplace-MBHistory -Messages $workMessages)
 							$workMessages = @(Repair-MBMessagesEncoding -Messages $workMessages)
 							$script:Messages = $workMessages
-						} catch {}
+						} catch {
+							try {
+								$workMessages = @(Compact-MBHistory -Messages $workMessages -Aggressive)
+								$workMessages = @(Repair-MBMessagesEncoding -Messages $workMessages)
+								$script:Messages = $workMessages
+							} catch {}
+						}
 					}
 				}
 
@@ -29243,8 +35266,8 @@ function Get-MBToolFingerprint {
 			try { [void]$parts.Add(('focus={0}' -f ([string](Get-MBTaskBoardNowId)).ToLowerInvariant())) } catch {}
 			try { [void]$parts.Add(('board_epoch={0}' -f [int](Get-MBTaskBoardEpoch))) } catch {}
 		}
-		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^FindFiles$|^DiffText$|^HexView$|^HexEdit$|^HexSearch$|^StringsScan$|^SandBox$|^SandBoxWrite$' {
-			foreach ($k in @('path','path2','compare','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','annotate','detail','next_diff','side_by_side','max_scan','disasm','trace','at_entry','max_insns','max_steps','follow_calls','prefer_branch','arch','dump_hex','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description','left','right','leftIsFile','rightIsFile','context','maxLines','content','edits','entropy','carve','rva','section','entropy_blocks','minLen','maxHits','encoding','filter','hash','functions','preset')) {
+		'^ReadFile$|^WriteFile$|^EditFile$|^ApplyPatch$|^ListDirectory$|^SearchFiles$|^FindFiles$|^DiffText$|^HexView$|^HexEdit$|^FindHexPattern$|^HexSearch$|^StringExtract$|^StringsScan$|^PeInfo$|^ImportTableViewer$|^ResourceEditor$|^SectionManager$|^SandBox$|^SandBoxWrite$' {
+			foreach ($k in @('path','path2','compare','search','replace','pattern','glob','globs','extensions','head','tail','offset','length','width','show_ascii','annotate','detail','next_diff','side_by_side','max_scan','disasm','trace','at_entry','max_insns','max_steps','follow_calls','prefer_branch','arch','dump_hex','hex','bytes','extend','backup','useRegex','replaceAll','occurrence','recursive','ignoreCase','maxResults','max','modified_within_days','min_bytes','max_bytes','patch','code','test_script','timeout_sec','expect_exit','expect_stdout','expect_stdout_regex','expect_stderr_empty','name','piece','save_as','compose','description','left','right','leftIsFile','rightIsFile','context','maxLines','content','edits','entropy','carve','rva','section','entropy_blocks','minLen','maxLen','maxHits','max','limit','all','encoding','filter','section','resolve_targets','action','id','undo','summary_only','skip_mz_header','ignore_mz_header','clean_urls','by_ordinal_only','source_text','text_encoding','validate','replace_hex','help','hash','functions','preset','action','dll','imports','exports','resources','type','name','lang','index','out_path','source_path','characteristics','flags','raw_size','virt_size','max_import_dlls','max_import_funcs','max_exports','max_resources','max_dlls','max_funcs','include_delay')) {
 				if (Test-MBHasProp $ArgsObj $k) {
 					$v = Get-MBProp $ArgsObj $k
 					if ($null -ne $v) {
@@ -34864,23 +40887,39 @@ function Invoke-MBTool {
 
 	if ($Name -and -not (Test-MBToolNameActive -Name $Name)) {
 		$allNames = @($Tools | ForEach-Object { $_.function.name })
-		$sw.Stop()
-		$script:MB.LastToolMs = $sw.ElapsedMilliseconds
-		$script:MB.ToolCalls++
-		try { Update-MBWpfLiveChrome } catch {}
 		$match = $null
 		foreach ($n in $allNames) {
 			if ($n -eq $Name -or $n.ToLowerInvariant() -eq $Name.ToLowerInvariant()) { $match = $n; break }
 		}
 		if (-not $match) { $match = Resolve-MBToolName -Name $Name }
+		# Auto-enable forensics/recovery when model calls those tools without EnableToolGroup first
+		$autoEnabled = $false
 		if ($match) {
-			if ((Test-MBToolNeedsVision -Name $match) -and -not (Test-MBModelHasVision)) {
-				return "ERROR: Tool '$match' requires vision. Current model has no 'vision' ability - do not call ReadImage, ReadPdf, or ViewScreen."
+			$grpAuto = Get-MBToolGroupForName -Name $match
+			if ($grpAuto -eq 'forensics' -or $grpAuto -eq 'recovery') {
+				try {
+					$null = Enable-MBToolGroup -Group $grpAuto
+					if (Test-MBToolNameActive -Name $match) {
+						$autoEnabled = $true
+						$Name = $match
+					}
+				} catch {}
 			}
-			$hint = Get-MBToolEnableHint -ToolName $match
-			return "ERROR: Tool '$match' is not in the active tool list. $hint"
 		}
-		return "ERROR: Unknown tool '$Name'. Prefer ROUTER in system prompt (volume->AudioVolume, brightness->DisplayBrightness). For gated tools: EnableToolGroup using MAP then real tool name. Do not invent tools or shell COM for OS UX knobs."
+		if (-not $autoEnabled) {
+			$sw.Stop()
+			$script:MB.LastToolMs = $sw.ElapsedMilliseconds
+			$script:MB.ToolCalls++
+			try { Update-MBWpfLiveChrome } catch {}
+			if ($match) {
+				if ((Test-MBToolNeedsVision -Name $match) -and -not (Test-MBModelHasVision)) {
+					return "ERROR: Tool '$match' requires vision. Current model has no 'vision' ability - do not call ReadImage, ReadPdf, or ViewScreen."
+				}
+				$hint = Get-MBToolEnableHint -ToolName $match
+				return "ERROR: Tool '$match' is not in the active tool list. $hint"
+			}
+			return "ERROR: Unknown tool '$Name'. Prefer ROUTER in system prompt (volume->AudioVolume, brightness->DisplayBrightness). For gated tools: EnableToolGroup using MAP then real tool name. Do not invent tools or shell COM for OS UX knobs."
+		}
 	}
 
 	$guard = Test-MBToolLoopGuard -Name $Name -ArgsObj $ArgsObj
@@ -35112,10 +41151,14 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'carve') { $p['carve'] = [bool](Get-MBProp $ArgsObj 'carve') }
 				if (Test-MBHasProp $ArgsObj 'hash') { $p['hash'] = [bool](Get-MBProp $ArgsObj 'hash') }
 				if (Test-MBHasProp $ArgsObj 'functions') { $p['functions'] = [bool](Get-MBProp $ArgsObj 'functions') }
+				if (Test-MBHasProp $ArgsObj 'skip_mz_header') { $p['skip_mz_header'] = [bool](Get-MBProp $ArgsObj 'skip_mz_header') }
+				if (Test-MBHasProp $ArgsObj 'ignore_mz_header') { $p['ignore_mz_header'] = [bool](Get-MBProp $ArgsObj 'ignore_mz_header') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
 				Invoke-HexView @p
 			}
 			"HexEdit" {
-				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
 				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
 				if (Test-MBHasProp $ArgsObj 'hex') { $p['hex'] = [string](Get-MBProp $ArgsObj 'hex') }
 				if (Test-MBHasProp $ArgsObj 'bytes') { $p['bytes'] = (Get-MBProp $ArgsObj 'bytes') }
@@ -35123,26 +41166,209 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'length') { $p['length'] = [int](Get-MBProp $ArgsObj 'length') }
 				if (Test-MBHasProp $ArgsObj 'extend') { $p['extend'] = [bool](Get-MBProp $ArgsObj 'extend') }
 				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = [bool](Get-MBProp $ArgsObj 'backup') }
+				if (Test-MBHasProp $ArgsObj 'action') { $p['action'] = [string](Get-MBProp $ArgsObj 'action') }
+				if (Test-MBHasProp $ArgsObj 'id') { $p['id'] = (Get-MBProp $ArgsObj 'id') }
+				if (Test-MBHasProp $ArgsObj 'undo') { $p['undo'] = [bool](Get-MBProp $ArgsObj 'undo') }
+				if (Test-MBHasProp $ArgsObj 'pattern') { $p['pattern'] = [string](Get-MBProp $ArgsObj 'pattern') }
+				if (Test-MBHasProp $ArgsObj 'replace_hex') { $p['replace_hex'] = [string](Get-MBProp $ArgsObj 'replace_hex') }
+				if (Test-MBHasProp $ArgsObj 'replace') { $p['replace'] = [string](Get-MBProp $ArgsObj 'replace') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				if (Test-MBHasProp $ArgsObj 'preview') { $p['preview'] = [bool](Get-MBProp $ArgsObj 'preview') }
+				if (Test-MBHasProp $ArgsObj 'dry_run') { $p['dry_run'] = [bool](Get-MBProp $ArgsObj 'dry_run') }
 				Invoke-HexEdit @p
+			}
+			"FindHexPattern" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'pattern') { $p['pattern'] = [string](Get-MBProp $ArgsObj 'pattern') }
+				if (Test-MBHasProp $ArgsObj 'hex') { $p['hex'] = [string](Get-MBProp $ArgsObj 'hex') }
+				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
+				if (Test-MBHasProp $ArgsObj 'maxResults') { $p['maxResults'] = (Get-MBProp $ArgsObj 'maxResults') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'limit') { $p['limit'] = (Get-MBProp $ArgsObj 'limit') }
+				if (Test-MBHasProp $ArgsObj 'all') { $p['all'] = [bool](Get-MBProp $ArgsObj 'all') }
+				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = (Get-MBProp $ArgsObj 'max_scan') }
+				if (Test-MBHasProp $ArgsObj 'resolve_targets') { $p['resolve_targets'] = [bool](Get-MBProp $ArgsObj 'resolve_targets') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				Invoke-FindHexPattern @p
 			}
 			"HexSearch" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
 				if (Test-MBHasProp $ArgsObj 'pattern') { $p['pattern'] = [string](Get-MBProp $ArgsObj 'pattern') }
 				if (Test-MBHasProp $ArgsObj 'hex') { $p['hex'] = [string](Get-MBProp $ArgsObj 'hex') }
 				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
-				if (Test-MBHasProp $ArgsObj 'maxResults') { $p['maxResults'] = [int](Get-MBProp $ArgsObj 'maxResults') }
+				if (Test-MBHasProp $ArgsObj 'maxResults') { $p['maxResults'] = (Get-MBProp $ArgsObj 'maxResults') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'limit') { $p['limit'] = (Get-MBProp $ArgsObj 'limit') }
+				if (Test-MBHasProp $ArgsObj 'all') { $p['all'] = [bool](Get-MBProp $ArgsObj 'all') }
 				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = (Get-MBProp $ArgsObj 'max_scan') }
-				Invoke-HexSearch @p
+				if (Test-MBHasProp $ArgsObj 'resolve_targets') { $p['resolve_targets'] = [bool](Get-MBProp $ArgsObj 'resolve_targets') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				Invoke-FindHexPattern @p
 			}
-			"StringsScan" {
+			"StringExtract" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
 				if (Test-MBHasProp $ArgsObj 'minLen') { $p['minLen'] = [int](Get-MBProp $ArgsObj 'minLen') }
-				if (Test-MBHasProp $ArgsObj 'maxHits') { $p['maxHits'] = [int](Get-MBProp $ArgsObj 'maxHits') }
+				if (Test-MBHasProp $ArgsObj 'maxLen') { $p['maxLen'] = [int](Get-MBProp $ArgsObj 'maxLen') }
+				if (Test-MBHasProp $ArgsObj 'maxHits') { $p['maxHits'] = (Get-MBProp $ArgsObj 'maxHits') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'limit') { $p['limit'] = (Get-MBProp $ArgsObj 'limit') }
+				if (Test-MBHasProp $ArgsObj 'all') { $p['all'] = [bool](Get-MBProp $ArgsObj 'all') }
 				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
 				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = (Get-MBProp $ArgsObj 'max_scan') }
 				if (Test-MBHasProp $ArgsObj 'encoding') { $p['encoding'] = [string](Get-MBProp $ArgsObj 'encoding') }
 				if (Test-MBHasProp $ArgsObj 'filter') { $p['filter'] = [string](Get-MBProp $ArgsObj 'filter') }
-				Invoke-StringsScan @p
+				if (Test-MBHasProp $ArgsObj 'section') { $p['section'] = [string](Get-MBProp $ArgsObj 'section') }
+				if (Test-MBHasProp $ArgsObj 'clean_urls') { $p['clean_urls'] = [bool](Get-MBProp $ArgsObj 'clean_urls') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				Invoke-StringExtract @p
+			}
+			"StringsScan" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'minLen') { $p['minLen'] = [int](Get-MBProp $ArgsObj 'minLen') }
+				if (Test-MBHasProp $ArgsObj 'maxLen') { $p['maxLen'] = [int](Get-MBProp $ArgsObj 'maxLen') }
+				if (Test-MBHasProp $ArgsObj 'maxHits') { $p['maxHits'] = (Get-MBProp $ArgsObj 'maxHits') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'limit') { $p['limit'] = (Get-MBProp $ArgsObj 'limit') }
+				if (Test-MBHasProp $ArgsObj 'all') { $p['all'] = [bool](Get-MBProp $ArgsObj 'all') }
+				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = (Get-MBProp $ArgsObj 'offset') }
+				if (Test-MBHasProp $ArgsObj 'max_scan') { $p['max_scan'] = (Get-MBProp $ArgsObj 'max_scan') }
+				if (Test-MBHasProp $ArgsObj 'encoding') { $p['encoding'] = [string](Get-MBProp $ArgsObj 'encoding') }
+				if (Test-MBHasProp $ArgsObj 'filter') { $p['filter'] = [string](Get-MBProp $ArgsObj 'filter') }
+				if (Test-MBHasProp $ArgsObj 'section') { $p['section'] = [string](Get-MBProp $ArgsObj 'section') }
+				if (Test-MBHasProp $ArgsObj 'clean_urls') { $p['clean_urls'] = [bool](Get-MBProp $ArgsObj 'clean_urls') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				Invoke-StringExtract @p
+			}
+			"PeInfo" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'imports') { $p['imports'] = [bool](Get-MBProp $ArgsObj 'imports') }
+				if (Test-MBHasProp $ArgsObj 'exports') { $p['exports'] = [bool](Get-MBProp $ArgsObj 'exports') }
+				if (Test-MBHasProp $ArgsObj 'resources') { $p['resources'] = [bool](Get-MBProp $ArgsObj 'resources') }
+				if (Test-MBHasProp $ArgsObj 'max_import_dlls') { $p['max_import_dlls'] = (Get-MBProp $ArgsObj 'max_import_dlls') }
+				if (Test-MBHasProp $ArgsObj 'max_import_funcs') { $p['max_import_funcs'] = (Get-MBProp $ArgsObj 'max_import_funcs') }
+				if (Test-MBHasProp $ArgsObj 'max_exports') { $p['max_exports'] = (Get-MBProp $ArgsObj 'max_exports') }
+				if (Test-MBHasProp $ArgsObj 'max_resources') { $p['max_resources'] = (Get-MBProp $ArgsObj 'max_resources') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'limit') { $p['limit'] = (Get-MBProp $ArgsObj 'limit') }
+				if (Test-MBHasProp $ArgsObj 'all') { $p['all'] = [bool](Get-MBProp $ArgsObj 'all') }
+				if (Test-MBHasProp $ArgsObj 'summary_only') { $p['summary_only'] = [bool](Get-MBProp $ArgsObj 'summary_only') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				Invoke-PeInfo @p
+			}
+			"ForensicsSummary" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'maxHits') { $p['maxHits'] = [int](Get-MBProp $ArgsObj 'maxHits') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				Invoke-ForensicsSummary @p
+			}
+			"ListRecycleBin" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'drive') { $p['drive'] = [string](Get-MBProp $ArgsObj 'drive') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'name_filter') { $p['name_filter'] = [string](Get-MBProp $ArgsObj 'name_filter') }
+				Invoke-ListRecycleBin @p
+			}
+			"RestoreRecycleBinItem" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'index') { $p['index'] = (Get-MBProp $ArgsObj 'index') }
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = [string](Get-MBProp $ArgsObj 'name') }
+				Invoke-RestoreRecycleBinItem @p
+			}
+			"ExportRecycleBinItem" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'index') { $p['index'] = (Get-MBProp $ArgsObj 'index') }
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = [string](Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'output_dir') { $p['output_dir'] = [string](Get-MBProp $ArgsObj 'output_dir') }
+				if (Test-MBHasProp $ArgsObj 'r_path') { $p['r_path'] = [string](Get-MBProp $ArgsObj 'r_path') }
+				Invoke-ExportRecycleBinItem @p
+			}
+			"ListDeletedFiles" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = [string](Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'name_filter') { $p['name_filter'] = [string](Get-MBProp $ArgsObj 'name_filter') }
+				if (Test-MBHasProp $ArgsObj 'min_bytes') { $p['min_bytes'] = [long](Get-MBProp $ArgsObj 'min_bytes') }
+				if (Test-MBHasProp $ArgsObj 'include_directories') { $p['include_directories'] = [bool](Get-MBProp $ArgsObj 'include_directories') }
+				if (Test-MBHasProp $ArgsObj 'recursive') { $p['recursive'] = (Get-MBProp $ArgsObj 'recursive') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
+				Invoke-ListDeletedFiles @p
+			}
+			"RecoverDeletedFile" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = [string](Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'mft_index') { $p['mft_index'] = (Get-MBProp $ArgsObj 'mft_index') }
+				if (Test-MBHasProp $ArgsObj 'output_dir') { $p['output_dir'] = [string](Get-MBProp $ArgsObj 'output_dir') }
+				if (Test-MBHasProp $ArgsObj 'output_path') { $p['output_path'] = [string](Get-MBProp $ArgsObj 'output_path') }
+				if (Test-MBHasProp $ArgsObj 'file_name') { $p['file_name'] = [string](Get-MBProp $ArgsObj 'file_name') }
+				if (Test-MBHasProp $ArgsObj 'max_bytes') { $p['max_bytes'] = [long](Get-MBProp $ArgsObj 'max_bytes') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
+				if (Test-MBHasProp $ArgsObj 'confirm_same_drive') { $p['confirm_same_drive'] = [bool](Get-MBProp $ArgsObj 'confirm_same_drive') }
+				Invoke-RecoverDeletedFile @p
+			}
+			"ListShadowCopies" { Invoke-ListShadowCopies }
+			"ListUsnRecent" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = [string](Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
+				Invoke-ListUsnRecent @p
+			}
+			"RecoverySmokeTest" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = [string](Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'verbose_log') { $p['verbose_log'] = [bool](Get-MBProp $ArgsObj 'verbose_log') }
+				Invoke-RecoverySmokeTest @p
+			}
+			"ImportTableViewer" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'dll') { $p['dll'] = [string](Get-MBProp $ArgsObj 'dll') }
+				if (Test-MBHasProp $ArgsObj 'max_dlls') { $p['max_dlls'] = (Get-MBProp $ArgsObj 'max_dlls') }
+				if (Test-MBHasProp $ArgsObj 'max_funcs') { $p['max_funcs'] = (Get-MBProp $ArgsObj 'max_funcs') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'limit') { $p['limit'] = (Get-MBProp $ArgsObj 'limit') }
+				if (Test-MBHasProp $ArgsObj 'all') { $p['all'] = [bool](Get-MBProp $ArgsObj 'all') }
+				if (Test-MBHasProp $ArgsObj 'include_delay') { $p['include_delay'] = [bool](Get-MBProp $ArgsObj 'include_delay') }
+				if (Test-MBHasProp $ArgsObj 'by_ordinal_only') { $p['by_ordinal_only'] = [bool](Get-MBProp $ArgsObj 'by_ordinal_only') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				Invoke-ImportTableViewer @p
+			}
+			"ResourceEditor" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'action') { $p['action'] = [string](Get-MBProp $ArgsObj 'action') }
+				if (Test-MBHasProp $ArgsObj 'type') { $p['type'] = [string](Get-MBProp $ArgsObj 'type') }
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = [string](Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'lang') { $p['lang'] = [string](Get-MBProp $ArgsObj 'lang') }
+				if (Test-MBHasProp $ArgsObj 'index') { $p['index'] = [int](Get-MBProp $ArgsObj 'index') }
+				if (Test-MBHasProp $ArgsObj 'out_path') { $p['out_path'] = [string](Get-MBProp $ArgsObj 'out_path') }
+				if (Test-MBHasProp $ArgsObj 'hex') { $p['hex'] = [string](Get-MBProp $ArgsObj 'hex') }
+				if (Test-MBHasProp $ArgsObj 'bytes') { $p['bytes'] = (Get-MBProp $ArgsObj 'bytes') }
+				if (Test-MBHasProp $ArgsObj 'source_path') { $p['source_path'] = [string](Get-MBProp $ArgsObj 'source_path') }
+				if (Test-MBHasProp $ArgsObj 'source_text') { $p['source_text'] = [string](Get-MBProp $ArgsObj 'source_text') }
+				if (Test-MBHasProp $ArgsObj 'text_encoding') { $p['text_encoding'] = [string](Get-MBProp $ArgsObj 'text_encoding') }
+				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = [bool](Get-MBProp $ArgsObj 'backup') }
+				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = (Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				Invoke-ResourceEditor @p
+			}
+			"SectionManager" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'action') { $p['action'] = [string](Get-MBProp $ArgsObj 'action') }
+				if (Test-MBHasProp $ArgsObj 'section') { $p['section'] = [string](Get-MBProp $ArgsObj 'section') }
+				if (Test-MBHasProp $ArgsObj 'index') { $p['index'] = [int](Get-MBProp $ArgsObj 'index') }
+				if (Test-MBHasProp $ArgsObj 'characteristics') { $p['characteristics'] = [string](Get-MBProp $ArgsObj 'characteristics') }
+				if (Test-MBHasProp $ArgsObj 'flags') { $p['flags'] = [string](Get-MBProp $ArgsObj 'flags') }
+				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = [string](Get-MBProp $ArgsObj 'name') }
+				if (Test-MBHasProp $ArgsObj 'hex') { $p['hex'] = [string](Get-MBProp $ArgsObj 'hex') }
+				if (Test-MBHasProp $ArgsObj 'bytes') { $p['bytes'] = (Get-MBProp $ArgsObj 'bytes') }
+				if (Test-MBHasProp $ArgsObj 'source_path') { $p['source_path'] = [string](Get-MBProp $ArgsObj 'source_path') }
+				if (Test-MBHasProp $ArgsObj 'raw_size') { $p['raw_size'] = [long](Get-MBProp $ArgsObj 'raw_size') }
+				if (Test-MBHasProp $ArgsObj 'virt_size') { $p['virt_size'] = [long](Get-MBProp $ArgsObj 'virt_size') }
+				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = [bool](Get-MBProp $ArgsObj 'backup') }
+				if (Test-MBHasProp $ArgsObj 'validate') { $p['validate'] = [bool](Get-MBProp $ArgsObj 'validate') }
+				if (Test-MBHasProp $ArgsObj 'help') { $p['help'] = [bool](Get-MBProp $ArgsObj 'help') }
+				if (Test-MBHasProp $ArgsObj 'dry_run') { $p['dry_run'] = [bool](Get-MBProp $ArgsObj 'dry_run') }
+				Invoke-SectionManager @p
 			}
 			"ReadImage" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path') }
@@ -35236,6 +41462,15 @@ function Invoke-MBTool {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path' 'C:\') }
 				if (Test-MBHasProp $ArgsObj 'deep') { $p['deep'] = [bool](Get-MBProp $ArgsObj 'deep') }
 				if (Test-MBHasProp $ArgsObj 'top') { $p['top'] = [int](Get-MBProp $ArgsObj 'top') }
+				if (Test-MBHasProp $ArgsObj 'mode') { $p['mode'] = [string](Get-MBProp $ArgsObj 'mode') }
+				if (Test-MBHasProp $ArgsObj 'largest_files') { $p['largest_files'] = [int](Get-MBProp $ArgsObj 'largest_files') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
+				Invoke-GetDiskSpace @p
+			}
+			# Alias: old ListLargestFiles tool name → GetDiskSpace mode=files
+			"ListLargestFiles" {
+				$p = @{ path = (Get-MBProp $ArgsObj 'path' 'C:\'); mode = 'files' }
+				if (Test-MBHasProp $ArgsObj 'top') { $p['top'] = [int](Get-MBProp $ArgsObj 'top'); $p['largest_files'] = [int](Get-MBProp $ArgsObj 'top') }
 				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
 				Invoke-GetDiskSpace @p
 			}
@@ -35957,6 +42192,80 @@ function Get-MBEstimatedPromptTokens {
 	return [int]($toolTokEst + $otherTokEst + [math]::Max(0, $ToolsTok))
 }
 
+function Get-MBMessagesContentFingerprint {
+	# Cheap content identity for token-cache invalidation after compact/history rewrites.
+	param([array]$Messages)
+	$count = 0
+	$chars = 0
+	$toolChars = 0
+	$roleBits = New-Object System.Text.StringBuilder
+	foreach ($m in @($Messages)) {
+		if ($null -eq $m) { continue }
+		$count++
+		$r = [string](Get-MBProp $m 'role')
+		if (-not $r) { $r = '?' }
+		try { [void]$roleBits.Append($r.Substring(0, 1).ToLowerInvariant()) } catch { [void]$roleBits.Append('?') }
+		$ch = 0
+		try { $ch = [int](Get-MBMessageCharCount -Message $m) } catch { $ch = 0 }
+		$chars += $ch
+		if ($r -eq 'tool') {
+			$tc = Get-MBProp $m 'content'
+			if ($null -ne $tc) { $toolChars += ([string]$tc).Length }
+		}
+	}
+	$toolsTok = 0
+	try { $toolsTok = [int]$script:MB.ToolsOverheadTok } catch { $toolsTok = 0 }
+	$stickyLen = 0
+	try { $stickyLen = ([string]$script:MB.StickyExtra).Length } catch { $stickyLen = 0 }
+	$wd = ''
+	try { $wd = [string]$script:MB.WorkingDir } catch { $wd = '' }
+	return '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $count, $chars, $toolChars, $toolsTok, $stickyLen, $roleBits.ToString(), $wd
+}
+
+function Reset-MBTokenEstimateCache {
+	# Drop local token estimate cache. -ClearUsage also forgets last server usage so
+	# post-compact UI cannot report the pre-compact prompt size.
+	param([switch]$ClearUsage)
+	try { $script:MB.TokCacheKey = '' } catch {}
+	try { $script:MB.TokCacheTokens = 0 } catch {}
+	try { $script:MB.TokCacheAt = [datetime]::MinValue } catch {}
+	if ($ClearUsage) {
+		try { $script:MB.LastServerPromptTokens = 0 } catch {}
+		try { $script:MB.LastUsageMsgFingerprint = '' } catch {}
+		try { $script:MB.TokenCountSource = 'estimate' } catch {}
+	}
+}
+
+function Set-MBLastUsagePromptTokens {
+	# Bind usage.prompt_tokens to a messages fingerprint so compact cannot reuse stale usage.
+	param(
+		[int]$PromptTokens,
+		[array]$Messages = $null
+	)
+	if ($PromptTokens -le 0) { return }
+	try { $script:MB.LastServerPromptTokens = [int]$PromptTokens } catch {}
+	try { $script:MB.TokenCountSource = 'usage' } catch {}
+	try { $script:MB.LastCtxTokens = [int]$PromptTokens } catch {}
+	$fp = ''
+	try {
+		if ($null -eq $Messages) {
+			try { $Messages = @($script:Messages) } catch { $Messages = @() }
+		}
+		$fp = Get-MBMessagesContentFingerprint -Messages $Messages
+	} catch { $fp = '' }
+	try { $script:MB.LastUsageMsgFingerprint = [string]$fp } catch {}
+	try {
+		if ($fp) {
+			$script:MB.TokCacheKey = $fp
+			$script:MB.TokCacheTokens = [int]$PromptTokens
+			$script:MB.TokCacheAt = Get-Date
+		} else {
+			$script:MB.TokCacheKey = ''
+			$script:MB.TokCacheTokens = 0
+		}
+	} catch {}
+}
+
 function Get-MBAccuratePromptTokens {
 	param(
 		[array]$Messages,
@@ -35965,16 +42274,20 @@ function Get-MBAccuratePromptTokens {
 	)
 
 	$toolsTok = [int]$script:MB.ToolsOverheadTok
-	$cacheKey = '{0}|{1}|{2}|{3}' -f @($Messages).Count, $MsgChars, $toolsTok, $script:MB.WorkingDir
+	# Content fingerprint (not just count) so shrink/compact invalidates the cache.
+	$cacheKey = ''
+	try { $cacheKey = Get-MBMessagesContentFingerprint -Messages $Messages } catch {
+		$cacheKey = '{0}|{1}|{2}|{3}' -f @($Messages).Count, $MsgChars, $toolsTok, $script:MB.WorkingDir
+	}
 	$now = Get-Date
 	if ($script:MB.TokCacheKey -eq $cacheKey -and $script:MB.TokCacheTokens -gt 0) {
 		$age = ($now - [datetime]$script:MB.TokCacheAt).TotalSeconds
+		# Short TTL only — never pin usage for a day across history rewrites.
 		$maxAge = 8
-		try {
-			if ([string]$script:MB.TokenCountSource -eq 'usage') { $maxAge = 86400 }
-		} catch { $maxAge = 8 }
 		if ($age -ge 0 -and $age -lt $maxAge) {
-			return [pscustomobject]@{ Tokens = [int]$script:MB.TokCacheTokens; Source = [string]$script:MB.TokenCountSource }
+			$src = [string]$script:MB.TokenCountSource
+			if ([string]::IsNullOrWhiteSpace($src)) { $src = 'estimate' }
+			return [pscustomobject]@{ Tokens = [int]$script:MB.TokCacheTokens; Source = $src }
 		}
 	}
 
@@ -36009,10 +42322,18 @@ function Get-MBAccuratePromptTokens {
 		}
 	}
 
-	if ([int]$script:MB.LastServerPromptTokens -gt 0) {
-		$script:MB.TokenCountSource = 'usage'
-		return [pscustomobject]@{ Tokens = [int]$script:MB.LastServerPromptTokens; Source = 'usage' }
-	}
+	# Usage only if it was measured against this exact history fingerprint.
+	try {
+		$usageFp = [string]$script:MB.LastUsageMsgFingerprint
+		$usageTok = [int]$script:MB.LastServerPromptTokens
+		if ($usageTok -gt 0 -and $usageFp -and $usageFp -eq $cacheKey) {
+			$script:MB.TokenCountSource = 'usage'
+			$script:MB.TokCacheKey = $cacheKey
+			$script:MB.TokCacheTokens = $usageTok
+			$script:MB.TokCacheAt = $now
+			return [pscustomobject]@{ Tokens = $usageTok; Source = 'usage' }
+		}
+	} catch {}
 
 	$est = Get-MBEstimatedPromptTokens -MsgChars $MsgChars -ToolPayloadChars $ToolPayloadChars -ToolsTok $toolsTok
 	$script:MB.TokenCountSource = 'estimate'
@@ -38629,6 +44950,11 @@ function Compact-MBHistory {
 	if ($rest.Count -le $KeepLast) {
 		$shrunk = @(Shrink-MBToolPayloads -Messages (@($head) + @($rest)) -RecentKeep 8 -OldMaxChars 2000)
 		try { $shrunk = @(Repair-MBToolMessageSequence -Messages $shrunk) } catch {}
+		try { Reset-MBTokenEstimateCache -ClearUsage } catch {}
+		try {
+			$script:MB.LastCompactReason = ("keep-tail noop (rest={0} <= keep={1}); tool-shrink only" -f $rest.Count, $KeepLast)
+			$script:MB.LastCompactOk = $false
+		} catch {}
 		return $shrunk
 	}
 
@@ -38739,9 +45065,606 @@ function Compact-MBHistory {
 	if ($sysN -lt 2) { [void]$final.Add($notice) }
 	$finalArr = @(Shrink-MBToolPayloads -Messages $final.ToArray() -RecentKeep 6 -OldMaxChars 1800 -RecentMaxChars 8000)
 	try { $finalArr = @(Repair-MBToolMessageSequence -Messages $finalArr) } catch {}
+	try { Reset-MBTokenEstimateCache -ClearUsage } catch {}
+	# Keep-tail still rewrites history — avoid reusing pre-compact prompt cache as if nothing changed.
+	try { if ([int]$script:MB.ForceCachePromptOff -lt 1) { $script:MB.ForceCachePromptOff = 1 } } catch {}
 	return $finalArr
 	} finally {
 		Exit-MBCompacting
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Full-replace compaction (Grok Build style)
+# Summarize whole history → rebuild a short conversation. Keep-tail alone was
+# leaving tool-heavy sessions near n_ctx while reporting "compacted".
+# ---------------------------------------------------------------------------
+
+function Get-MBLastRealUserQuery {
+	param([array]$Messages)
+	$last = ''
+	foreach ($m in @($Messages)) {
+		$r = [string](Get-MBProp $m 'role')
+		if ($r -ne 'user') { continue }
+		$c = [string](Get-MBProp $m 'content')
+		if ([string]::IsNullOrWhiteSpace($c)) { continue }
+		if ($c -match '(?i)^\[CONTINUE\]') { continue }
+		if ($c -match '(?i)This session is being continued') { continue }
+		if ($c -match '(?i)^Summarize this excerpt') { continue }
+		if ($c -match '(?i)<summary_request>') { continue }
+		if ($c -match '(?i)^Your task is to produce a faithful, concise summary') { continue }
+		if ($c -match '(?i)^Continue the work described in the compacted session') { continue }
+		if ($c -match '(?i)^\[AGENT MODE RESUME') { continue }
+		$last = $c
+	}
+	return $last
+}
+
+function Test-MBHasAgentResumeBlock {
+	param([array]$Messages)
+	foreach ($m in @($Messages)) {
+		if ([string](Get-MBProp $m 'role') -ne 'system') { continue }
+		$c = [string](Get-MBProp $m 'content')
+		if ($c -match '(?i)^\[AGENT MODE RESUME') { return $true }
+	}
+	return $false
+}
+
+function Get-MBPriorCompactSummaryText {
+	# Pull the "Earlier conversation..." body out of an existing AGENT MODE RESUME block (2nd+ compact).
+	param([array]$Messages)
+	foreach ($m in @($Messages)) {
+		if ([string](Get-MBProp $m 'role') -ne 'system') { continue }
+		$c = [string](Get-MBProp $m 'content')
+		if ($c -notmatch '(?i)^\[AGENT MODE RESUME') { continue }
+		$idx = $c.IndexOf('Earlier conversation', [StringComparison]::OrdinalIgnoreCase)
+		if ($idx -lt 0) { return $c }
+		$rest = $c.Substring($idx)
+		# Drop the header line
+		$nl = $rest.IndexOf("`n")
+		if ($nl -ge 0 -and $nl + 1 -lt $rest.Length) { $rest = $rest.Substring($nl + 1).Trim() }
+		if ($rest.Length -gt 8000) { $rest = $rest.Substring(0, 7997) + '...' }
+		return $rest
+	}
+	return ''
+}
+
+function Format-MBCompactSummaryClean {
+	# Mirror grok-build format_compact_summary: drop analysis scratchpad, keep summary body.
+	param([string]$Raw)
+	if ([string]::IsNullOrWhiteSpace($Raw)) { return '' }
+	$result = [string]$Raw
+	# Peel leading <analysis>...</analysis>
+	$guard = 0
+	while ($guard -lt 4 -and $result -match '(?is)<analysis\b[^>]*>') {
+		$guard++
+		$start = $result.IndexOf($Matches[0])
+		if ($start -lt 0) { break }
+		$before = $result.Substring(0, $start)
+		if ($before.Trim().Length -gt 0 -and $before -notmatch '(?is)<summary\b') { break }
+		$from = $start
+		$closeIdx = $result.IndexOf('</analysis>', $from, [StringComparison]::OrdinalIgnoreCase)
+		if ($closeIdx -ge 0) {
+			$end = $closeIdx + '</analysis>'.Length
+			$result = $result.Substring(0, $from) + $result.Substring($end)
+		} else {
+			$sumIdx = $result.IndexOf('<summary>', $from, [StringComparison]::OrdinalIgnoreCase)
+			if ($sumIdx -ge 0) {
+				$result = $result.Substring(0, $from) + $result.Substring($sumIdx)
+			} else {
+				$result = $result.Substring(0, $from)
+			}
+			break
+		}
+	}
+	if ($result -match '(?is)<summary\b[^>]*>(.*?)</summary>') {
+		$inner = [string]$Matches[1]
+		$result = "Summary:`n" + $inner.Trim()
+	}
+	$result = $result -replace '</?summary>', '' -replace '</?analysis>', ''
+	$result = $result -replace '</?summary_request>', ''
+	while ($result.Contains("`n`n`n")) { $result = $result.Replace("`n`n`n", "`n`n") }
+	return $result.Trim()
+}
+
+function Test-MBDegenerateCompactSummary {
+	param([string]$Raw, [int]$MinChars = 200)
+	$cleaned = Format-MBCompactSummaryClean -Raw $Raw
+	return ($cleaned.Length -lt $MinChars)
+}
+
+function Build-MBFullReplaceSummaryPrompt {
+	param([string]$UserContext = '')
+	$ctxSection = ''
+	if (-not [string]::IsNullOrWhiteSpace($UserContext)) {
+		$ctxSection = @"
+
+**User-provided context for this compaction:**
+$UserContext
+
+Please incorporate this context into your summary, ensuring it is prominently addressed in the relevant sections.
+
+"@
+	}
+	return @"
+Your task is to produce a faithful, concise summary of the conversation so far so that a successor assistant can continue the work seamlessly after the earlier turns are discarded. The successor will see the user's original query plus this summary. Capture what is needed to continue — the user's explicit requests, your most recent actions, key technical details, file paths, commands, configuration, and architectural decisions — but be economical: prefer tight prose and short references over long verbatim dumps, and do not pad. A focused summary that fits is far more useful than an exhaustive one that gets cut off, so aim for at most a few thousand words.
+$ctxSection
+CRITICAL: If earlier turns include a prior compaction summary (marked with a "This session is being continued" preamble), treat it as authoritative for the early history and carry its still-relevant information forward into your new summary so nothing important is lost across successive compactions.
+
+Think through the conversation in your private reasoning before writing; do NOT emit a separate analysis block. Output the final summary inside a single <summary>...</summary> block, organized into the following numbered sections. Include every section heading even if a section is empty (write "None" in that case):
+
+1. Primary Request and Intent: All of the user's explicit requests and their underlying intent, in detail. Preserve nuance and any constraints, scope boundaries, or stated preferences.
+2. Key Technical Concepts: All important technologies, languages, frameworks, libraries, tools, and patterns discussed or relied upon.
+3. Files and Code Sections: Every file examined, created, or modified. For each, give the full path, why it matters, and the relevant details (not only descriptions).
+4. Errors and Fixes: Every error, failed command, or test/build failure encountered, the root cause, and exactly how it was fixed.
+5. Problem Solving: Problems already solved and any in-progress diagnosis, including hypotheses still being evaluated.
+6. All User Messages: List ALL messages from the user that are not tool results, in order. Do NOT include this summarization instruction itself.
+7. Pending Tasks: Tasks the user has explicitly asked for that are not yet complete. Do not invent tasks.
+8. Current Work: Precisely what you were doing immediately before this summary request, with the most recent file names, commands, and state.
+9. Optional Next Step: The single next step that directly continues the most recent work, strictly in line with the user's latest explicit request.
+
+IMPORTANT: This is a PRIVATE compression pass only. Do NOT call or use any tools. Do NOT invent tool markup. Respond with ONLY the <summary>...</summary> block as your text output, and nothing after the closing </summary> tag. After this response the host will discard this instruction and restore normal agent tool-calling mode — your summary must not instruct the successor to avoid tools or to emit tools as plain text.
+"@
+}
+
+function Convert-MBMessagesForSummarizer {
+	# Flatten tool_calls / tool roles into plain chat text so the compact completion
+	# needs no tools schema and stays under local-server limits.
+	param(
+		[array]$Messages,
+		[int]$ToolMaxChars = 2500
+	)
+	$out = New-Object System.Collections.ArrayList
+	foreach ($m in @($Messages)) {
+		if ($null -eq $m) { continue }
+		$r = [string](Get-MBProp $m 'role')
+		$c = [string](Get-MBProp $m 'content')
+		if ($r -eq 'system') {
+			if (Test-MBIsTurnHygieneMessage $m) { continue }
+			if ($c -match '^\[Context compacted:') { continue }
+			# Prior compact resume can be huge — keep a short seed only (2nd+ compact).
+			if ($c -match '(?i)^\[AGENT MODE RESUME') {
+				$seed = $c
+				$idx = $seed.IndexOf('Earlier conversation', [StringComparison]::OrdinalIgnoreCase)
+				if ($idx -ge 0) { $seed = $seed.Substring($idx) }
+				if ($seed.Length -gt 3500) { $seed = $seed.Substring(0, 3497) + '...' }
+				[void]$out.Add(@{ role = 'system'; content = ("Prior compact summary seed:`n{0}" -f $seed) })
+				continue
+			}
+			# Keep base system + session state (truncated) — full agent prompt is wasted on summarizer
+			if (Test-MBIsBaseSystemMessage $m) {
+				if ($c.Length -gt 1200) { $c = $c.Substring(0, 1197) + '...' }
+			} elseif ($c.Length -gt 4000) {
+				$c = $c.Substring(0, 2000) + "`n...`n" + $c.Substring($c.Length - 1500)
+			}
+			[void]$out.Add(@{ role = 'system'; content = $c })
+			continue
+		}
+		if ($r -eq 'user') {
+			if ($c -match '(?i)^Your task is to produce a faithful, concise summary') { continue }
+			if ($c.Length -gt 8000) { $c = $c.Substring(0, 4000) + "`n...`n" + $c.Substring($c.Length - 3500) }
+			[void]$out.Add(@{ role = 'user'; content = $c })
+			continue
+		}
+		if ($r -eq 'assistant') {
+			$bits = New-Object System.Collections.ArrayList
+			if (-not [string]::IsNullOrWhiteSpace($c)) {
+				$ac = $c
+				if ($ac.Length -gt 4000) { $ac = $ac.Substring(0, 2000) + '...' + $ac.Substring($ac.Length - 1500) }
+				[void]$bits.Add($ac)
+			}
+			$tcs = Get-MBProp $m 'tool_calls'
+			if ($tcs) {
+				try {
+					foreach ($tc in @($tcs)) {
+						$fn = Get-MBProp $tc 'function'
+						$tn = [string](Get-MBProp $fn 'name')
+						$ta = [string](Get-MBProp $fn 'arguments')
+						if ($ta.Length -gt 500) { $ta = $ta.Substring(0, 497) + '...' }
+						# Neutral wording — do NOT use <tool_call> tags here; those leak into
+						# summaries and teach the successor model to emit tools as chat text.
+						if ($tn) { [void]$bits.Add(('Called tool {0} with args: {1}' -f $tn, $ta)) }
+					}
+				} catch {}
+			}
+			$text = ($bits -join "`n")
+			if ([string]::IsNullOrWhiteSpace($text)) { $text = '[assistant]' }
+			[void]$out.Add(@{ role = 'assistant'; content = $text })
+			continue
+		}
+		if ($r -eq 'tool') {
+			$dig = Get-MBToolResultDigest -Content $c -MaxChars $ToolMaxChars
+			$tid = [string](Get-MBProp $m 'tool_call_id')
+			$label = if ($tid) { "Tool result ($tid)" } else { 'Tool result' }
+			[void]$out.Add(@{ role = 'user'; content = ("{0}:`n{1}" -f $label, $dig) })
+			continue
+		}
+	}
+	return $out.ToArray()
+}
+
+function Fit-MBMessagesToTokenBudget {
+	# Drop oldest non-system turns until estimate fits budget (tool-pair safe).
+	param(
+		[array]$Messages,
+		[int]$BudgetTokens
+	)
+	if ($BudgetTokens -le 0) { return @($Messages) }
+	$msgs = @($Messages)
+	$guard = 0
+	while ($guard -lt 80 -and $msgs.Count -gt 4) {
+		$guard++
+		$est = Get-MBContextEstimate -Messages $msgs
+		if ([int]$est.PromptTokens -le $BudgetTokens) { break }
+		# Drop from index 1 (preserve leading system if present)
+		$start = 0
+		if ($msgs.Count -gt 0 -and [string](Get-MBProp $msgs[0] 'role') -eq 'system') { $start = 1 }
+		if ($start -ge $msgs.Count - 2) { break }
+		# Advance start past a tool-result island if needed (snap like Grok select)
+		$dropAt = $start
+		$dropRole = [string](Get-MBProp $msgs[$dropAt] 'role')
+		# Drop a whole early user/assistant/tool cluster (at least 1 message)
+		$dropCount = 1
+		if ($dropRole -eq 'assistant') {
+			$tcs = Get-MBProp $msgs[$dropAt] 'tool_calls'
+			if ($tcs -and @($tcs).Count -gt 0) {
+				$j = $dropAt + 1
+				while ($j -lt $msgs.Count -and [string](Get-MBProp $msgs[$j] 'role') -eq 'tool') {
+					$dropCount++
+					$j++
+				}
+			}
+		} elseif ($dropRole -eq 'tool') {
+			# Shouldn't start on tool after snap; skip orphan tools
+			$j = $dropAt
+			while ($j -lt $msgs.Count -and [string](Get-MBProp $msgs[$j] 'role') -eq 'tool') {
+				$dropCount++
+				$j++
+			}
+		}
+		$newList = New-Object System.Collections.ArrayList
+		for ($i = 0; $i -lt $msgs.Count; $i++) {
+			if ($i -ge $dropAt -and $i -lt ($dropAt + $dropCount)) { continue }
+			[void]$newList.Add($msgs[$i])
+		}
+		if ($newList.Count -ge $msgs.Count) { break }
+		$msgs = @($newList.ToArray())
+	}
+	return $msgs
+}
+
+function Prepare-MBSummarizerTurns {
+	# Input ladder: verbatim → fitted → lossy (Grok Build).
+	param(
+		[array]$Messages,
+		[ValidateSet('verbatim', 'fitted', 'lossy')]$Stage = 'verbatim',
+		[int]$BudgetTokens = 0
+	)
+	$toolMax = 2500
+	if ($Stage -eq 'fitted') { $toolMax = 900 }
+	if ($Stage -eq 'lossy') { $toolMax = 350 }
+
+	$work = @($Messages)
+	if ($Stage -eq 'lossy') {
+		$work = @(Shrink-MBToolPayloads -Messages $work -RecentKeep 2 -OldMaxChars 400 -RecentMaxChars 900)
+	} elseif ($Stage -eq 'fitted') {
+		$work = @(Shrink-MBToolPayloads -Messages $work -RecentKeep 4 -OldMaxChars 900 -RecentMaxChars 2000)
+	}
+
+	$flat = @(Convert-MBMessagesForSummarizer -Messages $work -ToolMaxChars $toolMax)
+	if ($BudgetTokens -gt 0 -and ($Stage -eq 'fitted' -or $Stage -eq 'lossy')) {
+		$flat = @(Fit-MBMessagesToTokenBudget -Messages $flat -BudgetTokens $BudgetTokens)
+	} elseif ($BudgetTokens -gt 0 -and $Stage -eq 'verbatim') {
+		$est = Get-MBContextEstimate -Messages $flat
+		if ([int]$est.PromptTokens -gt $BudgetTokens) {
+			$flat = @(Fit-MBMessagesToTokenBudget -Messages $flat -BudgetTokens $BudgetTokens)
+		}
+	}
+	return $flat
+}
+
+function Invoke-MBFullReplaceSummary {
+	param(
+		[array]$LlmTurns,
+		[string]$UserContext = '',
+		[int]$MaxTok = 2500,
+		[int]$TimeoutSec = 120
+	)
+	if (-not $LlmTurns -or @($LlmTurns).Count -eq 0) { return $null }
+	$prompt = Build-MBFullReplaceSummaryPrompt -UserContext $UserContext
+	$msgs = New-Object System.Collections.ArrayList
+	foreach ($m in @($LlmTurns)) { [void]$msgs.Add($m) }
+	[void]$msgs.Add(@{ role = 'user'; content = $prompt })
+	# Prefer model compact when enabled; still run when ModelCompact is off for full-replace
+	# (full-replace is the real recovery path).
+	return (Invoke-MBCompletion -Messages $msgs.ToArray() -MaxTok $MaxTok -Temp 0.1 -TimeoutSec $TimeoutSec)
+}
+
+function Reset-MBAgentModeAfterCompact {
+	# Summarizer runs as plain completion (no tools). Leave agent mode clearly ON for the next chat turn:
+	# - one/two-shot cache_prompt=false so llama.cpp does not reuse the summarizer slot prefix
+	# - best-effort slot erase so free-text / "do not call tools" KV does not bleed into tool chat
+	# - clear compacting flags
+	try { $script:MB.IsCompacting = $false } catch {}
+	try { $script:MB.CompactingDepth = 0 } catch {}
+	try {
+		# 2 = this turn's first stream + one retry/tool-loop rebuild still avoid stale cache
+		$script:MB.ForceCachePromptOff = 2
+	} catch {}
+	try {
+		# Quiet: do not spam UI; same path used on new endpoint connect
+		[void](Clear-MBServerSlots -Quiet)
+	} catch {}
+	try { Reset-MBTokenEstimateCache -ClearUsage } catch {}
+}
+
+function Get-MBPostCompactAgentResumeText {
+	param(
+		[string]$SummaryClean,
+		[string]$StageLabel = 'full-replace'
+	)
+	# System-role block: puts model BACK into tool-using agent mode after the no-tools summarizer pass.
+	$lines = New-Object System.Collections.ArrayList
+	[void]$lines.Add('[AGENT MODE RESUME — context was compacted]')
+	[void]$lines.Add('The previous model call was ONLY a private history-compression pass (no tools). That pass is finished.')
+	[void]$lines.Add('You are now back in normal MiniBot agent chat mode with the OpenAI tools array enabled on this request.')
+	[void]$lines.Add('REQUIREMENTS:')
+	[void]$lines.Add('- Use native API tool_calls / function calling for every tool. Do NOT write tool markup into chat text.')
+	[void]$lines.Add('- Forbidden in assistant content: <tool_call>, </tool_call>, <parameter>, <function>, ```tool, inventing XML/JSON tool scripts as the reply.')
+	[void]$lines.Add('- Do NOT produce another <summary> block. Do NOT keep summarizing unless the operator asks.')
+	[void]$lines.Add('- Continue the operator task using tools when needed; final user-facing text only after tools (or if no tool is required).')
+	[void]$lines.Add(('Compact stage: {0}' -f $StageLabel))
+	[void]$lines.Add('')
+	[void]$lines.Add('Earlier conversation (authoritative for pre-compact history):')
+	[void]$lines.Add($SummaryClean)
+	return ($lines -join "`n")
+}
+
+function Assemble-MBFullReplaceHistory {
+	param(
+		[string]$SummaryRaw,
+		[string]$LastUserQuery = '',
+		[array]$RecentTail = @(),
+		[string]$StageLabel = 'full-replace'
+	)
+	$cleaned = Format-MBCompactSummaryClean -Raw $SummaryRaw
+	if ([string]::IsNullOrWhiteSpace($cleaned)) { $cleaned = [string]$SummaryRaw }
+	if ($cleaned.Length -gt 12000) { $cleaned = $cleaned.Substring(0, 11997) + '...' }
+
+	# Sticky pointer only — full summary lives in the system resume block (not a user message).
+	$script:MB.StickyExtra = "full-replace ($StageLabel): session summary in AGENT MODE RESUME system block ({0} chars)." -f $cleaned.Length
+	if ($script:MB.StickyExtra.Length -gt 400) {
+		$script:MB.StickyExtra = $script:MB.StickyExtra.Substring(0, 397) + '...'
+	}
+
+	# Order matters for local models (Grok Build style):
+	#   system base + sticky → system resume/summary → optional recent tail → LAST user query
+	# Putting the summary last as role=user left the model answering the summarizer document
+	# in free-text / no-tools style (e.g. <tool_call> in the chat window).
+	$resume = Get-MBPostCompactAgentResumeText -SummaryClean $cleaned -StageLabel $StageLabel
+	$body = New-Object System.Collections.ArrayList
+	[void]$body.Add(@{
+		role    = 'system'
+		content = $resume
+	})
+
+	foreach ($m in @($RecentTail)) {
+		if ($null -eq $m) { continue }
+		if (Test-MBIsBaseSystemMessage $m) { continue }
+		if (Test-MBIsStateMessage $m) { continue }
+		[void]$body.Add($m)
+	}
+
+	$uq = ''
+	if (-not [string]::IsNullOrWhiteSpace($LastUserQuery)) {
+		$uq = $LastUserQuery
+		if ($uq.Length -gt 6000) { $uq = $uq.Substring(0, 5997) + '...' }
+	}
+	if ([string]::IsNullOrWhiteSpace($uq)) {
+		$uq = 'Continue the work described in the compacted session context. Use native tools when needed; do not summarize again.'
+	}
+	[void]$body.Add(@{ role = 'user'; content = $uq })
+
+	# Fresh system + single sticky ledger (no accumulated old stickies)
+	$synced = @(Sync-MBSystemMessages -Messages $body.ToArray())
+	$final = New-Object System.Collections.ArrayList
+	$sawSticky = $false
+	$sawResume = $false
+	foreach ($m in @($synced)) {
+		if (Test-MBIsStateMessage $m) {
+			if ($sawSticky) { continue }
+			$sawSticky = $true
+		}
+		if ([string](Get-MBProp $m 'role') -eq 'system') {
+			$c = [string](Get-MBProp $m 'content')
+			if ($c -match '^\[Context compacted:') { continue }
+			if ($c -match '(?i)^\[AGENT MODE RESUME') {
+				if ($sawResume) { continue }
+				$sawResume = $true
+			}
+		}
+		[void]$final.Add($m)
+	}
+	# Ensure resume system block is present (Sync can reorder; keep it after sticky when possible)
+	try { $finalArr = @(Repair-MBToolMessageSequence -Messages $final.ToArray()) } catch { $finalArr = @($final.ToArray()) }
+	return $finalArr
+}
+
+function FullReplace-MBHistory {
+	# Grok-style full-replace: summarize whole session, replace $Messages with a short rebuild.
+	# At most ONE nested-safe run: Manage/Ensure must not re-enter the 3-stage ladder.
+	param(
+		[array]$Messages,
+		[string]$UserContext = '',
+		[switch]$VerboseLog
+	)
+	try { Sync-MBAutoCompactFromWpf } catch {}
+
+	# Reentrancy / double-fire guard (Compact Now + Ensure, or hard auto re-entry)
+	try {
+		if ([bool]$script:MB.FullReplaceBusy) {
+			$script:MB.LastCompactReason = 'full-replace skipped: already in progress'
+			$script:MB.LastCompactOk = $false
+			if ($VerboseLog) { Write-Host '  full-replace: skipped (already running)' -ForegroundColor DarkYellow }
+			return @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 4 -OldMaxChars 1000 -RecentMaxChars 3000)
+		}
+		$ago = ([datetime]::UtcNow - [datetime]$script:MB.LastFullReplaceAt).TotalSeconds
+		if ($ago -ge 0 -and $ago -lt 8) {
+			$script:MB.LastCompactReason = ("full-replace skipped: cooldown {0:N1}s" -f $ago)
+			$script:MB.LastCompactOk = $false
+			if ($VerboseLog) { Write-Host ("  full-replace: skipped (cooldown {0:N0}s)" -f $ago) -ForegroundColor DarkYellow }
+			return @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 4 -OldMaxChars 1000 -RecentMaxChars 3000)
+		}
+	} catch {}
+
+	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+	$chatCount = 0
+	foreach ($m in @($Messages)) {
+		$r = [string](Get-MBProp $m 'role')
+		if ($r -and $r -ne 'system') { $chatCount++ }
+	}
+	# Nothing useful to replace
+	if ($chatCount -le 2) {
+		try { $script:MB.LastCompactOk = $false } catch {}
+		$script:MB.LastCompactReason = 'full-replace skipped: history already short'
+		return @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 4 -OldMaxChars 1200 -RecentMaxChars 4000)
+	}
+
+	$script:MB.FullReplaceBusy = $true
+	Enter-MBCompacting
+	try {
+		try { Thaw-MBWireState -Force } catch {}
+		Reset-MBTokenEstimateCache -ClearUsage
+		$before = Get-MBContextEstimate -Messages $Messages -ForceRefresh
+		$lastQ = Get-MBLastRealUserQuery -Messages $Messages
+		$priorSummary = ''
+		try { $priorSummary = Get-MBPriorCompactSummaryText -Messages $Messages } catch { $priorSummary = '' }
+		$hadResume = $false
+		try { $hadResume = [bool](Test-MBHasAgentResumeBlock -Messages $Messages) } catch { $hadResume = $false }
+
+		$budget = [math]::Floor((Get-MBEffectivePromptBudget) * 0.50)
+		if ($budget -lt 2048) { $budget = 2048 }
+
+		$summaryRaw = $null
+		$usedStage = ''
+		# 2nd+ compact: skip verbatim (usually fails / wastes a full n_ctx call); start fitted/lossy.
+		$stages = @('verbatim', 'fitted', 'lossy')
+		if ($hadResume) { $stages = @('fitted', 'lossy') }
+
+		foreach ($stage in $stages) {
+			if ($VerboseLog) {
+				Write-Host ("  full-replace: summarizer stage={0}..." -f $stage) -ForegroundColor DarkGray
+			}
+			try {
+				$turns = @(Prepare-MBSummarizerTurns -Messages $Messages -Stage $stage -BudgetTokens $budget)
+			} catch { $turns = @() }
+			if ($turns.Count -lt 2) {
+				if ($VerboseLog) { Write-Host ("  full-replace: stage={0} no turns" -f $stage) -ForegroundColor DarkGray }
+				continue
+			}
+
+			# If prior summary exists, prepend a short seed so successive compacts merge instead of amnesia
+			if ($priorSummary -and $stage -ne 'verbatim') {
+				$seedMsg = @{
+					role    = 'system'
+					content = ("Carry forward still-relevant facts from this prior compact summary:`n{0}" -f $priorSummary)
+				}
+				$turns = @($seedMsg) + @($turns)
+			}
+
+			$raw = $null
+			try {
+				# Shorter timeout on later stages — don't hang the UI in a 3×2 minute loop
+				$tmo = 90
+				if ($stage -eq 'lossy') { $tmo = 60 }
+				$raw = Invoke-MBFullReplaceSummary -LlmTurns $turns -UserContext $UserContext -MaxTok 2000 -TimeoutSec $tmo
+			} catch { $raw = $null }
+			if ([string]::IsNullOrWhiteSpace([string]$raw)) {
+				if ($VerboseLog) { Write-Host ("  full-replace: stage={0} empty model reply" -f $stage) -ForegroundColor DarkGray }
+				continue
+			}
+
+			$minChars = 160
+			if ($stage -eq 'lossy') { $minChars = 100 }
+			if (Test-MBDegenerateCompactSummary -Raw $raw -MinChars $minChars) {
+				if ($VerboseLog) {
+					Write-Host ("  full-replace: stage={0} summary too short, next..." -f $stage) -ForegroundColor DarkGray
+				}
+				continue
+			}
+			$summaryRaw = $raw
+			$usedStage = $stage
+			break
+		}
+
+		if ([string]::IsNullOrWhiteSpace([string]$summaryRaw)) {
+			# Extractive fallback — still a real replace (drops history). Prefer prior summary + new user lines.
+			if ($VerboseLog) {
+				Write-Host '  full-replace: model stages failed — extractive fallback' -ForegroundColor DarkYellow
+			}
+			$extractBits = New-Object System.Collections.ArrayList
+			if ($priorSummary) {
+				[void]$extractBits.Add(('Prior: {0}' -f ($(if ($priorSummary.Length -gt 900) { $priorSummary.Substring(0, 897) + '...' } else { $priorSummary }))))
+			}
+			foreach ($m in @($Messages)) {
+				$r = [string](Get-MBProp $m 'role')
+				$c = [string](Get-MBProp $m 'content')
+				if ($r -eq 'system' -and $c -match '(?i)^\[AGENT MODE RESUME') { continue }
+				if ($r -eq 'user' -and $c -and $c -notmatch '(?i)This session is being continued' -and $c -notmatch '(?i)^Continue the work described') {
+					$line = ($c -replace '\s+', ' ').Trim()
+					if ($line.Length -gt 220) { $line = $line.Substring(0, 217) + '...' }
+					[void]$extractBits.Add("User: $line")
+				} elseif ($r -eq 'assistant' -and $c) {
+					$line = ($c -replace '\s+', ' ').Trim()
+					if ($line.Length -gt 180) { $line = $line.Substring(0, 177) + '...' }
+					if ($line) { [void]$extractBits.Add("Agent: $line") }
+				}
+				if ($extractBits.Count -ge 16) { break }
+			}
+			$fallback = Build-MBStructuredCompactDigest -DroppedMessages $Messages -ExtractiveFallback ($extractBits -join " | ")
+			$summaryRaw = "<summary>`n1. Primary Request and Intent: (extractive fallback)`n2. Key Technical Concepts: None`n3. Files and Code Sections: see structured state`n4. Errors and Fixes: see structured state`n5. Problem Solving: None`n6. All User Messages: see highlights`n7. Pending Tasks: see task board in SESSION STATE`n8. Current Work: model summarizer failed or timed out; extractive digest used`n9. Optional Next Step: continue from last user query and SESSION STATE`n`nHighlights:`n$fallback`n</summary>"
+			$usedStage = 'extractive'
+		}
+
+		# No recent tool tail by default (keeps replace small; matches grok-build regression
+		# that drops working-tail tool blobs after compact).
+		$recentTail = @()
+		$newHist = @(Assemble-MBFullReplaceHistory -SummaryRaw $summaryRaw -LastUserQuery $lastQ -RecentTail $recentTail -StageLabel $usedStage)
+		# Leave summarizer mode: clear slot KV + force cache_prompt=false so next chat is agent+tools.
+		Reset-MBAgentModeAfterCompact
+		$after = Get-MBContextEstimate -Messages $newHist -ForceRefresh
+
+		$script:MB.CompactionCount++
+		try { $script:MB.FullReplaceGen = [int]$script:MB.FullReplaceGen + 1 } catch { $script:MB.FullReplaceGen = 1 }
+		try { $script:MB.LastFullReplaceAt = [datetime]::UtcNow } catch {}
+		$reduced = ([int]$after.PromptTokens -lt [int]$before.PromptTokens) -or (@($newHist).Count -lt @($Messages).Count)
+		$script:MB.LastCompactOk = [bool]$reduced
+		$script:MB.LastCompactReason = ("full-replace stage={0} ~{1:N0}->{2:N0} tok msgs {3}->{4} src={5} agent-resume" -f `
+			$usedStage, $before.PromptTokens, $after.PromptTokens, @($Messages).Count, @($newHist).Count, $after.TokenSource)
+
+		try { Freeze-MBWireState -Refresh } catch {}
+		try {
+			Write-MBDebugLog -Step 'FULL_REPLACE_OK' -Detail $script:MB.LastCompactReason
+		} catch {}
+		return $newHist
+	} catch {
+		try { $script:MB.LastCompactOk = $false } catch {}
+		try { $script:MB.LastCompactReason = "full-replace error: $($_.Exception.Message)" } catch {}
+		try { Write-MBDebugLog -Step 'FULL_REPLACE_ERR' -Detail $_.Exception.Message } catch {}
+		try { Reset-MBAgentModeAfterCompact } catch {}
+		# Fall back to aggressive keep-tail so caller still gets something smaller
+		try {
+			return @(Compact-MBHistory -Messages $Messages -Aggressive -PreferModelDigest)
+		} catch {
+			return $Messages
+		}
+	} finally {
+		try { $script:MB.FullReplaceBusy = $false } catch {}
+		Exit-MBCompacting
+		# Belt-and-suspenders: never leave IsCompacting stuck if Exit depth accounting glitches
+		try {
+			if ([int]$script:MB.CompactingDepth -le 0) { $script:MB.IsCompacting = $false }
+		} catch {}
 	}
 }
 
@@ -38750,7 +45673,7 @@ function Optimize-MBHistory {
 	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
 
 	if ($Messages.Count -gt $MaxHistoryMessages) {
-		return Compact-MBHistory -Messages $Messages -KeepLast ([math]::Floor($MaxHistoryMessages * 0.55))
+		return FullReplace-MBHistory -Messages $Messages
 	}
 
 	return @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 8 -OldMaxChars 4000 -RecentMaxChars $MaxToolResultChars)
@@ -38761,15 +45684,25 @@ function Ensure-MBPromptBudget {
 		[array]$Messages,
 		[double]$TargetPct = 0.72,
 		[int]$MaxPasses = 6,
-		[switch]$Verbose
+		[switch]$Verbose,
+		# Allow at most one full-replace inside this budget loop (default: never — caller owns FullReplace).
+		[switch]$AllowFullReplace
 	)
 
 	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
 	$budget = Get-MBEffectivePromptBudget
 	$targetTok = [math]::Floor($budget * $TargetPct)
-	$beforeTok = (Get-MBContextEstimate -Messages $Messages).PromptTokens
+	Reset-MBTokenEstimateCache
+	$beforeTok = (Get-MBContextEstimate -Messages $Messages -ForceRefresh).PromptTokens
 	$useModelDigest = $false
 	try { $useModelDigest = [bool]$script:MB.ModelCompact } catch { $useModelDigest = $false }
+	$didFullReplace = $false
+	# If caller just ran full-replace (cooldown) or busy, do not try again here
+	try {
+		if ([bool]$script:MB.FullReplaceBusy) { $didFullReplace = $true }
+		$ago = ([datetime]::UtcNow - [datetime]$script:MB.LastFullReplaceAt).TotalSeconds
+		if ($ago -ge 0 -and $ago -lt 8) { $didFullReplace = $true }
+	} catch {}
 
 	# Under wire freeze, skip soft shrink (preserves prompt-cache prefix).
 	# EnableToolGroup mid-loop inflates ToolsOverheadTok; that must NOT rewrite history
@@ -38781,13 +45714,14 @@ function Ensure-MBPromptBudget {
 				return $Messages
 			}
 			# Absolute overflow: fall through to trim (intentional cache break beats OOM)
+			try { Thaw-MBWireState -Force } catch {}
 		}
 	} catch {}
 
 	$pass = 0
 	while ($pass -lt $MaxPasses) {
 		$pass++
-		$est = Get-MBContextEstimate -Messages $Messages
+		$est = Get-MBContextEstimate -Messages $Messages -ForceRefresh
 		if ($est.PromptTokens -le $targetTok) { break }
 
 		if ($Verbose) {
@@ -38796,46 +45730,42 @@ function Ensure-MBPromptBudget {
 		}
 
 		if ($pass -eq 1) {
-			# Shrink tools first (fast). If still over budget after this pass, drop turns next.
+			# Always try cheap tool shrink first
 			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 5 -OldMaxChars 1500 -RecentMaxChars 5000)
-		} elseif ($pass -eq 2) {
-			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 3 -OldMaxChars 800 -RecentMaxChars 3000)
+		} elseif ($pass -eq 2 -and $AllowFullReplace -and -not $didFullReplace) {
+			# At most one full-replace per Ensure call (and reentrancy guard inside FullReplace)
+			$Messages = @(FullReplace-MBHistory -Messages $Messages -VerboseLog:$Verbose)
+			$didFullReplace = $true
+			Reset-MBTokenEstimateCache -ClearUsage
+		} elseif ($pass -le 4) {
 			if ($useModelDigest) {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 18 -PreferModelDigest)
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast ([math]::Max(4, 12 - $pass)) -Aggressive -PreferModelDigest)
 			} else {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 18)
-			}
-		} elseif ($pass -eq 3) {
-			if ($useModelDigest) {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 12 -Aggressive -PreferModelDigest)
-			} else {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 12 -Aggressive)
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast ([math]::Max(4, 12 - $pass)) -Aggressive)
 			}
 			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 2 -OldMaxChars 500 -RecentMaxChars 2000)
-		} elseif ($pass -eq 4) {
-			if ($useModelDigest) {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 8 -Aggressive -PreferModelDigest)
-			} else {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 8 -Aggressive)
-			}
-			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 2 -OldMaxChars 400 -RecentMaxChars 1200)
 		} else {
+			# Last-resort keep-tail + extreme tool shrink (no more FullReplace)
 			if ($useModelDigest) {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 6 -Aggressive -PreferModelDigest)
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 4 -Aggressive -PreferModelDigest)
 			} else {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 6 -Aggressive)
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 4 -Aggressive)
 			}
-			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 1 -OldMaxChars 300 -RecentMaxChars 800)
+			$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 1 -OldMaxChars 250 -RecentMaxChars 600)
 		}
 		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
+		Reset-MBTokenEstimateCache
 	}
 
-	$final = Get-MBContextEstimate -Messages $Messages
+	$final = Get-MBContextEstimate -Messages $Messages -ForceRefresh
 	if ($final.PromptTokens -lt $beforeTok -and [string]::IsNullOrWhiteSpace([string]$script:MB.LastCompactReason)) {
 		$script:MB.LastCompactReason = ("silent trim ~{0:N0}->{1:N0} tok" -f $beforeTok, $final.PromptTokens)
 	}
+	try {
+		$script:MB.LastCompactOk = ([int]$final.PromptTokens -le $targetTok) -or ([int]$final.PromptTokens -lt $beforeTok)
+	} catch {}
 	if ($final.PromptTokens -gt $budget) {
-		Write-MBWarn ("Context still ~{0:N0} tok over usable n_ctx room {1:N0} - consider /clear or /compact" -f $final.PromptTokens, $budget)
+		Write-MBWarn ("Context still ~{0:N0} tok over usable n_ctx room {1:N0} - system/tools overhead may dominate; /clear or disable tool groups" -f $final.PromptTokens, $budget)
 	}
 	return $Messages
 }
@@ -38855,15 +45785,16 @@ function Manage-MBContext {
 	if ($AppendOnly -or ($wireFrozen -and -not $ForceCompact)) {
 		# When frozen, Sync only reuses frozen system/sticky bytes (no EnableToolGroup rewrite).
 		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
-		$estAO = Get-MBContextEstimate -Messages $Messages
+		$estAO = Get-MBContextEstimate -Messages $Messages -ForceRefresh
 		$budgetAO = Get-MBEffectivePromptBudget
 		# Mid-loop tools growth can push estimate up; only emergency compact when truly over budget.
 		# Soft 0.95 was too aggressive after EnableToolGroup inflated ToolsOverheadTok.
 		$overHard = ($estAO.Level -eq 'hard') -or ($estAO.Pct -ge 1.0) -or ($estAO.PromptTokens -gt [math]::Floor($budgetAO * 1.02))
 		if ($ForceCompact -or $overHard) {
-			# Emergency only — breaks incremental board KV intentionally
+			# Emergency: at most one full-replace, then tool-only shrink (no nested FullReplace)
 			try { Thaw-MBWireState -Force } catch {}
-			$Messages = @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.68)
+			$Messages = @(FullReplace-MBHistory -Messages $Messages)
+			$Messages = @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.60)
 			try {
 				Freeze-MBWireState -Refresh
 				$Messages = @(Sync-MBSystemMessages -Messages $Messages)
@@ -38873,52 +45804,59 @@ function Manage-MBContext {
 	}
 
 	$Messages = @(Sync-MBSystemMessages -Messages $Messages)
-	$est = Get-MBContextEstimate -Messages $Messages
+	Reset-MBTokenEstimateCache
+	$est = Get-MBContextEstimate -Messages $Messages -ForceRefresh
 	$useModelDigest = $false
 	try { $useModelDigest = [bool]$script:MB.ModelCompact } catch { $useModelDigest = $false }
 
 	if ($ForceCompact) {
 		try { Thaw-MBWireState -Force } catch {}
-		$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 3 -OldMaxChars 800 -RecentMaxChars 2500)
-		if ($useModelDigest) {
-			$Messages = @(Compact-MBHistory -Messages $Messages -Aggressive -PreferModelDigest)
-		} else {
-			$Messages = @(Compact-MBHistory -Messages $Messages -Aggressive)
+		# Manual /compact: exactly one full-replace. Follow-up only shrinks tools/tail (no 2nd ladder).
+		$Messages = @(FullReplace-MBHistory -Messages $Messages -VerboseLog)
+		Reset-MBTokenEstimateCache -ClearUsage
+		$estF = Get-MBContextEstimate -Messages $Messages -ForceRefresh
+		$targetF = [math]::Floor((Get-MBEffectivePromptBudget) * 0.58)
+		if ([int]$estF.PromptTokens -gt $targetF) {
+			$Messages = @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.58 -Verbose)
 		}
-		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
-		$Messages = @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.65)
 		try { Freeze-MBWireState -Refresh } catch {}
 		return $Messages
 	}
 
 	if (-not $script:MB.AutoCompact) {
 		if ($est.PromptTokens -gt (Get-MBEffectivePromptBudget)) {
-			return @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.70)
+			# No auto-compact: allow one full-replace only if over absolute budget
+			return @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.65 -AllowFullReplace)
 		}
 		return $Messages
 	}
 
-	if ($est.Level -eq 'hard' -or $est.Pct -ge 0.92 -or $est.PromptTokens -gt (Get-MBEffectivePromptBudget)) {
-		# Real compact (drop turns + optional model digest), not tool-trim alone
-		return @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.68)
+	if ($est.Level -eq 'hard' -or $est.Pct -ge 0.88 -or $est.PromptTokens -gt (Get-MBEffectivePromptBudget)) {
+		# Hard: one full-replace, then tool shrink only
+		$Messages = @(FullReplace-MBHistory -Messages $Messages)
+		return @(Ensure-MBPromptBudget -Messages $Messages -TargetPct 0.62)
 	}
 
 	if ($est.Level -eq 'soft') {
-		# Soft used to only Shrink-MBToolPayloads — context % fell instantly while full turn
-		# history remained, so the next request rebuilt prompt cache over nearly the same log.
+		# Soft: shrink tools, then keep-tail; escalate to full-replace at most once.
 		$Messages = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 5 -OldMaxChars 1800 -RecentMaxChars ([math]::Min(8000, $MaxToolResultChars)))
-		$est2 = Get-MBContextEstimate -Messages $Messages
-		# Drop middle turns when still soft/hard or history is long
+		Reset-MBTokenEstimateCache
+		$est2 = Get-MBContextEstimate -Messages $Messages -ForceRefresh
 		$needDrop = ($est2.Level -ne 'ok') -or ($est2.Pct -ge [double]$script:MB.ContextSoftPct) -or (@($Messages).Count -gt [math]::Max(28, [int]($MaxHistoryMessages * 0.85)))
 		if ($needDrop) {
 			if ($useModelDigest) {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 20 -PreferModelDigest)
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 16 -PreferModelDigest)
 			} else {
-				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 20)
+				$Messages = @(Compact-MBHistory -Messages $Messages -KeepLast 16)
+			}
+			Reset-MBTokenEstimateCache -ClearUsage
+			$est3 = Get-MBContextEstimate -Messages $Messages -ForceRefresh
+			if ($est3.Level -eq 'hard' -or $est3.Pct -ge 0.85 -or $est3.PromptTokens -gt [math]::Floor((Get-MBEffectivePromptBudget) * 0.90)) {
+				$Messages = @(FullReplace-MBHistory -Messages $Messages)
 			}
 		}
 		$Messages = @(Sync-MBSystemMessages -Messages $Messages)
-		[void](Get-MBContextEstimate -Messages $Messages)
+		[void](Get-MBContextEstimate -Messages $Messages -ForceRefresh)
 		return $Messages
 	}
 
@@ -59212,12 +66150,31 @@ function Start-LocalAgent {
 					continue
 				}
 				'^/compact$' {
-					$before = Get-MBContextEstimate -Messages $script:Messages
+					try { Thaw-MBWireState -Force } catch {}
+					Reset-MBTokenEstimateCache -ClearUsage
+					$before = Get-MBContextEstimate -Messages $script:Messages -ForceRefresh
+					$beforeCount = @($script:Messages).Count
 					$script:Messages = @(Manage-MBContext -Messages $script:Messages -ForceCompact)
-					$script:Messages = @(Ensure-MBPromptBudget -Messages $script:Messages -TargetPct 0.65 -Verbose)
-					$after = Get-MBContextEstimate -Messages $script:Messages
-					Write-MBOk ("Compacted: {0:P0} -> {1:P0}  (~{2:N0} -> ~{3:N0} tok)  msgs {4}" -f `
-						$before.Pct, $after.Pct, $before.PromptTokens, $after.PromptTokens, $script:Messages.Count)
+					Reset-MBTokenEstimateCache -ClearUsage
+					$after = Get-MBContextEstimate -Messages $script:Messages -ForceRefresh
+					$afterCount = @($script:Messages).Count
+					$ok = $false
+					try { $ok = [bool]$script:MB.LastCompactOk } catch { $ok = $false }
+					if (-not $ok) {
+						$ok = ($after.PromptTokens -lt $before.PromptTokens) -or ($afterCount -lt $beforeCount)
+					}
+					$reason = ''
+					try { $reason = [string]$script:MB.LastCompactReason } catch { $reason = '' }
+					if ($ok) {
+						Write-MBOk ("Compacted: {0:P0} -> {1:P0}  (~{2:N0} -> ~{3:N0} tok)  msgs {4}->{5}  [{6}]" -f `
+							$before.Pct, $after.Pct, $before.PromptTokens, $after.PromptTokens, $beforeCount, $afterCount, $(if ($after.TokenSource) { $after.TokenSource } else { '?' }))
+						if ($reason) { Write-Host "    $reason" -ForegroundColor DarkGray }
+					} else {
+						Write-MBWarn ("Compact finished but context did not shrink: {0:P0} -> {1:P0}  (~{2:N0} -> ~{3:N0} tok)  msgs {4}->{5}" -f `
+							$before.Pct, $after.Pct, $before.PromptTokens, $after.PromptTokens, $beforeCount, $afterCount)
+						if ($reason) { Write-Host "    $reason" -ForegroundColor DarkGray }
+						Write-Host "    Tip: /clear if the server is still near n_ctx, or check that the model can summarize." -ForegroundColor DarkGray
+					}
 					try { Refresh-MBWpfStickyFromSession } catch {}
 					continue
 				}

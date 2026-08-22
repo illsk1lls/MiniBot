@@ -1,6 +1,6 @@
 # MiniBot
 
-**v2.51.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
+**v2.52.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
