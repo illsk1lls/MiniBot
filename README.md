@@ -94,7 +94,7 @@ The file begins with a hybrid CMD header. Rename to `.cmd` for double-click laun
 | `-ModelAlias` | *(empty)* | Display label in PoweredBy; empty → live server model id |
 | `-ApiKey` | `none` | HTTP **Bearer** only. Use `none` to skip. |
 | `-AgentName` | `MiniBot` | Window brand / agent identity |
-| `-Version` | `2.50.0` | Version string |
+| `-Version` | `2.51.0` | Version string |
 | `-MaxTokens` | `0` | Max completion tokens. **`0` = auto** (`n_ctx / 8` from server). |
 | `-ContextWindowTokens` | `0` | Fallback `n_ctx`. **`0` = use server `/props` + `/models` only** |
 | `-Temperature` | `0.15` | Sampling temperature |
