@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.52.2 - Local AI agent host for Windows PowerShell 5.1
+	MiniBot v2.52.0 - Local AI agent host for Windows PowerShell 5.1
 .DESCRIPTION
 	OpenAI-compatible agent client (WPF UI + tools). Hybrid .CMD/.PS1 launcher; irm|iex friendly.
 .NOTES
@@ -38,7 +38,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.52.2",
+	[string]$Version = "2.52.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -127,11 +127,11 @@ public static class Win32 {
 	[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
 	[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, int nCmdShow);
 	[DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
-	[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
-	[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+	[DllImport("kernel32.dll", SetLastError=true)] static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+	[DllImport("kernel32.dll", SetLastError=true)] static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
 	[DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr hObject);
 	const uint TH32CS_SNAPPROCESS = 2;
-	[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+	[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Auto)]
 	struct PROCESSENTRY32 {
 		public uint dwSize; public uint cntUsage; public uint th32ProcessID;
 		public IntPtr th32DefaultHeapID; public uint th32ModuleID; public uint cntThreads;
@@ -207,7 +207,7 @@ $script:MBInstallerCatalog = [ordered]@{
 	'adobe_reader' = [ordered]@{
 		id        = 'adobe_reader'
 		name      = 'Adobe Acrobat Reader DC'
-		url       = 'https://ardownload.adobe.com/pub/adobe/reader/win/AcrobatDC/2000920063/AcroRdrDC2000920063_en_US.exe'
+		url       = 'http://ardownload.adobe.com/pub/adobe/reader/win/AcrobatDC/2000920063/AcroRdrDC2000920063_en_US.exe'
 		file      = 'AcroRdrDC2000920063_en_US.exe'
 		kind      = 'exe'
 		install   = '/sAll /rs /msi EULA_ACCEPT=YES'
@@ -295,7 +295,7 @@ function Get-MBElevationLaunchArgs {
 
 	if ($path) {
 		$ext = [System.IO.Path]::GetExtension($path)
-		if ($ext -match '(?i)^\.(cmd|bat)$') {
+		if ($ext -match '^\.(?i)cmd|bat$') {
 			$pathEsc = $path.Replace("'", "''")
 			$cmd = "iex ([io.file]::ReadAllText('$pathEsc'))"
 			return (& $appendBound ("$psArgs -Command `"$cmd`""))
@@ -306,27 +306,9 @@ function Get-MBElevationLaunchArgs {
 
 	$def = [string]$script:MB_LaunchDefinition
 	if ([string]::IsNullOrWhiteSpace($def)) { return $null }
-	# irm|iex and other no-path launches: EncodedCommand of this script exceeds
-	# the Windows ~32,767-char argument limit. Materialize a -File instead.
-	try {
-		$base = $env:LOCALAPPDATA
-		if ([string]::IsNullOrWhiteSpace($base)) { $base = $env:TEMP }
-		if ([string]::IsNullOrWhiteSpace($base)) { $base = [System.IO.Path]::GetTempPath() }
-		$dir = Join-Path $base 'MiniBot'
-		if (-not (Test-Path -LiteralPath $dir)) {
-			New-Item -ItemType Directory -Path $dir -Force | Out-Null
-		}
-		$tmp = Join-Path $dir 'MiniBot-elev.ps1'
-		$utf8 = New-Object System.Text.UTF8Encoding $true
-		[System.IO.File]::WriteAllText($tmp, $def, $utf8)
-		$pathEsc = $tmp.Replace('"', '\"')
-		return (& $appendBound ("$psArgs -File `"$pathEsc`""))
-	} catch {
-		$bytes = [System.Text.Encoding]::Unicode.GetBytes($def)
-		$enc = [Convert]::ToBase64String($bytes)
-		if ($enc.Length -gt 24000) { return $null }
-		return "$psArgs -EncodedCommand $enc"
-	}
+	$bytes = [System.Text.Encoding]::Unicode.GetBytes($def)
+	$enc = [Convert]::ToBase64String($bytes)
+	return "$psArgs -EncodedCommand $enc"
 }
 
 function Get-MBAgentDisplayTitle {
@@ -413,7 +395,7 @@ function Test-MBEnvFlag {
 		$raw = [Environment]::GetEnvironmentVariable($Name, 'Machine')
 	}
 	if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
-	return [bool]($raw.Trim() -match '(?i)^(1|true|yes|on|y)$')
+	return [bool]($raw.Trim() -match '^(?i)1|true|yes|on|y$')
 }
 
 function Set-MBEnvFlag {
@@ -528,8 +510,8 @@ $script:MB = @{
 	ContextHardPct     = [double]$ContextHardPct
 	AutoCompact        = [bool]$AutoCompactEnabled
 	ModelCompact       = [bool]$ModelCompactEnabled
-	MaxTurns           = $(try { [int]$MaxTurns } catch { 50 })
-	TurnsLeft          = $(try { [int]$MaxTurns } catch { 50 })
+	MaxTurns           = $(try { [int]$MaxTurns } catch { 30 })
+	TurnsLeft          = $(try { [int]$MaxTurns } catch { 30 })
 	TurnsUsed          = 0
 	TurnsInFlight      = $false
 	# Unlimited tool-loop turns (disables MaxTurns cap; UI shows pulsing infinity)
@@ -583,8 +565,6 @@ $script:MB = @{
 	TaskBoardLastComplete = $null
 	TaskBoardEpoch     = 0
 	TaskBoardPaused    = $false
-	# Operator Stop/Esc: hold the board until resume/cancel. Model TaskBoard calls must not unpause.
-	TaskBoardOperatorOverride = $false
 	RecentFileReads    = @{}
 	PinnedPaths        = [ordered]@{}
 	ToolErrorsByPath   = @{}
@@ -652,7 +632,7 @@ $script:MB = @{
 	Wpf                = $null
 	ResolvedApiBase    = $null
 	# Launch primary API (llama.cpp / NPM). Extra endpoints (vLLM, Unsloth, ...) never inherit this auth.
-	PrimaryApiBase     = [string]$BaseUrl
+	PrimaryApiBase     = $(try { Normalize-MBApiBase -Url ([string]$BaseUrl) } catch { [string]$BaseUrl })
 	ActiveModel        = $(try { [string]$Model } catch { '' })
 	ActiveModelBase    = $null
 	ActiveModelKey     = ''
@@ -1072,8 +1052,8 @@ function Normalize-MBApiBase {
 		else { $u = "http://$u" }
 	}
 	while ($u.EndsWith('/')) { $u = $u.Substring(0, $u.Length - 1) }
-	$u = $u -replace '(?i)/chat/completions\s*$', '' -replace '(?i)/models\s*$', ''
-	$u = $u -replace '(?i)/v1/chat/completions\s*$', '' -replace '(?i)/v1/models\s*$', ''
+	$u = $u -replace '/chat/completions\s*$', '' -replace '/models\s*$', ''
+	$u = $u -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
 	while ($u.EndsWith('/')) { $u = $u.Substring(0, $u.Length - 1) }
 	return $u
 }
@@ -1090,7 +1070,7 @@ function Get-MBApiBaseUrl {
 		}
 	} catch {}
 	$u = Normalize-MBApiBase -Url ([string]$BaseUrl)
-	if ([string]::IsNullOrWhiteSpace($u)) { return 'http://127.0.0.1:8080/v1' }
+	if ([string]::IsNullOrWhiteSpace($u)) { return 'http://127.0.0.1:8080' }
 	return $u
 }
 
@@ -4553,8 +4533,8 @@ function Get-MBServerPropsFromBase {
 	}
 	# Prefer non-/v1 root for /props
 	$roots = New-Object System.Collections.ArrayList
-	if ($raw -match '(?i)/v1$') {
-		[void]$roots.Add(($raw -replace '(?i)/v1$', ''))
+	if ($raw -match '/v1$') {
+		[void]$roots.Add(($raw -replace '/v1$', ''))
 		[void]$roots.Add($raw)
 	} else {
 		[void]$roots.Add($raw)
@@ -5157,9 +5137,9 @@ function Get-MBRemoteModelsFromBase {
 
 	$bases = New-Object System.Collections.Generic.List[string]
 	# Prefer /v1 first for vLLM / Unsloth / OpenAI-compat; still try bare root for llama.cpp
-	if ($raw -match '(?i)/v1$') {
+	if ($raw -match '/v1$') {
 		[void]$bases.Add($raw)
-		$root = $raw -replace '(?i)/v1$', ''
+		$root = $raw -replace '/v1$', ''
 		if ($root -and -not $bases.Contains($root)) { [void]$bases.Add($root) }
 	} else {
 		[void]$bases.Add($raw + '/v1')
@@ -6091,7 +6071,7 @@ function Test-MBIsTaskBoardToolName {
 	param([string]$Name)
 	if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
 	$n = [string]$Name
-	if ($n -match '(?i)^(TaskBoard|todo_write|todo|todos|checklist|task_board|taskboard|task_plan|plan_tasks)$') {
+	if ($n -match '^(?i)TaskBoard|todo_write|todo|todos|checklist|task_board|taskboard|task_plan|plan_tasks$') {
 		return $true
 	}
 	try {
@@ -6187,9 +6167,7 @@ function Write-MBWorkedStamp {
 }
 
 function Hide-MBPromptForWork {
-	# Keep the prompt editable so the operator can type an inject while the model works.
-	# Empty box + Stop/Esc = abort. Non-empty + Enter/Send = abort + inject that text next.
-	try { Set-MBWpfWorkPromptOpen } catch { Set-MBWpfPromptEnabled -Enabled $false }
+	Set-MBWpfPromptEnabled -Enabled $false
 	Show-MBWorkingHint
 }
 
@@ -6582,7 +6560,7 @@ function Get-MBTaskApiOrigins {
 		$api = Get-MBApiBaseUrl
 		while ($api.EndsWith('/')) { $api = $api.Substring(0, $api.Length - 1) }
 		[void]$origins.Add($api)
-		$stripped = $api -replace '(?i)/v1$','' -replace '/openai$','' -replace '/api$',''
+		$stripped = $api -replace '/v1$','' -replace '/openai$','' -replace '/api$',''
 		if ($stripped -and $stripped -ne $api) { [void]$origins.Add($stripped) }
 		try {
 			$uri = [Uri]$api
@@ -6605,8 +6583,7 @@ function Test-MBApiKeyUsable {
 	param([string]$Key)
 	$k = [string]$Key
 	if ([string]::IsNullOrWhiteSpace($k)) { return $false }
-	$kl = $k.Trim().ToLowerInvariant()
-	if ($kl -eq 'none' -or $kl -eq 'null' -or $kl -eq '-' -or $kl -eq 'sk-none') { return $false }
+	if ($k -eq 'none' -or $k -eq 'null' -or $k -eq '-' -or $k -eq 'sk-none') { return $false }
 	return $true
 }
 
@@ -6618,8 +6595,8 @@ function Test-MBApiBasesMatch {
 	try { $nb = Normalize-MBApiBase -Url $B } catch { $nb = ([string]$B).Trim() }
 	if ([string]::IsNullOrWhiteSpace($na) -or [string]::IsNullOrWhiteSpace($nb)) { return $false }
 	if ([string]::Equals($na, $nb, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-	$ra = $na -replace '(?i)/v1$', ''
-	$rb = $nb -replace '(?i)/v1$', ''
+	$ra = $na -replace '/v1$', ''
+	$rb = $nb -replace '/v1$', ''
 	if ($ra -and $rb -and [string]::Equals($ra, $rb, [StringComparison]::OrdinalIgnoreCase)) { return $true }
 	return $false
 }
@@ -6668,7 +6645,7 @@ function Get-MBApiKeyForBase {
 		try { $map = $script:MB.ExtraApiKeys } catch { $map = $null }
 		if ($map -and $n) {
 			# exact + without/with /v1
-			foreach ($cand in @($n, ($n -replace '(?i)/v1$', ''), ($n + '/v1'))) {
+			foreach ($cand in @($n, ($n -replace '/v1$', ''), ($n + '/v1'))) {
 				if ([string]::IsNullOrWhiteSpace($cand)) { continue }
 				try {
 					if ($map -is [hashtable] -and $map.ContainsKey($cand)) {
@@ -6714,9 +6691,9 @@ function Set-MBApiKeyForBase {
 		}
 		$script:MB.ExtraApiKeys[$n] = [string]$ApiKeyValue
 		# Also index root and /v1 twin for lookup flexibility
-		$root = $n -replace '(?i)/v1$', ''
+		$root = $n -replace '/v1$', ''
 		if ($root -and $root -ne $n) { $script:MB.ExtraApiKeys[$root] = [string]$ApiKeyValue }
-		if ($n -notmatch '(?i)/v1$') { $script:MB.ExtraApiKeys[($n + '/v1')] = [string]$ApiKeyValue }
+		if ($n -notmatch '/v1$') { $script:MB.ExtraApiKeys[($n + '/v1')] = [string]$ApiKeyValue }
 	} catch {}
 	try {
 		if ($script:MB.Wpf -is [hashtable]) {
@@ -6744,9 +6721,9 @@ function Set-MBApiAuthModeForBase {
 			$script:MB.ExtraApiAuth = @{}
 		}
 		$script:MB.ExtraApiAuth[$n] = $m
-		$root = $n -replace '(?i)/v1$', ''
+		$root = $n -replace '/v1$', ''
 		if ($root -and $root -ne $n) { $script:MB.ExtraApiAuth[$root] = $m }
-		if ($n -notmatch '(?i)/v1$') { $script:MB.ExtraApiAuth[($n + '/v1')] = $m }
+		if ($n -notmatch '/v1$') { $script:MB.ExtraApiAuth[($n + '/v1')] = $m }
 	} catch {}
 	try {
 		if ($script:MB.Wpf -is [hashtable]) {
@@ -6772,7 +6749,7 @@ function Get-MBApiAuthModeForBase {
 	$map = $null
 	try { $map = $script:MB.ExtraApiAuth } catch { $map = $null }
 	if ($map -and $n) {
-		foreach ($cand in @($n, ($n -replace '(?i)/v1$', ''), ($n + '/v1'))) {
+		foreach ($cand in @($n, ($n -replace '/v1$', ''), ($n + '/v1'))) {
 			if ([string]::IsNullOrWhiteSpace($cand)) { continue }
 			try {
 				$v = $null
@@ -6926,7 +6903,6 @@ function Stop-MBBackendTasks {
 		try {
 			$handler = New-Object System.Net.Http.HttpClientHandler
 			$handler.AllowAutoRedirect = $true
-			try { $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate } catch {}
 			$client = New-Object System.Net.Http.HttpClient ($handler)
 			$client.Timeout = [TimeSpan]::FromSeconds(3)
 			try {
@@ -7007,29 +6983,8 @@ function Request-MBAbort {
 	$n = 0
 	try { $n = Stop-MBBackendTasks } catch { $n = 0 }
 
-	# Double-stop (or Stop while already paused with an empty prompt): cancel the board.
-	$doubleStop = $false
-	try {
-		$wasPaused = [bool]$script:MB.TaskBoardPaused
-		$hasOpen = $false
-		try { $hasOpen = [bool](Test-MBTaskBoardHasOpen) } catch { $hasOpen = $false }
-		$nowMs = [Environment]::TickCount
-		$dt = 0
-		try { $dt = $nowMs - [int]$script:MB.LastAbortMs } catch { $dt = 0 }
-		$idle = $true
-		try {
-			if ([bool]$script:MB.IsWorking -or [bool]$script:MB.IsThinking) { $idle = $false }
-		} catch {}
-		if ($wasPaused -and $hasOpen -and ($idle -or ($dt -ge 0 -and $dt -lt 2500))) {
-			$doubleStop = $true
-		}
-	} catch { $doubleStop = $false }
-	if ($doubleStop) {
-		try { $null = Cancel-MBTaskBoardForOperator } catch {}
-	} else {
-		# Collapse TaskBoard sticky to the active (yellow) stop row - keep full list for resume
-		try { Suspend-MBTaskBoardForInterrupt } catch {}
-	}
+	# Collapse TaskBoard sticky to the active (yellow) stop row - keep full list for resume
+	try { Suspend-MBTaskBoardForInterrupt } catch {}
 
 	if (-not $Silent) {
 		if ($script:MB.IsThinking) { try { Write-Host "" } catch {} }
@@ -7085,11 +7040,7 @@ function Get-MBSharedHttpClient {
 		return $script:MB.HttpClient
 	}
 	try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch {}
-	try {
-		$proto = [System.Net.SecurityProtocolType]::Tls12
-		try { $proto = $proto -bor [System.Net.SecurityProtocolType]::Tls13 } catch {}
-		[System.Net.ServicePointManager]::SecurityProtocol = $proto
-	} catch {}
+	try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
 
 	$handler = New-Object System.Net.Http.HttpClientHandler
 	$handler.AllowAutoRedirect = $true
@@ -7137,7 +7088,6 @@ function Invoke-MBHttpGetQuick {
 		$handler = New-Object System.Net.Http.HttpClientHandler
 		$handler.AllowAutoRedirect = $true
 		try { $handler.UseCookies = $false } catch {}
-		try { $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate } catch {}
 		$client = New-Object System.Net.Http.HttpClient ($handler)
 		$client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
 		try { $client.DefaultRequestHeaders.ExpectContinue = $false } catch {}
@@ -7212,7 +7162,7 @@ function Get-MBLlamaCppServerRoot {
 		try { $raw = Get-MBApiBaseUrl } catch { $raw = '' }
 	}
 	if ([string]::IsNullOrWhiteSpace($raw)) { return '' }
-	if ($raw -match '(?i)/v1$') { return ($raw -replace '(?i)/v1$', '') }
+	if ($raw -match '/v1$') { return ($raw -replace '/v1$', '') }
 	return $raw
 }
 
@@ -7249,7 +7199,6 @@ function Invoke-MBHttpPostQuick {
 		$handler = New-Object System.Net.Http.HttpClientHandler
 		$handler.AllowAutoRedirect = $true
 		try { $handler.UseCookies = $false } catch {}
-		try { $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate } catch {}
 		$client = New-Object System.Net.Http.HttpClient ($handler)
 		$client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
 		$req = New-Object System.Net.Http.HttpRequestMessage ([System.Net.Http.HttpMethod]::Post, $Url)
@@ -7448,21 +7397,7 @@ function Get-MBCredTarget {
 	return 'MiniBot'
 }
 
-function Get-MBCredStoreDir {
-	$base = $env:LOCALAPPDATA
-	if ([string]::IsNullOrWhiteSpace($base)) {
-		try { $base = [Environment]::GetFolderPath('LocalApplicationData') } catch { $base = $null }
-	}
-	if ([string]::IsNullOrWhiteSpace($base)) { $base = $env:TEMP }
-	return (Join-Path $base 'MiniBot')
-}
-
 function Get-MBLegacyCredFile {
-	Join-Path (Get-MBCredStoreDir) 'credentials.dpapi'
-}
-
-function Get-MBAncientThumbcacheCredPath {
-	# Pre-2.52.1 mistakenly stored DPAPI creds in Explorer's 32px thumbnail cache.
 	Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Explorer\thumbcache_32.dat"
 }
 
@@ -7486,18 +7421,6 @@ function Read-MBLegacyCredFile {
 	return $null
 }
 
-function Remove-MBCredFileIfMiniBotFormat {
-	# Only delete a path that parses as MiniBot DPAPI creds — never wipe Explorer thumbcache.
-	param([string]$Path)
-	if ([string]::IsNullOrWhiteSpace($Path)) { return }
-	if (-not (Test-Path -LiteralPath $Path)) { return }
-	$parsed = $null
-	try { $parsed = Read-MBLegacyCredFile -Path $Path } catch { $parsed = $null }
-	if ($parsed) {
-		try { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue } catch {}
-	}
-}
-
 function Save-MBStoredCredential {
 	param(
 		[string]$User,
@@ -7509,16 +7432,16 @@ function Save-MBStoredCredential {
 		try {
 			$ok = [MiniBot.Core.CredMan]::Write($target, $User, $Password)
 			if ($ok) {
-				$own = Get-MBLegacyCredFile
-				if (Test-Path -LiteralPath $own) {
-					Remove-Item -LiteralPath $own -Force -ErrorAction SilentlyContinue
+				# Remove legacy file after CredMan write
+				$legacy = Get-MBLegacyCredFile
+				if (Test-Path -LiteralPath $legacy) {
+					Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
 				}
-				Remove-MBCredFileIfMiniBotFormat -Path (Get-MBAncientThumbcacheCredPath)
 				return $true
 			}
 		} catch {}
 	}
-	# DPAPI file fallback if CredMan unavailable (MiniBot folder only — never Explorer thumbcache)
+	# DPAPI file fallback if CredMan unavailable
 	try {
 		$legacy = Get-MBLegacyCredFile
 		$dir = Split-Path -Parent $legacy
@@ -7531,7 +7454,6 @@ function Save-MBStoredCredential {
 		}
 		$encrypted = $sec | ConvertFrom-SecureString
 		"$User`n$encrypted" | Out-File -LiteralPath $legacy -Encoding UTF8 -Force
-		Remove-MBCredFileIfMiniBotFormat -Path (Get-MBAncientThumbcacheCredPath)
 		return $true
 	} catch {
 		return $false
@@ -7548,25 +7470,16 @@ function Read-MBStoredCredential {
 			}
 		} catch {}
 	}
-	$own = Get-MBLegacyCredFile
-	$fromFile = Read-MBLegacyCredFile -Path $own
-	$fromAncient = $false
-	if (-not $fromFile) {
-		$fromFile = Read-MBLegacyCredFile -Path (Get-MBAncientThumbcacheCredPath)
-		if ($fromFile) { $fromAncient = $true }
-	}
+	# Migrate legacy DPAPI file to Credential Manager
+	$legacy = Get-MBLegacyCredFile
+	$fromFile = Read-MBLegacyCredFile -Path $legacy
 	if ($fromFile) {
 		if ($script:HasCredMan) {
 			try {
 				if ([MiniBot.Core.CredMan]::Write($target, $fromFile.User, $fromFile.Pass)) {
-					if (Test-Path -LiteralPath $own) {
-						Remove-Item -LiteralPath $own -Force -ErrorAction SilentlyContinue
-					}
-					Remove-MBCredFileIfMiniBotFormat -Path (Get-MBAncientThumbcacheCredPath)
+					Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
 				}
 			} catch {}
-		} elseif ($fromAncient) {
-			try { $null = Save-MBStoredCredential -User $fromFile.User -Password $fromFile.Pass } catch {}
 		}
 		return $fromFile
 	}
@@ -7578,11 +7491,10 @@ function Clear-MBStoredCredential {
 	if ($script:HasCredMan) {
 		try { [void][MiniBot.Core.CredMan]::Delete($target) } catch {}
 	}
-	$own = Get-MBLegacyCredFile
-	if (Test-Path -LiteralPath $own) {
-		Remove-Item -LiteralPath $own -Force -ErrorAction SilentlyContinue
+	$legacy = Get-MBLegacyCredFile
+	if (Test-Path -LiteralPath $legacy) {
+		Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue
 	}
-	Remove-MBCredFileIfMiniBotFormat -Path (Get-MBAncientThumbcacheCredPath)
 }
 
 if ($script:MB_ClearCredsFromEnv) {
@@ -8744,9 +8656,9 @@ public const int ICON_BIG = 1;
 				$raw = $raw -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
 				while ($raw.EndsWith('/')) { $raw = $raw.Substring(0, $raw.Length - 1) }
 				$bases = New-Object System.Collections.Generic.List[string]
-				if ($raw -match '(?i)/v1$') {
+				if ($raw -match '/v1$') {
 					[void]$bases.Add($raw)
-					$root = $raw -replace '(?i)/v1$', ''
+					$root = $raw -replace '/v1$', ''
 					if ($root -and -not $bases.Contains($root)) { [void]$bases.Add($root) }
 				} else {
 					[void]$bases.Add($raw + '/v1')
@@ -8998,7 +8910,7 @@ public const int ICON_BIG = 1;
 					$k = ''
 					if ($mode -eq 'apikey') {
 						try { $k = [string]$epKey.Password } catch { $k = '' }
-						if (-not (Test-MBApiKeyUsable -Key $k)) {
+						if ([string]::IsNullOrWhiteSpace($k) -or $k -eq 'none') {
 							if ($epError) {
 								$epError.Foreground = $bcX.ConvertFromString('#F05C5C')
 								$epError.Text = 'API mode requires a Bearer token.'
@@ -10892,15 +10804,10 @@ function ConvertTo-MBRequestJson {
 	$json = if ($Object -is [string]) {
 		[string]$Object
 	} else {
-		# PS 5.1 ConvertTo-Json unwraps single-element arrays (tool_calls / messages / content parts).
 		try {
-			ConvertTo-MBJson -Object $Object -Depth $Depth
+			ConvertTo-Json -InputObject $Object -Depth $Depth -Compress
 		} catch {
-			try {
-				ConvertTo-Json -InputObject $Object -Depth $Depth -Compress
-			} catch {
-				ConvertTo-Json -InputObject $Object -Depth 6 -Compress
-			}
+			ConvertTo-Json -InputObject $Object -Depth 6 -Compress
 		}
 	}
 	return (ConvertTo-MBWireJson -Json $json)
@@ -11140,7 +11047,7 @@ function Test-MBReplyIncomplete {
 	if ($HasToolCalls) { return $false }
 	if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
 
-	if ($FinishReason -match '(?i)^(length|max_tokens|limit|max_completion_tokens)$') { return $true }
+	if ($FinishReason -match '^(?i)length|max_tokens|limit|max_completion_tokens$') { return $true }
 
 	$budget = [int](Get-MBEffectiveMaxTokens)
 	try {
@@ -11153,8 +11060,8 @@ function Test-MBReplyIncomplete {
 	$t = $Text.TrimEnd()
 	if ($t.Length -lt 12) { return $false }
 
-	if ($t -match '[\.\!\?…]$') { return $false }
-	if ($t -match '[\.\!\?…]["''”»)]$') { return $false }
+	if ($t -match '[\.\!\?...]$') { return $false }
+	if ($t -match '[\.\!\?...]["''”»)]$') { return $false }
 	if ($t -match '(?i)```\s*$') { return $false }
 	if ($t -match '[\)\]\}]\s*$') { return $false }          # ends with ) ] }
 	if ($t -match '(?i)\*\*\s*$') { return $false }
@@ -11164,7 +11071,7 @@ function Test-MBReplyIncomplete {
 	if ($t -match '(?i)^(ok|okay|yes|no|sure|yep|nope|got it|understood)\.?$') { return $false }
 
 	if ($t -match '[,;:]\s*$') { return $true }
-	if ($t -match '[-–—]\s*$') { return $true }
+	if ($t -match '[---]\s*$') { return $true }
 	if ($t -match '\b(the|a|an|and|or|to|of|for|with|that|this|lets|let''s|can|will|would|should|may|might|from|into|about)\s*$') {
 		return $true
 	}
@@ -11744,7 +11651,7 @@ function Convert-MBToBool {
 	param($Value, $Default = $false)
 	$def = $false
 	if ($Default -is [bool]) { $def = $Default }
-	elseif ("$Default" -match '(?i)^(1|true|yes)$') { $def = $true }
+	elseif ("$Default" -match '^(?i)1|true|yes$') { $def = $true }
 	if ($null -eq $Value) { return $def }
 	if ($Value -is [bool]) { return $Value }
 	if ($Value -is [int] -or $Value -is [long]) { return ($Value -ne 0) }
@@ -12782,7 +12689,7 @@ function Initialize-MBToolGroups {
 	[void]$script:MB.ActiveToolGroups.Add('core')
 	$profile = [string]$script:MB.ToolProfile
 	if ([string]::IsNullOrWhiteSpace($profile)) { $profile = [string]$ToolProfile }
-	if ($profile -match '(?i)^(full|all)$') {
+	if ($profile -match '^(?i)full|all$') {
 		foreach ($g in @(Get-MBToolGroupOrder)) {
 			if (-not ($script:MB.ActiveToolGroups -contains $g)) {
 				[void]$script:MB.ActiveToolGroups.Add($g)
@@ -17519,36 +17426,6 @@ function Test-MBRemoteWinRmAuthError {
 	return [bool]($t -match '(?i)(access is denied|access denied|unauthorized|logon failure|logon_failure|bad username|unknown user|wrong password|failed to authenticate|authentication failed|user name or password|credentials were rejected|WinRM cannot process|cannot find the computer|not a member of|TrustedHosts|explicit credentials)')
 }
 
-function Test-MBTcpPortOpen {
-	# Async TCP connect with short timeout (ms). Used by PortProbe / FindShares.
-	param(
-		[string]$Computer,
-		[int]$Port,
-		[int]$TimeoutMs = 300
-	)
-	$targetHost = ([string]$Computer).Trim()
-	if ([string]::IsNullOrWhiteSpace($targetHost)) { return $false }
-	if ($Port -lt 1 -or $Port -gt 65535) { return $false }
-	if ($TimeoutMs -lt 50) { $TimeoutMs = 50 }
-	if ($TimeoutMs -gt 10000) { $TimeoutMs = 10000 }
-	$tcp = $null
-	try {
-		$tcp = New-Object System.Net.Sockets.TcpClient
-		$iar = $tcp.BeginConnect($targetHost, $Port, $null, $null)
-		# exitContext=false: do not pump the WPF STA dispatcher while waiting
-		$ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
-		if (-not $ok) {
-			return $false
-		}
-		try { $tcp.EndConnect($iar) } catch { return $false }
-		return [bool]$tcp.Connected
-	} catch {
-		return $false
-	} finally {
-		try { if ($tcp) { $tcp.Close() } } catch {}
-	}
-}
-
 function Test-MBPortProbe {
 	# Unified native TCP port probe (single or multi-port). Flat int ports only.
 	# Returns: Target, Open[], Closed[], AnyOpen, PreferredPort, Ports[], ElapsedMs
@@ -17610,7 +17487,24 @@ function Test-MBPortProbe {
 	$closed = New-Object System.Collections.ArrayList
 	foreach ($pn in @($portList)) {
 		if ((Test-MBInterrupt)) { break }
-		$ok = Test-MBTcpPortOpen -Computer $addr -Port ([int]$pn) -TimeoutMs $TimeoutMs
+		$ok = $false
+		$tcp = $null
+		try {
+			$tcp = New-Object System.Net.Sockets.TcpClient
+			$iar = $tcp.BeginConnect($addr, [int]$pn, $null, $null)
+			$waited = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+			if ($waited) {
+				try { $tcp.EndConnect($iar) } catch { $ok = $false }
+				try { $ok = [bool]$tcp.Connected } catch { $ok = $false }
+			} else {
+				try { $tcp.Close() } catch {}
+				$ok = $false
+			}
+		} catch {
+			$ok = $false
+		} finally {
+			try { if ($tcp) { $tcp.Close() } } catch {}
+		}
 		if ($ok) { [void]$open.Add([int]$pn) } else { [void]$closed.Add([int]$pn) }
 	}
 	$pref = 0
@@ -17692,6 +17586,17 @@ function Test-MBRemoteServicePorts {
 	)
 	$ports = Get-MBPortProbeProfilePorts -Profile $Transport -Port $Port -UseSsl $UseSsl
 	return (Test-MBPortProbe -Computer $Address -Ports $ports -TimeoutMs $TimeoutMs)
+}
+
+function Test-MBTcpPortOpen {
+	# Compat wrapper (FindShares / SMB) — single-port bool via PortProbe.
+	param(
+		[string]$Computer,
+		[int]$Port,
+		[int]$TimeoutMs = 300
+	)
+	$r = Test-MBPortProbe -Computer $Computer -Port $Port -TimeoutMs $TimeoutMs
+	return [bool]$r.AnyOpen
 }
 
 function Get-MBRemotePortClosedBlockKey {
@@ -18853,7 +18758,7 @@ function Resolve-MBViewScreenSavePath {
 	}
 
 	$p = $Path.Trim().Trim('"').Trim("'")
-	if ($p -match '(?i)^(desktop|~\\Desktop|~/Desktop)$') {
+	if ($p -match '^(?i)desktop|~\\Desktop|~/Desktop$') {
 		return (Join-Path (Get-MBUserDesktopPath) $defaultName)
 	}
 	if ($p -eq '~') {
@@ -20282,8 +20187,8 @@ function Invoke-ListDeletedFiles {
 		$doRecursive = $true
 		if ($null -ne $recursive) {
 			if ($recursive -is [bool]) { $doRecursive = [bool]$recursive }
-			elseif ([string]$recursive -match '(?i)^(0|false|no|off)$') { $doRecursive = $false }
-			elseif ([string]$recursive -match '(?i)^(1|true|yes|on)$') { $doRecursive = $true }
+			elseif ([string]$recursive -match '^(?i)0|false|no|off$') { $doRecursive = $false }
+			elseif ([string]$recursive -match '^(?i)1|true|yes|on$') { $doRecursive = $true }
 		}
 
 		$volRoot = ''
@@ -21371,13 +21276,13 @@ function Invoke-GetLocalShares {
 	)
 	$incSpecial = $false
 	if ($include_special -is [bool]) { $incSpecial = $include_special }
-	elseif ([string]$include_special -match '(?i)^(1|true|yes|y|on)$') { $incSpecial = $true }
+	elseif ([string]$include_special -match '^(?i)1|true|yes|y|on$') { $incSpecial = $true }
 	$incNtfs = $true
 	if ($include_ntfs -is [bool]) { $incNtfs = $include_ntfs }
-	elseif ([string]$include_ntfs -match '(?i)^(0|false|no|off)$') { $incNtfs = $false }
+	elseif ([string]$include_ntfs -match '^(?i)0|false|no|off$') { $incNtfs = $false }
 	$doClip = $false
 	if ($copy_clipboard -is [bool]) { $doClip = $copy_clipboard }
-	elseif ([string]$copy_clipboard -match '(?i)^(1|true|yes|y|on)$') { $doClip = $true }
+	elseif ([string]$copy_clipboard -match '^(?i)1|true|yes|y|on$') { $doClip = $true }
 	if ($max -lt 1) { $max = 1 }
 	if ($max -gt 200) { $max = 200 }
 
@@ -21530,7 +21435,7 @@ function Invoke-GetMappedDrives {
 	)
 	$incDisc = $true
 	if ($include_disconnected -is [bool]) { $incDisc = $include_disconnected }
-	elseif ([string]$include_disconnected -match '(?i)^(0|false|no|off)$') { $incDisc = $false }
+	elseif ([string]$include_disconnected -match '^(?i)0|false|no|off$') { $incDisc = $false }
 
 	$maps = New-Object System.Collections.ArrayList
 	$seen = @{}
@@ -22120,16 +22025,16 @@ function Invoke-ScanNetwork {
 	)
 	$doActive = $true
 	if ($active -is [bool]) { $doActive = $active }
-	elseif ([string]$active -match '(?i)^(0|false|no|off)$') { $doActive = $false }
+	elseif ([string]$active -match '^(?i)0|false|no|off$') { $doActive = $false }
 	$doMac = $true
 	if ($resolve_mac -is [bool]) { $doMac = $resolve_mac }
-	elseif ([string]$resolve_mac -match '(?i)^(0|false|no|off)$') { $doMac = $false }
+	elseif ([string]$resolve_mac -match '^(?i)0|false|no|off$') { $doMac = $false }
 	$doHost = $true
 	if ($resolve_hostnames -is [bool]) { $doHost = $resolve_hostnames }
-	elseif ([string]$resolve_hostnames -match '(?i)^(0|false|no|off)$') { $doHost = $false }
+	elseif ([string]$resolve_hostnames -match '^(?i)0|false|no|off$') { $doHost = $false }
 	$doVend = $true
 	if ($resolve_vendors -is [bool]) { $doVend = $resolve_vendors }
-	elseif ([string]$resolve_vendors -match '(?i)^(0|false|no|off)$') { $doVend = $false }
+	elseif ([string]$resolve_vendors -match '^(?i)0|false|no|off$') { $doVend = $false }
 	if ($timeout_ms -lt 1000) { $timeout_ms = 1000 }
 	if ($timeout_ms -gt 30000) { $timeout_ms = 30000 }
 	if ($max_hosts -lt 1) { $max_hosts = 1 }
@@ -22253,6 +22158,36 @@ function Invoke-ScanNetwork {
 		hosts             = @($hosts)
 		note              = 'Active probe uses flood ping (Test-Connection -AsJob x subnet). MAC via ARP + SendARP (iphlpapi); vendors need MAC OUI. To find shares on hosts, use FindShares (not RunCommand Get-SmbShare/CimSession).'
 	}) -Depth 6
+}
+
+function Test-MBTcpPortOpen {
+	# Async TCP connect with short timeout (ms). No hang.
+	param(
+		[string]$Computer,
+		[int]$Port,
+		[int]$TimeoutMs = 300
+	)
+	$targetHost = ([string]$Computer).Trim()
+	if ([string]::IsNullOrWhiteSpace($targetHost)) { return $false }
+	if ($Port -lt 1 -or $Port -gt 65535) { return $false }
+	if ($TimeoutMs -lt 50) { $TimeoutMs = 50 }
+	if ($TimeoutMs -gt 10000) { $TimeoutMs = 10000 }
+	$tcp = $null
+	try {
+		$tcp = New-Object System.Net.Sockets.TcpClient
+		$iar = $tcp.BeginConnect($targetHost, $Port, $null, $null)
+		$ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $true)
+		if (-not $ok) {
+			try { $tcp.Close() } catch {}
+			return $false
+		}
+		try { $tcp.EndConnect($iar) } catch { return $false }
+		return [bool]$tcp.Connected
+	} catch {
+		return $false
+	} finally {
+		try { if ($tcp) { $tcp.Close() } } catch {}
+	}
 }
 
 function Test-MBShareMapGuess {
@@ -22500,7 +22435,7 @@ function Invoke-FindShares {
 	if ($probe_timeout_sec -gt 8) { $probe_timeout_sec = 8 }
 	$stopFirst = $false
 	if ($stop_on_first_match -is [bool]) { $stopFirst = $stop_on_first_match }
-	elseif ([string]$stop_on_first_match -match '(?i)^(1|true|yes|y|on)$') { $stopFirst = $true }
+	elseif ([string]$stop_on_first_match -match '^(?i)1|true|yes|y|on$') { $stopFirst = $true }
 
 	$sw = [System.Diagnostics.Stopwatch]::StartNew()
 	$results = New-Object System.Collections.ArrayList
@@ -23241,7 +23176,7 @@ function Invoke-MBHttpDownload {
 		[string]$OutPath,
 		[int]$TimeoutSec = 900,
 		[int64]$MaxBytes = 0,
-		[string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiniBot/2.52',
+		[string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiniBot/2.8',
 		[string]$Label = 'Downloading',
 		[switch]$ShowProgress
 	)
@@ -23249,11 +23184,7 @@ function Invoke-MBHttpDownload {
 		return @{ ok = $false; error = 'url/out required' }
 	}
 	if ($TimeoutSec -lt 15) { $TimeoutSec = 15 }
-	try {
-		$proto = [Net.SecurityProtocolType]::Tls12
-		try { $proto = $proto -bor [Net.SecurityProtocolType]::Tls13 } catch {}
-		[Net.ServicePointManager]::SecurityProtocol = $proto
-	} catch {}
+	try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls } catch {}
 
 	$dir = Split-Path -Parent $OutPath
 	if ($dir -and -not (Test-Path -LiteralPath $dir)) {
@@ -23404,7 +23335,7 @@ function Invoke-DownloadFile {
 	$leaf = [System.IO.Path]::GetFileName($dest)
 	if ([string]::IsNullOrWhiteSpace($leaf)) { $leaf = 'file' }
 	$r = Invoke-MBHttpDownload -Url $url -OutPath $dest -TimeoutSec $timeout_sec -MaxBytes $maxBytes `
-		-UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiniBot/2.52 DownloadFile' `
+		-UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MiniBot/2.8 DownloadFile' `
 		-Label ("Downloading {0}" -f $leaf) -ShowProgress
 	if (-not $r.ok) {
 		return "ERROR: $($r.error)"
@@ -27021,8 +26952,8 @@ function Resolve-MBForensicsLimit {
 	$wantAll = $false
 	try {
 		if ($All -is [bool] -and $All) { $wantAll = $true }
-		elseif ($null -ne $All -and [string]$All -ne '' -and [string]$All -notmatch '(?i)^(0|false|no|off)$') {
-			if ([string]$All -match '(?i)^(1|true|yes|on|all|full)$') { $wantAll = $true }
+		elseif ($null -ne $All -and [string]$All -ne '' -and [string]$All -notmatch '^(?i)0|false|no|off$') {
+			if ([string]$All -match '^(?i)1|true|yes|on|all|full$') { $wantAll = $true }
 		}
 	} catch {}
 	if ($wantAll) {
@@ -27033,7 +26964,7 @@ function Resolve-MBForensicsLimit {
 		return [int]$Default
 	}
 	$s = ([string]$Value).Trim()
-	if ($s -match '(?i)^(all|full|unlimited|\*|max)$') {
+	if ($s -match '^(?i)all|full|unlimited|\*|max$') {
 		if ($HardMax -lt 1) { $HardMax = 9999 }
 		return [int]$HardMax
 	}
@@ -34341,9 +34272,9 @@ function Test-ModelConnection {
 
 	$bases = New-Object System.Collections.Generic.List[string]
 	# Prefer /v1 first for vLLM / Unsloth / OpenAI-compat
-	if ($raw -match '(?i)/v1$') {
+	if ($raw -match '/v1$') {
 		[void]$bases.Add($raw)
-		$root = $raw -replace '(?i)/v1$', ''
+		$root = $raw -replace '/v1$', ''
 		if ($root -and -not $bases.Contains($root)) { [void]$bases.Add($root) }
 	} else {
 		[void]$bases.Add($raw + '/v1')
@@ -34565,18 +34496,10 @@ function Invoke-ModelStreaming {
 			$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $completionsUrl)
 
 			$authHdr = Get-MBAuthHeaderValue -BaseUrl $apiBase
-			if ($authHdr) {
-				try {
-					if ($authHdr -match '^(?i)Basic\s+(.+)$') {
-						$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $Matches[1].Trim())
-					} elseif ($authHdr -match '^(?i)Bearer\s+(.+)$') {
-						$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $Matches[1].Trim())
-					} else {
-						[void]$request.Headers.TryAddWithoutValidation('Authorization', $authHdr)
-					}
-				} catch {
-					try { [void]$request.Headers.TryAddWithoutValidation('Authorization', $authHdr) } catch {}
-				}
+			if ($authHdr -match '^(?i)Basic\s+(.+)$') {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $Matches[1].Trim())
+			} elseif ($authHdr -match '^(?i)Bearer\s+(.+)$') {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $Matches[1].Trim())
 			}
 
 			try {
@@ -34687,7 +34610,7 @@ function Invoke-ModelStreaming {
 					$namesShow = New-Object System.Collections.ArrayList
 					foreach ($nm0 in @($names)) {
 						$n0 = [string]$nm0
-						if ($n0 -match '(?i)^(TaskBoard|todo_write|todo|checklist|task_board|taskboard)$') { continue }
+						if ($n0 -match '^(?i)TaskBoard|todo_write|todo|checklist|task_board|taskboard$') { continue }
 						try {
 							$res0 = Resolve-MBToolName -Name $n0
 							if ($res0 -eq 'TaskBoard') { continue }
@@ -35179,18 +35102,10 @@ function Invoke-MBCompletion {
 			$cts.CancelAfter([TimeSpan]::FromSeconds([math]::Max(10, $TimeoutSec)))
 			$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $completionsUrl)
 			$authHdr2 = Get-MBAuthHeaderValue -BaseUrl (Get-MBApiBaseUrl)
-			if ($authHdr2) {
-				try {
-					if ($authHdr2 -match '^(?i)Basic\s+(.+)$') {
-						$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $Matches[1].Trim())
-					} elseif ($authHdr2 -match '^(?i)Bearer\s+(.+)$') {
-						$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $Matches[1].Trim())
-					} else {
-						[void]$request.Headers.TryAddWithoutValidation('Authorization', $authHdr2)
-					}
-				} catch {
-					try { [void]$request.Headers.TryAddWithoutValidation('Authorization', $authHdr2) } catch {}
-				}
+			if ($authHdr2 -match '^(?i)Basic\s+(.+)$') {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $Matches[1].Trim())
+			} elseif ($authHdr2 -match '^(?i)Bearer\s+(.+)$') {
+				$request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $Matches[1].Trim())
 			}
 			$request.Content = New-Object System.Net.Http.ByteArrayContent (,[byte[]]$bodyBytes)
 			$request.Content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue ("application/json")
@@ -36736,8 +36651,8 @@ function Convert-MBGroupPolicyRegValue {
 			$n = 0
 			if ($value -is [bool]) { return $(if ($value) { 1 } else { 0 }) }
 			if (-not [int]::TryParse([string]$value, [ref]$n)) {
-				if ([string]$value -match '(?i)^(true|on|yes|enable)') { return 1 }
-				if ([string]$value -match '(?i)^(false|off|no|disable)') { return 0 }
+				if ([string]$value -match '^(?i)true|on|yes|enable') { return 1 }
+				if ([string]$value -match '^(?i)false|off|no|disable') { return 0 }
 				throw "Cannot parse DWord value: $value"
 			}
 			return [int]$n
@@ -36788,7 +36703,7 @@ function Invoke-GroupPolicy {
 	if ($max -gt 300) { $max = 300 }
 	$doGpu = $false
 	if ($gpupdate -is [bool]) { $doGpu = $gpupdate }
-	elseif ([string]$gpupdate -match '(?i)^(1|true|yes|y|on)$') { $doGpu = $true }
+	elseif ([string]$gpupdate -match '^(?i)1|true|yes|y|on$') { $doGpu = $true }
 
 	$editionOk = $true
 	try { $editionOk = [bool](Test-MBWindowsHasLocalGroupPolicy) } catch { $editionOk = $true }
@@ -37489,7 +37404,7 @@ function Invoke-AddLocalUser {
 	if ([string]::IsNullOrEmpty($pass)) { return "ERROR: password required." }
 	$isAdmin = $false
 	if ($admin -is [bool]) { $isAdmin = $admin }
-	elseif ([string]$admin -match '(?i)^(1|true|yes|y|on)$') { $isAdmin = $true }
+	elseif ([string]$admin -match '^(?i)1|true|yes|y|on$') { $isAdmin = $true }
 	$fn = ([string]$full_name).Trim()
 	$desc = ([string]$description).Trim()
 	$details = "Create local user:`n  username = $user`n  password = $(Get-MBMaskedSecret $pass)`n  full_name = $(if ($fn) { $fn } else { '(none)' })`n  description = $(if ($desc) { $desc } else { '(none)' })`n  administrators = $isAdmin"
@@ -37613,7 +37528,7 @@ function Invoke-JoinDomain {
 	if ([string]::IsNullOrEmpty($pass)) { return "ERROR: password required." }
 	$doReboot = $false
 	if ($reboot -is [bool]) { $doReboot = $reboot }
-	elseif ([string]$reboot -match '(?i)^(1|true|yes|y|on)$') { $doReboot = $true }
+	elseif ([string]$reboot -match '^(?i)1|true|yes|y|on$') { $doReboot = $true }
 	$details = "Join domain:`n  domain = $dom`n  username = $user`n  password = $(Get-MBMaskedSecret $pass)`n  ou = $(if ($ouDn) { $ouDn } else { '(default)' })`n  new_name = $(if ($rename) { $rename } else { '(unchanged)' })`n  reboot = $doReboot`n`nRequires elevation and network access to a domain controller."
 	if (-not (Request-Confirmation -Title "JoinDomain requires approval" -Details $details)) {
 		return "BLOCKED BY USER: JoinDomain denied."
@@ -38076,7 +37991,7 @@ function Invoke-LeaveDomain {
 	if ([string]::IsNullOrWhiteSpace($wg)) { $wg = 'WORKGROUP' }
 	$doReboot = $false
 	if ($reboot -is [bool]) { $doReboot = $reboot }
-	elseif ([string]$reboot -match '(?i)^(1|true|yes|y|on)$') { $doReboot = $true }
+	elseif ([string]$reboot -match '^(?i)1|true|yes|y|on$') { $doReboot = $true }
 
 	# Require local admin creds via tool args (chat). No UI credential popup.
 	$verifiedUser = ''
@@ -38310,10 +38225,10 @@ function Invoke-MapNetworkDrive {
 	$pass = if ($null -eq $password) { '' } else { [string]$password }
 	$persist = $true
 	if ($persistent -is [bool]) { $persist = $persistent }
-	elseif ([string]$persistent -match '(?i)^(0|false|no|off)$') { $persist = $false }
+	elseif ([string]$persistent -match '^(?i)0|false|no|off$') { $persist = $false }
 	$doForce = $false
 	if ($force -is [bool]) { $doForce = $force }
-	elseif ([string]$force -match '(?i)^(1|true|yes|y|on)$') { $doForce = $true }
+	elseif ([string]$force -match '^(?i)1|true|yes|y|on$') { $doForce = $true }
 
 	$details = "Map network drive:`n  letter = ${let}:$(if ($autoLetter) { ' (auto-picked free letter; CD/DVD reserved skipped)' } else { '' })`n  path = $unc`n  username = $(if ($user) { $user } else { '(current user)' })`n  password = $(if ($user) { $pass } else { '(n/a)' })`n  persistent = $persist`n  force = $doForce"
 	if (-not (Request-Confirmation -Title "MapNetworkDrive requires approval" -Details $details)) {
@@ -38458,7 +38373,7 @@ function Invoke-AddNetworkPrinter {
 	if ($unc -notmatch '^\\\\') { return "ERROR: path must be a printer share UNC (\\\\server\\printer)." }
 	$makeDefault = $false
 	if ($set_default -is [bool]) { $makeDefault = $set_default }
-	elseif ([string]$set_default -match '(?i)^(1|true|yes|y|on)$') { $makeDefault = $true }
+	elseif ([string]$set_default -match '^(?i)1|true|yes|y|on$') { $makeDefault = $true }
 	$details = "Add network printer:`n  path = $unc`n  name = $(if ($friendly) { $friendly } else { '(driver/share default)' })`n  set_default = $makeDefault"
 	if (-not (Request-Confirmation -Title "AddNetworkPrinter requires approval" -Details $details)) {
 		return "BLOCKED BY USER: AddNetworkPrinter denied."
@@ -38998,8 +38913,8 @@ function Invoke-CreateShare {
 	if ($null -ne $everyone_full -and "$everyone_full" -ne '') {
 		$everyoneProvided = $true
 		if ($everyone_full -is [bool]) { $everyoneFull = [bool]$everyone_full }
-		elseif ([string]$everyone_full -match '(?i)^(1|true|yes|y|on)$') { $everyoneFull = $true }
-		elseif ([string]$everyone_full -match '(?i)^(0|false|no|off)$') { $everyoneFull = $false }
+		elseif ([string]$everyone_full -match '^(?i)1|true|yes|y|on$') { $everyoneFull = $true }
+		elseif ([string]$everyone_full -match '^(?i)0|false|no|off$') { $everyoneFull = $false }
 		else { $everyoneProvided = $false }
 	}
 	if (-not $everyoneProvided) { [void]$missing.Add('everyone_full') }
@@ -39035,16 +38950,16 @@ Then call CreateShare with path, name, everyone_full, access_username, access_pa
 
 	$doNet = $true
 	if ($ensure_network -is [bool]) { $doNet = $ensure_network }
-	elseif ([string]$ensure_network -match '(?i)^(0|false|no|off)$') { $doNet = $false }
+	elseif ([string]$ensure_network -match '^(?i)0|false|no|off$') { $doNet = $false }
 	$doDisc = $true
 	if ($ensure_discovery -is [bool]) { $doDisc = $ensure_discovery }
-	elseif ([string]$ensure_discovery -match '(?i)^(0|false|no|off)$') { $doDisc = $false }
+	elseif ([string]$ensure_discovery -match '^(?i)0|false|no|off$') { $doDisc = $false }
 	$doFolder = $true
 	if ($ensure_folder -is [bool]) { $doFolder = $ensure_folder }
-	elseif ([string]$ensure_folder -match '(?i)^(0|false|no|off)$') { $doFolder = $false }
+	elseif ([string]$ensure_folder -match '^(?i)0|false|no|off$') { $doFolder = $false }
 	$doForce = $false
 	if ($force -is [bool]) { $doForce = $force }
-	elseif ([string]$force -match '(?i)^(1|true|yes|y|on)$') { $doForce = $true }
+	elseif ([string]$force -match '^(?i)1|true|yes|y|on$') { $doForce = $true }
 
 	try {
 		if (-not [System.IO.Path]::IsPathRooted($folder)) {
@@ -42694,7 +42609,7 @@ function Get-MBTaskBoardItemCollection {
 		try {
 			if ($raw -is [System.Collections.IDictionary]) {
 				foreach ($k in @($raw.Keys)) {
-					if ([string]$k -match '(?i)^(id|title|status|note)$') { $looksLikeRow = $true; break }
+					if ([string]$k -match '^(?i)id|title|status|note$') { $looksLikeRow = $true; break }
 				}
 			} else {
 				if ($raw.PSObject.Properties['Id'] -or $raw.PSObject.Properties['id'] -or
@@ -42825,9 +42740,9 @@ function Format-MBTaskBoardText {
 		}
 	}
 	if ($paused) {
-		[void]$lines.Add('PAUSED: Operator stopped mid-board. Sticky shows the stopped task (kept until resume or cancel).')
-		[void]$lines.Add('Do NOT call TaskBoard set/update/clear/status-to-resume. Do NOT continue the plan.')
-		[void]$lines.Add('A new operator message is an INJECT — handle that message only. Resume only if they explicitly say continue/resume (or click Resume). Cancel/drop only if they say so (or click Cancel / Stop twice).')
+		[void]$lines.Add('PAUSED: Operator stopped mid-board. Sticky shows only the stopped task (kept for resume).')
+		[void]$lines.Add('DEFAULT after stop: TaskBoard action=clear then action=set a NEW board for any new request.')
+		[void]$lines.Add('RESUME only if operator explicitly asked to continue/resume this plan - then TaskBoard update from the NOW item and keep going (do not clear).')
 	} elseif ($open -gt 0) {
 		[void]$lines.Add(("Open: {0}" -f $open))
 	}
@@ -42845,7 +42760,7 @@ function Suspend-MBTaskBoardForInterrupt {
 	} catch {}
 	try { Update-MBWpfTaskBoardSticky -Action 'pause' } catch {}
 	try {
-		Update-MBWpfSticky -Status 'ready' -Hint ("stopped  {0}  type to inject  {0}  Stop again / Cancel drops the board" -f ([char]0x00B7))
+		Update-MBWpfSticky -Status 'ready' -Hint ("stopped  {0}  taskboard paused (resume or clear)" -f ([char]0x00B7))
 	} catch {}
 }
 
@@ -42856,72 +42771,6 @@ function Test-MBUserWantsTaskBoardResume {
 	if ($t -match '\b(continue|resume|keep going|pick up where|where you left|finish the (board|plan|list)|carry on|go on)\b') { return $true }
 	if ($t -match '^\s*(continue|resume|go)\s*[.!?]?\s*$') { return $true }
 	return $false
-}
-
-function Test-MBUserWantsTaskBoardCancel {
-	param([string]$Text)
-	if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
-	$t = $Text.ToLowerInvariant()
-	if ($t -match '^\s*(cancel|stop|drop|abort|clear)\s*(the\s+)?(board|plan|taskboard|task board|list)?\s*[.!?]?\s*$') { return $true }
-	if ($t -match '\b(cancel|drop|abort|clear|forget|discard)\s+(the\s+)?(board|plan|taskboard|task board)\b') { return $true }
-	if ($t -match '\bnever mind (the )?(board|plan|taskboard)\b') { return $true }
-	return $false
-}
-
-function Format-MBPausedBoardInject {
-	param([string]$Text)
-	$raw = [string]$Text
-	if ([string]::IsNullOrWhiteSpace($raw)) { return $raw }
-	return @(
-		'[OPERATOR INJECT] TaskBoard is PAUSED (operator Stop). Do not resume, update, or clear it unless this message explicitly asks to continue/resume or to cancel/drop the plan.'
-		'Handle the instruction below as a new operator message. Do not auto-continue paused steps.'
-		''
-		$raw.Trim()
-	) -join "`n"
-}
-
-function Repair-MBConversationAfterAbort {
-	# After Stop/Esc: fill missing tool results so the next request is not a 400 mismatch dump.
-	try {
-		$script:Messages = @(Repair-MBToolMessageSequence -Messages $script:Messages)
-	} catch {}
-	try { Reset-MBTokenEstimateCache -ClearUsage } catch {}
-}
-
-function Cancel-MBTaskBoardForOperator {
-	# Operator Cancel / double-Stop: drop the paused board without a model turn.
-	$had = $false
-	try { $had = [bool](Test-MBTaskBoardHasOpen) } catch { $had = $false }
-	try { $script:MB.TaskBoardOperatorOverride = $true } catch {}
-	try {
-		if ($had) {
-			try { $null = Invoke-TaskBoard -action 'clear' } catch {
-				try {
-					$script:MB.TaskBoard = [ordered]@{
-						Goal    = ''
-						Items   = (New-Object System.Collections.ArrayList)
-						Updated = (Get-Date).ToString('o')
-					}
-				} catch {}
-				try { Write-MBTaskBoardInline -Action 'clear' } catch {}
-			}
-		} else {
-			try { Update-MBWpfTaskBoardSticky -Action 'clear' } catch {}
-		}
-	} finally {
-		try { $script:MB.TaskBoardOperatorOverride = $false } catch {}
-		try { $script:MB.TaskBoardPaused = $false } catch {}
-		try { $script:MB.PendingTaskBoardNudge = $false } catch {}
-		try { $script:MB.WireFreezeHeldForBoard = $false } catch {}
-	}
-	try {
-		if ($script:MB.Wpf) { $script:MB.Wpf.TaskBoardPaused = $false }
-	} catch {}
-	try {
-		Update-MBWpfSticky -Status 'ready' -Hint ("enter send  {0}  taskboard cancelled" -f ([char]0x00B7))
-	} catch {}
-	try { Write-MBInfo 'Task board cancelled.' } catch {}
-	return $true
 }
 
 function ConvertTo-MBTaskBoardStatus {
@@ -43878,7 +43727,6 @@ function Update-MBWpfTaskBoardSticky {
 	$snap['WantRetract'] = [bool]$wantRetract
 	$snap['Empty'] = [bool]$empty
 	$snap['Paused'] = [bool]$showPausedChrome
-	try { $script:MB.Wpf.TaskBoardPaused = [bool]$showPausedChrome } catch {}
 	$snap['Goal'] = [string]$goal
 	$snap['Summary'] = [string]$sum
 	$snap['Rows'] = @($rowCopies.ToArray())
@@ -44024,25 +43872,6 @@ function Invoke-TaskBoard {
 		return (ConvertTo-MBTaskBoardJson $pay -Depth 8)
 	}.GetNewClosure()
 
-	$pausedNow = $false
-	$opOverride = $false
-	try { $pausedNow = [bool]$script:MB.TaskBoardPaused } catch { $pausedNow = $false }
-	try { $opOverride = [bool]$script:MB.TaskBoardOperatorOverride } catch { $opOverride = $false }
-	if ($pausedNow -and -not $opOverride) {
-		if ($act -eq 'status') {
-			try { Write-MBTaskBoardInline -Action 'pause' } catch {}
-			$extraPause = [ordered]@{
-				paused       = $true
-				board_paused = 1
-				note         = 'TaskBoard is PAUSED (operator Stop). Do not update/set/clear. Address the operator latest message. Resume only if they said continue/resume.'
-			}
-			return (& $buildStatePayload -ActionName 'status' -IncludeBoardText -Extra $extraPause)
-		}
-		return (New-MBTaskBoardErrorJson -Code 'board_paused' `
-			-Message 'TaskBoard is PAUSED because the operator stopped. Do not resume or mutate it.' `
-			-Hint 'Handle their latest message only. Resume only if they explicitly said continue/resume (or clicked Resume). Cancel only if they said drop/cancel the plan (or clicked Cancel / Stop twice).')
-	}
-
 	if ($act -eq 'clear') {
 		# Prefer open board; if already empty after complete, drop last-complete snapshot and report it
 		$clearedGoal = Get-MBTaskBoardGoal
@@ -44084,10 +43913,8 @@ function Invoke-TaskBoard {
 	}
 
 	if ($act -eq 'status') {
-		if (-not $pausedNow) {
-			try { $script:MB.TaskBoardPaused = $false } catch {}
-			try { $null = Ensure-MBTaskBoardProgress } catch {}
-		}
+		try { $script:MB.TaskBoardPaused = $false } catch {}
+		try { $null = Ensure-MBTaskBoardProgress } catch {}
 		$counts = Get-MBTaskBoardCounts
 		if ([int]$counts.total_count -eq 0) {
 			try { Write-MBTaskBoardInline -Action 'status' } catch {}
@@ -44207,9 +44034,7 @@ function Invoke-TaskBoard {
 	}
 
 	if ($act -eq 'update') {
-		if (-not $pausedNow) {
-			try { $script:MB.TaskBoardPaused = $false } catch {}
-		}
+		try { $script:MB.TaskBoardPaused = $false } catch {}
 		$work = Get-MBTaskBoardWorkingList
 		if ($work.Count -eq 0) {
 			return (New-MBTaskBoardErrorJson -Code 'empty_items' `
@@ -45851,9 +45676,7 @@ function Optimize-MBHistory {
 		return FullReplace-MBHistory -Messages $Messages
 	}
 
-	$out = @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 8 -OldMaxChars 4000 -RecentMaxChars $MaxToolResultChars)
-	try { $out = @(Repair-MBToolMessageSequence -Messages $out) } catch {}
-	return $out
+	return @(Shrink-MBToolPayloads -Messages $Messages -RecentKeep 8 -OldMaxChars 4000 -RecentMaxChars $MaxToolResultChars)
 }
 
 function Ensure-MBPromptBudget {
@@ -45944,7 +45767,6 @@ function Ensure-MBPromptBudget {
 	if ($final.PromptTokens -gt $budget) {
 		Write-MBWarn ("Context still ~{0:N0} tok over usable n_ctx room {1:N0} - system/tools overhead may dominate; /clear or disable tool groups" -f $final.PromptTokens, $budget)
 	}
-	try { $Messages = @(Repair-MBToolMessageSequence -Messages $Messages) } catch {}
 	return $Messages
 }
 
@@ -47010,29 +46832,7 @@ function Read-MBUserInput {
 	}
 	if ($script:MB.Wpf.ExitRequested) { return ([string][char]0x1B + 'WPF_CLOSE') }
 	try { Sync-MBCwdFromWpf } catch {}
-	# UI-injected slash commands / operator inject / TaskBoard resume|cancel
-	try {
-		$tba = [string]$script:MB.Wpf.TaskBoardUiAction
-		if (-not [string]::IsNullOrWhiteSpace($tba)) {
-			$script:MB.Wpf.TaskBoardUiAction = ''
-			if ($tba -eq 'cancel') {
-				try { $null = Cancel-MBTaskBoardForOperator } catch {}
-				return ''
-			}
-			if ($tba -eq 'resume') {
-				Add-MBInputHistory -Text 'continue'
-				return 'continue'
-			}
-		}
-	} catch {}
-	try {
-		$inj = [string]$script:MB.Wpf.PendingInject
-		if (-not [string]::IsNullOrWhiteSpace($inj)) {
-			$script:MB.Wpf.PendingInject = $null
-			Add-MBInputHistory -Text $inj
-			return $inj
-		}
-	} catch {}
+	# UI-injected slash commands
 	try {
 		$pend = [string]$script:MB.Wpf.PendingUiCommand
 		if (-not [string]::IsNullOrWhiteSpace($pend)) {
@@ -47046,25 +46846,6 @@ function Read-MBUserInput {
 	if ($null -eq $result) { $result = "" }
 	try { Sync-MBCwdFromWpf } catch {}
 	# Re-check inject while we waited for input
-	try {
-		$tba2 = [string]$script:MB.Wpf.TaskBoardUiAction
-		if (-not [string]::IsNullOrWhiteSpace($tba2) -and [string]::IsNullOrWhiteSpace($result)) {
-			$script:MB.Wpf.TaskBoardUiAction = ''
-			if ($tba2 -eq 'cancel') {
-				try { $null = Cancel-MBTaskBoardForOperator } catch {}
-				$result = ''
-			} elseif ($tba2 -eq 'resume') {
-				$result = 'continue'
-			}
-		}
-	} catch {}
-	try {
-		$inj2 = [string]$script:MB.Wpf.PendingInject
-		if (-not [string]::IsNullOrWhiteSpace($inj2) -and [string]::IsNullOrWhiteSpace($result)) {
-			$script:MB.Wpf.PendingInject = $null
-			$result = $inj2
-		}
-	} catch {}
 	try {
 		$pend2 = [string]$script:MB.Wpf.PendingUiCommand
 		if (-not [string]::IsNullOrWhiteSpace($pend2) -and [string]::IsNullOrWhiteSpace($result)) {
@@ -47693,7 +47474,7 @@ function Load-MBSessionJson {
 	if ($obj.toolProfile) {
 		try {
 			$tp = [string]$obj.toolProfile
-			if ($tp -match '(?i)^(core|full)$') { $script:MB.ToolProfile = $tp.ToLowerInvariant() }
+			if ($tp -match '^(?i)core|full$') { $script:MB.ToolProfile = $tp.ToLowerInvariant() }
 		} catch {}
 	}
 	$rawMsgs = @($obj.messages)
@@ -48107,7 +47888,7 @@ function Import-MBTranscript {
 	}
 	if ($parsed.ToolProfile -and -not $Append) {
 		try {
-			if ($parsed.ToolProfile -match '(?i)^(core|full)$') {
+			if ($parsed.ToolProfile -match '^(?i)core|full$') {
 				$script:MB.ToolProfile = $parsed.ToolProfile
 			}
 		} catch {}
@@ -53236,7 +53017,7 @@ function Sync-MBAutoCompactFromWpf {
 }
 
 function Get-MBConfiguredMaxTurns {
-	$n = 50
+	$n = 30
 	try {
 		if ($null -ne $script:MB.MaxTurns -and [int]$script:MB.MaxTurns -gt 0) {
 			$n = [int]$script:MB.MaxTurns
@@ -53244,7 +53025,7 @@ function Get-MBConfiguredMaxTurns {
 			$n = [int]$MaxTurns
 		}
 	} catch {
-		try { $n = [int]$MaxTurns } catch { $n = 50 }
+		try { $n = [int]$MaxTurns } catch { $n = 30 }
 	}
 	if ($n -lt 1) { $n = 1 }
 	if ($n -gt 200) { $n = 200 }
@@ -53345,7 +53126,7 @@ function Sync-MBMaxTurnsFromWpf {
 
 		if ([bool]$script:MB.Wpf.MaxTurnsDirty) {
 			$n = 30
-			try { $n = [int]$script:MB.Wpf.MaxTurnsSetting } catch { $n = 50 }
+			try { $n = [int]$script:MB.Wpf.MaxTurnsSetting } catch { $n = 30 }
 			if ($n -lt 1) { $n = 1 }
 			if ($n -gt 200) { $n = 200 }
 			$script:MB.MaxTurns = $n
@@ -53790,50 +53571,10 @@ function Set-MBWpfPromptEnabled {
 		[switch]$Focus
 	)
 	if (-not (Test-MBWpfActive)) { return }
-	if ($Enabled) {
-		try { $script:MB.Wpf.WorkPromptOpen = $false } catch {}
-	}
 	$script:MB.Wpf.PromptArmed = [bool]$Enabled
 	$script:MB.Wpf.PendingPromptEnabled = [bool]$Enabled
 	if ($Enabled -and $Focus) {
 		try { $script:MB.Wpf.PendingPromptFocus = $true } catch {}
-	}
-}
-
-function Set-MBWpfWorkPromptOpen {
-	# Editable prompt while the model is working (inject). Send button stays Stop until they type.
-	if (-not (Test-MBWpfActive)) { return }
-	try { $script:MB.Wpf.WorkPromptOpen = $true } catch {}
-	try { $script:MB.Wpf.PromptArmed = $false } catch {}
-	try { $script:MB.Wpf.PendingPromptEnabled = $null } catch {}
-	$promptRef = $null
-	$d = $null
-	try { $promptRef = $script:MB.Wpf.Prompt } catch {}
-	try { $d = $script:MB.Wpf.Dispatcher } catch {}
-	$sb = {
-		try {
-			$p = $promptRef
-			if ($p) {
-				$p.IsEnabled = $true
-				$p.Focusable = $true
-				$p.IsReadOnly = $false
-			}
-			try {
-				if ($script:MB.Wpf.SyncSendBtn) {
-					$has = $false
-					try { $has = -not [string]::IsNullOrWhiteSpace([string]$p.Text) } catch {}
-					& $script:MB.Wpf.SyncSendBtn $has
-				}
-			} catch {}
-			try { [void]$p.Focus() } catch {}
-		} catch {}
-	}.GetNewClosure()
-	try {
-		if ($d -and $d.CheckAccess()) { & $sb }
-		elseif ($d) { [void]$d.BeginInvoke([Action]$sb, [System.Windows.Threading.DispatcherPriority]::Input) }
-		else { & $sb }
-	} catch {
-		try { Invoke-MBWpf -Action $sb } catch {}
 	}
 }
 
@@ -54340,7 +54081,6 @@ function Start-MBWpfHost {
 		TaskBoardStickyGoal = $null
 		TaskBoardStickySum = $null
 		TaskBoardStickyLabel = $null
-		TaskBoardStickyActions = $null
 		TaskBoardMaxScrollH = 260.0
 		TaskBoardPulseEls = $null
 		TaskBoardExpanded = $false
@@ -54395,10 +54135,6 @@ function Start-MBWpfHost {
 		InputWait     = New-Object System.Threading.AutoResetEvent $false
 		InputResult   = $null
 		PromptArmed   = $false
-		WorkPromptOpen = $false
-		PendingInject = $null
-		TaskBoardUiAction = ''
-		TaskBoardPaused = $false
 		ExitRequested = $false
 		# all exits hard-kill the process (single-instance lock)
 		SoftClose     = $false
@@ -54445,11 +54181,11 @@ function Start-MBWpfHost {
 		AutoApproveOn = $(try { [bool]$script:MB.AutoApprove } catch { $false })
 		AutoApproveDirty = $false
 		AutoCompactDirty = $false
-		MaxTurnsSetting = $(try { [int]$script:MB.MaxTurns } catch { try { [int]$MaxTurns } catch { 50 } })
+		MaxTurnsSetting = $(try { [int]$script:MB.MaxTurns } catch { try { [int]$MaxTurns } catch { 30 } })
 		MaxTurnsDirty = $false
 		UnlimitedTurns = $(try { [bool]$script:MB.UnlimitedTurns } catch { $false })
 		UnlimitedTurnsDirty = $false
-		TurnsLeft = $(try { [int]$script:MB.TurnsLeft } catch { try { [int]$MaxTurns } catch { 50 } })
+		TurnsLeft = $(try { [int]$script:MB.TurnsLeft } catch { try { [int]$MaxTurns } catch { 30 } })
 		TurnsUsed = 0
 		TurnsInFlight = $false
 		AaTurnsNumTb = $null
@@ -55123,14 +54859,10 @@ function Start-MBWpfHost {
                                  VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
                                  MaxWidth="520"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                      <TextBlock x:Name="TaskBoardStickySum" Text=""
-                                 Foreground="#6A6A76" FontSize="11"
-                                 FontFamily="Consolas, Cascadia Mono, Courier New"
-                                 VerticalAlignment="Center" Margin="8,0,0,0"/>
-                      <StackPanel x:Name="TaskBoardStickyActions" Orientation="Horizontal"
-                                  VerticalAlignment="Center" Margin="10,0,0,0" Visibility="Collapsed"/>
-                    </StackPanel>
+                    <TextBlock x:Name="TaskBoardStickySum" Grid.Column="1" Text=""
+                               Foreground="#6A6A76" FontSize="11"
+                               FontFamily="Consolas, Cascadia Mono, Courier New"
+                               VerticalAlignment="Center" Margin="8,0,0,0"/>
                   </Grid>
                 </Border>
                 <!-- Only the checklist scrolls; cap ~5 visible rows -->
@@ -55728,7 +55460,6 @@ function Start-MBWpfHost {
 			$W.TaskBoardStickyGoal = $window.FindName('TaskBoardStickyGoal')
 			$W.TaskBoardStickySum = $window.FindName('TaskBoardStickySum')
 			$W.TaskBoardStickyLabel = $window.FindName('TaskBoardStickyLabel')
-			$W.TaskBoardStickyActions = $window.FindName('TaskBoardStickyActions')
 			$W.HdrBrandAccent = $window.FindName('HdrBrandAccent')
 			# Items scroller shows at most 5 rows; title banner stays fixed above it
 			$W.TaskBoardMaxVisibleRows = 5
@@ -56017,7 +55748,6 @@ function Start-MBWpfHost {
 						if (-not $W.TaskBoardStickyGoal) { $W.TaskBoardStickyGoal = $W.Window.FindName('TaskBoardStickyGoal') }
 						if (-not $W.TaskBoardStickySum) { $W.TaskBoardStickySum = $W.Window.FindName('TaskBoardStickySum') }
 						if (-not $W.TaskBoardStickyLabel) { $W.TaskBoardStickyLabel = $W.Window.FindName('TaskBoardStickyLabel') }
-						if (-not $W.TaskBoardStickyActions) { $W.TaskBoardStickyActions = $W.Window.FindName('TaskBoardStickyActions') }
 					}
 				} catch {}
 				if (-not $W.TaskBoardSticky) { return }
@@ -56147,56 +55877,6 @@ function Start-MBWpfHost {
 							$W.BrushCache[$hxLabel] = $conv.ConvertFromString($hxLabel)
 						}
 						$labelTb.Foreground = $W.BrushCache[$hxLabel]
-					}
-				} catch {}
-				try { $W.TaskBoardPaused = [bool]$pausedUi } catch {}
-				try {
-					$actHost = $null
-					try { $actHost = $W.TaskBoardStickyActions } catch { $actHost = $null }
-					if (-not $actHost -and $W.Window) {
-						try { $actHost = $W.Window.FindName('TaskBoardStickyActions'); $W.TaskBoardStickyActions = $actHost } catch {}
-					}
-					if ($actHost) {
-						try { $actHost.Children.Clear() } catch {}
-						if ($pausedUi) {
-							$actHost.Visibility = [System.Windows.Visibility]::Visible
-							$mkTbBtn = {
-								param([string]$lab, [string]$fgHex, [string]$bdHex, [string]$cmd)
-								$b = New-Object System.Windows.Controls.Button
-								$b.Content = $lab
-								$b.Padding = New-Object System.Windows.Thickness(8, 2, 8, 2)
-								$b.Margin = New-Object System.Windows.Thickness(4, 0, 0, 0)
-								$b.FontSize = 11
-								$b.Cursor = [System.Windows.Input.Cursors]::Hand
-								$b.Focusable = $false
-								try { $b.FontFamily = $W.MonoFont } catch {}
-								$b.Foreground = $conv.ConvertFromString($fgHex)
-								$b.Background = $conv.ConvertFromString('#1A1A1E')
-								$b.BorderBrush = $conv.ConvertFromString($bdHex)
-								$b.BorderThickness = New-Object System.Windows.Thickness(1)
-								$b.Tag = $cmd
-								$b.add_Click({
-									param($s2, $e2)
-									try {
-										$c = [string]$s2.Tag
-										$W.TaskBoardUiAction = $c
-										if ($c -eq 'cancel') {
-											try { [void]$W.InputWait.Set() } catch {}
-										} else {
-											try { [void]$W.InputWait.Set() } catch {}
-										}
-										try {
-											if ([bool]$W.WorkPromptOpen) { $W.InterruptFlag = $true }
-										} catch {}
-									} catch {}
-								}.GetNewClosure())
-								return $b
-							}.GetNewClosure()
-							[void]$actHost.Children.Add((& $mkTbBtn 'Resume' '#9ECE6A' '#3D5A3A' 'resume'))
-							[void]$actHost.Children.Add((& $mkTbBtn 'Cancel' '#F7768E' '#5A2E2E' 'cancel'))
-						} else {
-							$actHost.Visibility = [System.Windows.Visibility]::Collapsed
-						}
 					}
 				} catch {}
 
@@ -58917,9 +58597,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				$raw = $raw -replace '/v1/chat/completions\s*$', '' -replace '/v1/models\s*$', ''
 				while ($raw.EndsWith('/')) { $raw = $raw.Substring(0, $raw.Length - 1) }
 				$bases = New-Object System.Collections.Generic.List[string]
-				if ($raw -match '(?i)/v1$') {
+				if ($raw -match '/v1$') {
 					[void]$bases.Add($raw)
-					$root = $raw -replace '(?i)/v1$', ''
+					$root = $raw -replace '/v1$', ''
 					if ($root -and -not $bases.Contains($root)) { [void]$bases.Add($root) }
 				} else {
 					[void]$bases.Add($raw + '/v1')
@@ -59085,7 +58765,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					$k = ''
 					if ($mode -eq 'apikey') {
 						try { $k = [string]$W.AddEpKey.Password } catch { $k = '' }
-						if (-not (Test-MBApiKeyUsable -Key $k)) {
+						if ([string]::IsNullOrWhiteSpace($k) -or $k -eq 'none') {
 							if ($W.AddEpError) {
 								$W.AddEpError.Foreground = $bcX.ConvertFromString('#F05C5C')
 								$W.AddEpError.Text = 'API mode requires a Bearer token.'
@@ -63726,7 +63406,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										} catch {}
 										try {
 											if (-not [bool]$W.UnlimitedTurns) {
-												$disp = 50
+												$disp = 30
 												if ([bool]$W.TurnsInFlight) {
 													$disp = [int]$W.TurnsLeft
 												} else {
@@ -64287,8 +63967,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											param([int]$Delta)
 											try {
 												if ([bool]$W.UnlimitedTurns) { return }
-												$cur = 50
-												try { $cur = [int]$W.MaxTurnsSetting } catch { $cur = 50 }
+												$cur = 30
+												try { $cur = [int]$W.MaxTurnsSetting } catch { $cur = 30 }
 												$nxt = $cur + [int]$Delta
 												if ($nxt -lt 1) { $nxt = 1 }
 												if ($nxt -gt 200) { $nxt = 200 }
@@ -64349,15 +64029,15 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 											}
 											return $tb
 										}.GetNewClosure()
-										$turnsShow = 50
+										$turnsShow = 30
 										try {
 											if ([bool]$W.TurnsInFlight -and -not [bool]$W.UnlimitedTurns) { $turnsShow = [int]$W.TurnsLeft }
 											else { $turnsShow = [int]$W.MaxTurnsSetting }
 										} catch {
-											try { $turnsShow = [int]$W.MaxTurnsSetting } catch { $turnsShow = 50 }
+											try { $turnsShow = [int]$W.MaxTurnsSetting } catch { $turnsShow = 30 }
 										}
 										if ($turnsShow -lt 0) { $turnsShow = 0 }
-										if ($turnsShow -gt 200) { $turnsShow = 50 }
+										if ($turnsShow -gt 200) { $turnsShow = 30 }
 										[void]$aaTurnsCountPanel.Children.Add((& $mkAaMidTb 'Turns[' $false))
 										$aaTurnsNum = & $mkAaMidTb ([string]$turnsShow) $true
 										$W.AaTurnsNumTb = $aaTurnsNum
@@ -64516,9 +64196,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												$W.UnlimitedTurnsDirty = $true
 												# STA: freeze/restore on shared MB bag (main runspace Sync also applies via Dirty)
 												try {
-													$cfg = 50
-													try { $cfg = [int]$W.MaxTurnsSetting } catch { $cfg = 50 }
-													if ($cfg -lt 1) { $cfg = 50 }
+													$cfg = 30
+													try { $cfg = [int]$W.MaxTurnsSetting } catch { $cfg = 30 }
+													if ($cfg -lt 1) { $cfg = 30 }
 													if ($cfg -gt 200) { $cfg = 200 }
 													if ($nxt) {
 														$snap = $cfg
@@ -64635,7 +64315,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 												if ($opening) {
 													try {
 														if (-not [bool]$W.UnlimitedTurns) {
-															$disp = 50
+															$disp = 30
 															if ([bool]$W.TurnsInFlight) {
 																$disp = [int]$W.TurnsLeft
 															} else {
@@ -65361,19 +65041,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 							} catch {}
 						}
 					} catch {}
-					$workOpen = $false
-					try { $workOpen = [bool]$W.WorkPromptOpen } catch { $workOpen = $false }
-					if ($workOpen -and $W.Prompt -and -not [bool]$W.AuthActive) {
-						try {
-							$W.Prompt.IsEnabled = $true
-							$W.Prompt.Focusable = $true
-							$W.Prompt.IsReadOnly = $false
-							$W.PromptArmed = $false
-							$hasTxt = $false
-							try { $hasTxt = -not [string]::IsNullOrWhiteSpace([string]$W.Prompt.Text) } catch {}
-							if ($W.SyncSendBtn) { & $W.SyncSendBtn $hasTxt }
-						} catch {}
-					} elseif ($null -ne $W.PendingPromptEnabled) {
+					if ($null -ne $W.PendingPromptEnabled) {
 						$en = [bool]$W.PendingPromptEnabled
 						$W.PendingPromptEnabled = $null
 						$wantFocus = $false
@@ -65744,24 +65412,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 
 			$submitPrompt = {
 				try {
-					$working = $false
-					try { $working = [bool]$W.WorkPromptOpen } catch { $working = $false }
-					if (-not $W.Prompt) { return $false }
-					if (-not $working -and (-not $W.PromptArmed -or $W.Prompt.IsReadOnly)) { return $false }
+					if (-not $W.PromptArmed -or -not $W.Prompt -or $W.Prompt.IsReadOnly) { return $false }
 					$text = [string]$W.Prompt.Text
-					if ($working) {
-						if ([string]::IsNullOrWhiteSpace($text)) { return $false }
-						$W.PendingInject = $text
-						$W.Prompt.Clear()
-						$W.HistIndex = -1
-						try {
-							[void]$W.History.Add($text)
-							while ($W.History.Count -gt 80) { $W.History.RemoveAt(0) }
-						} catch {}
-						$W.InterruptFlag = $true
-						try { if ($W.SyncSendBtn) { & $W.SyncSendBtn $false } } catch {}
-						return $true
-					}
 					$W.Prompt.Clear()
 					if (-not [string]::IsNullOrWhiteSpace($text)) {
 						try {
@@ -65781,23 +65433,10 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 
 			$interruptWork = {
 				try {
-					$hasDraft = $false
-					try {
-						if ($W.Prompt) { $hasDraft = -not [string]::IsNullOrWhiteSpace([string]$W.Prompt.Text) }
-					} catch { $hasDraft = $false }
-					$working = $false
-					try { $working = [bool]$W.WorkPromptOpen } catch { $working = $false }
-					$paused = $false
-					try { $paused = [bool]$W.TaskBoardPaused } catch { $paused = $false }
-					# Idle + paused + empty prompt = cancel the board (second Stop)
-					if (-not $working -and $paused -and -not $hasDraft) {
-						$W.TaskBoardUiAction = 'cancel'
-						try { [void]$W.InputWait.Set() } catch {}
-						return
-					}
-					# Idle typing: never abort or wipe the draft
-					if (-not $working) { return }
 					$W.InterruptFlag = $true
+					if ($W.PromptArmed -and $W.Prompt -and -not $W.Prompt.IsReadOnly) {
+						try { $W.Prompt.Clear() } catch {}
+					}
 				} catch {}
 			}.GetNewClosure()
 
@@ -65817,15 +65456,7 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				$W.SendBtn.add_Click({
 					param($s, $e)
 					try {
-						$working = $false
-						try { $working = [bool]$W.WorkPromptOpen } catch { $working = $false }
-						$hasTxt = $false
-						try {
-							if ($W.Prompt) { $hasTxt = -not [string]::IsNullOrWhiteSpace([string]$W.Prompt.Text) }
-						} catch {}
-						if ($working -and $hasTxt) {
-							[void](& $submitPrompt)
-						} elseif ([string]$W.SendMode -eq 'stop' -or -not [bool]$W.PromptArmed) {
+						if ([string]$W.SendMode -eq 'stop' -or -not [bool]$W.PromptArmed) {
 							& $interruptWork
 						} else {
 							[void](& $submitPrompt)
@@ -65841,10 +65472,8 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 				try {
 					if ($e.Key -eq 'Return') {
 						$e.Handled = $true
-						$working = $false
-						try { $working = [bool]$W.WorkPromptOpen } catch { $working = $false }
-						if ((-not $W.PromptArmed -and -not $working) -or ($sender.IsReadOnly -and -not $working)) {
-							try { & $uiLog 'ENTER_IGNORED' ("armed={0} readOnly={1} work={2}" -f $W.PromptArmed, $sender.IsReadOnly, $working) } catch {}
+						if (-not $W.PromptArmed -or $sender.IsReadOnly) {
+							try { & $uiLog 'ENTER_IGNORED' ("armed={0} readOnly={1}" -f $W.PromptArmed, $sender.IsReadOnly) } catch {}
 							return
 						}
 						$mods = [System.Windows.Input.Keyboard]::Modifiers
@@ -65905,19 +65534,6 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 					} catch {}
 				}
 			}.GetNewClosure())
-
-			try {
-				$W.Prompt.add_TextChanged({
-					try {
-						$working = $false
-						try { $working = [bool]$W.WorkPromptOpen } catch { $working = $false }
-						if (-not $working) { return }
-						$hasTxt = $false
-						try { $hasTxt = -not [string]::IsNullOrWhiteSpace([string]$W.Prompt.Text) } catch {}
-						if ($W.SyncSendBtn) { & $W.SyncSendBtn $hasTxt }
-					} catch {}
-				}.GetNewClosure())
-			} catch {}
 
 			$window.add_Closing({
 				param($s, $ev)
@@ -66368,7 +65984,7 @@ function Start-LocalAgent {
 				}
 				'^/tools$' {
 					Write-Host ""
-					if ($arg -match '(?i)^(list|groups?)$') {
+					if ($arg -match '^(?i)list|groups?$') {
 						Write-Host (Get-MBToolGroupsStatus) -ForegroundColor Gray
 						Write-Host ""
 						continue
@@ -66695,28 +66311,6 @@ function Start-LocalAgent {
 		try { $isLoadResume = [bool]$script:MB.LoadResumeTurn } catch { $isLoadResume = $false }
 		if ($isLoadResume) { $script:MB.LoadResumeTurn = $false }
 		Write-MBDebugLog -Step 'TURN_BEGIN' -Detail ("preview={0} loadResume={1}" -f $trimmed, $isLoadResume)
-		# After Stop/Esc: resume only on explicit continue; cancel on drop/cancel; else hold the board.
-		$heldBoardInject = $false
-		try {
-			if (-not $isLoadResume -and [bool]$script:MB.TaskBoardPaused -and (Test-MBTaskBoardHasOpen)) {
-				if (Test-MBUserWantsTaskBoardCancel -Text ([string]$userInput)) {
-					try { $null = Cancel-MBTaskBoardForOperator } catch {}
-					# Bare cancel/drop: no model turn
-					if ($trimmed -match '(?i)^(cancel|stop|drop|abort|clear)\s*(the\s+)?(board|plan|taskboard|task board|list)?\s*[.!?]?\s*$' `
-						-or $trimmed -match '(?i)^never mind (the )?(board|plan|taskboard)\s*[.!?]?\s*$') {
-						try { Refresh-MBWpfStickyFromSession } catch {}
-						continue
-					}
-				} elseif (Test-MBUserWantsTaskBoardResume -Text ([string]$userInput)) {
-					Resume-MBTaskBoardUi
-				} else {
-					$heldBoardInject = $true
-					try {
-						$userInput = Format-MBPausedBoardInject -Text ([string]$userInput)
-					} catch {}
-				}
-			}
-		} catch {}
 		# Keep /retry on the real last user line from the loaded session
 		if (-not $isLoadResume) {
 			$script:LastUserMessage = $userInput
@@ -66738,7 +66332,14 @@ function Start-LocalAgent {
 				Register-MBMultiStepNudgeFromUser -Text ([string]$userInput)
 			}
 		} catch {}
-		try { Repair-MBConversationAfterAbort } catch {}
+		# After Stop/Esc: "continue" / "resume" expands sticky and ensures an active [>] row
+		try {
+			if (-not $isLoadResume -and [bool]$script:MB.TaskBoardPaused -and (Test-MBTaskBoardHasOpen)) {
+				if (Test-MBUserWantsTaskBoardResume -Text ([string]$userInput)) {
+					Resume-MBTaskBoardUi
+				}
+			}
+		} catch {}
 		Write-MBDebugLog -Step 'TURN_CONTEXT_MANAGE'
 		try {
 			$holdFreeze = $false
@@ -66824,7 +66425,6 @@ function Start-LocalAgent {
 				}
 
 				if ($script:MB.Interrupt -or ($response -and $response.interrupted)) {
-					try { Repair-MBConversationAfterAbort } catch {}
 					Reset-MBInterrupt
 					Write-Host "  [turn aborted - stream cancelled]" -ForegroundColor Red
 					break
@@ -66870,9 +66470,7 @@ function Start-LocalAgent {
 					}
 
 					try {
-						$boardHeld = $false
-						try { $boardHeld = [bool]$script:MB.TaskBoardPaused } catch { $boardHeld = $false }
-						if (-not $isLoadResume -and -not $boardHeld -and (Test-MBTaskBoardHasOpen) -and $turn -lt $maxTurnsNow) {
+						if (-not $isLoadResume -and (Test-MBTaskBoardHasOpen) -and $turn -lt $maxTurnsNow) {
 							$finalTextStr = [string]$finalText
 							if (Test-MBReplySignalsTaskBoardDone -Text $finalTextStr) {
 								try {
@@ -66909,7 +66507,7 @@ function Start-LocalAgent {
 					try { if ($response.truncated) { $needCont = $true } } catch {}
 					$haveUsageCont = $false
 					try {
-						if ($fr -match '(?i)^(length|max_tokens|limit)$') { $haveUsageCont = $true }
+						if ($fr -match '^(?i)length|max_tokens|limit$') { $haveUsageCont = $true }
 						elseif ($ct -gt 0 -and $response.truncated) { $haveUsageCont = $true }
 					} catch {}
 					if (-not $needCont) {
@@ -66987,7 +66585,7 @@ function Start-LocalAgent {
 						try {
 							if ($contResponse.truncated) { $needCont = $true; $haveUsageCont = $true }
 						} catch {}
-						if ($fr -match '(?i)^(length|max_tokens|limit|max_completion_tokens)$') {
+						if ($fr -match '^(?i)length|max_tokens|limit|max_completion_tokens$') {
 							$needCont = $true
 							$haveUsageCont = $true
 						}
@@ -67147,7 +66745,6 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 				}
 
 				if ($script:MB.Interrupt) {
-					try { Repair-MBConversationAfterAbort } catch {}
 					Reset-MBInterrupt
 					Write-Host "  [tool loop aborted]" -ForegroundColor Yellow
 					break
@@ -67193,7 +66790,7 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 						foreach ($n in @($fedToolNames)) {
 							$k = ([string]$n).ToLowerInvariant()
 							if ([string]::IsNullOrWhiteSpace($k) -or $seenFn.ContainsKey($k)) { continue }
-							if ($k -match '(?i)^(taskboard|task_board|todo_write|todo|todos|checklist|task_plan|plan_tasks)$') { continue }
+							if ($k -match '^(?i)taskboard|task_board|todo_write|todo|todos|checklist|task_plan|plan_tasks$') { continue }
 							$seenFn[$k] = $true
 							[void]$uniq.Add([string]$n)
 						}
