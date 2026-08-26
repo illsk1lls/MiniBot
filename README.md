@@ -1,6 +1,6 @@
 # MiniBot
 
-**v2.52.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
+**v2.52.2** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
@@ -94,11 +94,11 @@ The file begins with a hybrid CMD header. Rename to `.cmd` for double-click laun
 | `-ModelAlias` | *(empty)* | Display label in PoweredBy; empty → live server model id |
 | `-ApiKey` | `none` | HTTP **Bearer** only. Use `none` to skip. |
 | `-AgentName` | `MiniBot` | Window brand / agent identity |
-| `-Version` | `2.51.0` | Version string |
+| `-Version` | `2.52.2` | Version string |
 | `-MaxTokens` | `0` | Max completion tokens. **`0` = auto** (`n_ctx / 8` from server). |
 | `-ContextWindowTokens` | `0` | Fallback `n_ctx`. **`0` = use server `/props` + `/models` only** |
 | `-Temperature` | `0.15` | Sampling temperature |
-| `-MaxTurns` | `30` | Max tool-loop turns per user message (UI: **Unlimited** disables the cap) |
+| `-MaxTurns` | `50` | Max tool-loop turns per user message (UI: **Unlimited** disables the cap) |
 | `-MaxReplyContinues` | `5` | Auto-continue when a reply is truncated |
 | `-MaxToolResultChars` | `10000` | Cap on tool output returned to the model |
 | `-MaxHistoryMessages` | `48` | Soft history length target |
