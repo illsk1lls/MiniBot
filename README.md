@@ -1,170 +1,77 @@
 # MiniBot
 
-**v2.60.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
+**v2.61.0** — one Windows PowerShell 5.1 script. Point it at an OpenAI-compatible server and you get a chat window that can use the PC: files, tools, and changes that ask first.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
 </p>
 
-MiniBot is a single-file agent harness: progressive tools, operator approvals for host changes, multi-endpoint model switching, connect recovery when the endpoint is down, LAN discovery and domain remoting, and a UI built for day-to-day work.
+The script is the whole app. Copy `MiniBot.ps1` (or rename it to `.cmd` and double-click). No installer, no extra runtime.
 
 ---
 
-## Highlights
+## What you can do with it
 
-| Area | Capability |
-|------|------------|
-| **Models** | llama.cpp, vLLM, Unsloth Studio, xAI Grok, and other OpenAI-compatible `/v1` servers |
-| **Endpoints** | Primary `-BaseUrl` plus optional extras; per-endpoint auth: **API key**, **NPM Basic**, or **none** |
-| **Connect** | Fast hard-timeout probe; if the host is down (or `-BaseUrl` is empty), **Connect** collects URL + auth without hard-exiting |
-| **UI** | Borderless dark WPF chrome, sticky status, tool-group chips, **PoweredBy** model/endpoint picker, **TaskBoard sticky** under chips |
-| **Media** | Inline images, video, and audio via `![label](path)` - external players only as a last resort |
-| **Visualize** | Inline **SVG** charts - WPF **SvgView** draws shapes, dashed strokes, `rgba`, and `tspan` labels (save SVG/HTML from the card) |
-| **Speed** | Prefill / generation timing under replies (**pp/s** · **t/s**) when the server or stream window provides it |
-| **Network** | **PortProbe**, **FindShares**, **FindWebHosts**, **FindRdp** - targeted host(s) or LAN search when hosts are omitted |
-| **Remote** | **RemoteCommand** (WinRM) for domain admins on domain-joined hosts - orange / unavailable off-domain |
-| **Safety** | Auto-approve off by default; mutating actions require Yes / No / All |
-| **Tools** | Progressive groups (catalog-order chips; volume/brightness, GPO, shares, CAB/ISO, Gallery, SearchWeb/BrowsePage, …) |
-| **TaskBoard** | Multi-step checklist: sticky flyout under chips + SESSION STATE (`set` / `update` / `status` / `clear`) |
-| **Edit stack** | **EditFile** / **ApplyPatch** / **WriteFile**: line-range edits, whitespace and indent tolerant match, `@@` hints, atomic save, default **`.bak`**. Saves include a **VERIFY** syntax check for PowerShell, JSON, and XML |
-| **Coding** | **SearchFiles** with line context (skips `.git` and `node_modules`), **RunProjectCheck** for the test command already on the machine, and a four-step checklist the model has to follow |
-| **Forensics** | **ForensicsSummary**, **PeInfo**, **HexView** / **HexEdit** (presets, session undo), **FindHexPattern**, **StringExtract**, imports, resources, sections |
-| **Deploy** | One `.ps1` (or hybrid `.cmd`), optional elevation, single-instance lock |
+| You want to… | Use |
+|---|---|
+| Talk to a local model (llama.cpp, vLLM, Unsloth) or a cloud one (xAI and other `/v1` servers) | `-BaseUrl` |
+| Switch models or add another server without restarting | Title bar **PoweredBy** menu |
+| Have it edit code | `EditFile`, `ApplyPatch`, `WriteFile`. A `.bak` is written next to the file. PowerShell, JSON, and XML are parsed after the save |
+| Find text in a project | `SearchFiles` (skips `.git` and `node_modules`, gives a line number) |
+| Check that a change actually runs | `RunProjectCheck` — uses a test command already on the machine (`*.Tests.ps1`, `npm test`, `cargo test`, `go test`, `dotnet test`, `pytest`). It does not install anything |
+| Look at a picture, PDF, or the screen | vision tools |
+| Play a video or audio clip in the chat | `![title](C:\full\path\to\file.mp4)` |
+| Draw a chart | SVG between `@@@RenderOpen` and `@@@RenderClose` |
+| Inspect an EXE or DLL | forensics tools (`PeInfo`, `HexView`, `HexEdit`, strings, imports) |
+| Fix or inventory the PC | system, diag, repair, registry, shares, Group Policy |
+| Reach another PC on the domain | `RemoteCommand` (WinRM). Off-domain it stays unavailable |
+| Pick up yesterday’s chat | `/sessions` then `/resume` |
+| Save a readable copy of the chat | `/save` — the picker suggests `minibot-<date>.md` |
 
----
+Auto-approve is **off**. Anything that changes the machine asks Yes / No / All.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Markdown.png" alt="Markdown Support"><br>
-  Markdown Support
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Markdown.png" alt="Chat with markdown"><br>
+  Chat
 </p>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-CodeBlock.png" alt="Codeblocks"><br>
-  Codeblocks
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-CodeBlock.png" alt="A code block"><br>
+  Code blocks show line numbers, the language, and a Copy button. Copy does not include the line numbers. A long block scrolls inside the card.
 </p>
 
 ---
 
-## Requirements
+## What you need
 
-| Requirement | Notes |
-|-------------|--------|
-| **Windows 10 / 11** | WPF desktop host |
-| **Windows PowerShell 5.1** | `%SystemRoot%\System32\WindowsPowerShell\v1.0` |
-| **OpenAI-compatible API** | Chat completions (set `-BaseUrl` to your server) |
-| **Elevation** | Re-launches elevated when repair, setup, share, or identity tools need it |
-| **Optional** | `System.Speech` for voice; **curl.exe** (System32) for HTTPS with bad/self-signed certs via tools; Poppler / ImageMagick / Ghostscript for richer PDF rendering |
-| **RemoteCommand** | Domain-joined PC + signed-in **domain user**; WinRM enabled and reachable on the **remote** target (5985 / 5986) |
+| | |
+|---|---|
+| Windows 10 or 11 | The window is WPF |
+| Windows PowerShell 5.1 | `System32\WindowsPowerShell\v1.0`. PowerShell 7 is not required |
+| A chat server | Anything that speaks OpenAI `/v1/chat/completions` |
+| Admin, sometimes | Repair, setup, shares, and local users re-launch elevated |
+| Domain + WinRM | Only for `RemoteCommand` (ports 5985 / 5986 on the other PC) |
+
+Optional: `System.Speech` for voice. `curl.exe` (already on Windows 10+) for HTTPS tools that skip certificate checks. Poppler, ImageMagick, or Ghostscript if you want better PDF pages.
 
 ---
 
-## Quick start
+## Start it
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\MiniBot.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 -HideConsole:$false
 ```
 
-Or rename to `.cmd` and double-click (hybrid launcher minimizes the console).
+Home lab on port 8080, no API key:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\MiniBot.ps1" `
+powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
   -BaseUrl "http://127.0.0.1:8080/v1" `
+  -ApiKey none `
   -ModelAlias "HomeLab" `
   -HideConsole:$false
 ```
 
-### Hybrid launcher
-
-The file begins with a hybrid CMD header. Rename to `.cmd` for double-click launch. For pure hybrid CMD use, follow the comment at the top of the script regarding lines above `@START`.
-
-### First session
-
-1. MiniBot probes the primary base with a **short hard timeout**. If nothing answers (or `-BaseUrl` is empty), the **Connect** dialog opens (URL + auth mode).
-2. Authenticate if required (optional save to Windows Credential Manager).
-3. Type a task and press **Enter**.
-4. Use the title bar for working directory, context budget, and **PoweredBy** (model / endpoint picker).
-5. Tool-group chips show active groups; multi-step work paints a **TaskBoard sticky** under the chips (scrollable rows, active task highlighted).
-
----
-
-## Parameters
-
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `-BaseUrl` | *(script default)* | Primary API base (port lives in the URL). Prefer `…/v1` for vLLM / Unsloth; bare `:8080` is fine for many llama.cpp builds. Empty `""` opens Connect immediately. |
-| `-Model` | *(empty)* | Preferred model id; empty → auto-pick from `/models` or PoweredBy. Slash ids OK (`unsloth/…`). |
-| `-ModelAlias` | *(empty)* | Display label in PoweredBy; empty → live server model id |
-| `-ApiKey` | `none` | HTTP **Bearer** only. Use `none` to skip. |
-| `-AgentName` | `MiniBot` | Window brand / agent identity |
-| `-Version` | `2.60.0` | Version string |
-| `-MaxTokens` | `0` | Max completion tokens. **`0` = auto** (`n_ctx / 8` from server). |
-| `-ContextWindowTokens` | `0` | Fallback `n_ctx`. **`0` = use server `/props` + `/models` only** |
-| `-Temperature` | `0.15` | Sampling temperature |
-| `-MaxTurns` | `50` | Max tool-loop turns per user message (UI: **Unlimited** disables the cap) |
-| `-MaxReplyContinues` | `5` | Auto-continue when a reply is truncated |
-| `-MaxToolResultChars` | `10000` | Cap on tool output returned to the model |
-| `-MaxHistoryMessages` | `48` | Soft history length target |
-| `-CommandTimeoutSec` | `360` | Default command / process timeout |
-| `-ContextSoftPct` | `0.72` | Soft auto-compact threshold |
-| `-ContextHardPct` | `0.88` | Hard auto-compact threshold |
-| `-AutoCompactEnabled` | `$true` | Auto-trim history under budget pressure |
-| `-ModelCompactEnabled` | `$true` | Model-written digest on compact (else extractive) |
-| `-AutoApproveEnabled` | `$false` | Start with auto-approve **off** |
-| `-SpeechEnabled` | `$false` | Voice mode at launch (Right-Ctrl hold-to-talk) |
-| `-SpeechAutoReply` | `$true` | TTS final assistant text when speech is on |
-| `-StoreCredentials` | `$false` | Persist login via Credential Manager |
-| `-ToolProfile` | `core` | `core` = progressive groups; `full` = all groups unlocked |
-| `-TaskApiBase` | `""` | Optional origin for backend task cancel |
-| `-DebugLog` | `$false` | Write `MiniBot-debug.log` (Desktop preferred) |
-| `-HideConsole` | `$true` | Hide PowerShell / Windows Terminal host |
-
-Booleans: `-Name:$true` / `-Name:$false`.
-
-### Environment
-
-| Variable | Effect |
-|----------|--------|
-| `$env:store=1` | Store credentials (if `-StoreCredentials` not set on the command line) |
-| `$env:clear=1` | Clear stored MiniBot credentials at launch |
-| `$env:debug=1` | Enable file debug log |
-| `$env:speech=1` | Enable speech at launch |
-
-**Hold Caps Lock during launch** to clear stored credentials and force a fresh login.
-
----
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Login.png" alt="Basic Auth Support"><br>
-  Basic Auth Support
-</p>
-
----
-
-## Multi-endpoint & authentication
-
-**Primary host** is always `-BaseUrl`. Auth for primary:
-
-| Mode | How |
-|------|-----|
-| **API key** | `-ApiKey '…'` → `Authorization: Bearer …` |
-| **NPM Basic** | Session login through your reverse proxy (Connect / Login UI) |
-| **None** | `-ApiKey 'none'` and no NPM login (open LAN servers) |
-
-**Extra endpoints** (hardcode near the top of the script, or **PoweredBy → + Add endpoint**):
-
-| Mode | Behavior |
-|------|----------|
-| `apikey` | Bearer from the per-base key map |
-| `npm` | Same NPM Basic session as primary |
-| `none` | No Authorization header |
-
-```powershell
-# Example hardcode (edit MiniBot.ps1 near the top):
-# $script:MBExtraApiBases = @('http://192.168.1.20:8000/v1')
-# $script:MBExtraApiAuth  = @{ 'http://192.168.1.20:8000/v1' = 'apikey' }
-# $script:MBExtraApiKeys  = @{ 'http://192.168.1.20:8000/v1' = 'token-abc123' }
-```
-
-**Cloud example (xAI):**
+xAI:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
@@ -173,254 +80,254 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
   -Model "grok-4.5"
 ```
 
+If `-BaseUrl` is empty, or nothing answers, a Connect box opens. Put the URL there and pick API key, NPM basic auth, or none. Hold **Caps Lock** while launching to throw away a saved login and start clean.
+
+Rename the file to `.cmd` if you want a double-click. The top of the script is a CMD header; the comment above `@START` says which lines that header uses.
+
+First time in the window: type, Enter. The title bar shows the folder, how full the context window is, and the model. Chips under that are tool groups. A multi-step job draws a task list under the chips.
+
 ---
 
-## User interface
+## The window
 
-- Borderless dark chrome: drag, minimize, maximize to work area, close  
-- Title bar brand, path, context budget, **PoweredBy** model / endpoint menu (**+** adds an endpoint)  
-- Chat log with banners, code, tables, **inline media**, and **SVG visualization** cards  
-- Sticky header: path, budget, auto-approve / auto-compact, tool-group chips  
-- **TaskBoard sticky** under chips: goal, scrollable rows (max ~5 visible), purple **in_progress**, yellow when paused on Stop/Esc  
-- Approval strips: **Yes** / **No** / **All**  
-- **Send** ↔ **Stop** while the agent runs (Stop ≈ Esc interrupt)  
-- **Connect / Login** shared window for endpoint recovery  
+Drag the borderless frame. Minimize, maximize, close are on the title bar.
 
-### Keyboard
+- **PoweredBy** picks the model and the server. **+** adds another server for this session.
+- **Send** becomes **Stop** while it is working. Stop is the same as Esc.
+- Approval strips are **Yes**, **No**, and **All** (All means yes for the rest of this kind of action).
+- A task list under the chips is the current plan. Purple is the step it is on. Yellow means you hit Stop and it is paused on that step.
 
-| Key | Action |
-|-----|--------|
-| **Enter** | Send |
-| **Ctrl+Enter** / **Shift+Enter** | Newline |
-| Trailing `\` | Continue multi-line |
-| **Esc** (idle) | Clear draft |
-| **Esc** (busy) | Interrupt stream and tools (TaskBoard collapses to paused active row) |
-| **Up** / **Down** | Input history |
-| **Right-Ctrl** (hold) | Push-to-talk when speech is on |
+| Key | What it does |
+|---|---|
+| Enter | Send |
+| Ctrl+Enter or Shift+Enter | New line |
+| End a line with `\` | Keep typing on the next line |
+| Esc, while idle | Clear the draft |
+| Esc, while busy | Stop the reply and the tools |
+| Up / Down | Earlier things you typed |
+| Hold Right-Ctrl | Talk, if speech is on |
 
-### Inline media
+### Show a file in the chat
 
 ```text
-![clip title](C:\Users\You\Videos\clip.mp4)
+![clip](C:\Users\You\Videos\clip.mp4)
 ```
 
-Supported: common images, video (`mp4` / `m4v` / `mov` / `wmv`), audio (`mp3` / `wav` / `flac` / `m4a` / …). Prefer absolute paths.
+Images: png, jpg, gif, webp, bmp, tif. Video: mp4, m4v, mov, wmv. Audio: mp3, wav, flac, m4a, and the usual others. Use a full path. MiniBot plays it in the chat. It opens an outside player only if you ask, or if the format will not play inline.
 
-### Inline visualization (SVG)
+### Draw a chart
 
 ```text
 @@@RenderOpen
 <svg width="680" height="240" viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg">
-  <!-- numeric width/height required; viewBox + xmlns required -->
+  <rect width="680" height="240" fill="#1A1A1E"/>
 </svg>
 @@@RenderClose
 ```
 
-| Rule | Detail |
-|------|--------|
-| **Format** | SVG only - not WPF XAML, not markdown fences around the body |
-| **Size** | Numeric `width` and `height` (pixels) |
-| **Theme** | Dark palette: `#121216` / `#1A1A1E` bg, `#E5E7EB` text, `#7AA2F7` accent |
-| **Drawn** | Shapes, paths, text/`tspan`, dashed strokes, `rgb`/`rgba`. Gradients, filters, markers, and `<use>` are skipped (the card title counts them) |
-| **Save** | Card actions export **SVG** or **HTML** |
+`width` and `height` have to be numbers, and the SVG needs `viewBox` and `xmlns`. Do not wrap that block in a markdown fence.
+
+Shapes, paths, text, `tspan`, dashed lines, and `rgb` / `rgba` draw. Gradients, filters, markers, and `<use>` do not. If some of those are in the file, the card title says how many were skipped. The card can save SVG or HTML.
+
+Dark colors that match the window: background `#121216` / `#1A1A1E`, text `#E5E7EB`, accent `#7AA2F7`.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Login.png" alt="Login"><br>
+  Login
+</p>
 
 ---
 
-## Slash commands
+## Commands you type
 
-| Command | Description |
-|---------|-------------|
-| `/help` | Full help |
-| `/doctor` | Check the harness itself (no files written) |
-| `/status` | Session stats and context bar |
-| `/context` | Detailed context breakdown |
-| `/clear` | Clear chat history (sticky notes / pins kept) |
-| `/compact` | Aggressive history trim |
-| `/note <text>` | Pin a sticky note |
-| `/find <text>` | Pin a finding |
-| `/forget` | Clear notes, findings, digest, path pins, TaskBoard |
-| `/auto [on\|off]` | Toggle auto-approve |
-| `/autocompact` | Toggle automatic compaction |
-| `/cd <path>` | Change working directory |
-| `/wd` | Print working directory |
-| `/tools` | List tools and groups |
-| `/tools <group>` | Enable a group (comma-separated OK) |
-| `/tools full` \| `core` \| `list` | Full surface / core-only / list |
-| `/sandbox` | Show sandbox root |
-| `/sandbox clear` \| `clear all` | Clear session or all machine sandboxes |
-| `/save [path]` | Save a copy. Picker if omitted; suggested name is `minibot-date.md` |
-| `/load [path]` | Load a saved copy |
-| `/sessions` | List chats autosaved for this folder |
-| `/resume [n\|id]` | Continue the latest chat, or one from the list |
-| `/model` | Show active model id |
-| `/retry` | Re-send last user message |
-| `/speech [on\|off]` | Voice (`auto`, `test`, `listen`, `say …`) |
-| `exit` / `quit` | End session |
+| Command | What it does |
+|---|---|
+| `/help` | The short list inside the app |
+| `/doctor` | Checks that this script still parses and the coding checks are present. Writes nothing |
+| `/status` | Session and context |
+| `/context` | Where the context budget went |
+| `/clear` | Wipe the chat. Notes you pinned stay. The chat you cleared is still in `/sessions` |
+| `/compact` | Shrink history so the server has room |
+| `/note …` | Pin a note the model keeps seeing |
+| `/find …` | Pin a finding |
+| `/forget` | Drop notes, findings, and the task list |
+| `/auto on` or `off` | Auto-approve. Off is the default |
+| `/autocompact` | Turn automatic history shrink on or off |
+| `/cd <path>` | Working folder |
+| `/wd` | Print the working folder |
+| `/tools` | Which groups are on |
+| `/tools <group>` | Turn a group on. Commas are fine: `/tools files,web` |
+| `/tools full` | Turn every group on |
+| `/tools core` | Back to the small set |
+| `/sandbox` | Where the PowerShell lab writes |
+| `/sandbox clear` | Delete this session’s lab files |
+| `/sessions` | Chats saved for this folder |
+| `/resume` | Continue the newest one |
+| `/resume 2` or `/resume abcd` | A number from the list, or the start of an id |
+| `/save` | Picker. Suggested name is `minibot-20260922-153045.md` |
+| `/save C:\path\file.md` | That path, no picker. `.md` is a transcript. Anything else is JSON |
+| `/load` | Open a file you saved |
+| `/model` | Model id |
+| `/retry` | Send your last message again |
+| `/speech on` | Voice. Also `off`, `test`, `listen`, `say hello` |
+| `exit` | Quit |
 
----
+Chats also save themselves under `%LOCALAPPDATA%\MiniBot\sessions`, one folder per working directory. That folder is not inside your project. `/save` is the copy you choose.
 
-## Tool groups
-
-Only **active** groups are exposed to the model. **`core` is always on.** Default launch uses progressive groups (`-ToolProfile core`); use `-ToolProfile full` or `/tools full` for everything.
-
-| Group | Role |
-|-------|------|
-| **core** | Read/write/edit/patch, find/search, DiffText, shell, CWD, env, **TaskBoard**, EnableToolGroup |
-| **vision** | **ReadImage**, **ReadPdf**, **ViewScreen** |
-| **sound** | **SpeakText**, **AudioVolume** |
-| **forensics** | **HexView**, **HexEdit**, **HexSearch**, **StringsScan** |
-| **system** | Inventory, processes, memory, power, services, software, updates, **DisplayBrightness** |
-| **network** | Adapters, LAN scan, **PortProbe**, **FindShares** / **FindWebHosts** / **FindRdp**, **RemoteCommand** |
-| **diag** | BSOD, events, disk, startup/tasks/drivers, StopProcess |
-| **repair** | sfc / DISM / chkdsk |
-| **setup** | Windows options, **GroupPolicy**, restore, uninstall, reboot, NewMachineSetup |
-| **identity** | Local users, join / leave domain |
-| **shares** | Map/unmap, create/remove share, network printer |
-| **installers** | Silent install catalog |
-| **sandbox** | Multi-step PowerShell lab |
-| **files** | Download, zip, **CAB**, **ISO**, **BulkRename**, **FindDuplicates** |
-| **packages** | PowerShell Gallery |
-| **registry** | **ReadRegistry** / **SetRegistry** |
-| **clipboard** | Clipboard read / write (approval) |
-| **web** | **SearchWeb**, **BrowsePage**, **MakeHttpRequest**, GitHub helpers |
-| **docs** | **SearchMicrosoftLearn** / **ReadMicrosoftLearn**, SS64 helpers |
-
-### Notable tool behavior
-
-| Area | Behavior |
-|------|----------|
-| **TaskBoard** | Sticky flyout under chips (not chat). `action=set\|update\|status\|clear`. Auto-advance next pending on done. Stop/Esc pauses sticky to the active row (yellow); full board kept for resume. Multi-step asks nudge the model to set a board. |
-| **SearchWeb** | Results `{title,url,snippet}[]`. Engines: DuckDuckGo (unwraps `uddg=` redirects) + **Bing** + **Brave** when blocked. `engine=auto\|duckduckgo\|bing\|brave`. Prefer `engine=bing` on bot-blocked hosts. Then **BrowsePage** best URLs. |
-| **BrowsePage** | Readable extract + links; `needs_render=true` for JS shells. Default `verify_ssl=false` uses curl `-k`. |
-| **ReadRegistry** / **SetRegistry** | Paths: `HKLM:\SOFTWARE\…`, `HKLM\SOFTWARE\…`, `HKEY_LOCAL_MACHINE\…`. Set types: `String\|DWord\|QWord\|…` and `REG_DWORD` / `REG_SZ` / `int` / `0xHEX`. Set always prompts. |
-| **Volume / speak** | **AudioVolume** / **SpeakText** (sound group) |
-| **Brightness** | **DisplayBrightness** (system group) |
-| **Group Policy** | **GroupPolicy** (setup) - local Policies registry. Orange on Home/Core. |
-| **PortProbe** | TCP open/closed. Targeted `computer=` / `hosts=` or LAN flood when omitted. |
-| **FindShares** | Locate network shares (targeted or LAN). Not net-view loops. |
-| **RemoteCommand** | WinRM remoting (approval). Domain-joined + domain user. |
-| **HTTP** | **MakeHttpRequest**: default `verify_ssl=false` → curl `-k`. |
-| **Hex / PE** | Forensics group: disasm, IAT, entropy, carve, hash, HexSearch `??`, StringsScan. |
-| **BulkRename** | `find`/`replace` or `template`; **dry_run=true** default. |
-| **FindDuplicates** | Size buckets then SHA256. |
-| **Loop hygiene** | Same tool+args blocked after retest; NEED_INPUT / TOOLS_DONE; path pins + errors in SESSION STATE |
-
-### Network discovery modes
-
-| Mode | How |
-|------|-----|
-| **Targeted** | `computer=IP` or `hosts=['IP',…]` - only those machines (self skipped) |
-| **Search** | Omit hosts - ICMP flood on the local prefix, then service ports / share guesses |
-
-**RemoteCommand** is always single-host (`host=` + `command=`). Prefer **PortProbe** first for reachability.
-
-### Files & archives
-
-| Tool | Purpose |
-|------|---------|
-| **DownloadFile** | HTTP download with live progress |
-| **ExpandArchive** / **CompressArchive** | Zip extract / create |
-| **MakeCab** / **ExpandCab** | Cabinet build / extract |
-| **MakeIso** | Build data ISOs (IMAPI2) |
-| **MountIso** / **UnmountIso** | Mount and dismount ISO images |
+If the folder has `minibot.md`, `AGENTS.md`, or `CLAUDE.md`, the closest one is shown to the model as the project’s own rules. MiniBot does not create those files.
 
 ---
 
-## Installer catalog
+## Launch options
 
-| Id | Package |
-|----|---------|
-| `7zip` | 7-Zip |
-| `chrome` | Google Chrome |
-| `adobe_reader` | Adobe Acrobat Reader DC |
-| `adwcleaner` | ADWCleaner |
-| `vlc` | VLC media player |
+Booleans are `-Name:$true` and `-Name:$false`.
 
-- **ListInstallers** / **InstallPackage** - always prompt before install.  
-- **NewMachineSetup** - one approval for Windows settings plus the catalog.  
-- Catalog lives in `$script:MBInstallerCatalog` near the top of the script.
+| Parameter | Default | |
+|---|---|---|
+| `-BaseUrl` | the script default | Server URL. Put the port in the URL. `…/v1` for vLLM and Unsloth. Many llama.cpp builds are fine without `/v1`. `""` skips the probe and opens Connect |
+| `-Model` | empty | Model id. Empty picks from `/models`. Slash ids are fine (`unsloth/…`) |
+| `-ModelAlias` | empty | Name shown in PoweredBy. Empty shows the server’s id |
+| `-ApiKey` | `none` | Bearer token. `none` sends no key |
+| `-AgentName` | `MiniBot` | Name in the title bar |
+| `-Version` | `2.61.0` | Shown in the title |
+| `-MaxTokens` | `0` | Reply length. `0` means about one eighth of the server context |
+| `-ContextWindowTokens` | `0` | Only if the server will not say its context size |
+| `-Temperature` | `0.15` | |
+| `-MaxTurns` | `50` | Tool rounds per message. The UI can set this to unlimited |
+| `-MaxReplyContinues` | `5` | How many times to keep going when a reply is cut off |
+| `-MaxToolResultChars` | `10000` | How much of a tool result the model sees |
+| `-MaxHistoryMessages` | `48` | Soft cap before compacting |
+| `-CommandTimeoutSec` | `360` | How long a command may run |
+| `-ContextSoftPct` | `0.72` | Start compacting here |
+| `-ContextHardPct` | `0.88` | Compact harder here |
+| `-AutoCompactEnabled` | `$true` | |
+| `-ModelCompactEnabled` | `$true` | Ask the model to write the summary. Off uses a plain extract |
+| `-AutoApproveEnabled` | `$false` | Leave this off unless you mean it |
+| `-SpeechEnabled` | `$false` | |
+| `-SpeechAutoReply` | `$true` | Read the answer aloud when speech is on |
+| `-StoreCredentials` | `$false` | Save the login in Windows Credential Manager |
+| `-ToolProfile` | `core` | `core` starts small. `full` turns every group on |
+| `-TaskApiBase` | empty | Optional URL for cancelling a backend task |
+| `-DebugLog` | `$false` | `MiniBot-debug.log` on the Desktop, or in TEMP |
+| `-HideConsole` | `$true` | Hide the PowerShell window. Use `$false` when you need to see errors |
 
----
+| Environment | |
+|---|---|
+| `$env:store=1` | Save credentials, if you did not pass `-StoreCredentials` |
+| `$env:clear=1` | Forget saved credentials at launch |
+| `$env:debug=1` | Write the debug log |
+| `$env:speech=1` | Start with speech on |
 
-## Approvals & safety
+### More than one server
 
-- **Auto-approve is off by default.** Host mutations need confirmation.  
-- Read-only shell may auto-run; multi-statement, redirects, downloads, writers, and repair tools prompt.  
-- **Esc** / **Stop** cancels the stream and tears down tracked child process trees.  
-- Network tools prompt when using non-GET methods, credentials, or private/local URLs.  
+The primary server is `-BaseUrl`. Its auth is the API key, an NPM basic-auth login, or none.
 
----
-
-## Context & compaction
-
-Budget is derived from the server context window (or `-ContextWindowTokens`) minus the completion reserve. Soft/hard percentages drive auto-compact when enabled. Force with **`/compact`**. Sticky notes and findings survive **`/clear`**.
-
-Default completion size is **auto** (`-MaxTokens 0` → about `n_ctx / 8`).
-
-During a multi-step tool loop, MiniBot keeps an **append-only** message prefix (frozen system/SESSION STATE) so local servers can reuse prompt cache between tool results. State is refreshed at the end of each user turn.
-
----
-
-## Sessions & runtime
-
-- **`/save`** / **`/load`** - JSON or Markdown (path or file picker).  
-- **`/retry`** after transient API errors.  
-- Single-instance lock per application id.  
-- Optional elevation re-launch preserves bound parameters.  
-- Model list refresh runs **after** the main WPF host is up.
-
----
-
-## Example launches
+Extra servers can be typed into the script, or added with PoweredBy → **+**.
 
 ```powershell
-# Default script base (Connect dialog if nothing is listening)
-powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 -HideConsole:$false
-
-# Local llama.cpp-style base without /v1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
-  -BaseUrl "http://127.0.0.1:8080" `
-  -ModelAlias "Local" `
-  -HideConsole:$false
-
-# OpenAI-compat /v1 + API key
-powershell -NoProfile -ExecutionPolicy Bypass -File .\MiniBot.ps1 `
-  -BaseUrl "http://192.168.1.20:8000/v1" `
-  -ApiKey "token-abc123" `
-  -Model "my-model"
+# Near the top of MiniBot.ps1:
+# $script:MBExtraApiBases = @('http://192.168.1.20:8000/v1')
+# $script:MBExtraApiAuth  = @{ 'http://192.168.1.20:8000/v1' = 'apikey' }
+# $script:MBExtraApiKeys  = @{ 'http://192.168.1.20:8000/v1' = 'token-abc123' }
 ```
 
----
-
-## Troubleshooting
-
-| Symptom | What to try |
-|---------|-------------|
-| No connection / blank after hide console | Wait for **Connect** (probes are short); check `-BaseUrl`, firewall, server health; `-HideConsole:$false`; run `/status` |
-| Auth loop | Hold **Caps Lock** at launch or `$env:clear=1`; re-login; `-StoreCredentials:$true` |
-| Empty model list | Confirm auth mode (API vs None vs NPM); wait for `/models` after Connect; use PoweredBy → refresh if needed |
-| 401 on cloud host | Use Auth = **API** and a Bearer key - not None/NPM |
-| 500 / 502 | Wait, then **`/retry`** |
-| Context pressure | `/compact`, `/clear`; raise server `n_ctx`; avoid huge tool dumps |
-| Tools missing | `/tools list`, `/tools <group>`, or `-ToolProfile full` |
-| GroupPolicy orange | Windows Home/Core has no local GPO editor - expected |
-| Vision tools orange | Active model has no `vision` ability |
-| RemoteCommand orange | Host/user not on a domain (workgroup or local login) - domain-admin tool only |
-| Remote port closed | Enable WinRM / firewall on the **remote** PC; do not thrash with shell probes |
-| Bad HTTPS in tools | Install **System32\curl.exe** (Win10+); `verify_ssl=false` uses `curl -k` |
-| SearchWeb empty / few hits | DDG often bot-blocks lab IPs - try `engine=bing` or `engine=brave`; then **BrowsePage** known URLs; MS docs → **SearchMicrosoftLearn** |
-| TaskBoard sticky stuck / wrong task | Stop/Esc pauses (yellow); new plan → **clear** then **set**; if the board is fully done it should auto-clear - use TaskBoard `action=clear` if it lingers |
-| “Task board incomplete - continuing…” | Open items still pending - mark remaining `done` or `clear`; a clear “ALL PASSED” style final answer should auto-close the board |
-| SetRegistry type error | Use `DWord` / `String` / `REG_DWORD` / `REG_SZ` / `int` (not arbitrary strings); path like `HKLM:\SOFTWARE\…` |
-| Console needed | `-HideConsole:$false` |
-| Diagnostics | `-DebugLog:$true` or `$env:debug=1` → Desktop / TEMP `MiniBot-debug.log` |
+`apikey` sends that server’s bearer token. `npm` reuses the primary basic-auth login. `none` sends no Authorization header.
 
 ---
 
-## License / deploy notes
+## Tools
 
-Single-file distribution: copy `MiniBot.ps1` (or rename to `.cmd`). Edit the param defaults and optional `$script:MBExtraApiBases` / keys near the top for your lab. Optional XAML icon assets beside the script are used when present.
+The model only sees groups that are on. **core** is always on. Everything else waits until the task needs it, or until you run `/tools <group>`.
+
+| Group | What is in it |
+|---|---|
+| core | Read, write, edit, patch, search, diff, shell, folder, env, task list |
+| vision | Pictures, PDFs, the screen |
+| sound | Speak, volume |
+| forensics | Hex, PE headers, imports, resources, sections, strings |
+| system | Processes, services, software, updates, brightness |
+| network | Adapters, port checks, shares, web hosts, RDP, remote command |
+| diag | Crash dumps, event log, disk, startup |
+| repair | sfc, DISM, chkdsk |
+| setup | Windows options, Group Policy, restore, uninstall, reboot, new-PC setup |
+| identity | Local users, join or leave a domain |
+| shares | Map a drive, create a share, add a printer |
+| installers | Silent installs from the small catalog below |
+| sandbox | A PowerShell scratch folder for experiments |
+| files | Download, zip, CAB, ISO, bulk rename, duplicate files |
+| packages | PowerShell Gallery |
+| registry | Read and set values |
+| clipboard | Read and write, with approval |
+| web | Search, open a page, HTTP, GitHub |
+| docs | Microsoft Learn and SS64 |
+
+A few that people trip on:
+
+- **Search the web** returns title, url, and snippet. If DuckDuckGo blocks the PC, ask for Bing or Brave, then open the useful links.
+- **Open a page** pulls readable text. Pages that are only a JavaScript shell come back as needing a render. Certificate checks are off by default and go through `curl -k`.
+- **Registry paths** look like `HKLM:\SOFTWARE\…`. Types are `String`, `DWord`, `QWord`, or the `REG_SZ` / `REG_DWORD` names. Setting a value always asks.
+- **Port check** with no host walks the local subnet. Pass a computer name or a list if you mean specific machines.
+- **Find shares** is the same idea: one host, or the subnet. It is not a loop of `net view`.
+- **Remote command** is one host and one command, and it asks first.
+- **Rename many files** previews unless you turn the dry run off.
+- **Duplicate files** groups by size, then hashes.
+
+### Archives
+
+| Tool | |
+|---|---|
+| DownloadFile | HTTP download, with progress |
+| ExpandArchive / CompressArchive | Zip only. CAB has its own tools. 7z and rar are refused |
+| MakeCab / ExpandCab | Cabinet files |
+| MakeIso | A data ISO |
+| MountIso / UnmountIso | Mount and eject |
+
+### Installers
+
+`7zip`, `chrome`, `adobe_reader`, `adwcleaner`, `vlc`.
+
+`ListInstallers` and `InstallPackage` ask before they install. `NewMachineSetup` is one approval for a batch of Windows settings plus that catalog. The list is `$script:MBInstallerCatalog` near the top of the script.
+
+---
+
+## When it asks, and when it shrinks the chat
+
+Changes to the PC wait for Yes / No / All. A read-only command may run on its own. Several statements, a redirect, a download, or a repair tool asks.
+
+Esc or Stop cancels the reply and kills child processes MiniBot started.
+
+The context budget comes from the server, minus room for the reply. Around 72% it starts trimming. Around 88% it trims harder. `/compact` does it now. `/clear` wipes the chat and keeps pinned notes.
+
+While tools are running, the start of the conversation stays put so a local server can reuse its prompt cache. It refreshes when your turn ends.
+
+---
+
+## If something is wrong
+
+| What you see | What to do |
+|---|---|
+| No connection | Wait for the Connect box. Check the URL and that the server is up. Launch with `-HideConsole:$false` |
+| Keeps asking you to log in | Caps Lock at launch, or `$env:clear=1`, then log in again |
+| No models in the list | Auth mode has to match the server. API key, none, and NPM are different. Give `/models` a moment after Connect |
+| 401 from a cloud server | Auth has to be API, with a real bearer key |
+| 500 or 502 | Wait, then `/retry` |
+| Context full | `/compact` or `/clear`. A bigger `n_ctx` on the server helps more than another compact |
+| It says a tool does not exist | `/tools list`, then `/tools <group>`, or start with `-ToolProfile full` |
+| Group Policy is greyed out | Home and Core editions do not have a local policy editor |
+| Vision tools are greyed out | This model did not advertise vision |
+| Remote command is greyed out | This PC is not on a domain, or you are logged in with a local account |
+| Remote port closed | Turn on WinRM on the other PC. Do not keep probing it from the shell |
+| HTTPS tools fail | `curl.exe` should be in System32. The tools call `curl -k` when certificate checks are off |
+| Web search comes back empty | The lab IP is probably blocked. Try Bing or Brave, or open a URL you already know. Microsoft docs have their own search tool |
+| The task list is stuck | Stop pauses it (yellow). A new plan should clear the old one first. If every step is done and the list is still there, clear it |
+| Registry type rejected | Use `DWord`, `String`, `REG_DWORD`, or `REG_SZ` |
+| You need the console | `-HideConsole:$false` |
+| You need a log | `-DebugLog:$true` or `$env:debug=1` |
+
+---
+
+## License
+
+MIT. Copy `MiniBot.ps1`. Icons next to the script are picked up when they are there.
 
 Made for IRM | IEX Deployment
-
-MIT

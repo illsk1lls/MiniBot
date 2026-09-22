@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.60.0 - Local AI agent host for Windows PowerShell 5.1
+	MiniBot v2.61.0 - Local AI agent host for Windows PowerShell 5.1
 .DESCRIPTION
 	OpenAI-compatible agent client (WPF UI + tools). Hybrid .CMD/.PS1 launcher; irm|iex friendly.
 .NOTES
@@ -38,7 +38,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.60.0",
+	[string]$Version = "2.61.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -52082,6 +52082,7 @@ function Write-MBMdCodeOpen {
 	}
 	$lang = ([string]$Lang).Trim()
 	if ($lang.StartsWith('```')) { $lang = $lang.TrimStart('`').Trim() }
+	if ($lang -match '^(\S+)') { $lang = $Matches[1] }
 	$title = ([string]$Title).Trim()
 	try { $title = ConvertTo-MBWpfSafeText -Text $title } catch {}
 	try { $lang = ConvertTo-MBWpfSafeText -Text $lang } catch {}
@@ -61918,36 +61919,50 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 						else { $plain = $plain.Substring(0, $plain.Length - 1) }
 					}
 					$norm = & $synNormLang $lang
-					$tokens = & $synTokenize $plain $norm
 					$doc = New-Object System.Windows.Documents.FlowDocument
 					$doc.PagePadding = New-Object System.Windows.Thickness(0)
 					try { $doc.TextAlignment = [System.Windows.TextAlignment]::Left } catch {}
-					$para = New-Object System.Windows.Documents.Paragraph
-					$para.Margin = New-Object System.Windows.Thickness(0)
-					$para.Padding = New-Object System.Windows.Thickness(0)
-					try { $para.LineHeight = 18 } catch {}
-					if ($null -eq $tokens -or $tokens.Count -eq 0) {
-						$run = New-Object System.Windows.Documents.Run ($(if ($null -eq $plain) { '' } else { $plain }))
-						$hx0 = '#C8C8D0'
-						if (-not $brushCache.ContainsKey($hx0)) { $brushCache[$hx0] = $conv.ConvertFromString($hx0) }
-						$run.Foreground = $brushCache[$hx0]
-						if ($monoFont) { $run.FontFamily = $monoFont }
-						[void]$para.Inlines.Add($run)
-					} else {
-						foreach ($tok in $tokens) {
-							$k = [string]$tok.K
-							if (-not $synColorMap.ContainsKey($k)) { $k = 'plain' }
-							$hx = [string]$synColorMap[$k]
-							if (-not $brushCache.ContainsKey($hx)) {
-								$brushCache[$hx] = $conv.ConvertFromString($hx)
-							}
-							$run = New-Object System.Windows.Documents.Run ([string]$tok.T)
-							$run.Foreground = $brushCache[$hx]
+					$lines = @(([string]$plain) -split "`n", -1)
+					if ($lines.Count -eq 0) { $lines = @('') }
+					$digits = [Math]::Max(2, ([string]$lines.Count).Length)
+					$hxGutter = '#5C5C66'
+					if (-not $brushCache.ContainsKey($hxGutter)) { $brushCache[$hxGutter] = $conv.ConvertFromString($hxGutter) }
+					$lineNo = 1
+					foreach ($rawLine in $lines) {
+						$lineText = ([string]$rawLine).Replace("`t", '    ')
+						$para = New-Object System.Windows.Documents.Paragraph
+						$para.Margin = New-Object System.Windows.Thickness(0)
+						$para.Padding = New-Object System.Windows.Thickness(0)
+						try { $para.LineHeight = 18 } catch {}
+						$gutter = New-Object System.Windows.Documents.Run (($lineNo.ToString().PadLeft($digits)) + '  ')
+						$gutter.Foreground = $brushCache[$hxGutter]
+						if ($monoFont) { $gutter.FontFamily = $monoFont }
+						[void]$para.Inlines.Add($gutter)
+						$tokens = & $synTokenize $lineText $norm
+						if ($null -eq $tokens -or $tokens.Count -eq 0) {
+							$run = New-Object System.Windows.Documents.Run ($lineText)
+							$hx0 = '#C8C8D0'
+							if (-not $brushCache.ContainsKey($hx0)) { $brushCache[$hx0] = $conv.ConvertFromString($hx0) }
+							$run.Foreground = $brushCache[$hx0]
 							if ($monoFont) { $run.FontFamily = $monoFont }
 							[void]$para.Inlines.Add($run)
+						} else {
+							foreach ($tok in $tokens) {
+								$k = [string]$tok.K
+								if (-not $synColorMap.ContainsKey($k)) { $k = 'plain' }
+								$hx = [string]$synColorMap[$k]
+								if (-not $brushCache.ContainsKey($hx)) {
+									$brushCache[$hx] = $conv.ConvertFromString($hx)
+								}
+								$run = New-Object System.Windows.Documents.Run ([string]$tok.T)
+								$run.Foreground = $brushCache[$hx]
+								if ($monoFont) { $run.FontFamily = $monoFont }
+								[void]$para.Inlines.Add($run)
+							}
 						}
+						[void]$doc.Blocks.Add($para)
+						$lineNo++
 					}
-					[void]$doc.Blocks.Add($para)
 					try {
 						$pw = [double]$rtb.ActualWidth
 						if ([double]::IsNaN($pw) -or $pw -lt 40) {
@@ -62640,15 +62655,30 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								if ([string]::IsNullOrWhiteSpace($codeTitle)) {
 									try { $codeTitle = [string]$item.CodeTitle } catch { $codeTitle = '' }
 								}
+								$pretty = $lang
+								switch -Regex ($lang.ToLowerInvariant()) {
+									'^(ps1|psm1|psd1|powershell|pwsh|ps)$' { $pretty = 'PowerShell' }
+									'^(py|python|pyw)$' { $pretty = 'Python' }
+									'^(js|javascript|jsx|mjs|cjs)$' { $pretty = 'JavaScript' }
+									'^(ts|typescript|tsx)$' { $pretty = 'TypeScript' }
+									'^(json|jsonc)$' { $pretty = 'JSON' }
+									'^(sh|bash|zsh|shell)$' { $pretty = 'Shell' }
+									'^(cs|csharp|c#)$' { $pretty = 'C#' }
+									'^(cpp|cxx|cc|hpp)$' { $pretty = 'C++' }
+									'^(html|xml|svg)$' { $pretty = $lang.ToUpperInvariant() }
+									'^(md|markdown)$' { $pretty = 'Markdown' }
+									'^(yml|yaml)$' { $pretty = 'YAML' }
+									'^code$' { $pretty = 'Code' }
+								}
 								# Header: "title  ·  lang" or just lang (middot built at runtime — no source mojibake)
-								$hdrLabel = $lang
+								$hdrLabel = $pretty
 								try {
 									if (-not [string]::IsNullOrWhiteSpace($codeTitle)) {
 										$dot = [string][char]0x00B7
-										$langLow = $lang.ToLowerInvariant()
+										$langLow = $pretty.ToLowerInvariant()
 										$titleLow = $codeTitle.ToLowerInvariant()
 										if ($langLow -ne 'code' -and $langLow -ne 'text' -and -not $titleLow.Contains($langLow)) {
-											$hdrLabel = ('{0}  {1}  {2}' -f $codeTitle, $dot, $lang)
+											$hdrLabel = ('{0}  {1}  {2}' -f $codeTitle, $dot, $pretty)
 										} else {
 											$hdrLabel = $codeTitle
 										}
@@ -62719,8 +62749,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 								$codeBox.FontSize = 12.5
 								$codeBox.Padding = New-Object System.Windows.Thickness(10, 8, 10, 10)
 								$codeBox.MinHeight = 28
+								$codeBox.MaxHeight = 420
 								$codeBox.HorizontalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled
-								$codeBox.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Disabled
+								$codeBox.VerticalScrollBarVisibility = [System.Windows.Controls.ScrollBarVisibility]::Auto
 								try {
 									$codeBox.Document.PagePadding = New-Object System.Windows.Thickness(0)
 									$codeBox.Document.PageWidth = [Math]::Max(80, $stretchW - 8)
@@ -62730,6 +62761,9 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									Lang     = $lang
 									Plain    = ''
 									Rtb      = $codeBox
+									LangTb   = $langTb
+									HdrBase  = $hdrLabel
+									HlAt     = 0
 									LiveHl   = $true
 								}
 								$codeBox.Tag = $codeMeta
@@ -62870,12 +62904,16 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										if ($meta -is [hashtable]) {
 											$meta['Plain'] = [string]$meta['Plain'] + $piece
 											$plainNow = [string]$meta['Plain']
-											if ($plainNow.Length -le 24000) {
+											$hlAt = 0
+											try { $hlAt = [int]$meta['HlAt'] } catch { $hlAt = 0 }
+											$due = ($hlAt -eq 0) -or ($piece.IndexOf([char]10) -ge 0) -or (($plainNow.Length - $hlAt) -ge 800)
+											if ($plainNow.Length -le 48000 -and $due) {
 												$bc = $null
 												try { $bc = $W['BrushCache'] } catch { try { $bc = $W.BrushCache } catch {} }
 												if ($null -eq $bc) { $bc = @{}; try { $W['BrushCache'] = $bc } catch {} }
 												& $paintCodeHighlight $box $plainNow ([string]$meta['Lang']) $conv $bc $W.MonoFont
-											} else {
+												$meta['HlAt'] = $plainNow.Length
+											} elseif ($plainNow.Length -gt 48000) {
 												try { $box.AppendText($piece) } catch {}
 												$meta['LiveHl'] = $false
 											}
@@ -62923,6 +62961,16 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 										}
 										$meta['Plain'] = $plainClose
 										& $paintCodeHighlight $box $plainClose ([string]$meta['Lang']) $conv $bc $W.MonoFont
+										try {
+											$lt = $meta['LangTb']
+											$base = [string]$meta['HdrBase']
+											if ($null -ne $lt -and -not [string]::IsNullOrWhiteSpace($base)) {
+												$nLines = 1
+												if ($plainClose.Length -gt 0) { $nLines = @($plainClose -split "`n", -1).Count }
+												$word = if ($nLines -eq 1) { 'line' } else { 'lines' }
+												$lt.Text = ('{0}   {1} {2}' -f $base, $nLines, $word)
+											}
+										} catch {}
 									}
 								}
 								if ($W -is [hashtable]) {
