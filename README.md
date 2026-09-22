@@ -1,6 +1,6 @@
 # MiniBot
 
-**v2.54.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
+**v2.56.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
@@ -26,8 +26,8 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 | **Safety** | Auto-approve off by default; mutating actions require Yes / No / All |
 | **Tools** | Progressive groups (catalog-order chips; volume/brightness, GPO, shares, CAB/ISO, Gallery, SearchWeb/BrowsePage, …) |
 | **TaskBoard** | Multi-step checklist: sticky flyout under chips + SESSION STATE (`set` / `update` / `status` / `clear`) |
-| **Edit stack** | **EditFile** / **ApplyPatch** / **WriteFile**: line-range edits, whitespace and indent tolerant match, `@@` hints, atomic save, default **`.bak`** |
-| **Forensics** | Progressive group: **HexView** / **HexEdit** / **HexSearch** / **StringsScan** |
+| **Edit stack** | **EditFile** / **ApplyPatch** / **WriteFile**: line-range edits, whitespace and indent tolerant match, `@@` hints, atomic save, default **`.bak`**. Saves include a **VERIFY** syntax check for PowerShell, JSON, and XML |
+| **Forensics** | **ForensicsSummary**, **PeInfo**, **HexView** / **HexEdit** (presets, session undo), **FindHexPattern**, **StringExtract**, imports, resources, sections |
 | **Deploy** | One `.ps1` (or hybrid `.cmd`), optional elevation, single-instance lock |
 
 ---
@@ -94,7 +94,7 @@ The file begins with a hybrid CMD header. Rename to `.cmd` for double-click laun
 | `-ModelAlias` | *(empty)* | Display label in PoweredBy; empty → live server model id |
 | `-ApiKey` | `none` | HTTP **Bearer** only. Use `none` to skip. |
 | `-AgentName` | `MiniBot` | Window brand / agent identity |
-| `-Version` | `2.54.0` | Version string |
+| `-Version` | `2.56.0` | Version string |
 | `-MaxTokens` | `0` | Max completion tokens. **`0` = auto** (`n_ctx / 8` from server). |
 | `-ContextWindowTokens` | `0` | Fallback `n_ctx`. **`0` = use server `/props` + `/models` only** |
 | `-Temperature` | `0.15` | Sampling temperature |

@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.54.0 - Local AI agent host for Windows PowerShell 5.1
+	MiniBot v2.56.0 - Local AI agent host for Windows PowerShell 5.1
 .DESCRIPTION
 	OpenAI-compatible agent client (WPF UI + tools). Hybrid .CMD/.PS1 launcher; irm|iex friendly.
 .NOTES
@@ -38,7 +38,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.54.0",
+	[string]$Version = "2.56.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -11229,6 +11229,14 @@ function Convert-MBJsonReady {
 	try { return [string]$Object } catch { return $null }
 }
 
+function Test-MBJsonRowObject {
+	# [pscustomobject] is PSObject on Windows PowerShell 5.1, so every list matches it.
+	# Real rows are PSCustomObject and must not be enumerated as arrays.
+	param($Object)
+	if ($null -eq $Object) { return $false }
+	return $Object -is [System.Management.Automation.PSCustomObject]
+}
+
 function New-MBJsonArrayBox {
 	# Box that ConvertTo-MBJsonCore always emits as a flat JSON array (0/1/N).
 	param($Items)
@@ -11242,7 +11250,7 @@ function New-MBJsonArrayBox {
 		for ($g = 0; $g -lt 3; $g++) {
 			if ($null -eq $cur) { break }
 			if ($cur -is [string] -or $cur -is [ValueType]) { break }
-			if ($cur -is [System.Collections.IDictionary] -or $cur -is [pscustomobject]) { break }
+			if ($cur -is [System.Collections.IDictionary] -or (Test-MBJsonRowObject $cur)) { break }
 			if ($cur -is [System.Collections.IList]) {
 				$n0 = 0
 				try { $n0 = [int]$cur.Count } catch { $n0 = 0 }
@@ -11251,7 +11259,7 @@ function New-MBJsonArrayBox {
 					try { $only = $cur[0] } catch { $only = $null }
 					if ($null -ne $only -and -not ($only -is [string]) -and -not ($only -is [ValueType]) -and
 						-not ($only -is [System.Collections.IDictionary]) -and
-						-not ($only -is [pscustomobject]) -and
+						-not (Test-MBJsonRowObject $only) -and
 						($only -is [System.Collections.IList])) {
 						$cur = $only
 						continue
@@ -11261,9 +11269,7 @@ function New-MBJsonArrayBox {
 			break
 		}
 		if ($null -ne $cur) {
-			if ($cur -is [System.Collections.IDictionary] -or $cur -is [pscustomobject]) {
-				[void]$al.Add($cur)
-			} elseif ($cur -is [System.Collections.IList] -and -not ($cur -is [string])) {
+			if ($cur -is [System.Collections.IList] -and -not ($cur -is [string]) -and -not ($cur -is [System.Collections.IDictionary])) {
 				$n = 0
 				try { $n = [int]$cur.Count } catch { $n = 0 }
 				for ($i = 0; $i -lt $n; $i++) {
@@ -11271,9 +11277,9 @@ function New-MBJsonArrayBox {
 					try { $el = $cur[$i] } catch { continue }
 					if ($null -eq $el) { continue }
 					if ($el -is [System.Array] -and $el.Length -eq 0) { continue }
-					# Flatten one more nested list-of-rows if present
+					# Flatten one accidental list wrapper. Keep row objects intact.
 					if ($el -is [System.Collections.IList] -and -not ($el -is [string]) -and
-						-not ($el -is [System.Collections.IDictionary]) -and -not ($el -is [pscustomobject])) {
+						-not ($el -is [System.Collections.IDictionary]) -and -not (Test-MBJsonRowObject $el)) {
 						$n2 = 0
 						try { $n2 = [int]$el.Count } catch { $n2 = 0 }
 						for ($j = 0; $j -lt $n2; $j++) {
@@ -11285,6 +11291,8 @@ function New-MBJsonArrayBox {
 						[void]$al.Add($el)
 					}
 				}
+			} elseif ($cur -is [System.Collections.IDictionary] -or (Test-MBJsonRowObject $cur)) {
+				[void]$al.Add($cur)
 			} elseif ($cur -is [System.Collections.IEnumerable] -and -not ($cur -is [string])) {
 				foreach ($el in $cur) {
 					if ($null -ne $el) { [void]$al.Add($el) }
@@ -11462,9 +11470,8 @@ function Expand-MBJsonFlatList {
 			} catch {}
 			continue
 		}
-		# Scalar / row object
-		if ($cur -is [string] -or $cur -is [ValueType] -or
-			$cur -is [System.Collections.IDictionary] -or $cur -is [pscustomobject]) {
+		# Scalar / row object. Lists are not rows even though [pscustomobject] matches PSObject on 5.1.
+		if ($cur -is [string] -or $cur -is [ValueType] -or $cur -is [System.Collections.IDictionary] -or (Test-MBJsonRowObject $cur)) {
 			[void]$out.Add($cur)
 			continue
 		}
@@ -12130,12 +12137,12 @@ ROUTER (intent->tool; enable group first if off; do not shell these):
 MAP: vision=ReadImage/ReadPdf/ViewScreen | sound=SpeakText/AudioVolume | forensics=ForensicsSummary/PeInfo/HexView/HexEdit/FindHexPattern/StringExtract/ImportTableViewer/ResourceEditor/SectionManager | recovery=ListRecycleBin/ListDeletedFiles/RecoverDeletedFile/ListShadowCopies/ListUsnRecent | system=inventory+services+DisplayBrightness | network=LAN+PortProbe+FindShares+FindWebHosts+FindRdp+RemoteCommand | diag=BSOD/disk/events/space/kill | repair=sfc/dism/chkdsk | setup=options/GroupPolicy/restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso/BulkRename/FindDuplicates | packages=PSGallery | registry | clipboard | docs=SearchMicrosoftLearn/ReadMicrosoftLearn/SearchSs64/ReadSs64 | web=HTTP/SearchWeb/BrowsePage
 DOCS (group=docs): official Windows/PowerShell/cmd references when unsure of API/policy/syntax. Prefer SearchMicrosoftLearn + ReadMicrosoftLearn for MS docs; SearchSs64 + ReadSs64 for cmd/PowerShell/bash cheat sheets. EnableToolGroup group=docs first. Not for general web (use web group). Local Get-Help is version-accurate when available — still use Learn for product docs.
 FindFiles: multi-ext one call; truncated=normal (use rows); specific ask->narrow; vague play/show->pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice->tell operator. User text = results only.
-FINAL REPLY after tools (when no more tools): short DID: (what worked) and NEXT: (follow-up) or ASK: (operator input). Keep it tight for local models.
+FINAL REPLY after tools (when no more tools): short DID: and NEXT: or ASK:. DID: only what tool evidence showed (VERIFY syntax, HexEdit verified, command output). A write or patch SUCCESS is not "it works". Keep it tight for local models.
 "@
 
 $script:MBGroupPrompt = [ordered]@{
 	core = @"
-CORE: multi-step → TaskBoard first (one board call/turn; ordered plan; execute ONLY now; update id=now status=done epoch=<from last result>; never mark later steps early; blocked+note if stuck; after complete do not invent a new board). Text files: ReadFile numbered=true before edits; EditFile unique search OR startLine+endLine (whitespace/tab/indent tolerant); ApplyPatch for hunks (@@ line hints, context may omit the leading space); WriteFile to create/overwrite. path.bak default. List/Search/FindFiles; DiffText; RunCommand last resort; EnableToolGroup. Prefer specialized tools. PE/binary: forensics. Deleted files (live NTFS): recovery. Images/PDF/screen: vision. MEDIA: ![label](absolute-path).
+CORE: multi-step → TaskBoard first (one board call/turn; ordered plan; execute ONLY now; update id=now status=done epoch=<from last result>; never mark later steps early; blocked+note if stuck; after complete do not invent a new board). Text files: ReadFile numbered=true before edits; EditFile unique search OR startLine+endLine (whitespace/tab/indent tolerant); ApplyPatch for hunks (@@ line hints, context may omit the leading space); WriteFile to create/overwrite. path.bak default. VERIFY CODE: SUCCESS means saved, not correct. VERIFY syntax=FAIL must be fixed before claiming. syntax=ok is parse-only (ps1/json/xml). Quote LANDED or ReadFile numbered=true on that range. Claim behavior only after a run (RunCommand, or SandBox ok=true). List/Search/FindFiles; DiffText; RunCommand last resort; EnableToolGroup. Prefer specialized tools. PE/binary: forensics. Deleted files (live NTFS): recovery. Images/PDF/screen: vision. MEDIA: ![label](absolute-path).
 "@
 	vision = @"
 VISION: ReadImage (auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true -> show with ![label](path) inline, not external open). No ReadFile on images/PDF. SpeakText is sound group.
@@ -12144,7 +12151,7 @@ VISION: ReadImage (auto-downscale); ReadPdf page=1 first; ViewScreen look-only d
 SOUND: SpeakText (SAPI TTS); AudioVolume (get/set/mute/unmute, level=0-100). Prefer over shell COM / nircmd volume. Display brightness is system group.
 "@
 	forensics = @"
-FORENSICS: ForensicsSummary or PeInfo first (summary_only / large PE auto all=true). Forensics tools auto-enable the forensics group if still off. HexView (pe.sections; disasm/trace follow_calls; at_entry|section=.text|skip_mz_header). HexEdit (patch|replace_pattern|undo|history|export_history; presets force_jcc|invert_jcc|nop_range). FindHexPattern (multi-pattern with ; ; max=all; resolve_targets; hit.next). StringExtract (clean_urls; filter=data|url; next_steps). ImportTableViewer (all=true; by_ordinal_only; next_steps->HexView). ResourceEditor (get text_preview; replace source_text=). SectionManager (validate=true; list warnings). Prefer over ReadAllBytes. Not for text source (EditFile). Deleted-file undelete is the recovery group (not forensics).
+FORENSICS: ForensicsSummary or PeInfo first (summary_only / large PE auto all=true). ForensicsSummary returns pe and strings objects. Forensics tools auto-enable the forensics group if still off. HexView (pe.sections; navigation says which of offset/section/rva/at_entry won; disasm/trace follow_calls; at_entry|section=.text|skip_mz_header). HexEdit (patch|replace_pattern|undo|history|export_history; presets force_jcc|invert_jcc|nop_range; undo restores EOF growth). VERIFY DISASM: verified=true only when disasm_after matches the preset (force_jcc=jmp, invert_jcc=flipped jcc, nop_range=nop, ret0=xor+ret, int3=int3). verified=false: do not claim the preset worked — quote disasm_after or HexView that offset disasm=true. Raw hex has no preset check. Trace both taken and not-taken before saying which path runs. FindHexPattern (multi-pattern with ; ; 0x prefixes ok; max=all; resolve_targets; hit.next). StringExtract (clean_urls; filter=data|url; section= must exist; next_steps). ImportTableViewer (all=true; by_ordinal_only; status=error when the file is not a PE; next_steps->HexView). ResourceEditor (get text_preview; get_text; replace source_text= / text_encoding=; STRING is a 16-slot table, one line or "N: text" per slot). SectionManager (validate=true; dry_run=true; add keeps trailing overlay). Prefer over ReadAllBytes. Not for text source (EditFile). Deleted-file undelete is the recovery group (not forensics).
 "@
 	recovery = @"
 RECOVERY (live NTFS only — NOT formatted/wiped disks; deleted data only): Prefer ListRecycleBin first (normal Delete-to-Bin). Then ListDeletedFiles (MFT not-in-use; path=C:\ or existing folder; recursive default). ALWAYS show MarkdownPreview + OperatorListPath / full Files before recover. RecoverDeletedFile mft_index= copy-out to NEW path. ExportRecycleBinItem / RestoreRecycleBinItem for Bin. ListShadowCopies = VSS; ListUsnRecent = USN sample; RecoverySmokeTest = self-check. Live free space / largest files = GetDiskSpace (diag group), not recovery. Formatting destroys MFT — lab tools for wiped disks. Prefer other drive for recovered output.
@@ -12256,12 +12263,12 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents under path."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" } }; required = @("path","pattern") } } },
 	@{ type = "function"; function = @{ name = "DiffText"; description = "Unified line diff (LCS-based) of two strings or files. Shows @@ hunks with context."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" }; context = @{ type = "integer"; description = "Context lines around changes (default 3)" }; maxLines = @{ type = "integer"; description = "Max output lines (default 200)" } }; required = @("left","right") } } },
-	@{ type = "function"; function = @{ name = "HexView"; description = "Binary/PE forensics: hex dump + PE labels; disasm=true x86/x64 with IAT/delay/export labels + uncertain resync; hash=true SHA256 file+sections; functions=true prologue scan; entropy/carve; at_entry/rva/section. Flags .NET managed. DIFF path2. Prefer over ReadAllBytes. HexEdit presets; FindHexPattern; StringExtract; PeInfo/ImportTableViewer/ResourceEditor/SectionManager."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default false; use detail=full for tour)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" }; disasm = @{ type = "boolean"; description = "x86/x64 disassembly; IAT/export labels on indirect calls" }; trace = @{ type = "boolean"; description = "Walk control flow from offset (follow JMP; list JE/JNE both paths)" }; at_entry = @{ type = "boolean"; description = "Start at PE entry point file offset" }; rva = @{ type = "string"; description = "PE RVA (decimal/0x) -> map to file offset" }; section = @{ type = "string"; description = "PE section name (e.g. .text) -> start raw offset" }; max_insns = @{ type = "integer"; description = "Disasm instruction count (default 48, max 200)" }; max_steps = @{ type = "integer"; description = "Trace steps (default 32, max 80)" }; follow_calls = @{ type = "boolean"; description = "trace: step into CALL targets" }; prefer_branch = @{ type = "string"; description = "trace: fallthrough (default) or taken at Jcc" }; arch = @{ type = "string"; description = "auto|x86|x64 (default auto from PE)" }; dump_hex = @{ type = "boolean"; description = "Include hex dump (default true)" }; entropy = @{ type = "boolean"; description = "Shannon entropy map (high = packed/encrypted)" }; entropy_blocks = @{ type = "integer"; description = "Entropy windows (default 64)" }; carve = @{ type = "boolean"; description = "Find embedded MZ/PE images" }; hash = @{ type = "boolean"; description = "SHA256 of file + each PE section" }; functions = @{ type = "boolean"; description = "Heuristic function prologue scan in .text" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes OR replace_pattern across file OR undo session patches. action=patch|replace_pattern|undo|undo_all|history|export_history. presets force_jcc|invert_jcc|nop_range|ret0. history lists all undo_ids. Session stack (export_history saves JSON). path.bak when backup=true. help=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Target file (optional for action=history; filter for undo_all)" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; preset = @{ type = "string"; description = "force_jcc|invert_jcc|nop_range|ret0|ret|int3" }; length = @{ type = "integer"; description = "Byte count for nop_range/int3 presets" }; extend = @{ type = "boolean" }; backup = @{ type = "boolean"; description = "Write path.bak before patch (default true)" }; action = @{ type = "string"; description = "patch|undo|undo_all|history" }; id = @{ type = "integer"; description = "undo id from prior patch undo_id" }; undo = @{ type = "boolean"; description = "true = action=undo (last or id=)" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "FindHexPattern"; description = "Hex pattern search with ?? wildcards. Multi-pattern separated by semicolon. Large PE auto-raises max. resolve_targets=true; each hit.next suggests HexView. all=true|max=all. help=true. Alias: HexSearch."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string"; description = "Hex bytes with optional ?? wildcards" }; hex = @{ type = "string"; description = "Alias for pattern" }; offset = @{ type = "string"; description = "Start offset" }; maxResults = @{ type = "integer"; description = "Max hits (default 32, max 9999)" }; max = @{ type = "string"; description = "Cap or 'all' (alias of maxResults; all=9999)" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = max 9999 hits" }; max_scan = @{ type = "integer"; description = "Max bytes to scan from offset (0=to EOF)" }; resolve_targets = @{ type = "boolean"; description = "Resolve relative CALL/JMP/Jcc targets and IAT/export labels (default false; CF kinds still get targets when decodable)" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "StringExtract"; description = "ASCII/UTF-16 strings. clean_urls=true (default) strips cert junk before http://. filter=url|data|code|interesting. max=all. next_steps for BrowsePage/ReadRegistry/HexView. help=true. Alias: StringsScan."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; minLen = @{ type = "integer"; description = "Minimum string length (default 4, floor 3)" }; maxLen = @{ type = "integer"; description = "Maximum string length (0=no max)" }; maxHits = @{ type = "integer"; description = "Max strings (default 80, max 9999)" }; max = @{ type = "string"; description = "Cap or all (alias maxHits)" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = maxHits 9999" }; offset = @{ type = "string" }; max_scan = @{ type = "integer"; description = "Max bytes to scan (0=full file)" }; encoding = @{ type = "string"; description = "ascii|utf16|both (default both)" }; filter = @{ type = "string"; description = "path|url|ip|registry|email|interesting|data|code|clean or free text; data=non-EXEC sections, code=EXEC only" }; section = @{ type = "string"; description = "PE section name e.g. .rdata" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "PeInfo"; description = "PE overview: sections, dirs, timestamp, entry, imports/exports/resources. Large PE (>=10MB) auto-raises caps. summary_only=true for quick triage. all=true|max=all. section_name_warnings for non-standard names. help=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; imports = @{ type = "boolean"; description = "Include import DLL/func summary (default true)" }; exports = @{ type = "boolean"; description = "Include exports (default true)" }; resources = @{ type = "boolean"; description = "Include resource tree summary (default true)" }; max_import_dlls = @{ type = "integer" }; max_import_funcs = @{ type = "integer" }; max_exports = @{ type = "integer" }; max_resources = @{ type = "integer" }; max = @{ type = "string"; description = "Shared cap or 'all' for all list limits" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = high caps for large PEs" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "ForensicsSummary"; description = "Quick PE triage in one call: PeInfo summary_only + StringExtract filter=interesting + next_steps (ImportTableViewer/HexView/FindHexPattern). Prefer first for unknown EXE/DLL."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxHits = @{ type = "integer"; description = "Max interesting strings (default 40)" }; help = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexView"; description = "Binary/PE forensics: hex dump + PE labels; disasm=true x86/x64 with IAT/delay/export labels + uncertain resync; hash=true SHA256 file+sections; functions=true prologue scan; entropy/carve; at_entry/rva/section. Flags .NET managed. DIFF path2. Prefer over ReadAllBytes. HexEdit presets; FindHexPattern; StringExtract; PeInfo/ImportTableViewer/ResourceEditor/SectionManager."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default false; use detail=full for tour)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" }; disasm = @{ type = "boolean"; description = "x86/x64 disassembly; IAT/export labels on indirect calls" }; trace = @{ type = "boolean"; description = "Walk control flow from offset (follow JMP; list JE/JNE both paths)" }; at_entry = @{ type = "boolean"; description = "Start at PE entry point file offset" }; rva = @{ type = "string"; description = "PE RVA (decimal/0x) -> map to file offset" }; section = @{ type = "string"; description = "PE section name (e.g. .text) -> start raw offset" }; max_insns = @{ type = "integer"; description = "Disasm instruction count (default 48, max 200)" }; max_steps = @{ type = "integer"; description = "Trace steps (default 32, max 80)" }; follow_calls = @{ type = "boolean"; description = "trace: step into CALL targets" }; prefer_branch = @{ type = "string"; description = "trace: fallthrough (default) or taken at Jcc" }; arch = @{ type = "string"; description = "auto|x86|x64 (default auto from PE)" }; dump_hex = @{ type = "boolean"; description = "Include hex dump (default true)" }; entropy = @{ type = "boolean"; description = "Shannon entropy map (high = packed/encrypted)" }; entropy_blocks = @{ type = "integer"; description = "Entropy windows (default 64)" }; carve = @{ type = "boolean"; description = "Find embedded MZ/PE images" }; hash = @{ type = "boolean"; description = "SHA256 of file + each PE section" }; functions = @{ type = "boolean"; description = "Heuristic function prologue scan in .text" }; detail = @{ type = "string"; description = "minimal|full (full forces annotate)" }; skip_mz_header = @{ type = "boolean"; description = "At offset 0, jump to the PE entry or .text instead of the DOS stub" }; ignore_mz_header = @{ type = "boolean"; description = "Alias of skip_mz_header" }; help = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes OR replace_pattern across file OR undo session patches. action=patch|replace_pattern|undo|undo_all|history|export_history. presets force_jcc|invert_jcc|nop_range|ret0. Near force_jcc keeps the displacement. Undo shrinks a file this patch extended. history lists all undo_ids. Session stack (export_history saves JSON). path.bak when backup=true. help=true. dry_run=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Target file (optional for action=history; filter for undo_all)" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; preset = @{ type = "string"; description = "force_jcc|invert_jcc|nop_range|ret0|ret|int3" }; length = @{ type = "integer"; description = "Byte count for nop_range/int3 presets" }; extend = @{ type = "boolean" }; backup = @{ type = "boolean"; description = "Write path.bak before patch (default true)" }; action = @{ type = "string"; description = "patch|undo|undo_all|history" }; id = @{ type = "integer"; description = "undo id from prior patch undo_id" }; undo = @{ type = "boolean"; description = "true = action=undo (last or id=)" }; pattern = @{ type = "string"; description = "replace_pattern: hex with optional ??" }; replace_hex = @{ type = "string"; description = "replace_pattern: same length as pattern; ?? keeps the original byte" }; replace = @{ type = "string"; description = "Alias of replace_hex" }; max = @{ type = "string"; description = "Max replace_pattern hits" }; preview = @{ type = "boolean"; description = "Alias of dry_run" }; dry_run = @{ type = "boolean"; description = "Show the patch and do not write" }; help = @{ type = "boolean" } }; required = @() } } },
+	@{ type = "function"; function = @{ name = "FindHexPattern"; description = "Hex pattern search with ?? wildcards. Multi-pattern separated by semicolon. Large PE auto-raises max. resolve_targets=true; each hit.next suggests HexView. all=true|max=all. help=true. Alias: HexSearch."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string"; description = "Hex bytes with optional ?? wildcards" }; hex = @{ type = "string"; description = "Alias for pattern" }; offset = @{ type = "string"; description = "Start offset" }; maxResults = @{ type = "integer"; description = "Max hits (default 32, max 9999)" }; max = @{ type = "string"; description = "Cap or 'all' (alias of maxResults; all=9999)" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = max 9999 hits" }; max_scan = @{ type = "integer"; description = "Max bytes to scan from offset (0=to EOF)" }; resolve_targets = @{ type = "boolean"; description = "Resolve relative CALL/JMP/Jcc targets and IAT/export labels (default false; CF kinds still get targets when decodable)" }; help = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "StringExtract"; description = "ASCII/UTF-16 strings. clean_urls=true (default) strips cert junk before http://. filter=url|data|code|interesting. max=all. next_steps for BrowsePage/ReadRegistry/HexView. help=true. Alias: StringsScan."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; minLen = @{ type = "integer"; description = "Minimum string length (default 4, floor 3)" }; maxLen = @{ type = "integer"; description = "Maximum string length (0=no max)" }; maxHits = @{ type = "integer"; description = "Max strings (default 80, max 9999)" }; max = @{ type = "string"; description = "Cap or all (alias maxHits)" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = maxHits 9999" }; offset = @{ type = "string" }; max_scan = @{ type = "integer"; description = "Max bytes to scan (0=full file)" }; encoding = @{ type = "string"; description = "ascii|utf16|both (default both)" }; filter = @{ type = "string"; description = "path|url|ip|registry|email|interesting|data|code|clean or free text; data=non-EXEC sections, code=EXEC only" }; section = @{ type = "string"; description = "PE section name e.g. .rdata" }; clean_urls = @{ type = "boolean"; description = "Strip junk before http:// (default true)" }; help = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "PeInfo"; description = "PE overview: sections, dirs, timestamp, entry, imports/exports/resources. Large PE (>=10MB) auto-raises caps. summary_only=true for quick triage. all=true|max=all. section_name_warnings for non-standard names. help=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; imports = @{ type = "boolean"; description = "Include import DLL/func summary (default true)" }; exports = @{ type = "boolean"; description = "Include exports (default true)" }; resources = @{ type = "boolean"; description = "Include resource tree summary (default true)" }; max_import_dlls = @{ type = "integer" }; max_import_funcs = @{ type = "integer" }; max_exports = @{ type = "integer" }; max_resources = @{ type = "integer" }; max = @{ type = "string"; description = "Shared cap or 'all' for all list limits" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = high caps for large PEs" }; summary_only = @{ type = "boolean"; description = "Headers and section names only" }; help = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ForensicsSummary"; description = "Quick PE triage in one call: PeInfo summary_only + StringExtract filter=interesting, returned as pe and strings objects, plus next_steps. Prefer first for unknown EXE/DLL."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; maxHits = @{ type = "integer"; description = "Max interesting strings (default 40)" }; help = @{ type = "boolean" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "ListRecycleBin"; description = "LIVE system Recycle Bin list (normal Delete-to-Bin). Prefer BEFORE ListDeletedFiles when the user emptied a folder with Delete (not Shift+Delete). Returns Items + MarkdownPreview. Not for formatted disks. No approval."; parameters = @{ type = "object"; properties = @{ drive = @{ type = "string"; description = "Optional drive letter e.g. C: to scan that volume Recycle.Bin" }; max = @{ type = "integer"; description = "Max items (default 500)" }; name_filter = @{ type = "string" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "RestoreRecycleBinItem"; description = "Restore a Recycle Bin item to its original path via Shell. ALWAYS approval. index= from ListRecycleBin. May conflict if a file already exists at the original path. Prefer ExportRecycleBinItem for safer copy-out."; parameters = @{ type = "object"; properties = @{ index = @{ type = "integer" }; name = @{ type = "string" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "ExportRecycleBinItem"; description = "Copy a Recycle Bin file to a NEW output folder (does not remove from Bin). ALWAYS approval. Prefer other drive for output_dir. index= or r_path= from ListRecycleBin."; parameters = @{ type = "object"; properties = @{ index = @{ type = "integer" }; name = @{ type = "string" }; output_dir = @{ type = "string" }; r_path = @{ type = "string"; description = "RPath from ListRecycleBin FS entries" } }; required = @() } } },
@@ -12270,9 +12277,9 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "ListShadowCopies"; description = "List Volume Shadow Copies (VSS) on this live PC. Empty if VSS/restore points off. Not for formatted disks. Read-only."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "ListUsnRecent"; description = "Best-effort recent USN journal sample on live NTFS (fsutil). May be empty. Not useful after format."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; max = @{ type = "integer" }; timeout_sec = @{ type = "integer" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "RecoverySmokeTest"; description = "Self-check recovery stack on live NTFS (DiskWalk, recycle shell, VSS, overwrite refuse). Read-mostly. verbose_log=true sets DiskWalk LogLevel=3."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; verbose_log = @{ type = "boolean" } }; required = @() } } },
-	@{ type = "function"; function = @{ name = "ImportTableViewer"; description = "List PE imports + delay-load (IAT offsets). Large PE auto all=true. by_ordinal_only=true. next_steps suggests HexView at iat_file_hex. all=true|max=all. help=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; dll = @{ type = "string"; description = "Filter DLL name substring e.g. KERNEL32" }; max_dlls = @{ type = "integer" }; max_funcs = @{ type = "integer" }; max = @{ type = "string"; description = "Shared cap or 'all'" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = high caps" }; include_delay = @{ type = "boolean"; description = "Include delay-load imports (default true)" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "ResourceEditor"; description = "PE resource tree: action=list|get|extract|replace. Filter type=/name=/lang= or index=. replace requires hex=/bytes=/source_path= and size <= original (pads). ALWAYS prompts on replace. backup=.bak default."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; action = @{ type = "string"; description = "list|get|extract|replace" }; type = @{ type = "string"; description = "ICON|BITMAP|STRING|DIALOG|VERSION|MANIFEST|RCDATA|..." }; name = @{ type = "string" }; lang = @{ type = "string" }; index = @{ type = "integer" }; out_path = @{ type = "string"; description = "extract destination" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; source_path = @{ type = "string" }; backup = @{ type = "boolean" }; max = @{ type = "integer" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "SectionManager"; description = "PE sections: action=list|set_chars|add|remove. set_chars section=.text characteristics=0x... or flags=EXEC|READ|WRITE|CODE. add appends section (name/hex/source_path). remove last section only. ALWAYS prompts on mutate. backup default."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; action = @{ type = "string"; description = "list|set_chars|add|remove" }; section = @{ type = "string" }; index = @{ type = "integer" }; characteristics = @{ type = "string"; description = "0x hex or decimal characteristics" }; flags = @{ type = "string"; description = "EXEC|READ|WRITE|CODE|IDATA|UDATA|..." }; name = @{ type = "string"; description = "New section name (add), max 8 chars" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; source_path = @{ type = "string" }; raw_size = @{ type = "integer" }; virt_size = @{ type = "integer" }; backup = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ImportTableViewer"; description = "List PE imports + delay-load (IAT offsets). Large PE auto all=true. by_ordinal_only=true. next_steps suggests HexView at iat_file_hex. all=true|max=all. help=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; dll = @{ type = "string"; description = "Filter DLL name substring e.g. KERNEL32" }; max_dlls = @{ type = "integer" }; max_funcs = @{ type = "integer" }; max = @{ type = "string"; description = "Shared cap or 'all'" }; limit = @{ type = "string"; description = "Alias of max" }; all = @{ type = "boolean"; description = "true = high caps" }; include_delay = @{ type = "boolean"; description = "Include delay-load imports (default true)" }; by_ordinal_only = @{ type = "boolean"; description = "Keep only ordinal imports" }; help = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ResourceEditor"; description = "PE resource tree: action=list|get|get_text|extract|replace. Filter type=/name=/lang= or index=. replace uses hex=/bytes=/source_path=/source_text= and size <= original (pads). STRING source_text is a 16-slot table. ALWAYS prompts on replace. backup=.bak default."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; action = @{ type = "string"; description = "list|get|get_text|extract|replace" }; type = @{ type = "string"; description = "ICON|BITMAP|STRING|DIALOG|VERSION|MANIFEST|RCDATA|... (RT_ prefix ok)" }; name = @{ type = "string" }; lang = @{ type = "string" }; index = @{ type = "integer" }; out_path = @{ type = "string"; description = "extract destination" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; source_path = @{ type = "string" }; source_text = @{ type = "string"; description = "replace: text payload. STRING resources are a 16-slot table (one line per slot, or N: text)." }; text_encoding = @{ type = "string"; description = "utf8 (default) | utf16 | ascii. Ignored for STRING table rebuild unless utf8/ascii/raw." }; backup = @{ type = "boolean" }; max = @{ type = "integer" }; help = @{ type = "boolean" } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "SectionManager"; description = "PE sections: action=list|set_chars|add|remove. set_chars section=.text characteristics=0x... or flags=EXEC|READ|WRITE|CODE. add appends section (name/hex/source_path). remove last section only. ALWAYS prompts on mutate. backup default."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; action = @{ type = "string"; description = "list|set_chars|add|remove" }; section = @{ type = "string" }; index = @{ type = "integer" }; characteristics = @{ type = "string"; description = "0x hex or decimal characteristics" }; flags = @{ type = "string"; description = "EXEC|READ|WRITE|CODE|IDATA|UDATA|..." }; name = @{ type = "string"; description = "New section name (add), max 8 chars" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; source_path = @{ type = "string" }; raw_size = @{ type = "integer" }; virt_size = @{ type = "integer" }; backup = @{ type = "boolean" }; validate = @{ type = "boolean"; description = "Warn on unusual section flags (default true)" }; dry_run = @{ type = "boolean"; description = "Preview add/remove/set_chars without writing" }; help = @{ type = "boolean" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "HexSearch"; description = "Alias of FindHexPattern. Prefer FindHexPattern."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; hex = @{ type = "string" }; offset = @{ type = "string" }; maxResults = @{ type = "integer" }; max = @{ type = "string" }; limit = @{ type = "string" }; all = @{ type = "boolean" }; max_scan = @{ type = "integer" }; resolve_targets = @{ type = "boolean" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "StringsScan"; description = "Alias of StringExtract. Prefer StringExtract. ASCII/UTF-16 string extraction with filters."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; minLen = @{ type = "integer" }; maxLen = @{ type = "integer" }; maxHits = @{ type = "integer" }; offset = @{ type = "string" }; max_scan = @{ type = "integer" }; encoding = @{ type = "string" }; filter = @{ type = "string" }; section = @{ type = "string" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "GetWorkingDirectory"; description = "Agent CWD."; parameters = @{ type = "object"; properties = @{} } } },
@@ -12552,9 +12559,9 @@ $script:MBToolUserTips = [ordered]@{
 	FindHexPattern        = 'Search for hex patterns (?? wildcards). max=all; resolve_targets=true for CALL/JMP targets.'
 	StringExtract         = 'Extract readable strings from a binary (filter=data|code|url|interesting; section/maxLen; paths, URLs, registry keys, etc.).'
 	PeInfo                = 'PE overview: sections, imports/exports summary, resources, timestamps.'
-	ForensicsSummary      = 'Quick triage: PE summary + interesting strings + suggested follow-ups.'
+	ForensicsSummary      = 'Quick triage: PE summary object + interesting strings object + suggested follow-ups.'
 	ImportTableViewer     = 'List imported DLLs and functions (with IAT offsets).'
-	ResourceEditor        = 'List, extract, or replace PE resources (icons, strings, dialogs, manifest).'
+	ResourceEditor        = 'List, extract, or replace PE resources. replace source_text= for manifests; STRING resources use a 16-slot table.'
 	SectionManager        = 'List or modify PE sections (permissions, add, remove last).'
 	HexSearch             = 'Alias of FindHexPattern.'
 	StringsScan           = 'Alias of StringExtract.'
@@ -15787,6 +15794,76 @@ function Get-MBEditPreview {
 	return $result
 }
 
+function Test-MBSourceText {
+	# Parse-only check of text the edit tools just wrote. Not a behavior test.
+	param(
+		[string]$Path,
+		[string]$Text
+	)
+	if ($null -eq $Text) { $Text = '' }
+	$ext = ''
+	try { $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant() } catch { $ext = '' }
+	$errors = New-Object System.Collections.Generic.List[string]
+	$kind = 'none'
+	if ($ext -in @('.ps1', '.psm1', '.psd1')) {
+		$kind = 'powershell'
+		$tokens = $null
+		$parseErrs = $null
+		try {
+			[void][System.Management.Automation.Language.Parser]::ParseInput([string]$Text, [ref]$tokens, [ref]$parseErrs)
+			foreach ($e in @($parseErrs)) {
+				$line = 0
+				try { $line = [int]$e.Extent.StartLineNumber } catch { $line = 0 }
+				$msg = ''
+				try { $msg = [string]$e.Message } catch { $msg = 'parse error' }
+				[void]$errors.Add(('line {0}: {1}' -f $line, $msg))
+				if ($errors.Count -ge 4) { break }
+			}
+		} catch {
+			[void]$errors.Add($_.Exception.Message)
+		}
+	} elseif ($ext -eq '.json') {
+		$kind = 'json'
+		try { $null = [string]$Text | ConvertFrom-Json -ErrorAction Stop } catch { [void]$errors.Add($_.Exception.Message) }
+	} elseif ($ext -in @('.xml', '.config', '.csproj', '.xaml', '.svg', '.xsl', '.xslt')) {
+		$kind = 'xml'
+		try { $null = [xml]([string]$Text) } catch { [void]$errors.Add($_.Exception.Message) }
+	}
+	$ok = $null
+	$note = 'No syntax check for this file type. Re-read the edited lines and run the program before claiming it works.'
+	if ($kind -ne 'none') {
+		$ok = ($errors.Count -eq 0)
+		if ($ok) {
+			$note = "syntax=ok ($kind). Parse only — run the code before claiming behavior."
+		} else {
+			$detail = ($errors -join ' | ')
+			if ($detail.Length -gt 500) { $detail = $detail.Substring(0, 497) + '...' }
+			$note = "syntax=FAIL ($kind): $detail"
+		}
+	}
+	return @{ Kind = $kind; Ok = $ok; Note = $note }
+}
+
+function Format-MBCodeVerifyBlock {
+	# Evidence block appended to edit-tool results so the model checks the save.
+	param(
+		[string]$Path,
+		[string]$NewText,
+		[string]$DiffPreview = ''
+	)
+	$v = Test-MBSourceText -Path $Path -Text $NewText
+	$lines = New-Object System.Collections.Generic.List[string]
+	[void]$lines.Add('VERIFY: ' + [string]$v.Note)
+	$diff = [string]$DiffPreview
+	if (-not [string]::IsNullOrWhiteSpace($diff) -and $diff -ne '(identical)') {
+		if ($diff.Length -gt 1600) { $diff = $diff.Substring(0, 1600) + "`n... diff truncated ..." }
+		[void]$lines.Add('LANDED:')
+		[void]$lines.Add($diff)
+	}
+	[void]$lines.Add('Do not claim more than VERIFY shows. ReadFile numbered=true on this range if LANDED is not enough. Run it before claiming behavior.')
+	return ($lines -join "`n")
+}
+
 function Invoke-WriteFile {
 	param(
 		[string]$path,
@@ -15863,8 +15940,12 @@ function Invoke-WriteFile {
 		try { Register-MBFileRead -Path $path } catch {}
 		$bakNote = if ($bakPath) { ", bak=$bakPath" } else { '' }
 		$nudgeNote = if ($nudge) { " [$nudge]" } else { '' }
-		if ($script:MB.AutoApprove) { return "SUCCESS (auto-approved): Written $path ($action, enc=$enc, nl=$nl$bakNote)$nudgeNote" }
-		return "SUCCESS: Written $path ($action, enc=$enc, nl=$nl$bakNote)$nudgeNote"
+		$verifyBlock = ''
+		try { $verifyBlock = Format-MBCodeVerifyBlock -Path $path -NewText ([string]$content) -DiffPreview '' } catch { $verifyBlock = '' }
+		$prefix = if ($script:MB.AutoApprove) { 'SUCCESS (auto-approved)' } else { 'SUCCESS' }
+		$head = "${prefix}: Written $path ($action, enc=$enc, nl=$nl$bakNote)$nudgeNote"
+		if ($verifyBlock) { return ($head + "`n" + $verifyBlock) }
+		return $head
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -16058,7 +16139,15 @@ $(Get-MBProp $overall 'Preview' '')
 		try {
 			if ($modes -and $modes.Count -gt 0) { $modeNote = ", match=" + ($modes -join '; ') }
 		} catch {}
-		return "SUCCESS${auto}: Edit applied to $path (hunks=$($editList.Count), matches=$totalMatches, enc=$($file.Encoding), nl=$($file.Newline), $sumNote$modeNote$bakNote)$nudgeNote"
+		$verifyBlock = ''
+		try {
+			$prevTxt = ''
+			try { $prevTxt = [string](Get-MBProp $overall 'Preview' '') } catch { $prevTxt = '' }
+			$verifyBlock = Format-MBCodeVerifyBlock -Path $path -NewText ([string]$working) -DiffPreview $prevTxt
+		} catch { $verifyBlock = '' }
+		$head = "SUCCESS${auto}: Edit applied to $path (hunks=$($editList.Count), matches=$totalMatches, enc=$($file.Encoding), nl=$($file.Newline), $sumNote$modeNote$bakNote)$nudgeNote"
+		if ($verifyBlock) { return ($head + "`n" + $verifyBlock) }
+		return $head
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -16503,7 +16592,16 @@ Or:
 		}
 	}
 	$auto = if ($script:MB.AutoApprove) { ' (auto-approved)' } else { '' }
-	return "SUCCESS${auto}: Patch applied:`n - " + ($ok -join "`n - ")
+	$verifyBits = New-Object System.Collections.Generic.List[string]
+	foreach ($p in $plan) {
+		try {
+			$vb = Format-MBCodeVerifyBlock -Path ([string]$p.Path) -NewText ([string]$p.NewText) -DiffPreview ([string]$p.Preview)
+			if ($vb) { [void]$verifyBits.Add($vb) }
+		} catch {}
+	}
+	$head = "SUCCESS${auto}: Patch applied:`n - " + ($ok -join "`n - ")
+	if ($verifyBits.Count -gt 0) { return ($head + "`n" + ($verifyBits -join "`n")) }
+	return $head
 }
 
 function Stop-MBProcessTree {
@@ -27965,7 +28063,8 @@ function Convert-MBHexPatternToBytesAndMask {
 		# split by space; also split contiguous hex into pairs when no spaces
 		foreach ($t in ($p -split ' ')) {
 			if ([string]::IsNullOrWhiteSpace($t)) { continue }
-			if ($t -eq '??' -or $t -eq '?') { $tokens += '??'; continue }
+			if ($t -match '^(?i)(?:0x|\\x)(.+)$') { $t = $Matches[1] }
+			if ($t -eq '??' -or $t -eq '?' -or $t -eq '*' -or $t -eq '**') { $tokens += '??'; continue }
 			if ($t -match '^[0-9A-Fa-f]{2}$') { $tokens += $t.ToUpperInvariant(); continue }
 			if ($t -match '^[0-9A-Fa-f?]+$') {
 				$s = $t
@@ -27981,6 +28080,7 @@ function Convert-MBHexPatternToBytesAndMask {
 		}
 	} else {
 		$s = $p
+		if ($s -match '^(?i)0x([0-9A-Fa-f]+)$') { $s = $Matches[1] }
 		if (($s.Length % 2) -ne 0) { throw 'Odd-length hex pattern' }
 		for ($i = 0; $i -lt $s.Length; $i += 2) {
 			$pair = $s.Substring($i, 2)
@@ -28121,6 +28221,74 @@ function Get-MBPeSectionNameWarnings {
 	return @($warn)
 }
 
+function Convert-MBPeStringTable {
+	# IMAGE_RESOURCE_DATA for RT_STRING: up to 16 WORD lengths, each followed by that many WCHARs.
+	param([byte[]]$Bytes)
+	if ($null -eq $Bytes -or $Bytes.Length -lt 2) { return $null }
+	$slots = New-Object System.Collections.ArrayList
+	$i = 0
+	for ($n = 0; $n -lt 16; $n++) {
+		if (($i + 2) -gt $Bytes.Length) { break }
+		$len = [int][BitConverter]::ToUInt16($Bytes, $i)
+		$i += 2
+		$need = $len * 2
+		if ($len -gt 8192 -or ($i + $need) -gt $Bytes.Length) { return $null }
+		if ($len -eq 0) {
+			[void]$slots.Add('')
+		} else {
+			[void]$slots.Add([System.Text.Encoding]::Unicode.GetString($Bytes, $i, $need))
+		}
+		$i += $need
+	}
+	if ($slots.Count -eq 0) { return $null }
+	$left = $Bytes.Length - $i
+	if ($left -gt 3 -and $slots.Count -lt 16) { return $null }
+	return ,$slots
+}
+
+function Convert-MBTextToPeStringTable {
+	# One line per slot, or "N: text" for slot N (0-15). Unused slots are empty.
+	param([string]$Text)
+	$slots = New-Object string[] 16
+	for ($i = 0; $i -lt 16; $i++) { $slots[$i] = '' }
+	$lines = @([string]$Text -split "`r?`n")
+	$indexed = ($lines.Count -gt 0)
+	foreach ($ln in $lines) {
+		if ($ln -match '^\s*$') { continue }
+		if ($ln -notmatch '^\s*(\d{1,2})\s*:\s?(.*)$') { $indexed = $false; break }
+		$ix = [int]$Matches[1]
+		if ($ix -lt 0 -or $ix -gt 15) { $indexed = $false; break }
+	}
+	if ($indexed) {
+		foreach ($ln in $lines) {
+			if ($ln -match '^\s*(\d{1,2})\s*:\s?(.*)$') {
+				$slots[[int]$Matches[1]] = [string]$Matches[2]
+			}
+		}
+	} else {
+		if ($lines.Count -gt 16) {
+			return @{ Ok = $false; Error = 'STRING resource holds at most 16 strings. Pass one string per line, or "N: text" for slot N (0-15).' }
+		}
+		for ($i = 0; $i -lt $lines.Count; $i++) { $slots[$i] = [string]$lines[$i] }
+	}
+	$ms = New-Object System.IO.MemoryStream
+	$bw = New-Object System.IO.BinaryWriter($ms)
+	try {
+		for ($i = 0; $i -lt 16; $i++) {
+			$raw = [System.Text.Encoding]::Unicode.GetBytes([string]$slots[$i])
+			$nchars = [int]($raw.Length / 2)
+			$ms.WriteByte([byte]($nchars -band 0xFF))
+			$ms.WriteByte([byte](($nchars -shr 8) -band 0xFF))
+			if ($raw.Length -gt 0) { $ms.Write($raw, 0, $raw.Length) }
+		}
+		$bw.Flush()
+		$bytes = $ms.ToArray()
+	} finally {
+		try { $bw.Dispose() } catch {}
+	}
+	return @{ Ok = $true; Bytes = $bytes }
+}
+
 function Convert-MBResourceBytesToText {
 	# Best-effort decode for STRING/MANIFEST/VERSION/RCDATA previews.
 	param([byte[]]$Bytes, [string]$TypeHint = '')
@@ -28128,6 +28296,30 @@ function Convert-MBResourceBytesToText {
 		return @{ text = $null; encoding = $null }
 	}
 	$t = ([string]$TypeHint).ToUpperInvariant()
+	if ($t -eq 'RT_STRING') { $t = 'STRING' }
+	if ($t -eq 'STRING') {
+		$tbl = Convert-MBPeStringTable -Bytes $Bytes
+		if ($tbl -and $tbl.Count -gt 0) {
+			$lines = New-Object System.Collections.ArrayList
+			for ($si = 0; $si -lt $tbl.Count; $si++) {
+				$sv = [string]$tbl[$si]
+				if (-not [string]::IsNullOrEmpty($sv)) {
+					[void]$lines.Add(('{0}: {1}' -f $si, $sv))
+				}
+			}
+			return @{ text = ($lines -join "`n"); encoding = 'utf16_stringtable'; string_table = $tbl }
+		}
+	}
+	# Drop trailing NUL padding (resource slots are padded to the original size) but keep a
+	# final 00 that belongs to a UTF-16 code unit.
+	$end = $Bytes.Length
+	while ($end -gt 0 -and $Bytes[$end - 1] -eq 0) { $end-- }
+	if (($end % 2) -eq 1 -and $end -lt $Bytes.Length) { $end++ }
+	if ($end -gt 0 -and $end -lt $Bytes.Length) {
+		$trimmed = New-Object byte[] $end
+		[Array]::Copy($Bytes, 0, $trimmed, 0, $end)
+		$Bytes = $trimmed
+	}
 	# UTF-16LE BOM
 	if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
 		$s = [System.Text.Encoding]::Unicode.GetString($Bytes, 2, $Bytes.Length - 2)
@@ -28179,11 +28371,23 @@ function Add-MBHexEditUndoEntry {
 		[byte[]]$BeforeBytes,
 		[byte[]]$AfterBytes,
 		[string]$Preset = '',
-		[string]$BackupPath = $null
+		[string]$BackupPath = $null,
+		[long]$FileLengthBefore = -1,
+		[bool]$Created = $false
 	)
 	try {
 		Initialize-MBHexEditStack
-		if ($null -eq $BeforeBytes -or $BeforeBytes.Length -eq 0) { return $null }
+		if ($null -eq $BeforeBytes) { $BeforeBytes = New-Object byte[] 0 }
+		$hasLen = ($FileLengthBefore -ge 0)
+		if ($BeforeBytes.Length -eq 0 -and -not $hasLen -and -not $Created) { return $null }
+		$wrote = 0
+		if ($AfterBytes) { $wrote = [int]$AfterBytes.Length }
+		$fileAfter = $null
+		if ($hasLen) {
+			$fileAfter = [long]$FileLengthBefore
+			$end = [long]$Offset + [long]$wrote
+			if ($end -gt $fileAfter) { $fileAfter = $end }
+		}
 		$script:MB.HexEditStackSeq = [int]$script:MB.HexEditStackSeq + 1
 		$id = [int]$script:MB.HexEditStackSeq
 		$entry = [ordered]@{
@@ -28192,8 +28396,12 @@ function Add-MBHexEditUndoEntry {
 			offset = $Offset
 			offset_hex = ('0x{0:X}' -f $Offset)
 			length = $BeforeBytes.Length
-			before_hex = (($BeforeBytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
+			before_hex = $(if ($BeforeBytes.Length -gt 0) { (($BeforeBytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') } else { '' })
 			after_hex = $(if ($AfterBytes) { (($AfterBytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') } else { $null })
+			wrote_length = $wrote
+			file_length_before = $(if ($hasLen) { [long]$FileLengthBefore } else { $null })
+			file_length_after = $fileAfter
+			created = [bool]$Created
 			preset = $(if ($Preset) { $Preset } else { $null })
 			backup = $BackupPath
 			time_utc = [datetime]::UtcNow.ToString('o')
@@ -28222,6 +28430,8 @@ function Get-MBHexEditUndoHistory {
 			length = $e.length
 			before_hex = $e.before_hex
 			after_hex = $e.after_hex
+			file_length_before = $(if ($null -ne $e.file_length_before) { $e.file_length_before } else { $null })
+			created = $(if ($e.created) { $true } else { $false })
 			preset = $e.preset
 			backup = $e.backup
 			time_utc = $e.time_utc
@@ -28302,13 +28512,20 @@ function Invoke-MBHexEditUndo {
 			$p = [string]$e.path
 			$off = [long]$e.offset
 			$before = $e._before
-			if ($null -eq $before -or $before.Length -eq 0) {
-				# rebuild from before_hex
+			if ($null -eq $before) {
 				if ($e.before_hex) {
 					$before = Convert-MBHexStringToBytes -Hex ([string]$e.before_hex)
+				} else {
+					$before = New-Object byte[] 0
 				}
 			}
-			if ($null -eq $before -or $before.Length -eq 0) {
+			$created = $false
+			try { if ($e.created) { $created = $true } } catch { $created = $false }
+			$flBefore = $null
+			$flAfter = $null
+			try { if ($null -ne $e.file_length_before) { $flBefore = [long]$e.file_length_before } } catch { $flBefore = $null }
+			try { if ($null -ne $e.file_length_after) { $flAfter = [long]$e.file_length_after } } catch { $flAfter = $null }
+			if (($null -eq $before -or $before.Length -eq 0) -and $null -eq $flBefore -and -not $created) {
 				[void]$errors.Add(('id {0}: no before-bytes stored' -f $e.id))
 				continue
 			}
@@ -28317,16 +28534,29 @@ function Invoke-MBHexEditUndo {
 				continue
 			}
 			$fs = $null
+			$removedFile = $false
 			try {
 				$fs = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-				if (($off + $before.Length) -gt $fs.Length) {
-					# allow shrink? only write what fits / extend
-					$need = $off + $before.Length
-					$fs.SetLength($need)
+				if ($created -and $null -ne $flAfter -and $fs.Length -ne $flAfter) {
+					throw 'file grew after this patch; undo the newer edit first'
 				}
-				[void]$fs.Seek($off, [System.IO.SeekOrigin]::Begin)
-				$fs.Write($before, 0, $before.Length)
-				$fs.Flush()
+				$canResize = ($null -ne $flBefore -and $null -ne $flAfter -and $fs.Length -eq $flAfter -and $flAfter -gt $flBefore)
+				if ($created -and $null -ne $flAfter -and $fs.Length -eq $flAfter) {
+					$fs.Dispose()
+					$fs = $null
+					Remove-Item -LiteralPath $p -Force
+					$removedFile = $true
+				} else {
+					if ($null -ne $before -and $before.Length -gt 0) {
+						if (($off + $before.Length) -gt $fs.Length) {
+							$fs.SetLength($off + $before.Length)
+						}
+						[void]$fs.Seek($off, [System.IO.SeekOrigin]::Begin)
+						$fs.Write($before, 0, $before.Length)
+					}
+					if ($canResize) { $fs.SetLength($flBefore) }
+					$fs.Flush()
+				}
 			} finally {
 				if ($fs) { try { $fs.Dispose() } catch {} }
 			}
@@ -28334,8 +28564,10 @@ function Invoke-MBHexEditUndo {
 				id = $e.id
 				path = $p
 				offset_hex = $e.offset_hex
-				restored_bytes = $before.Length
+				restored_bytes = $(if ($removedFile) { 0 } else { $before.Length })
 				restored_hex = $e.before_hex
+				truncated_to = $(if ($canResize -and -not $removedFile) { $flBefore } else { $null })
+				deleted = $removedFile
 			})
 			# remove from stack
 			for ($i = $stack.Count - 1; $i -ge 0; $i--) {
@@ -28541,6 +28773,7 @@ function Find-MBHexPattern {
 		$buf = New-Object byte[] ($chunk + $overlap + $patLen)
 		$pos = $Offset
 		$scanned = 0L
+		$truncated = $false
 		while ($pos -lt $scanEnd -and $hits.Count -lt $MaxResults) {
 			$want = [int][Math]::Min([long]$chunk + $overlap, $scanEnd - $pos)
 			if ($want -lt $patLen) { break }
@@ -28570,6 +28803,7 @@ function Find-MBHexPattern {
 			}
 			$step = $n - $overlap
 			if ($step -lt 1) { $step = 1 }
+			if ($hits.Count -ge $MaxResults -and ($pos + $i) -le ($scanEnd - $patLen)) { $truncated = $true }
 			$pos += $step
 		}
 		return @{
@@ -28579,7 +28813,7 @@ function Find-MBHexPattern {
 			hits        = @($hits)
 			count       = $hits.Count
 			scanned     = $scanned
-			truncated   = ($hits.Count -ge $MaxResults)
+			truncated   = $truncated
 		}
 	} catch {
 		return @{ Ok = $false; Error = $_.Exception.Message; hits = @() }
@@ -28647,16 +28881,23 @@ function Get-MBFileStrings {
 			}
 		}
 	} catch { $peSecs = $null }
-	if ($secFilter -and $peSecs) {
+	if ($secFilter) {
+		if (-not $peSecs) {
+			return @{ Ok = $false; Error = "section '$secFilter' requires a PE with a section table"; hits = @() }
+		}
 		$want = $null
 		foreach ($s in @($peSecs)) {
 			if ([string]::Equals([string]$s.name, $secFilter, [StringComparison]::OrdinalIgnoreCase)) { $want = $s; break }
 			if ($s.name.TrimStart('.') -eq $secFilter.TrimStart('.')) { $want = $s; break }
 		}
-		if ($want -and [uint32]$want.raw_ptr -gt 0 -and [uint32]$want.raw_size -gt 0) {
-			$Offset = [long][uint32]$want.raw_ptr
-			$MaxScan = [long][uint32]$want.raw_size
+		if (-not $want) {
+			return @{ Ok = $false; Error = "section '$secFilter' not found"; hits = @() }
 		}
+		if ([uint32]$want.raw_ptr -eq 0 -or [uint32]$want.raw_size -eq 0) {
+			return @{ Ok = $false; Error = "section '$secFilter' has no raw bytes (uninitialized or not stored in the file)"; hits = @() }
+		}
+		$Offset = [long][uint32]$want.raw_ptr
+		$MaxScan = [long][uint32]$want.raw_size
 	}
 	$testCompilerNoise = {
 		param([string]$S)
@@ -28716,6 +28957,7 @@ function Get-MBFileStrings {
 		return $true
 	}
 	$hits = New-Object System.Collections.ArrayList
+	$truncFlag = $false
 	$fs = $null
 	try {
 		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
@@ -28761,8 +29003,10 @@ function Get-MBFileStrings {
 						$runStart = -1L
 					}
 				}
+				if ($hits.Count -ge $MaxHits -and $i -lt $n) { $truncFlag = $true }
 				$pos += $n
 			}
+			if ($hits.Count -ge $MaxHits -and $pos -lt $scanEnd) { $truncFlag = $true }
 			if ($run.Count -ge $MinLen -and $hits.Count -lt $MaxHits) {
 				$s = [System.Text.Encoding]::ASCII.GetString($run.ToArray())
 				if (& $acceptHit $s $runStart) {
@@ -28822,8 +29066,10 @@ function Get-MBFileStrings {
 						$runStart = -1L
 					}
 				}
+				if ($hits.Count -ge $MaxHits -and $i -lt $n) { $truncFlag = $true }
 				$pos += $n
 			}
+			if ($hits.Count -ge $MaxHits -and $pos -lt $scanEnd) { $truncFlag = $true }
 			if ($chars.Count -ge $MinLen -and $hits.Count -lt $MaxHits) {
 				$s = -join $chars
 				if (& $acceptHit $s $runStart) {
@@ -28852,7 +29098,7 @@ function Get-MBFileStrings {
 			encoding = $encMode
 			count = $hits.Count
 			hits = @($hits)
-			truncated = ($hits.Count -ge $MaxHits)
+			truncated = $truncFlag
 		}
 	} catch {
 		return @{ Ok = $false; Error = $_.Exception.Message; hits = @() }
@@ -29897,7 +30143,12 @@ function Get-MBPeImportTableDetailed {
 					$out.total_functions += $r.total
 					if ($r.truncated) { $out.truncated = $true }
 					if ($r.count -eq 0) {
-						$out.note = 'Import directory mapped but no DLL descriptors found (empty or bound-only)'
+						$dllFilt = ([string]$DllFilter).Trim()
+						if ($dllFilt) {
+							$out.note = ("No import DLLs matched filter '{0}'." -f $dllFilt)
+						} else {
+							$out.note = 'Import directory mapped but no DLL descriptors found (empty or bound-only)'
+						}
 					}
 				} catch {
 					$out.note = ('Import parse skipped: {0}' -f $_.Exception.Message)
@@ -30309,6 +30560,41 @@ function Get-MBPeInfoBundle {
 	return $payload
 }
 
+function Format-MBPeParseError {
+	param([string]$Code)
+	$c = ([string]$Code).Trim()
+	switch ($c) {
+		'too_small' { return 'Not a valid PE file (file too small for PE headers)' }
+		'not_mz' { return 'Not a valid PE file (missing MZ DOS header)' }
+		'not_pe' { return 'Not a valid PE file (MZ present but PE signature missing)' }
+		'bad_lfanew' { return 'Not a valid PE file (invalid e_lfanew / PE header offset)' }
+		'bad_optional' { return 'Not a valid PE file (optional header magic not PE32/PE32+)' }
+		'not_found' { return 'File not found' }
+		default {
+			if ([string]::IsNullOrWhiteSpace($c)) { return 'PE parse failed' }
+			if ($c -match ' ') { return $c }
+			return "PE parse failed: $c"
+		}
+	}
+}
+
+function Convert-MBForensicsToolResult {
+	# Child tools return JSON text or an ERROR string. Unwrap JSON so summaries are objects.
+	param($Raw)
+	$s = if ($null -eq $Raw) { '' } else { [string]$Raw }
+	if ([string]::IsNullOrWhiteSpace($s)) {
+		return @{ Ok = $false; Error = 'empty result'; Value = $null }
+	}
+	if ($s.StartsWith('ERROR:')) {
+		return @{ Ok = $false; Error = $s.Substring(6).Trim(); Value = $null }
+	}
+	try {
+		return @{ Ok = $true; Error = $null; Value = ($s | ConvertFrom-Json) }
+	} catch {
+		return @{ Ok = $false; Error = $s; Value = $null }
+	}
+}
+
 function Invoke-PeInfo {
 	param(
 		[string]$path,
@@ -30367,7 +30653,7 @@ function Invoke-PeInfo {
 	try {
 		$r = Get-MBPeInfoBundle -Path $path -IncludeImports $imports -IncludeExports $exports -IncludeResources $resources `
 			-MaxImportDlls ([int]$max_import_dlls) -MaxImportFuncs ([int]$max_import_funcs) -MaxExports ([int]$max_exports) -MaxResources ([int]$max_resources)
-		if (-not $r.Ok) { return "ERROR: $($r.Error)" }
+		if (-not $r.Ok) { return ("ERROR: {0}" -f (Format-MBPeParseError -Code ([string]$r.Error))) }
 		if ($r -is [System.Collections.IDictionary]) {
 			$trunc = $false
 			try {
@@ -30439,20 +30725,27 @@ function Invoke-ForensicsSummary {
 	$t0 = [datetime]::UtcNow
 	$peJson = $null
 	$stJson = $null
-	try { $peJson = [string](Invoke-PeInfo -path $path -summary_only $true) } catch { $peJson = ('ERROR: {0}' -f $_.Exception.Message) }
-	try { $stJson = [string](Invoke-StringExtract -path $path -filter 'interesting' -maxHits $maxHits -clean_urls $true) } catch { $stJson = ('ERROR: {0}' -f $_.Exception.Message) }
+	try { $peRaw = [string](Invoke-PeInfo -path $path -summary_only $true) } catch { $peRaw = ('ERROR: {0}' -f $_.Exception.Message) }
+	try { $stRaw = [string](Invoke-StringExtract -path $path -filter 'interesting' -maxHits $maxHits -clean_urls $true) } catch { $stRaw = ('ERROR: {0}' -f $_.Exception.Message) }
+	$pe = Convert-MBForensicsToolResult -Raw $peRaw
+	$st = Convert-MBForensicsToolResult -Raw $stRaw
+	$status = 'ok'
+	if (-not $pe.Ok -and -not $st.Ok) { $status = 'error' }
+	elseif (-not $pe.Ok -or -not $st.Ok) { $status = 'partial' }
 	$ns1 = [ordered]@{ tool = 'ImportTableViewer'; suggest = ('ImportTableViewer path={0} all=true' -f $path) }
 	$ns2 = [ordered]@{ tool = 'HexView'; suggest = ('HexView path={0} at_entry=true disasm=true' -f $path) }
 	$ns3 = [ordered]@{ tool = 'FindHexPattern'; suggest = ('FindHexPattern path={0} pattern=E8 ?? ?? ?? ?? resolve_targets=true' -f $path) }
 	return ConvertTo-MBJson ([ordered]@{
-		status = 'ok'
+		status = $status
 		path = $path
 		elapsed_ms = [int]([datetime]::UtcNow - $t0).TotalMilliseconds
-		pe_json = $peJson
-		strings_json = $stJson
+		pe = $pe.Value
+		pe_error = $pe.Error
+		strings = $st.Value
+		strings_error = $st.Error
 		next_steps = @($ns1, $ns2, $ns3)
-		hint = 'Triage bundle (pe_json + strings_json). Deep dive: PeInfo full, ImportTableViewer, HexView at_entry.'
-	}) -Depth 10
+		hint = 'Triage bundle (pe + strings objects). Deep dive: PeInfo full, ImportTableViewer, HexView at_entry.'
+	}) -Depth 12
 }
 
 function Invoke-ImportTableViewer {
@@ -30495,6 +30788,19 @@ function Invoke-ImportTableViewer {
 	}
 	try {
 		$imp = Get-MBPeImportTableDetailed -Path $path -MaxDlls ([int]$max_dlls) -MaxFuncsPerDll ([int]$max_funcs) -DllFilter $dll
+		if ($imp -and [string]$imp.note -eq 'PE header parse failed') {
+			return ConvertTo-MBJson ([ordered]@{
+				status = 'error'
+				path = $path
+				error = (Format-MBPeParseError -Code ([string]$imp.Error))
+				import_dll_count = 0
+				delay_dll_count = 0
+				total_functions = 0
+				imports = @()
+				delay_imports = @()
+				hint = 'Not a usable PE import table. PeInfo reports the same header problem.'
+			}) -Depth 6
+		}
 		$imports = if ($imp) { @($imp.import_dlls) } else { @() }
 		$delay = if ($imp) { @($imp.delay_dlls) } else { @() }
 		if ($by_ordinal_only) {
@@ -30564,15 +30870,15 @@ function Invoke-ImportTableViewer {
 		return ConvertTo-MBJson $payload -Depth 10
 	} catch {
 		return ConvertTo-MBJson ([ordered]@{
-			status = 'ok'
+			status = 'error'
 			path = $path
+			error = ('Import analysis error: {0}' -f $_.Exception.Message)
 			import_dll_count = 0
 			delay_dll_count = 0
 			total_functions = 0
 			imports = @()
 			delay_imports = @()
-			note = ('Import analysis error: {0}' -f $_.Exception.Message)
-			hint = 'Structured empty result — PE may be damaged or not a PE. Try PeInfo first.'
+			hint = 'PE may be damaged or not a PE. Try PeInfo first.'
 		}) -Depth 6
 	}
 }
@@ -30589,9 +30895,20 @@ function Invoke-ResourceEditor {
 		[string]$hex = '',
 		$bytes = $null,
 		[string]$source_path = '',
+		[string]$source_text = '',
+		[string]$text_encoding = '',
 		[bool]$backup = $true,
-		[int]$max = 200
+		[int]$max = 200,
+		[bool]$help = $false
 	)
+	if ($help) {
+		return ConvertTo-MBJson ([ordered]@{
+			tool = 'ResourceEditor'
+			actions = @('list', 'get', 'get_text', 'extract', 'replace')
+			options = @('type=', 'name=', 'lang=', 'index=', 'source_text=', 'text_encoding=utf8|utf16|ascii', 'hex=', 'source_path=')
+			note = 'STRING resources are a 16-slot length-prefixed table. source_text is one line per slot, or "N: text". MANIFEST/RCDATA use source_text as raw encoded bytes. Replacement cannot grow the slot.'
+		}) -Depth 5
+	}
 	$path = Resolve-MBPath -Path $path -MustExist
 	if ([string]::IsNullOrWhiteSpace($path)) { return 'ERROR: Empty or invalid path' }
 	if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "ERROR: File not found: $path" }
@@ -30603,19 +30920,21 @@ function Invoke-ResourceEditor {
 	if ($act -in @('swap', 'write', 'set', 'patch')) { $act = 'replace' }
 	try {
 		$tree = Get-MBPeResourceTree -Path $path -MaxEntries $max
-		if (-not $tree.Ok) { return "ERROR: $($tree.Error)" }
+		if (-not $tree.Ok) { return ("ERROR: {0}" -f (Format-MBPeParseError -Code ([string]$tree.Error))) }
 		$res = @($tree.resources)
 		if ($type) {
 			$t = $type.Trim()
+			if ($t -match '^(?i)RT_(.+)$') { $t = $Matches[1] }
 			$res = @($res | Where-Object {
-				[string]$_.type -eq $t -or [string]$_.type_id -eq $t -or
+				[string]$_.type_id -eq $t -or
 				([string]$_.type).Equals($t, [StringComparison]::OrdinalIgnoreCase)
 			})
 		}
 		if ($name) {
 			$n = $name.Trim()
 			$res = @($res | Where-Object {
-				[string]$_.name -eq $n -or [string]$_.name_id -eq $n
+				([string]$_.name).Equals($n, [StringComparison]::OrdinalIgnoreCase) -or
+				[string]$_.name_id -eq $n
 			})
 		}
 		if ($lang) {
@@ -30666,15 +30985,17 @@ function Invoke-ResourceEditor {
 					note = 'No decodable text (binary resource). Use action=get for hex dump or extract for raw bytes.'
 				}) -Depth 8
 			}
-			return ConvertTo-MBJson ([ordered]@{
+			$gt = [ordered]@{
 				status = 'ok'
 				path = $path
 				resource = $item
 				text = $txt
 				text_encoding = $dec.encoding
 				data_size = $dataSize
-				hint = 'Text-only view. action=get for hex+text; action=extract to save.'
-			}) -Depth 8
+				hint = 'Text-only view. STRING text is "slot: value". action=get for hex+text; action=extract to save; action=replace source_text=.'
+			}
+			if ($dec.string_table) { $gt['string_table'] = @($dec.string_table) }
+			return ConvertTo-MBJson $gt -Depth 8
 		}
 		if ($act -eq 'get') {
 			$rb = Read-MBFileBytes -Path $path -Offset $dataOff -Length ([Math]::Min($dataSize, 4096))
@@ -30765,7 +31086,12 @@ function Invoke-ResourceEditor {
 				$newBytes = Convert-MBHexStringToBytes -Hex $hex
 			} elseif (-not [string]::IsNullOrWhiteSpace($source_text)) {
 				$te = ([string]$text_encoding).Trim().ToLowerInvariant()
-				if ($te -in @('utf16', 'utf16le', 'unicode')) {
+				$isStringRes = ([string]$item.type) -match '^(?i)STRING$'
+				if ($isStringRes -and $te -notin @('utf8', 'ascii', 'us-ascii', 'raw')) {
+					$built = Convert-MBTextToPeStringTable -Text $source_text
+					if (-not $built.Ok) { return "ERROR: $($built.Error)" }
+					$newBytes = $built.Bytes
+				} elseif ($te -in @('utf16', 'utf16le', 'unicode')) {
 					$newBytes = [System.Text.Encoding]::Unicode.GetBytes($source_text)
 				} elseif ($te -in @('ascii', 'us-ascii')) {
 					$newBytes = [System.Text.Encoding]::ASCII.GetBytes($source_text)
@@ -30834,6 +31160,17 @@ Backup: $backup
 	}
 }
 
+function Get-MBAlignUp {
+	# Integer ceiling to a power-of-two or any positive alignment.
+	# [long](x / y) rounds a double, so (aligned-1)/align becomes the next boundary.
+	param([long]$Value, [long]$Alignment)
+	if ($Alignment -le 1) { return $Value }
+	if ($Value -le 0) { return [long]0 }
+	$rem = $Value % $Alignment
+	if ($rem -eq 0) { return $Value }
+	return ($Value + ($Alignment - $rem))
+}
+
 function Invoke-SectionManager {
 	param(
 		[string]$path,
@@ -30870,17 +31207,7 @@ function Invoke-SectionManager {
 	if ($act -in @('del', 'delete')) { $act = 'remove' }
 	$layout = Get-MBPeHeaderLayout -Path $path
 	if (-not $layout.Ok) {
-		$errMap = @{
-			'too_small' = 'Not a valid PE file (file too small for PE headers)'
-			'not_mz' = 'Not a valid PE file (missing MZ DOS header)'
-			'not_pe' = 'Not a valid PE file (MZ present but PE signature missing)'
-			'bad_lfanew' = 'Not a valid PE file (invalid e_lfanew / PE header offset)'
-			'bad_optional' = 'Not a valid PE file (optional header magic not PE32/PE32+)'
-			'not_found' = 'File not found'
-		}
-		$code = [string]$layout.Error
-		$human = if ($errMap.ContainsKey($code)) { $errMap[$code] } else { "PE parse failed: $code" }
-		return "ERROR: $human"
+		return ("ERROR: {0}" -f (Format-MBPeParseError -Code ([string]$layout.Error)))
 	}
 	if ($act -in @('get', 'get_section', 'show_section')) {
 		$sec = $null
@@ -31065,8 +31392,7 @@ Backup: $backup
 		if ($secAlign -lt 0x1000) { $secAlign = 0x1000 }
 		$alignUp = {
 			param([long]$V, [long]$A)
-			if ($A -le 0) { return $V }
-			return [long](([long](($V + $A - 1) / $A)) * $A)
+			return (Get-MBAlignUp -Value $V -Alignment $A)
 		}
 		$rawSizeAligned = [uint32](& $alignUp ([long]$payload.Length) ([long]$fileAlign))
 		$vSize = if ($virt_size -gt 0) { [uint32]$virt_size } else { [uint32][Math]::Max($payload.Length, 1) }
@@ -31082,6 +31408,14 @@ Backup: $backup
 			if ($rawEnd -gt $lastRawEnd) { $lastRawEnd = $rawEnd }
 		}
 		$newRawPtr = [uint32](& $alignUp $lastRawEnd ([long]$fileAlign))
+		$overlayNote = $null
+		$fileLen = 0L
+		try { $fileLen = [long](Get-Item -LiteralPath $path).Length } catch { $fileLen = 0 }
+		if ($fileLen -gt [long]$newRawPtr) {
+			$placed = [uint32](& $alignUp $fileLen ([long]$fileAlign))
+			$overlayNote = ('Bytes past the last section (file size 0x{0:X}, section end 0x{1:X}) were left in place. New raw data starts at 0x{2:X}.' -f $fileLen, $newRawPtr, $placed)
+			$newRawPtr = $placed
+		}
 		$newChars = & $parseChars $characteristics $flags
 		if ($null -eq $newChars) { $newChars = [uint32]0x40000040 } # READ|IDATA default
 		# room for section header?
@@ -31103,7 +31437,7 @@ RawPtr: 0x$('{0:X}' -f $newRawPtr)  RawSize: 0x$('{0:X}' -f $rawSizeAligned)
 Chars: 0x$('{0:X}' -f $newChars) [$(Format-MBPeSectionFlags -Chars $newChars)]
 Payload: $($payload.Length) bytes
 New SizeOfImage: 0x$('{0:X}' -f $newSizeOfImage)
-Backup: $backup
+$(if ($overlayNote) { "Overlay: $overlayNote`n" } else { '' })Backup: $backup
 "@
 		if ($dry_run) {
 			return ConvertTo-MBJson ([ordered]@{
@@ -31116,6 +31450,7 @@ Backup: $backup
 				raw_size = $rawSizeAligned
 				characteristics_hex = ('0x{0:X}' -f $newChars)
 				size_of_image_hex = ('0x{0:X}' -f $newSizeOfImage)
+				overlay = $overlayNote
 				hint = 'dry_run only — re-call without dry_run=true to apply.'
 			}) -Depth 6
 		}
@@ -31168,6 +31503,7 @@ Backup: $backup
 				characteristics_hex = ('0x{0:X}' -f $newChars)
 				size_of_image_hex = ('0x{0:X}' -f $newSizeOfImage)
 				backup = $bakPath
+				overlay = $overlayNote
 				note = 'Section appended. Relocs/code references not auto-updated. Verify with PeInfo/SectionManager list.'
 			}) -Depth 6
 		} finally {
@@ -31193,7 +31529,7 @@ Backup: $backup
 			$secAlign = [uint32]$layout.SectionAlignment
 			if ($secAlign -lt 0x1000) { $secAlign = 0x1000 }
 			$vaEnd = [long][uint32]$prev.virt_rva + [long][Math]::Max([uint32]$prev.virt_size, 1)
-			$newSizeOfImage = [uint32]([long](([long](($vaEnd + $secAlign - 1) / $secAlign)) * $secAlign))
+			$newSizeOfImage = [uint32](Get-MBAlignUp -Value $vaEnd -Alignment ([long]$secAlign))
 		}
 		$truncateTo = [long]$sec.raw_ptr
 		$details = @"
@@ -32119,22 +32455,29 @@ function Invoke-HexView {
 	if ($arch -eq 'x64') { $is64 = $true }
 	elseif ($arch -eq 'x86') { $is64 = $false }
 	elseif ($peCtx -and $peCtx.Ok) { $is64 = [bool]$peCtx.Is64 }
+	$navFrom = 'offset'
+	$navNote = $null
 
 	# skip DOS/MZ header noise when starting at 0 (beginners often hit db soup)
 	if (($skip_mz_header -or $ignore_mz_header) -and $off -eq 0 -and -not $at_entry -and [string]::IsNullOrWhiteSpace($section) -and ($null -eq $rva -or [string]$rva -eq '')) {
+		$skipped = $false
 		if ($peCtx -and $peCtx.Ok) {
 			if ($null -ne $peCtx.EntryFile) {
 				$off = [long]$peCtx.EntryFile
+				$skipped = $true
 			} else {
 				foreach ($s in @($peCtx.Sections)) {
 					$sn = [string]$s.name
 					if ($sn -match '(?i)^\.?text$' -and [uint32]$s.raw_ptr -gt 0) {
 						$off = [long][uint32]$s.raw_ptr
+						$skipped = $true
 						break
 					}
 				}
 			}
 		}
+		if ($skipped) { $navFrom = 'skip_mz_header' }
+		else { $navNote = 'skip_mz_header was set, but this file has no mapped PE entry or .text section. The view stays at offset 0.' }
 	}
 
 	# section= name -> start of raw data
@@ -32148,17 +32491,18 @@ function Invoke-HexView {
 				}
 			}
 			if (-not $foundSec) {
-				# allow .text without dot etc
 				foreach ($s in @($peCtx.Sections)) {
 					$sn = [string]$s.name
 					if ($sn.TrimStart('.') -eq $want.TrimStart('.')) { $foundSec = $s; break }
 				}
 			}
-			if ($foundSec -and [uint32]$foundSec.raw_ptr -gt 0) {
-				$off = [long][uint32]$foundSec.raw_ptr
-			} else {
-				return "ERROR: section '$section' not found or has no raw data"
+			if (-not $foundSec) { return "ERROR: section '$section' not found" }
+			if ([uint32]$foundSec.raw_ptr -eq 0 -or [uint32]$foundSec.raw_size -eq 0) {
+				return "ERROR: section '$section' has no raw bytes (uninitialized or not stored in the file)"
 			}
+			$off = [long][uint32]$foundSec.raw_ptr
+			if ($navFrom -ne 'offset') { $navNote = "section= overrides $navFrom" }
+			$navFrom = 'section'
 		} else {
 			return 'ERROR: section= requires a PE with section table'
 		}
@@ -32174,6 +32518,8 @@ function Invoke-HexView {
 				return ("ERROR: RVA 0x{0:X} not mapped to a section" -f $rvaVal)
 			}
 			$off = [long]$fo
+			if ($navFrom -ne 'offset') { $navNote = "rva= overrides $navFrom" }
+			$navFrom = 'rva'
 		} else {
 			return 'ERROR: rva= requires a PE with section table'
 		}
@@ -32182,6 +32528,8 @@ function Invoke-HexView {
 	if ($at_entry) {
 		if ($peCtx -and $peCtx.Ok -and $null -ne $peCtx.EntryFile) {
 			$off = [long]$peCtx.EntryFile
+			if ($navFrom -ne 'offset') { $navNote = "at_entry=true overrides $navFrom" }
+			$navFrom = 'at_entry'
 		} else {
 			return 'ERROR: at_entry=true but PE entry file offset not found (not a PE or unmapped EP)'
 		}
@@ -32208,6 +32556,8 @@ function Invoke-HexView {
 			$off = [long]$diffInfo.Offset
 			$align = [Math]::Max(0L, $off - ($off % [Math]::Max(1, $width)))
 			$off = $align
+			$navNote = "next_diff moved the window from $navFrom"
+			$navFrom = 'next_diff'
 		}
 	}
 
@@ -32354,7 +32704,8 @@ function Invoke-HexView {
 		disasm = $disasm
 		trace = $trace
 		arch = $(if ($is64) { 'x64' } else { 'x86' })
-		legend = 'pe.sections always listed. disasm=true: x86/x64 + IAT/delay/export labels. hash=true SHA256 file+sections. functions/entropy/carve/rva/section/at_entry. PeInfo/ImportTableViewer/ResourceEditor/SectionManager. FindHexPattern ??; StringExtract; HexEdit disasm context + presets.'
+		navigation = [ordered]@{ source = $navFrom; note = $navNote }
+		legend = 'pe.sections always listed. navigation.source is offset|section|rva|at_entry|skip_mz_header. disasm=true: x86/x64 + IAT/delay/export labels. hash=true SHA256 file+sections. functions/entropy/carve. PeInfo/ImportTableViewer/ResourceEditor/SectionManager. FindHexPattern ??; StringExtract; HexEdit disasm context + presets.'
 	}
 	if ($dump) { $payload['dump'] = $dump }
 	try { $payload['byte_classes'] = Get-MBByteClassSummary -Bytes $ra.Bytes } catch {}
@@ -32495,7 +32846,7 @@ function Invoke-HexView {
 					dotnet_warning = $d.dotnet_warning
 					listing = ($lines -join "`n")
 					instructions = @($d.instructions)
-					how_to_follow = 'Lines starting with ? are uncertain (db) or resync skips. JMP/Jcc/CALL -> file_offset; [dll!func] via IAT/delay. functions=true for prologue list.'
+					how_to_follow = 'Lines starting with ? are uncertain (db) or resync skips. JMP/Jcc/CALL -> file_offset; [dll!func] via IAT/delay. functions=true for prologue list. A HexEdit SUCCESS is not proof — quote these mnemonics or HexEdit verify.verified before claiming what the bytes do.'
 				}
 			} else {
 				$payload['disassembly_error'] = [string]$d.Error
@@ -32714,10 +33065,16 @@ function Invoke-FindHexPattern {
 			}
 			$patIdx++
 		}
-		# Sort by offset for multi-pattern
+		# Sort by offset and apply one cap across every pattern.
+		$sorted = New-Object System.Collections.ArrayList
 		try {
-			$sorted = @($allHits | Sort-Object { [long]$_.offset })
-		} catch { $sorted = @($allHits) }
+			foreach ($h in ($allHits | Sort-Object { [long]$_.offset })) {
+				if ($sorted.Count -ge $maxResults) { $anyTrunc = $true; break }
+				[void]$sorted.Add($h)
+			}
+		} catch {
+			$sorted = $allHits
+		}
 		$truncNote = Add-MBForensicsTruncationNote -Truncated $anyTrunc -Tool 'FindHexPattern' -Count $sorted.Count -Cap $maxResults
 		return ConvertTo-MBJson ([ordered]@{
 			status      = 'ok'
@@ -32920,12 +33277,11 @@ function Resolve-MBHexEditPreset {
 					$b1 = [int]$br.Bytes[1]
 					if ($b1 -ge 0x80 -and $b1 -le 0x8F) {
 						$rel = [BitConverter]::ToInt32($br.Bytes, 2)
-						# Original: next = off+6, target = next+rel
-						# New: 90 E9 rel' where next' = off+5, need next'+rel' = target => rel' = rel+1
-						$newRel = $rel + 1
-						$rb = [BitConverter]::GetBytes([int]$newRel)
+						# 0F 8x rel32 and 90 E9 rel32 are both 6 bytes and end at the same address,
+						# so the near displacement stays the same (adding 1 jumps one byte too far).
+						$rb = [BitConverter]::GetBytes([int]$rel)
 						$patch = [byte[]](0x90, 0xE9, $rb[0], $rb[1], $rb[2], $rb[3])
-						return @{ Ok = $true; Patch = $patch; Note = ('force_jcc: near 0F {0:X2} -> 90 E9 (nop+jmp near, rel adjusted +1)' -f $b1) }
+						return @{ Ok = $true; Patch = $patch; Note = ('force_jcc: near 0F {0:X2} -> 90 E9 (nop+jmp near, same displacement)' -f $b1) }
 					}
 				}
 				return @{ Ok = $false; Error = ('force_jcc: byte at offset is 0x{0:X2} (need 7x short Jcc or 0F 8x near Jcc)' -f $b0) }
@@ -32981,11 +33337,124 @@ function Resolve-MBHexEditPreset {
 				return @{ Ok = $true; Patch = $patch; Note = ("int3: {0} x CC" -f $len) }
 			}
 			default {
-				return @{ Ok = $false; Error = "unknown preset '$Preset' (use force_jcc|nop_range|ret0|ret|int3)" }
+				return @{ Ok = $false; Error = "unknown preset '$Preset' (use force_jcc|invert_jcc|nop_range|ret0|ret|int3)" }
 			}
 		}
 	} catch {
 		return @{ Ok = $false; Error = $_.Exception.Message }
+	}
+}
+
+function Get-MBDisasmMarkedMnemonics {
+	# Lines from Get-MBX86DisasmListing. '>' means the instruction overlaps the patch.
+	param([string]$Listing)
+	$out = New-Object System.Collections.ArrayList
+	if ([string]::IsNullOrWhiteSpace($Listing)) { return $out }
+	foreach ($line in ([string]$Listing -split "`r?`n")) {
+		if ($line -notmatch '^>') { continue }
+		$body = $line.Substring(1).Trim()
+		$parts = @([regex]::Split($body, '\s{2,}'))
+		if ($parts.Count -lt 3) { continue }
+		$mnem = ([string]$parts[2]).Trim()
+		if ($mnem -match '^(\S+)') { $mnem = $Matches[1] }
+		[void]$out.Add([ordered]@{
+			offset_hex = [string]$parts[0]
+			mnemonic = $mnem.ToLowerInvariant()
+		})
+	}
+	return $out
+}
+
+function Test-MBJccMnemonic {
+	param([string]$Mnemonic)
+	$m = ([string]$Mnemonic).Trim().ToLowerInvariant()
+	if ($m -eq 'jmp' -or $m -eq 'call') { return $false }
+	return $m -match '^(jo|jno|jb/jc|jae/jnc|je/jz|jne/jnz|jbe|ja|js|jns|jp|jnp|jl|jge|jle|jg|loopne|loope|loop|jcxz/jecxz)$'
+}
+
+function Get-MBHexEditDisasmVerify {
+	# Compare a preset's intent to the marked instructions in disasm_after.
+	param(
+		[string]$Preset = '',
+		[string]$BeforeListing = '',
+		[string]$AfterListing = '',
+		[string]$OffsetHex = ''
+	)
+	$p = ([string]$Preset).Trim().ToLowerInvariant() -replace '[-\s]', '_'
+	switch ($p) {
+		'force_jmp' { $p = 'force_jcc' }
+		'force' { $p = 'force_jcc' }
+		'always_jump' { $p = 'force_jcc' }
+		'nop' { $p = 'nop_range' }
+		'nops' { $p = 'nop_range' }
+		'ret_0' { $p = 'ret0' }
+		'return0' { $p = 'ret0' }
+		'xor_ret' { $p = 'ret0' }
+		'swap_jz' { $p = 'invert_jcc' }
+		'flip_jcc' { $p = 'invert_jcc' }
+		'swap_jcc' { $p = 'invert_jcc' }
+	}
+	$after = @(Get-MBDisasmMarkedMnemonics -Listing $AfterListing)
+	$before = @(Get-MBDisasmMarkedMnemonics -Listing $BeforeListing)
+	$am = @($after | ForEach-Object { [string]$_.mnemonic })
+	$bm = @($before | ForEach-Object { [string]$_.mnemonic })
+	$expect = 'raw bytes (no preset expectation)'
+	$checked = $false
+	$verified = $false
+	$reason = 'No preset. disasm_after is the evidence. Quote the marked mnemonic before saying what the bytes do.'
+	$hasMark = ($am.Count -gt 0)
+	if ($p -eq 'force_jcc') {
+		$checked = $true
+		$expect = 'unconditional jmp in the patched bytes (a leading nop is ok)'
+		$jccLeft = @($am | Where-Object { Test-MBJccMnemonic $_ })
+		$verified = ($hasMark -and ($am -contains 'jmp') -and $jccLeft.Count -eq 0)
+		$reason = if ($verified) { 'Marked instructions include jmp and no conditional jump.' } elseif (-not $hasMark) { 'No marked instruction in disasm_after.' } else { 'Patch is not an unconditional jmp. Do not claim the branch was forced.' }
+	} elseif ($p -eq 'invert_jcc') {
+		$checked = $true
+		$expect = 'a different conditional jump than before'
+		$a0 = if ($am.Count -gt 0) { [string]$am[0] } else { '' }
+		$b0 = if ($bm.Count -gt 0) { [string]$bm[0] } else { '' }
+		$verified = ((Test-MBJccMnemonic $a0) -and (Test-MBJccMnemonic $b0) -and ($a0 -ne $b0))
+		$reason = if ($verified) { "Conditional jump changed from $b0 to $a0." } elseif (-not $hasMark) { 'No marked instruction in disasm_after.' } else { "Expected a flipped conditional jump (before=$b0 after=$a0)." }
+	} elseif ($p -eq 'nop_range') {
+		$checked = $true
+		$expect = 'nop on every marked instruction'
+		$bad = @($am | Where-Object { $_ -ne 'nop' })
+		$verified = ($hasMark -and $bad.Count -eq 0)
+		$reason = if ($verified) { 'Every marked instruction is nop.' } elseif (-not $hasMark) { 'No marked instruction in disasm_after.' } else { ('Not all marked instructions are nop: {0}' -f ($bad -join ', ')) }
+	} elseif ($p -eq 'ret0') {
+		$checked = $true
+		$expect = 'xor then ret'
+		$verified = (($am -contains 'xor') -and ($am -contains 'ret'))
+		$reason = if ($verified) { 'Marked instructions include xor and ret.' } else { 'ret0 did not disassemble as xor + ret.' }
+	} elseif ($p -eq 'ret') {
+		$checked = $true
+		$expect = 'ret'
+		$verified = ($hasMark -and [string]$am[0] -eq 'ret')
+		$reason = if ($verified) { 'First marked instruction is ret.' } else { 'First marked instruction is not ret.' }
+	} elseif ($p -eq 'int3') {
+		$checked = $true
+		$expect = 'int3 on every marked instruction'
+		$bad = @($am | Where-Object { $_ -ne 'int3' })
+		$verified = ($hasMark -and $bad.Count -eq 0)
+		$reason = if ($verified) { 'Every marked instruction is int3.' } else { 'Not every marked instruction is int3.' }
+	}
+	$claim = if (-not $checked) {
+		'Bytes only. Quote disasm_after (lines starting with >) before describing the instruction. HexView offset=' + $OffsetHex + ' disasm=true if this listing is missing.'
+	} elseif ($verified) {
+		'verified=true. You may say the preset landed. Quote the marked mnemonic. This does not prove the program takes that path — trace both sides before claiming control flow.'
+	} else {
+		'verified=false. Do not claim the preset worked. HexView offset=' + $OffsetHex + ' disasm=true, or undo.'
+	}
+	return [ordered]@{
+		checked = $checked
+		verified = [bool]$verified
+		preset = $(if ($Preset) { [string]$Preset } else { $null })
+		expect = $expect
+		marked_before = @($bm)
+		marked_after = @($am)
+		reason = $reason
+		claim = $claim
 	}
 }
 
@@ -33102,6 +33571,7 @@ function Invoke-HexEdit {
 		$rh = $repHex.Trim() -replace '[,\-:]', ' ' -replace '\s+', ' '
 		foreach ($tok in ($rh -split ' ')) {
 			if ([string]::IsNullOrWhiteSpace($tok)) { continue }
+			if ($tok -match '^(?i)(?:0x|\\x)(.+)$') { $tok = $Matches[1] }
 			$repTokens += $tok.ToUpperInvariant()
 		}
 		if ($repTokens.Count -eq 0) { return 'ERROR: empty replace_hex' }
@@ -33114,19 +33584,29 @@ function Invoke-HexEdit {
 		if ($found.count -eq 0) {
 			return ConvertTo-MBJson ([ordered]@{ status = 'ok'; path = $path; pattern = $pat; replaced = 0; note = 'no matches' }) -Depth 5
 		}
-		$details = "replace_pattern`nPath: $path`nPattern: $pat`nReplace: $repHex`nHits: $($found.count)$(if ($found.truncated) { ' (TRUNCATED — raise max=)' } else { '' })"
+		$useHits = New-Object System.Collections.ArrayList
+		$skippedOverlap = 0
+		$lastEnd = -1L
+		foreach ($h in ($found.hits | Sort-Object { [long]$_.offset })) {
+			$absHit = [long]$h.offset
+			if ($absHit -lt $lastEnd) { $skippedOverlap++; continue }
+			[void]$useHits.Add($h)
+			$lastEnd = $absHit + [long]$pm.Length
+		}
+		$details = "replace_pattern`nPath: $path`nPattern: $pat`nReplace: $repHex`nHits: $($useHits.Count)$(if ($skippedOverlap -gt 0) { " ($skippedOverlap overlapping hit(s) skipped)" } else { '' })$(if ($found.truncated) { ' (TRUNCATED — raise max=)' } else { '' })"
 		if ($dry_run) {
-			$hitList = @($found.hits | Select-Object -First 24 | ForEach-Object { $_.offset_hex })
+			$hitList = @($useHits | Select-Object -First 24 | ForEach-Object { $_.offset_hex })
 			return ConvertTo-MBJson ([ordered]@{
 				status = 'preview'
 				dry_run = $true
 				path = $path
 				pattern = $pat
 				replace_hex = $repHex
-				would_replace = $found.count
+				would_replace = $useHits.Count
+				skipped_overlap = $skippedOverlap
 				truncated_search = [bool]$found.truncated
 				sample_offsets = $hitList
-				hint = 'dry_run only — no writes. Re-call without dry_run=true to apply.'
+				hint = 'dry_run only — no writes. Re-call without dry_run=true to apply. Overlapping hits are skipped.'
 			}) -Depth 6
 		}
 		if (-not (Request-Confirmation -Title 'HexEdit replace_pattern requires approval' -Details $details -Code $details -CodeLang 'text')) {
@@ -33139,7 +33619,7 @@ function Invoke-HexEdit {
 		$nRep = 0
 		try {
 			$fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-			foreach ($h in @($found.hits)) {
+			foreach ($h in $useHits) {
 				$abs = [long]$h.offset
 				$before = New-Object byte[] $pm.Length
 				[void]$fs.Seek($abs, [System.IO.SeekOrigin]::Begin)
@@ -33147,7 +33627,7 @@ function Invoke-HexEdit {
 				if ($rn -lt $pm.Length) { continue }
 				$after = New-Object byte[] $pm.Length
 				for ($i = 0; $i -lt $pm.Length; $i++) {
-					if ($repTokens[$i] -eq '??' -or $repTokens[$i] -eq '?') {
+					if ($repTokens[$i] -eq '??' -or $repTokens[$i] -eq '?' -or $repTokens[$i] -eq '*') {
 						$after[$i] = $before[$i]
 					} else {
 						$after[$i] = [Convert]::ToByte($repTokens[$i], 16)
@@ -33170,11 +33650,19 @@ function Invoke-HexEdit {
 			pattern = $pat
 			replace_hex = $repHex
 			replaced = $nRep
+			skipped_overlap = $skippedOverlap
 			truncated_search = [bool]$found.truncated
 			truncation_hint = (Add-MBForensicsTruncationNote -Truncated ([bool]$found.truncated) -Tool 'HexEdit replace_pattern search' -Count $nRep -Cap $maxHits)
 			backup = $bakPath
 			undo_ids = @($undoIds)
-			hint = 'All replacements stacked for undo (newest ids last). action=history lists full stack; action=undo_all reverts.'
+			verify = [ordered]@{
+				checked = $false
+				verified = $false
+				replaced = $nRep
+				sample_offset = $(if ($useHits.Count -gt 0) { [string]$useHits[0].offset_hex } else { $null })
+				claim = 'Sites were overwritten. HexView disasm=true at sample_offset before claiming what the new bytes do. One site is not proof for every hit.'
+			}
+			hint = 'All replacements stacked for undo (newest ids last). action=history lists full stack; action=undo_all reverts. verify.verified is false until you disassemble a hit.'
 		}) -Depth 8
 	}
 
@@ -33319,6 +33807,10 @@ $(if ($disasmBefore) { "`nDisasm BEFORE ( > = patch range ):`n$disasmBefore`n" }
 	} elseif ($beforeDump) {
 		"BEFORE:`n$beforeDump`n`nAFTER:`n$previewDump"
 	} else { $previewDump }
+	$hexVerify = $null
+	try {
+		$hexVerify = Get-MBHexEditDisasmVerify -Preset $preset -BeforeListing $disasmBefore -AfterListing $disasmAfter -OffsetHex ('0x{0:X}' -f $off)
+	} catch { $hexVerify = $null }
 	if ($dry_run) {
 		return ConvertTo-MBJson ([ordered]@{
 			status = 'preview'
@@ -33333,7 +33825,8 @@ $(if ($disasmBefore) { "`nDisasm BEFORE ( > = patch range ):`n$disasmBefore`n" }
 			after_dump = $previewDump
 			disasm_before = $(if ($disasmBefore) { $disasmBefore } else { $null })
 			disasm_after = $(if ($disasmAfter) { $disasmAfter } else { $null })
-			hint = 'dry_run/preview only — no bytes written. Re-call without dry_run=true to apply (approval required). Presets: force_jcc|invert_jcc|nop_range|ret0|ret|int3; or hex=/bytes=[].'
+			verify = $hexVerify
+			hint = 'dry_run/preview only — no bytes written. Trust verify.verified, not the preset name. Re-call without dry_run=true to apply (approval required).'
 		}) -Depth 8
 	}
 	if (-not (Request-Confirmation -Title 'HexEdit requires approval' -Details $details -Code $codeShow -CodeLang 'text')) {
@@ -33374,9 +33867,9 @@ $(if ($disasmBefore) { "`nDisasm BEFORE ( > = patch range ):`n$disasmBefore`n" }
 		} catch {}
 		$undoId = $null
 		try {
-			if ($null -ne $beforeBytes -and $beforeBytes.Length -gt 0) {
-				$undoId = Add-MBHexEditUndoEntry -Path $path -Offset $off -BeforeBytes $beforeBytes -AfterBytes $patch -Preset $preset -BackupPath $bakPath
-			}
+			$beforeForUndo = $beforeBytes
+			if ($null -eq $beforeForUndo) { $beforeForUndo = New-Object byte[] 0 }
+			$undoId = Add-MBHexEditUndoEntry -Path $path -Offset $off -BeforeBytes $beforeForUndo -AfterBytes $patch -Preset $preset -BackupPath $bakPath -FileLengthBefore $curSize -Created (-not $exists)
 		} catch { $undoId = $null }
 		return ConvertTo-MBJson @{
 			status     = $tag
@@ -33389,11 +33882,12 @@ $(if ($disasmBefore) { "`nDisasm BEFORE ( > = patch range ):`n$disasmBefore`n" }
 			preset     = $(if ($preset) { $preset } else { $null })
 			preset_note = $(if ($presetNote) { $presetNote } else { $null })
 			undo_id    = $undoId
-			undo_hint  = $(if ($null -ne $undoId) { ('HexEdit action=undo id={0}  (or action=history / undo_all)' -f $undoId) } else { 'No undo entry (missing before-bytes); use path.bak if backup=true' })
+			undo_hint  = $(if ($null -ne $undoId) { ('HexEdit action=undo id={0}  (or action=history / undo_all). Undo also shrinks a file this patch extended.' -f $undoId) } else { 'No undo entry; use path.bak if backup=true' })
 			disasm_before = $(if ($disasmBefore) { $disasmBefore } else { $null })
 			disasm_after  = $(if ($disasmAfter) { $disasmAfter } else { $null })
 			disasm_error  = $(if ($disasmError) { $disasmError } else { $null })
 			disasm_mark   = 'Lines prefixed with > are inside the patched byte range'
+			verify     = $hexVerify
 			dump       = $previewDump
 		}
 	} catch {
