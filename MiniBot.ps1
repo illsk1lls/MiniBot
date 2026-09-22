@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.52.0 - Local AI agent host for Windows PowerShell 5.1
+	MiniBot v2.54.0 - Local AI agent host for Windows PowerShell 5.1
 .DESCRIPTION
 	OpenAI-compatible agent client (WPF UI + tools). Hybrid .CMD/.PS1 launcher; irm|iex friendly.
 .NOTES
@@ -38,7 +38,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.52.0",
+	[string]$Version = "2.54.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -6466,7 +6466,7 @@ function Show-MBHelp {
 	Write-Host ""
 	Write-MBRule -Label "core highlights"
 	Write-Host "  TaskBoard - ordered plan cursor (SESSION STATE); execute only now; set|update|status|clear" -ForegroundColor Gray
-	Write-Host "  Edit stack - EditFile / ApplyPatch / WriteFile (unified LCS diffs, path.bak default)" -ForegroundColor Gray
+	Write-Host "  Edit stack - EditFile (search or startLine/endLine) / ApplyPatch / WriteFile; whitespace-tolerant; path.bak; atomic save" -ForegroundColor Gray
 	Write-Host "  Forensics group - PeInfo/HexView/HexEdit/FindHexPattern/StringExtract/ImportTableViewer/ResourceEditor/SectionManager" -ForegroundColor Gray
 	Write-Host "  Recovery group  - RecycleBin/MFT undelete/VSS/USN (live NTFS deleted data only; not formatted disks)" -ForegroundColor Gray
 	Write-Host "  Web - SearchWeb then BrowsePage; MakeHttpRequest for APIs; GitHub raw helpers" -ForegroundColor Gray
@@ -12135,7 +12135,7 @@ FINAL REPLY after tools (when no more tools): short DID: (what worked) and NEXT:
 
 $script:MBGroupPrompt = [ordered]@{
 	core = @"
-CORE: multi-step → TaskBoard first (one board call/turn; ordered plan; execute ONLY now; update id=now status=done epoch=<from last result>; never mark later steps early; blocked+note if stuck; after complete do not invent a new board). Text files Read/Write/Edit/ApplyPatch; List/Search/FindFiles; DiffText; RunCommand last resort; EnableToolGroup. Prefer specialized tools. ReadFile before Edit/ApplyPatch. Mutating file tools write path.bak by default. PE/binary: forensics. Deleted files (live NTFS): recovery. Images/PDF/screen: vision. MEDIA: ![label](absolute-path).
+CORE: multi-step → TaskBoard first (one board call/turn; ordered plan; execute ONLY now; update id=now status=done epoch=<from last result>; never mark later steps early; blocked+note if stuck; after complete do not invent a new board). Text files: ReadFile numbered=true before edits; EditFile unique search OR startLine+endLine (whitespace/tab/indent tolerant); ApplyPatch for hunks (@@ line hints, context may omit the leading space); WriteFile to create/overwrite. path.bak default. List/Search/FindFiles; DiffText; RunCommand last resort; EnableToolGroup. Prefer specialized tools. PE/binary: forensics. Deleted files (live NTFS): recovery. Images/PDF/screen: vision. MEDIA: ![label](absolute-path).
 "@
 	vision = @"
 VISION: ReadImage (auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true -> show with ![label](path) inline, not external open). No ReadFile on images/PDF. SpeakText is sound group.
@@ -12247,10 +12247,10 @@ function Get-MBSystemPrompt {
 $SystemPrompt = Get-MBSystemPrompt
 
 $Tools = @(
-	@{ type = "function"; function = @{ name = "ReadFile"; description = "Read text files (head/tail/offset+length). NEVER images/video/PDF/binary — use vision tools or ![path]."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; head = @{ type = "integer" }; tail = @{ type = "integer" }; offset = @{ type = "integer" }; length = @{ type = "integer" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "WriteFile"; description = "Create/overwrite whole file. Prefer EditFile/ApplyPatch for edits. ALWAYS prompts. Default backup=true writes path.bak before overwrite."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" }; backup = @{ type = "boolean"; description = "Write path.bak before overwrite (default true; ignored on create)" } }; required = @("path","content") } } },
-	@{ type = "function"; function = @{ name = "EditFile"; description = "Search/replace (unique match default). replaceAll / occurrence / edits[] supported. ALWAYS prompts. Default backup=true writes path.bak first. Prefer ReadFile first."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" }; backup = @{ type = "boolean"; description = "Write path.bak before apply (default true)" }; edits = @{ type = "array"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply unified diff / *** Update File patch. Creates files when --- /dev/null or *** Add File. ALWAYS prompts. Default backup=true for existing targets."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string" }; path = @{ type = "string" }; backup = @{ type = "boolean"; description = "Write path.bak before patching existing files (default true)" } }; required = @("patch") } } },
+	@{ type = "function"; function = @{ name = "ReadFile"; description = "Read text files. head/tail or offset+length (1-based lines). numbered=true prefixes 'NNNN| ' which is NOT file content — use those numbers with EditFile startLine. NEVER images/video/PDF/binary."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; head = @{ type = "integer" }; tail = @{ type = "integer" }; offset = @{ type = "integer" }; length = @{ type = "integer" }; numbered = @{ type = "boolean"; description = "Prefix each line with its 1-based number. Not part of the file." } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "WriteFile"; description = "Create/overwrite a whole text file. Prefer EditFile/ApplyPatch for edits. Refuses binaries. ALWAYS prompts. Atomic save. Default backup=true writes path.bak before overwrite."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; content = @{ type = "string" }; backup = @{ type = "boolean"; description = "Write path.bak before overwrite (default true; ignored on create)" } }; required = @("path","content") } } },
+	@{ type = "function"; function = @{ name = "EditFile"; description = "Edit text. Unique search/replace, or startLine+endLine (1-based inclusive) to replace that span with replace. edits[] for several. Exact match first; then trailing space, tabs-vs-spaces, and one uniform indent shift. ALWAYS prompts. backup=true writes path.bak. ReadFile numbered=true first. Do not copy the NNNN| prefix into search."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; search = @{ type = "string" }; replace = @{ type = "string" }; startLine = @{ type = "integer"; description = "1-based first line. With endLine and no search, replaces that span. With search, limits the match to the span." }; endLine = @{ type = "integer"; description = "1-based last line inclusive. Defaults to startLine." }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" }; backup = @{ type = "boolean"; description = "Write path.bak before apply (default true)" }; edits = @{ type = "array"; items = @{ type = "object"; properties = @{ search = @{ type = "string" }; replace = @{ type = "string" }; startLine = @{ type = "integer" }; endLine = @{ type = "integer" }; useRegex = @{ type = "boolean" }; replaceAll = @{ type = "boolean" }; occurrence = @{ type = "integer" } }; required = @("search","replace") } } }; required = @("path") } } },
+	@{ type = "function"; function = @{ name = "ApplyPatch"; description = "Apply a unified diff. @@ -old,count disambiguates duplicate matches. Context lines may omit the leading space. @@ -N,0 inserts at that line. Creates files on --- /dev/null or *** Add File. ALWAYS prompts. Default backup=true for existing targets."; parameters = @{ type = "object"; properties = @{ patch = @{ type = "string" }; path = @{ type = "string" }; backup = @{ type = "boolean"; description = "Write path.bak before patching existing files (default true)" } }; required = @("patch") } } },
 	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell (default) or cmd. Pass exact command text. Mutating/multi-statement/redirects need approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string" }; shell = @{ type = "string"; enum = @("powershell","cmd") }; timeout_sec = @{ type = "integer" } }; required = @("command") } } },
 	@{ type = "function"; function = @{ name = "RemoteCommand"; description = "Domain-administrator remoting tool (WinRM only). REQUIRES this host domain-joined with a signed-in domain user (orange/unavailable on workgroup or local-user sessions). Run a command on a REMOTE host (not this PC). ALWAYS approval. Native WinRM/PowerShell remoting. host= + command= required. shell=powershell|cmd|pwsh. Prefer username=DOMAIN\\DomainAdmin + password. Empty password only if account is truly blank. Optional port, use_ssl, timeout_sec. transport=winrm only. On auth failure NEED_INPUT for domain admin credentials. Do not use local RunCommand for remote hosts."; parameters = @{ type = "object"; properties = @{ host = @{ type = "string"; description = "Remote IP or hostname (also accepts user@host or host:port)" }; computer = @{ type = "string"; description = "Alias for host" }; command = @{ type = "string"; description = "Command/script to run on the remote host" }; transport = @{ type = "string"; description = "winrm only (default)" }; shell = @{ type = "string"; description = "powershell (default), cmd, or pwsh" }; username = @{ type = "string"; description = "Domain account preferred: DOMAIN\\DomainAdmin (domain admin tool)" }; password = @{ type = "string"; description = "Domain account password (WinRM). Empty only if truly blank" }; port = @{ type = "integer"; description = "WinRM port (default 5985 / 5986 with use_ssl)" }; use_ssl = @{ type = "boolean"; description = "WinRM over HTTPS" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default harness CommandTimeout)" } }; required = @("host","command") } } },
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
@@ -12520,9 +12520,9 @@ $script:MBToolGroupMeta = [ordered]@{
 # Keys must match tool function names. Keep short, plain language; no agent routing.
 $script:MBToolUserTips = [ordered]@{
 	# core
-	ReadFile              = 'Read a text file (optionally head, tail, or a slice). Not for images, video, or PDFs.'
+	ReadFile              = 'Read a text file (head, tail, slice, or numbered lines). Not for images, video, or PDFs.'
 	WriteFile             = 'Create or overwrite a whole text file. You will be asked to approve.'
-	EditFile              = 'Search-and-replace edit in a file (diff shown in chat). You will be asked to approve.'
+	EditFile              = 'Search-and-replace or replace a line range (diff shown in chat). You will be asked to approve.'
 	ApplyPatch            = 'Apply a unified diff / patch to files. You will be asked to approve.'
 	ListDirectory         = 'List files and folders in a directory.'
 	SearchFiles           = 'Search inside file contents under a folder (regex).'
@@ -14104,13 +14104,62 @@ function Get-MBReadFileMediaBlockMessage {
 	return "BLOCKED: File looks binary/media - never ReadFile. Use ReadImage/ReadPdf for vision media, or ![path] to display for the operator."
 }
 
+function Test-MBTextMutationBlocked {
+	# Refuse Edit/Write/Patch on binaries. UTF-16 text (BOM) is allowed; sniff would otherwise call it binary because of NULs.
+	param([string]$Path)
+	if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+	$ext = ''
+	try { $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant() } catch { $ext = '' }
+	$blocked = @(
+		'.exe','.dll','.sys','.drv','.ocx','.com','.scr','.msi','.msp','.mst','.cab',
+		'.dmp','.hdmp','.mdmp','.kdmp',
+		'.zip','.rar','.7z','.tar','.gz','.bz2','.xz','.iso','.img','.wim','.esd',
+		'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.odt','.ods','.odp',
+		'.db','.sqlite','.mdb','.accdb','.bin','.pak','.bundle','.so','.dylib',
+		'.png','.jpg','.jpeg','.gif','.bmp','.ico','.webp','.tif','.tiff','.heic','.heif','.jfif',
+		'.mp4','.m4v','.mov','.avi','.mkv','.wmv','.webm',
+		'.mp3','.wav','.flac','.aac','.ogg','.m4a','.wma'
+	)
+	if ($ext -and ($blocked -contains $ext)) {
+		return "BLOCKED: '$ext' is not a text edit. Images/PDF use vision; PE/binary use forensics HexEdit; archives use the files tools."
+	}
+	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+	$utf16 = $false
+	try {
+		$fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		try {
+			$buf = New-Object byte[] 8192
+			$n = $fs.Read($buf, 0, $buf.Length)
+			if ($n -ge 2 -and (($buf[0] -eq 0xFF -and $buf[1] -eq 0xFE) -or ($buf[0] -eq 0xFE -and $buf[1] -eq 0xFF))) {
+				$utf16 = $true
+			} elseif ($n -gt 0) {
+				for ($i = 0; $i -lt $n; $i++) {
+					if ($buf[$i] -eq 0) {
+						return 'BLOCKED: file contains NUL bytes. Use HexEdit for binary patches, not EditFile/ApplyPatch/WriteFile.'
+					}
+				}
+			}
+		} finally { try { $fs.Dispose() } catch {} }
+	} catch {}
+	if (-not $utf16) {
+		try {
+			$sniff = Test-MBBinaryMediaSniff -Path $Path
+			if ($sniff) {
+				return "BLOCKED: file looks like $sniff, not text. Images/PDF use vision; binaries use HexEdit."
+			}
+		} catch {}
+	}
+	return $null
+}
+
 function Invoke-ReadFile {
 	param(
 		[string]$path,
 		[int]$head = 0,
 		[int]$tail = 0,
 		[int]$offset = 0,
-		[int]$length = 0
+		[int]$length = 0,
+		[bool]$numbered = $false
 	)
 
 	$path = Resolve-MBPath $path
@@ -14154,22 +14203,44 @@ function Invoke-ReadFile {
 	}
 
 	try {
-		# prefer UTF-8 over ANSI when high-bit characters present
-		$result = $null
-		if ($tail -gt 0) {
-			$result = Limit-MBResult ((Get-Content -LiteralPath $path -Tail $tail -Encoding UTF8 -ErrorAction Stop | Out-String))
+		# Same decoder EditFile uses, so a copied search string matches the bytes we write back.
+		# Large files stay streamed — do not ReadAllBytes a multi-MB log just to show a tail.
+		if ($isLarge) {
+			$rawLines = @()
+			if ($tail -gt 0) {
+				$rawLines = @(Get-Content -LiteralPath $path -Tail $tail -Encoding UTF8 -ErrorAction Stop)
+			}
+			elseif ($head -gt 0) {
+				$rawLines = @(Get-Content -LiteralPath $path -TotalCount $head -Encoding UTF8 -ErrorAction Stop)
+			}
+			elseif (($offset -gt 0) -and ($length -gt 0)) {
+				$rawLines = @(Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | Select-Object -Skip ($offset - 1) -First $length)
+			}
+			$body = [string]($rawLines -join "`r`n")
+			if ($numbered) {
+				$note = '# large-file slice. '
+				if ($tail -gt 0) {
+					$note += 'Numbers below count this tail only, not the file. Use offset+length for real line numbers.'
+				} else {
+					$note += 'The "NNNN| " prefix is NOT file content.'
+				}
+				$sb = New-Object System.Text.StringBuilder
+				[void]$sb.AppendLine($note)
+				for ($i = 0; $i -lt $rawLines.Count; $i++) {
+					$no = if ($tail -gt 0) { $i + 1 } elseif ($offset -gt 0) { $offset + $i } else { $i + 1 }
+					[void]$sb.AppendLine(('{0,4}| {1}' -f $no, [string]$rawLines[$i]))
+				}
+				$body = $sb.ToString().TrimEnd("`r", "`n")
+			}
+			try { Register-MBFileRead -Path $path } catch {}
+			return (Limit-MBResult $body)
 		}
-		elseif ($head -gt 0) {
-			$result = Limit-MBResult ((Get-Content -LiteralPath $path -TotalCount $head -Encoding UTF8 -ErrorAction Stop | Out-String))
-		}
-		elseif (($offset -gt 0) -and ($length -gt 0)) {
-			$result = Limit-MBResult ((Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | Select-Object -Skip ($offset - 1) -First $length | Out-String))
-		}
-		else {
-			$result = Limit-MBResult ((Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop))
-		}
+
+		$doc = Read-MBTextFile -Path $path
+		$result = Get-MBFileSliceText -Text ([string]$doc.Text) -Newline ([string]$doc.Newline) `
+			-Head $head -Tail $tail -Offset $offset -Length $length -Numbered $numbered
 		try { Register-MBFileRead -Path $path } catch {}
-		return $result
+		return (Limit-MBResult $result)
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -14192,6 +14263,101 @@ function Convert-MBToNewlineStyle {
 		'CR'   { return ($n -replace "`n", "`r") }
 		default { return $n }
 	}
+}
+
+function Expand-MBIndentTabs {
+	param([AllowNull()][string]$Line)
+	if ($null -eq $Line -or $Line.IndexOf("`t") -lt 0) { return [string]$Line }
+	$sb = New-Object System.Text.StringBuilder ($Line.Length + 8)
+	$col = 0
+	foreach ($ch in $Line.ToCharArray()) {
+		if ($ch -eq [char]9) {
+			$pad = 4 - ($col % 4)
+			if ($pad -le 0) { $pad = 4 }
+			[void]$sb.Append([char]32, $pad)
+			$col += $pad
+		} else {
+			[void]$sb.Append($ch)
+			$col++
+		}
+	}
+	return $sb.ToString()
+}
+
+function Get-MBLineSpans {
+	# LF text only. Each span is one line; Nl is 1 when that line ends with a newline.
+	param([AllowNull()][string]$Text)
+	$list = New-Object System.Collections.Generic.List[object]
+	if ([string]::IsNullOrEmpty($Text)) { return $list }
+	$i = 0
+	$n = $Text.Length
+	while ($i -lt $n) {
+		$start = $i
+		while ($i -lt $n -and $Text[$i] -ne "`n") { $i++ }
+		$end = $i
+		$nl = 0
+		if ($i -lt $n -and $Text[$i] -eq "`n") {
+			$nl = 1
+			$i++
+		}
+		[void]$list.Add(@{
+			Start = $start
+			End   = $end
+			Nl    = $nl
+			Text  = $Text.Substring($start, $end - $start)
+		})
+	}
+	return $list
+}
+
+function Get-MBFileSliceText {
+	param(
+		[AllowNull()][string]$Text,
+		[string]$Newline = 'LF',
+		[int]$Head = 0,
+		[int]$Tail = 0,
+		[int]$Offset = 0,
+		[int]$Length = 0,
+		[bool]$Numbered = $false
+	)
+	if ($null -eq $Text) { $Text = '' }
+	$lf = $Text -replace "`r`n", "`n" -replace "`r", "`n"
+	$spans = Get-MBLineSpans -Text $lf
+	$total = $spans.Count
+	$from = 0
+	$to = $total
+	if ($Tail -gt 0) {
+		$take = [math]::Min($total, $Tail)
+		$from = $total - $take
+	}
+	elseif ($Head -gt 0) {
+		$to = [math]::Min($total, $Head)
+	}
+	elseif (($Offset -gt 0) -and ($Length -gt 0)) {
+		$from = [math]::Max(0, $Offset - 1)
+		if ($from -gt $total) { $from = $total }
+		$to = [math]::Min($total, $from + $Length)
+	}
+	if ($Numbered) {
+		$firstShown = 0
+		$lastShown = 0
+		if ($to -gt $from) {
+			$firstShown = $from + 1
+			$lastShown = $to
+		}
+		$sb = New-Object System.Text.StringBuilder
+		[void]$sb.AppendLine(('# lines {0}-{1} of {2}. The "NNNN| " prefix is NOT file content. EditFile startLine/endLine uses these numbers; search text must omit the prefix.' -f $firstShown, $lastShown, $total))
+		for ($i = $from; $i -lt $to; $i++) {
+			[void]$sb.AppendLine(('{0,4}| {1}' -f ($i + 1), [string]$spans[$i].Text))
+		}
+		return $sb.ToString().TrimEnd("`r", "`n")
+	}
+	$sb2 = New-Object System.Text.StringBuilder
+	for ($i = $from; $i -lt $to; $i++) {
+		[void]$sb2.Append([string]$spans[$i].Text)
+		if ([int]$spans[$i].Nl -gt 0) { [void]$sb2.Append("`n") }
+	}
+	return (Convert-MBToNewlineStyle -Text $sb2.ToString() -Style $Newline)
 }
 
 function Read-MBTextFile {
@@ -14258,7 +14424,28 @@ function Write-MBTextFile {
 	if ($dir -and -not (Test-Path -LiteralPath $dir)) {
 		New-Item -ItemType Directory -Path $dir -Force | Out-Null
 	}
-	[System.IO.File]::WriteAllText($Path, $payload, $enc)
+	# Same-directory temp, then replace, so a crash cannot leave a half-written target.
+	$tmpName = '.mbwrite-' + [guid]::NewGuid().ToString('n')
+	$tmp = if ($dir) { Join-Path $dir $tmpName } else { $tmpName }
+	try {
+		[System.IO.File]::WriteAllText($tmp, $payload, $enc)
+		if ([System.IO.File]::Exists($Path)) {
+			$replaced = $false
+			try {
+				[System.IO.File]::Replace($tmp, $Path, $null, $true)
+				$replaced = $true
+			} catch {}
+			if (-not $replaced) {
+				[System.IO.File]::Copy($tmp, $Path, $true)
+				try { [System.IO.File]::Delete($tmp) } catch {}
+			}
+		} else {
+			[System.IO.File]::Move($tmp, $Path)
+		}
+	} catch {
+		try { if ([System.IO.File]::Exists($tmp)) { [System.IO.File]::Delete($tmp) } } catch {}
+		throw
+	}
 }
 
 function Backup-MBFile {
@@ -14424,6 +14611,194 @@ function Get-MBLineDiffOpsLcs {
 	return $ops
 }
 
+function Get-MBLisAnchorIndices {
+	# Longest increasing subsequence of pair.N. Pairs must already be in increasing O order.
+	param($Pairs)
+	$seq = New-Object System.Collections.Generic.List[object]
+	if ($null -eq $Pairs) { return $seq }
+	$n = 0
+	try { $n = [int]$Pairs.Count } catch { return $seq }
+	if ($n -le 0) { return $seq }
+	# Plain arrays. PS 5.1's generic-list indexer returns null inside a nested index.
+	$items = $Pairs.ToArray()
+	$prev = New-Object int[] $n
+	for ($i = 0; $i -lt $n; $i++) { $prev[$i] = -1 }
+	$tailIdx = New-Object int[] $n
+	$tailLen = 0
+	for ($i = 0; $i -lt $n; $i++) {
+		$val = [int]$items[$i].N
+		$lo = 0
+		$hi = $tailLen
+		while ($lo -lt $hi) {
+			# Floor, not [int] cast: PowerShell rounds x.5 to even and mid can step past hi.
+			$mid = [int]([Math]::Floor(($lo + $hi) / 2))
+			$at = $tailIdx[$mid]
+			$midN = [int]$items[$at].N
+			if ($midN -lt $val) { $lo = $mid + 1 } else { $hi = $mid }
+		}
+		if ($lo -eq $tailLen) {
+			$tailIdx[$tailLen] = $i
+			$tailLen++
+		} else {
+			$tailIdx[$lo] = $i
+		}
+		if ($lo -gt 0) {
+			$prevAt = $lo - 1
+			$prev[$i] = $tailIdx[$prevAt]
+		}
+	}
+	if ($tailLen -le 0) { return $seq }
+	$order = New-Object int[] $tailLen
+	$cur = $tailIdx[$tailLen - 1]
+	$fill = $tailLen - 1
+	while ($cur -ge 0 -and $fill -ge 0) {
+		$order[$fill] = $cur
+		$fill--
+		$cur = $prev[$cur]
+	}
+	$start = $fill + 1
+	for ($k = $start; $k -lt $tailLen; $k++) {
+		[void]$seq.Add($items[$order[$k]])
+	}
+	return $seq
+}
+
+function Add-MBShiftedDiffOps {
+	param($Dest, $Ops, [int]$ShiftOld, [int]$ShiftNew)
+	foreach ($op in $Ops) {
+		if ($null -eq $op) { continue }
+		$kind = [string]$op.Op
+		$oNo = 0
+		$nNo = 0
+		if ($kind -eq 'eq') {
+			$oNo = $ShiftOld + [int]$op.OldNo
+			$nNo = $ShiftNew + [int]$op.NewNo
+		} elseif ($kind -eq 'del') {
+			$oNo = $ShiftOld + [int]$op.OldNo
+		} else {
+			$nNo = $ShiftNew + [int]$op.NewNo
+		}
+		[void]$Dest.Add([pscustomobject]@{ Op = $kind; Text = $op.Text; OldNo = $oNo; NewNo = $nNo })
+	}
+}
+
+function Get-MBGapDiffOps {
+	param(
+		[string[]]$OldLines,
+		[string[]]$NewLines,
+		[int]$MaxLcsLines,
+		[long]$MaxLcsCells,
+		[int]$Depth
+	)
+	$oldA = @($OldLines)
+	$newA = @($NewLines)
+	$n = $oldA.Count
+	$m = $newA.Count
+	$cells = [long]$n * [long]$m
+	$small = ($n -le $MaxLcsLines) -and ($m -le $MaxLcsLines) -and ($cells -le $MaxLcsCells)
+	if ($small) {
+		return (Get-MBLineDiffOpsLcs -OldLines $oldA -NewLines $newA)
+	}
+	if ($Depth -ge 8) {
+		$script:__mbDiffUsedLcs = $false
+		return (Get-MBLineDiffOpsIndexAligned -OldLines $oldA -NewLines $newA)
+	}
+	return (Get-MBLineDiffOpsPatience -OldLines $oldA -NewLines $newA -MaxLcsLines $MaxLcsLines -MaxLcsCells $MaxLcsCells -Depth $Depth)
+}
+
+function Get-MBLineDiffOpsPatience {
+	# Unique common lines become anchors so a large file with a few edits does not fall back to index alignment.
+	param(
+		[string[]]$OldLines,
+		[string[]]$NewLines,
+		[int]$MaxLcsLines = 700,
+		[long]$MaxLcsCells = 250000,
+		[int]$Depth = 0
+	)
+	$oldA = @($OldLines)
+	$newA = @($NewLines)
+	$n = $oldA.Count
+	$m = $newA.Count
+	$ops = New-Object System.Collections.Generic.List[object]
+	if ($n -eq 0 -and $m -eq 0) { return $ops }
+
+	$oldPos = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+	$newPos = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+	$oldDup = New-Object 'System.Collections.Generic.HashSet[string]'
+	$newDup = New-Object 'System.Collections.Generic.HashSet[string]'
+	for ($i = 0; $i -lt $n; $i++) {
+		$k = [string]$oldA[$i]
+		if ($oldDup.Contains($k)) { continue }
+		if ($oldPos.ContainsKey($k)) {
+			[void]$oldPos.Remove($k)
+			[void]$oldDup.Add($k)
+		} else {
+			$oldPos[$k] = $i
+		}
+	}
+	for ($j = 0; $j -lt $m; $j++) {
+		$k = [string]$newA[$j]
+		if ($newDup.Contains($k)) { continue }
+		if ($newPos.ContainsKey($k)) {
+			[void]$newPos.Remove($k)
+			[void]$newDup.Add($k)
+		} else {
+			$newPos[$k] = $j
+		}
+	}
+	$pairs = New-Object System.Collections.Generic.List[object]
+	for ($i = 0; $i -lt $n; $i++) {
+		$k = [string]$oldA[$i]
+		if (-not $oldPos.ContainsKey($k)) { continue }
+		if (-not $newPos.ContainsKey($k)) { continue }
+		if ([int]$oldPos[$k] -ne $i) { continue }
+		[void]$pairs.Add([pscustomobject]@{ O = $i; N = [int]$newPos[$k]; Text = $k })
+	}
+	$lis = Get-MBLisAnchorIndices -Pairs $pairs
+	if ($null -eq $lis -or $lis.Count -eq 0) {
+		$script:__mbDiffUsedLcs = $false
+		return (Get-MBLineDiffOpsIndexAligned -OldLines $oldA -NewLines $newA)
+	}
+
+	$prevO = -1
+	$prevN = -1
+	foreach ($anchor in $lis) {
+		$gsO = $prevO + 1
+		$geO = [int]$anchor.O - 1
+		$gsN = $prevN + 1
+		$geN = [int]$anchor.N - 1
+		if ($geO -ge $gsO -or $geN -ge $gsN) {
+			$gapOld = @()
+			$gapNew = @()
+			if ($geO -ge $gsO) { $gapOld = @($oldA[$gsO..$geO]) }
+			if ($geN -ge $gsN) { $gapNew = @($newA[$gsN..$geN]) }
+			$gapOps = Get-MBGapDiffOps -OldLines $gapOld -NewLines $gapNew -MaxLcsLines $MaxLcsLines -MaxLcsCells $MaxLcsCells -Depth ($Depth + 1)
+			Add-MBShiftedDiffOps -Dest $ops -Ops $gapOps -ShiftOld $gsO -ShiftNew $gsN
+		}
+		[void]$ops.Add([pscustomobject]@{
+			Op = 'eq'
+			Text = [string]$anchor.Text
+			OldNo = ([int]$anchor.O + 1)
+			NewNo = ([int]$anchor.N + 1)
+		})
+		$prevO = [int]$anchor.O
+		$prevN = [int]$anchor.N
+	}
+	$gsO = $prevO + 1
+	$geO = $n - 1
+	$gsN = $prevN + 1
+	$geN = $m - 1
+	if ($geO -ge $gsO -or $geN -ge $gsN) {
+		$gapOld = @()
+		$gapNew = @()
+		if ($geO -ge $gsO) { $gapOld = @($oldA[$gsO..$geO]) }
+		if ($geN -ge $gsN) { $gapNew = @($newA[$gsN..$geN]) }
+		$gapOps = Get-MBGapDiffOps -OldLines $gapOld -NewLines $gapNew -MaxLcsLines $MaxLcsLines -MaxLcsCells $MaxLcsCells -Depth ($Depth + 1)
+		Add-MBShiftedDiffOps -Dest $ops -Ops $gapOps -ShiftOld $gsO -ShiftNew $gsN
+	}
+	return $ops
+}
+
 function Get-MBLineDiffOps {
 	param(
 		[string[]]$OldLines,
@@ -14450,10 +14825,12 @@ function Get-MBLineDiffOps {
 		$midOld = if ($midOldN -gt 0) { $OldLines[$pre..($pre + $midOldN - 1)] } else { @() }
 		$midNew = if ($midNewN -gt 0) { $NewLines[$pre..($pre + $midNewN - 1)] } else { @() }
 		$useLcs = ($midOldN -le $MaxLcsLines) -and ($midNewN -le $MaxLcsLines) -and (([long]$midOldN * [long]$midNewN) -le $MaxLcsCells)
-		$midOps = if ($useLcs) {
-			Get-MBLineDiffOpsLcs -OldLines @($midOld) -NewLines @($midNew)
+		if ($useLcs) {
+			$midOps = Get-MBLineDiffOpsLcs -OldLines @($midOld) -NewLines @($midNew)
+			$script:__mbDiffUsedLcs = $true
 		} else {
-			Get-MBLineDiffOpsIndexAligned -OldLines @($midOld) -NewLines @($midNew)
+			$script:__mbDiffUsedLcs = $true
+			$midOps = Get-MBLineDiffOpsPatience -OldLines @($midOld) -NewLines @($midNew) -MaxLcsLines $MaxLcsLines -MaxLcsCells $MaxLcsCells -Depth 0
 		}
 		# Mid ops use 1-based indices within the mid slice; shift to full-file line numbers
 		foreach ($op in $midOps) {
@@ -14469,7 +14846,6 @@ function Get-MBLineDiffOps {
 			}
 			[void]$ops.Add([pscustomobject]@{ Op = $op.Op; Text = $op.Text; OldNo = $oNo; NewNo = $nNo })
 		}
-		$script:__mbDiffUsedLcs = [bool]$useLcs
 	} else {
 		$script:__mbDiffUsedLcs = $true
 	}
@@ -14927,7 +15303,259 @@ function Find-MBLiteralMatches {
 		[void]$positions.Add($found)
 		$idx = $found + $step
 	}
-	return @($positions)
+	return $positions
+}
+
+function Get-MBSearchLines {
+	param([AllowNull()][string]$Search)
+	if ($null -eq $Search) { $Search = '' }
+	$inc = $Search.EndsWith("`n")
+	$parts = @($Search -split "`n", -1)
+	if ($inc) {
+		if ($parts.Count -le 1) { $parts = @('') }
+		else { $parts = @($parts[0..($parts.Count - 2)]) }
+	}
+	return @{ Lines = $parts; IncludeFinalNl = [bool]$inc }
+}
+
+function Test-MBFuzzyBlockUseful {
+	param([string[]]$Lines, [string]$Mode)
+	$nonWs = 0
+	$nonEmpty = 0
+	foreach ($ln in @($Lines)) {
+		$t = ([string]$ln).Trim()
+		if ($t.Length -eq 0) { continue }
+		$nonEmpty++
+		$nonWs += $t.Length
+	}
+	if ($Mode -eq 'indent') {
+		if ($nonEmpty -ge 2 -and $nonWs -ge 12) { return $true }
+		if ($nonWs -ge 24) { return $true }
+		return $false
+	}
+	if ($nonEmpty -ge 2 -and $nonWs -ge 8) { return $true }
+	if ($nonWs -ge 12) { return $true }
+	return $false
+}
+
+function Add-MBLineHit {
+	param($Hits, $Spans, [int]$LineIndex, [int]$Count, [bool]$IncludeFinalNl, [int]$Delta, [bool]$UseTabs, [string]$Mode)
+	$start = [int]$Spans[$LineIndex].Start
+	$last = $Spans[$LineIndex + $Count - 1]
+	$end = [int]$last.End
+	if ($IncludeFinalNl) { $end += [int]$last.Nl }
+	# A blank line has no characters. Keep its newline so the match is not zero-width.
+	if ($end -eq $start -and [int]$last.Nl -gt 0) { $end += [int]$last.Nl }
+	if ($end -lt $start) { $end = $start }
+	[void]$Hits.Add(@{
+		Line    = ($LineIndex + 1)
+		Index   = $start
+		Length  = ($end - $start)
+		Delta   = $Delta
+		UseTabs = $UseTabs
+		Mode    = $Mode
+	})
+}
+
+function Find-MBExactLineBlockHits {
+	param($Spans, [string[]]$Needles, [bool]$IncludeFinalNl = $false)
+	# ArrayList, not List[object]: PS 5.1 throws "Argument types do not match" when wrapping the latter.
+	$hits = New-Object System.Collections.ArrayList
+	$need = @($Needles)
+	$ns = $need.Count
+	if ($ns -lt 1 -or $null -eq $Spans -or $Spans.Count -lt $ns) { return $hits }
+	$limit = $Spans.Count - $ns
+	for ($i = 0; $i -le $limit; $i++) {
+		$ok = $true
+		for ($j = 0; $j -lt $ns; $j++) {
+			if (([string]$Spans[$i + $j].Text) -cne ([string]$need[$j])) { $ok = $false; break }
+		}
+		if (-not $ok) { continue }
+		Add-MBLineHit -Hits $hits -Spans $Spans -LineIndex $i -Count $ns -IncludeFinalNl $IncludeFinalNl -Delta 0 -UseTabs $false -Mode 'exact'
+	}
+	return $hits
+}
+
+function Find-MBLineBlockHits {
+	param($Spans, [string[]]$Needles, [string]$Mode, [bool]$IncludeFinalNl = $false)
+	$hits = New-Object System.Collections.ArrayList
+	$need = @($Needles)
+	$ns = $need.Count
+	if ($ns -lt 1 -or $null -eq $Spans -or $Spans.Count -lt $ns) { return $hits }
+	if (-not (Test-MBFuzzyBlockUseful -Lines $need -Mode $Mode)) { return $hits }
+	$limit = $Spans.Count - $ns
+	for ($i = 0; $i -le $limit; $i++) {
+		if ($Mode -eq 'indent') {
+			$delta = $null
+			$useTabs = $false
+			$saw = $false
+			$ok = $true
+			for ($j = 0; $j -lt $ns; $j++) {
+				$fe = (Expand-MBIndentTabs -Line ([string]$Spans[$i + $j].Text)).TrimEnd()
+				$se = (Expand-MBIndentTabs -Line ([string]$need[$j])).TrimEnd()
+				$fBody = $fe.TrimStart()
+				$sBody = $se.TrimStart()
+				if ($fBody -cne $sBody) { $ok = $false; break }
+				if ($fBody.Length -eq 0) { continue }
+				$fInd = $fe.Length - $fBody.Length
+				$sInd = $se.Length - $sBody.Length
+				$d = $fInd - $sInd
+				if ($null -eq $delta) { $delta = $d }
+				elseif ($d -ne $delta) { $ok = $false; break }
+				$saw = $true
+				if (([string]$Spans[$i + $j].Text).StartsWith("`t")) { $useTabs = $true }
+			}
+			if (-not $ok -or -not $saw) { continue }
+			if ($null -eq $delta -or [int]$delta -eq 0) { continue }
+			if ([math]::Abs([int]$delta) -gt 24) { continue }
+			Add-MBLineHit -Hits $hits -Spans $Spans -LineIndex $i -Count $ns -IncludeFinalNl $IncludeFinalNl -Delta ([int]$delta) -UseTabs $useTabs -Mode 'indent'
+		} else {
+			$ok = $true
+			for ($j = 0; $j -lt $ns; $j++) {
+				$ft = [string]$Spans[$i + $j].Text
+				$nt = [string]$need[$j]
+				$match = $false
+				if ($Mode -eq 'trim') { $match = ($ft.TrimEnd() -ceq $nt.TrimEnd()) }
+				else { $match = ((Expand-MBIndentTabs -Line $ft).TrimEnd() -ceq (Expand-MBIndentTabs -Line $nt).TrimEnd()) }
+				if (-not $match) { $ok = $false; break }
+			}
+			if (-not $ok) { continue }
+			Add-MBLineHit -Hits $hits -Spans $Spans -LineIndex $i -Count $ns -IncludeFinalNl $IncludeFinalNl -Delta 0 -UseTabs $false -Mode $Mode
+		}
+	}
+	return $hits
+}
+
+function Select-MBHitByHint {
+	param($Hits, [int]$HintLine)
+	if ($null -eq $Hits) { return $null }
+	$count = 0
+	try { $count = [int]$Hits.Count } catch { $count = 0 }
+	if ($count -le 0) { return $null }
+	if ($count -eq 1) { return $Hits[0] }
+	if ($HintLine -le 0) { return $null }
+	$best = $null
+	$bestD = [int]::MaxValue
+	$second = [int]::MaxValue
+	foreach ($h in $Hits) {
+		if ($null -eq $h) { continue }
+		$d = [math]::Abs([int]$h.Line - $HintLine)
+		if ($d -lt $bestD) {
+			$second = $bestD
+			$bestD = $d
+			$best = $h
+		} elseif ($d -lt $second) {
+			$second = $d
+		}
+	}
+	if ($null -eq $best) { return $null }
+	if ($second -eq $bestD) { return $null }
+	return $best
+}
+
+function Add-MBIndentColumns {
+	param([AllowNull()][string]$Text, [int]$Delta, [bool]$UseTabs)
+	$outH = @{ Ok = $true; Text = [string]$Text }
+	if ($null -eq $Text -or $Delta -eq 0 -or $Text.Length -eq 0) { return $outH }
+	$inc = $Text.EndsWith("`n")
+	$parts = @($Text -split "`n", -1)
+	if ($inc) {
+		if ($parts.Count -le 1) { $parts = @('') }
+		else { $parts = @($parts[0..($parts.Count - 2)]) }
+	}
+	$built = New-Object System.Collections.Generic.List[string]
+	foreach ($ln in $parts) {
+		$line = [string]$ln
+		if ($line.Trim().Length -eq 0) {
+			[void]$built.Add($line)
+			continue
+		}
+		if ($Delta -gt 0) {
+			if ($UseTabs -and (($Delta % 4) -eq 0)) { $prefix = "`t" * [int]($Delta / 4) }
+			else { $prefix = ' ' * $Delta }
+			[void]$built.Add($prefix + $line)
+		} else {
+			$cols = [math]::Abs($Delta)
+			$exp = Expand-MBIndentTabs -Line $line
+			$have = 0
+			while ($have -lt $cols -and $have -lt $exp.Length -and $exp[$have] -eq ' ') { $have++ }
+			if ($have -lt $cols) {
+				$outH.Ok = $false
+				$outH.Text = ''
+				return $outH
+			}
+			[void]$built.Add($exp.Substring($cols))
+		}
+	}
+	$joined = [string]($built -join "`n")
+	if ($inc) { $joined += "`n" }
+	$outH.Text = $joined
+	return $outH
+}
+
+function Format-MBAmbiguousMatches {
+	param($Hits, [string]$Label)
+	$locs = New-Object System.Collections.Generic.List[string]
+	$n = 0
+	$total = 0
+	try { $total = [int]$Hits.Count } catch { $total = 0 }
+	foreach ($h in $Hits) {
+		if ($null -eq $h) { continue }
+		if ($n -ge 5) { break }
+		[void]$locs.Add(('  match at line {0} ({1})' -f $h.Line, $h.Mode))
+		$n++
+	}
+	$extra = if ($total -gt 5) { "`n  ... +$($total - 5) more" } else { '' }
+	return @"
+Search matched $total times ($Label) - refusing ambiguous edit (unique match required by default).
+Make 'search' unique with surrounding lines, OR set replaceAll=true, OR set occurrence=N (1-based).
+Matches:
+$($locs -join "`n")$extra
+"@
+}
+
+function Convert-MBToLineList {
+	param($Value)
+	$list = New-Object System.Collections.Generic.List[string]
+	if ($null -eq $Value) { return $list }
+	foreach ($x in @($Value)) {
+		if ($null -eq $x) { continue }
+		[void]$list.Add([string]$x)
+	}
+	return $list
+}
+
+function Get-MBLineWindow {
+	param([string]$ContentLF, [int]$StartLine, [int]$EndLine)
+	$spans = Get-MBLineSpans -Text $ContentLF
+	$count = $spans.Count
+	if ($count -eq 0) { return @{ Error = 'File is empty; use WriteFile to create content.' } }
+	if ($StartLine -lt 1 -or $StartLine -gt $count) { return @{ Error = "startLine=$StartLine is outside 1..$count" } }
+	if ($EndLine -lt $StartLine) { return @{ Error = "endLine=$EndLine is before startLine=$StartLine" } }
+	if ($EndLine -gt $count) { return @{ Error = "endLine=$EndLine is past EOF ($count lines)" } }
+	$first = $spans[$StartLine - 1]
+	$last = $spans[$EndLine - 1]
+	$index = [int]$first.Start
+	$len = ([int]$last.End + [int]$last.Nl) - $index
+	return @{
+		Error     = $null
+		Index     = $index
+		Length    = $len
+		HadNl     = ([int]$last.Nl -gt 0)
+		LineCount = $count
+	}
+}
+
+function Update-MBLineRangeText {
+	param([string]$ContentLF, [int]$StartLine, [int]$EndLine, [AllowNull()][string]$Replacement)
+	$win = Get-MBLineWindow -ContentLF $ContentLF -StartLine $StartLine -EndLine $EndLine
+	if ($win.Error) { return @{ Error = [string]$win.Error; Text = $ContentLF } }
+	$repl = if ($null -eq $Replacement) { '' } else { [string]$Replacement }
+	$repl = $repl -replace "`r`n", "`n" -replace "`r", "`n"
+	# Keep the following line on its own line. Joining lines is a search/replace, not a line-range edit.
+	if ($repl.Length -gt 0 -and [bool]$win.HadNl -and -not $repl.EndsWith("`n")) { $repl += "`n" }
+	$newText = $ContentLF.Remove([int]$win.Index, [int]$win.Length).Insert([int]$win.Index, $repl)
+	return @{ Error = $null; Text = $newText }
 }
 
 function Invoke-MBLiteralReplace {
@@ -14943,87 +15571,118 @@ function Invoke-MBLiteralReplace {
 		NewContent = $Content
 		Error      = $null
 		Mode       = 'LITERAL'
+		EolFlex    = $false
 	}
 	if ([string]::IsNullOrEmpty($Search)) {
 		$result.Error = 'Empty search string'
 		return $result
 	}
-
-	$positions = @(Find-MBLiteralMatches -Content $Content -Search $Search)
-	$usedSearch = $Search
-	$usedReplace = $Replace
+	if ($null -eq $Content) { $Content = '' }
+	$work = [string]$Content
+	$workSearch = [string]$Search
+	$workReplace = if ($null -eq $Replace) { '' } else { [string]$Replace }
 	$eolFlex = $false
 
+	$positions = @(Find-MBLiteralMatches -Content $work -Search $workSearch)
 	if ($positions.Count -eq 0) {
-		$cNorm = $Content -replace "`r`n", "`n" -replace "`r", "`n"
-		$sNorm = $Search -replace "`r`n", "`n" -replace "`r", "`n"
-		$rNorm = if ($null -eq $Replace) { '' } else { $Replace -replace "`r`n", "`n" -replace "`r", "`n" }
-		if ($sNorm -ne $Search -or $cNorm -ne $Content) {
+		$cNorm = $work -replace "`r`n", "`n" -replace "`r", "`n"
+		$sNorm = $workSearch -replace "`r`n", "`n" -replace "`r", "`n"
+		$rNorm = $workReplace -replace "`r`n", "`n" -replace "`r", "`n"
+		if ($sNorm -ne $workSearch -or $cNorm -ne $work) {
 			$positions = @(Find-MBLiteralMatches -Content $cNorm -Search $sNorm)
-			if ($positions.Count -gt 0) {
-				$eolFlex = $true
-				$usedSearch = $sNorm
-				$usedReplace = $rNorm
-				$Content = $cNorm
-			}
+			$work = $cNorm
+			$workSearch = $sNorm
+			$workReplace = $rNorm
+			if ($positions.Count -gt 0) { $eolFlex = $true }
 		}
 	}
 
-	$result.Count = $positions.Count
-	$result.EolFlex = $eolFlex
-
-	if ($positions.Count -eq 0) {
-		$hint = Find-MBSearchNearMiss -Content $Content -Search $Search
-		$msg = 'Search string not found (literal). Include more surrounding context from ReadFile, or fix whitespace.'
-		if ($hint) { $msg = "$msg`n$hint" }
-		$result.Error = $msg
-		return $result
-	}
-
-	if ($Occurrence -gt 0) {
-		if ($Occurrence -gt $positions.Count) {
-			$result.Error = "occurrence=$Occurrence but only $($positions.Count) match(es) found"
+	$spans = New-Object System.Collections.ArrayList
+	$modeLabel = 'exact'
+	$fuzzy = $false
+	if ($positions.Count -gt 0) {
+		foreach ($p in $positions) {
+			$lineNo = ([regex]::Matches($work.Substring(0, [int]$p), "`n")).Count + 1
+			[void]$spans.Add(@{
+				Line = $lineNo; Index = [int]$p; Length = $workSearch.Length
+				Delta = 0; UseTabs = $false; Mode = 'exact'
+			})
+		}
+	} else {
+		$info = Get-MBSearchLines -Search $workSearch
+		$lineSpans = Get-MBLineSpans -Text $work
+		foreach ($mode in @('trim', 'tabs', 'indent')) {
+			$hits = Find-MBLineBlockHits -Spans $lineSpans -Needles @($info.Lines) -Mode $mode -IncludeFinalNl ([bool]$info.IncludeFinalNl)
+			if ($null -eq $hits -or $hits.Count -eq 0) { continue }
+			foreach ($h in $hits) { [void]$spans.Add($h) }
+			break
+		}
+		if ($spans.Count -eq 0) {
+			$hint = Find-MBSearchNearMiss -Content $work -Search $workSearch
+			$msg = 'Search string not found (literal). Include more surrounding context from ReadFile, or fix whitespace.'
+			if ($hint) { $msg = "$msg`n$hint" }
+			$result.Error = $msg
 			return $result
 		}
-		$pos = $positions[$Occurrence - 1]
-		$result.NewContent = $Content.Remove($pos, $usedSearch.Length).Insert($pos, [string]$usedReplace)
+		$fuzzy = $true
+		$modeLabel = [string]$spans[0].Mode
+		$d0 = [int]$spans[0].Delta
+		$t0 = [bool]$spans[0].UseTabs
+		foreach ($h in $spans) {
+			if ([int]$h.Delta -ne $d0 -or [bool]$h.UseTabs -ne $t0) {
+				$result.Count = $spans.Count
+				$result.Error = "Search matched $($spans.Count) places with different indents. Narrow the search so one block is unique."
+				return $result
+			}
+		}
+		if ($modeLabel -eq 'indent' -and $d0 -ne 0) {
+			$adj = Add-MBIndentColumns -Text $workReplace -Delta $d0 -UseTabs $t0
+			if (-not $adj.Ok) {
+				$result.Error = 'Matched with an indent shift, but the replacement is indented less than the file. Include the file indent in replace, or match a larger block.'
+				return $result
+			}
+			$workReplace = [string]$adj.Text
+			$sign = if ($d0 -gt 0) { "+$d0" } else { "$d0" }
+			$modeLabel = "indent$sign"
+		}
+	}
+
+	$result.Count = $spans.Count
+	$result.EolFlex = ($eolFlex -or $fuzzy)
+	if ($Occurrence -gt 0) {
+		if ($Occurrence -gt $spans.Count) {
+			$result.Error = "occurrence=$Occurrence but only $($spans.Count) match(es) found"
+			return $result
+		}
+		$one = $spans[$Occurrence - 1]
+		$result.NewContent = $work.Remove([int]$one.Index, [int]$one.Length).Insert([int]$one.Index, $workReplace)
 		$result.Count = 1
-		$result.Mode = "LITERAL#${Occurrence}"
+		$suffix = if ($fuzzy) { "~$modeLabel" } else { '' }
+		$result.Mode = "LITERAL$suffix#${Occurrence}"
 		return $result
 	}
-
-	if (-not $ReplaceAll -and $positions.Count -gt 1) {
-		$locs = New-Object System.Collections.Generic.List[string]
-		$lines = $Content -split "`n", -1
-		foreach ($p in ($positions | Select-Object -First 5)) {
-			$before = $Content.Substring(0, $p)
-			$lineNo = ([regex]::Matches($before, "`n")).Count + 1
-			$snippet = $usedSearch -replace "`n", '\n'
-			if ($snippet.Length -gt 80) { $snippet = $snippet.Substring(0, 77) + '...' }
-			[void]$locs.Add("  match at line ~$lineNo : $snippet")
+	if (-not $ReplaceAll -and $spans.Count -gt 1) {
+		$result.Error = (Format-MBAmbiguousMatches -Hits $spans -Label $(if ($fuzzy) { $modeLabel } else { 'exact' }))
+		return $result
+	}
+	for ($i = 1; $i -lt $spans.Count; $i++) {
+		$prevEnd = [int]$spans[$i - 1].Index + [int]$spans[$i - 1].Length
+		if ([int]$spans[$i].Index -lt $prevEnd) {
+			$result.Error = 'Matches overlap. Narrow the search so each hit is separate.'
+			return $result
 		}
-		$extra = if ($positions.Count -gt 5) { "`n  ... +$($positions.Count - 5) more" } else { '' }
-		$result.Error = @"
-Search matched $($positions.Count) times - refusing ambiguous edit (unique match required by default).
-Make 'search' unique with surrounding lines, OR set replaceAll=true, OR set occurrence=N (1-based).
-Matches:
-$($locs -join "`n")$extra
-"@
-		return $result
 	}
-
-	if ($ReplaceAll -or $positions.Count -eq 1) {
-		$newText = $Content
-		for ($i = $positions.Count - 1; $i -ge 0; $i--) {
-			$p = $positions[$i]
-			$newText = $newText.Remove($p, $usedSearch.Length).Insert($p, [string]$usedReplace)
-		}
-		$result.NewContent = $newText
-		$result.Mode = if ($ReplaceAll -and $positions.Count -gt 1) { 'LITERAL*all' } else { 'LITERAL' }
-		return $result
+	$newText = $work
+	for ($i = $spans.Count - 1; $i -ge 0; $i--) {
+		$sp = $spans[$i]
+		$newText = $newText.Remove([int]$sp.Index, [int]$sp.Length).Insert([int]$sp.Index, $workReplace)
 	}
-
-	$result.Error = 'Unexpected replace path'
+	$result.NewContent = $newText
+	if ($fuzzy) {
+		$result.Mode = if ($ReplaceAll -and $spans.Count -gt 1) { "LITERAL~$modeLabel*all" } else { "LITERAL~$modeLabel" }
+	} else {
+		$result.Mode = if ($ReplaceAll -and $spans.Count -gt 1) { 'LITERAL*all' } else { 'LITERAL' }
+	}
 	return $result
 }
 
@@ -15135,6 +15794,8 @@ function Invoke-WriteFile {
 		[bool]$backup = $true
 	)
 	$path = Resolve-MBPath $path
+	$blockedWrite = Test-MBTextMutationBlocked -Path $path
+	if ($blockedWrite) { return "ERROR: $path - $blockedWrite" }
 	$bytes = [System.Text.Encoding]::UTF8.GetByteCount([string]$content)
 	$exists = Test-Path -LiteralPath $path
 	$action = if ($exists) { 'OVERWRITE' } else { 'CREATE' }
@@ -15218,10 +15879,14 @@ function Invoke-EditFile {
 		[bool]$replaceAll = $false,
 		[int]$occurrence = 0,
 		[bool]$backup = $true,
+		[int]$startLine = 0,
+		[int]$endLine = 0,
 		$edits = $null
 	)
 	$path = Resolve-MBPath $path
 	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: File not found: $path" }
+	$blockedEdit = Test-MBTextMutationBlocked -Path $path
+	if ($blockedEdit) { return "ERROR: $path - $blockedEdit" }
 
 	try {
 		$file = Read-MBTextFile -Path $path
@@ -15236,32 +15901,52 @@ function Invoke-EditFile {
 		foreach ($e in $arr) {
 			if ($null -eq $e) { continue }
 			$s = $null; $r = $null; $rx = $useRegex; $ra = $replaceAll; $occ = $occurrence
+			$sl = 0; $el = 0
 			if ($e -is [hashtable]) {
 				$s = [string]$e['search']; $r = [string]$e['replace']
 				if ($e.ContainsKey('useRegex')) { $rx = [bool]$e['useRegex'] }
 				if ($e.ContainsKey('replaceAll')) { $ra = [bool]$e['replaceAll'] }
 				if ($e.ContainsKey('occurrence')) { $occ = [int]$e['occurrence'] }
+				if ($e.ContainsKey('startLine')) { $sl = (Convert-MBToInt $e['startLine'] 0) }
+				elseif ($e.ContainsKey('start_line')) { $sl = (Convert-MBToInt $e['start_line'] 0) }
+				if ($e.ContainsKey('endLine')) { $el = (Convert-MBToInt $e['endLine'] 0) }
+				elseif ($e.ContainsKey('end_line')) { $el = (Convert-MBToInt $e['end_line'] 0) }
 			} else {
 				$s = [string](Get-MBProp $e 'search')
 				$r = [string](Get-MBProp $e 'replace')
 				if (Test-MBHasProp $e 'useRegex') { $rx = [bool](Get-MBProp $e 'useRegex') }
 				if (Test-MBHasProp $e 'replaceAll') { $ra = [bool](Get-MBProp $e 'replaceAll') }
 				if (Test-MBHasProp $e 'occurrence') { $occ = [int](Get-MBProp $e 'occurrence') }
+				if (Test-MBHasProp $e 'startLine') { $sl = (Convert-MBToInt (Get-MBProp $e 'startLine') 0) }
+				elseif (Test-MBHasProp $e 'start_line') { $sl = (Convert-MBToInt (Get-MBProp $e 'start_line') 0) }
+				if (Test-MBHasProp $e 'endLine') { $el = (Convert-MBToInt (Get-MBProp $e 'endLine') 0) }
+				elseif (Test-MBHasProp $e 'end_line') { $el = (Convert-MBToInt (Get-MBProp $e 'end_line') 0) }
 			}
-			if ([string]::IsNullOrEmpty($s)) {
-				return "ERROR: edits[] entry missing search"
+			if ($sl -gt 0 -and $el -le 0) { $el = $sl }
+			if ([string]::IsNullOrEmpty($s) -and $sl -le 0) {
+				return "ERROR: edits[] entry missing search (or startLine/endLine)"
 			}
-			[void]$editList.Add([pscustomobject]@{ search = $s; replace = $r; useRegex = $rx; replaceAll = $ra; occurrence = $occ })
+			[void]$editList.Add([pscustomobject]@{
+				search = $s; replace = $r; useRegex = $rx; replaceAll = $ra; occurrence = $occ
+				startLine = $sl; endLine = $el
+			})
 		}
 	}
 	if ($editList.Count -eq 0) {
-		if ([string]::IsNullOrEmpty($search)) {
-			return "ERROR: Provide search/replace or edits[] (array of {search, replace})."
+		if ([string]::IsNullOrEmpty($search) -and $startLine -le 0) {
+			return "ERROR: Provide search/replace, startLine/endLine, or edits[] (array of {search, replace})."
 		}
+		$elOne = $endLine
+		if ($startLine -gt 0 -and $elOne -le 0) { $elOne = $startLine }
 		[void]$editList.Add([pscustomobject]@{
 			search = $search; replace = $replace; useRegex = $useRegex
 			replaceAll = $replaceAll; occurrence = $occurrence
+			startLine = $startLine; endLine = $elOne
 		})
+	}
+	elseif ($editList.Count -eq 1 -and $startLine -gt 0 -and [int]$editList[0].startLine -le 0) {
+		$editList[0].startLine = $startLine
+		$editList[0].endLine = $(if ($endLine -gt 0) { $endLine } else { $startLine })
 	}
 
 	$content = [string]$file.Text
@@ -15275,10 +15960,39 @@ function Invoke-EditFile {
 		$step++
 		$sLF = ([string]$ed.search) -replace "`r`n", "`n" -replace "`r", "`n"
 		$rLF = if ($null -eq $ed.replace) { '' } else { ([string]$ed.replace) -replace "`r`n", "`n" -replace "`r", "`n" }
-		$preview = Get-MBEditPreview -Content $working -Search $sLF -Replace $rLF `
-			-UseRegex ([bool]$ed.useRegex) -ReplaceAll ([bool]$ed.replaceAll) -Occurrence ([int]$ed.occurrence)
-		if ($preview.Error) {
-			return "ERROR: edit #$step failed: $($preview.Error)"
+		$sl = 0
+		$el = 0
+		try { $sl = [int]$ed.startLine } catch { $sl = 0 }
+		try { $el = [int]$ed.endLine } catch { $el = 0 }
+		if ($sl -gt 0 -and $el -le 0) { $el = $sl }
+		if ($sl -gt 0 -and [string]::IsNullOrEmpty($sLF)) {
+			$ranged = Update-MBLineRangeText -ContentLF $working -StartLine $sl -EndLine $el -Replacement $rLF
+			if ($ranged.Error) { return "ERROR: edit #$step failed: $($ranged.Error)" }
+			$preview = @{
+				Count = 1; NewContent = [string]$ranged.Text; Error = $null
+				Mode = ("LINES {0}-{1}" -f $sl, $el); Preview = ''; LineDiffs = 0
+			}
+			try {
+				$ld = Get-MBLineDiffPreview -OldText $working -NewText ([string]$ranged.Text)
+				$preview.Preview = [string](Get-MBProp $ld 'Preview' '')
+				$preview.LineDiffs = [int](Get-MBProp $ld 'LineDiffs' 0)
+			} catch {}
+		}
+		elseif ($sl -gt 0) {
+			$win = Get-MBLineWindow -ContentLF $working -StartLine $sl -EndLine $el
+			if ($win.Error) { return "ERROR: edit #$step failed: $($win.Error)" }
+			$windowText = $working.Substring([int]$win.Index, [int]$win.Length)
+			$inner = Get-MBEditPreview -Content $windowText -Search $sLF -Replace $rLF `
+				-UseRegex ([bool]$ed.useRegex) -ReplaceAll ([bool]$ed.replaceAll) -Occurrence ([int]$ed.occurrence)
+			if ($inner.Error) { return "ERROR: edit #$step failed within lines ${sl}-${el}: $($inner.Error)" }
+			$inner.NewContent = $working.Remove([int]$win.Index, [int]$win.Length).Insert([int]$win.Index, [string]$inner.NewContent)
+			$inner.Mode = ([string]$inner.Mode) + (" @{0}-{1}" -f $sl, $el)
+			$preview = $inner
+		}
+		else {
+			$preview = Get-MBEditPreview -Content $working -Search $sLF -Replace $rLF `
+				-UseRegex ([bool]$ed.useRegex) -ReplaceAll ([bool]$ed.replaceAll) -Occurrence ([int]$ed.occurrence)
+			if ($preview.Error) { return "ERROR: edit #$step failed: $($preview.Error)" }
 		}
 		$totalMatches += [int]$preview.Count
 		[void]$modes.Add([string]$preview.Mode)
@@ -15340,10 +16054,149 @@ $(Get-MBProp $overall 'Preview' '')
 				-Summary ([string](Get-MBProp $overall 'Summary' '')) -Rows $dr -MaxLines 100
 		} catch {}
 		$sumNote = [string](Get-MBProp $overall 'Summary' '')
-		return "SUCCESS${auto}: Edit applied to $path (hunks=$($editList.Count), matches=$totalMatches, enc=$($file.Encoding), nl=$($file.Newline), $sumNote$bakNote)$nudgeNote"
+		$modeNote = ''
+		try {
+			if ($modes -and $modes.Count -gt 0) { $modeNote = ", match=" + ($modes -join '; ') }
+		} catch {}
+		return "SUCCESS${auto}: Edit applied to $path (hunks=$($editList.Count), matches=$totalMatches, enc=$($file.Encoding), nl=$($file.Newline), $sumNote$modeNote$bakNote)$nudgeNote"
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
+}
+
+function Invoke-MBApplyUnifiedHunks {
+	# Apply hunks against the original text, bottom-up, so later hunks still see the context they were built from.
+	param([string]$Work, $Hunks)
+	$result = @{ Ok = $false; Text = $Work; Note = ''; Error = $null }
+	if ($null -eq $Work) { $Work = '' }
+	$spans = Get-MBLineSpans -Text $Work
+	$edits = New-Object System.Collections.ArrayList
+	$notes = New-Object System.Collections.Generic.List[string]
+	$hNum = 0
+	foreach ($h in @($Hunks)) {
+		$hNum++
+		$oldLines = Convert-MBToLineList -Value (Get-MBProp $h 'Old' $null)
+		$newLines = Convert-MBToLineList -Value (Get-MBProp $h 'New' $null)
+		$oldStart = 0
+		$oldCount = -1
+		try { $oldStart = [int](Get-MBProp $h 'OldStart' 0) } catch { $oldStart = 0 }
+		try { $oldCount = [int](Get-MBProp $h 'OldCount' -1) } catch { $oldCount = -1 }
+
+		if ($oldLines.Count -eq 0) {
+			if ($oldCount -ne 0) {
+				$result.Error = "hunk #$hNum has an empty old side (include context, or use @@ -N,0 for a pure insert)."
+				return $result
+			}
+			$insert = ''
+			if ($newLines.Count -gt 0) { $insert = [string]($newLines -join "`n") }
+			$idx = 0
+			if ($oldStart -le 0) { $idx = 0 }
+			elseif ($oldStart -ge $spans.Count) { $idx = $Work.Length }
+			else { $idx = [int]$spans[$oldStart].Start }
+			if ($insert.Length -gt 0) {
+				if ($idx -gt 0 -and $Work[$idx - 1] -ne "`n") { $insert = "`n" + $insert }
+				$follows = ($idx -lt $Work.Length)
+				$keepFinal = ((-not $follows) -and $Work.Length -gt 0 -and $Work.EndsWith("`n"))
+				if (($follows -or $keepFinal) -and -not $insert.EndsWith("`n")) { $insert += "`n" }
+			}
+			[void]$edits.Add(@{ Index = $idx; Length = 0; Text = $insert; Hunk = $hNum })
+			[void]$notes.Add("hunk#$hNum insert@$oldStart")
+			continue
+		}
+
+		$picked = $null
+		$oldA = @($oldLines)
+		$newA = @($newLines)
+		for ($dh = 0; $dh -le 2 -and $null -eq $picked; $dh++) {
+			for ($dt = 0; $dt -le 2 -and $null -eq $picked; $dt++) {
+				if (($dh + $dt) -ge $oldA.Count) { continue }
+				$contextOk = $true
+				for ($k = 0; $k -lt $dh; $k++) {
+					if ($k -ge $newA.Count) { $contextOk = $false; break }
+					if (([string]$oldA[$k]) -cne ([string]$newA[$k])) { $contextOk = $false; break }
+				}
+				if (-not $contextOk) { continue }
+				for ($k = 0; $k -lt $dt; $k++) {
+					$oi = $oldA.Count - 1 - $k
+					$ni = $newA.Count - 1 - $k
+					if ($ni -lt 0) { $contextOk = $false; break }
+					if (([string]$oldA[$oi]) -cne ([string]$newA[$ni])) { $contextOk = $false; break }
+				}
+				if (-not $contextOk) { continue }
+				$oEnd = $oldA.Count - 1 - $dt
+				$nEnd = $newA.Count - 1 - $dt
+				if ($oEnd -lt $dh) { continue }
+				$oTry = @($oldA[$dh..$oEnd])
+				if ($nEnd -lt $dh) { $nTry = @() } else { $nTry = @($newA[$dh..$nEnd]) }
+				if (@($oTry).Count -eq 0) { continue }
+				$hits = Find-MBExactLineBlockHits -Spans $spans -Needles $oTry
+				if ($null -eq $hits -or $hits.Count -eq 0) {
+					foreach ($mode in @('trim', 'tabs', 'indent')) {
+						$hits = Find-MBLineBlockHits -Spans $spans -Needles $oTry -Mode $mode
+						if ($null -ne $hits -and $hits.Count -gt 0) { break }
+					}
+				}
+				if ($null -eq $hits -or $hits.Count -eq 0) { continue }
+				$one = $null
+				if ($hits.Count -eq 1) { $one = $hits[0] }
+				else { $one = Select-MBHitByHint -Hits $hits -HintLine $oldStart }
+				if ($null -eq $one) { continue }
+				$repl = ''
+				if (@($nTry).Count -gt 0) { $repl = [string](@($nTry) -join "`n") }
+				if ([string]$one.Mode -eq 'indent') {
+					$adj = Add-MBIndentColumns -Text $repl -Delta ([int]$one.Delta) -UseTabs ([bool]$one.UseTabs)
+					if (-not $adj.Ok) { continue }
+					$repl = [string]$adj.Text
+				}
+				$idx = [int]$one.Index
+				$len = [int]$one.Length
+				if ($repl.Length -eq 0 -and $len -gt 0) {
+					$endsWithNl = ($Work[$idx + $len - 1] -eq "`n")
+					if (-not $endsWithNl -and ($idx + $len) -lt $Work.Length -and $Work[$idx + $len] -eq "`n") { $len++ }
+					elseif (-not $endsWithNl -and $idx -gt 0 -and ($idx + $len) -ge $Work.Length -and $Work[$idx - 1] -eq "`n") {
+						$idx--
+						$len++
+					}
+				}
+				$tag = [string]$one.Mode
+				$dropN = $dh + $dt
+				if ([string]$one.Mode -eq 'indent') {
+					$sign = [int]$one.Delta
+					$tag = if ($sign -gt 0) { "indent+$sign" } else { "indent$sign" }
+				}
+				if ($dropN -gt 0) { $tag = "$tag,drop=$dropN" }
+				$picked = @{ Index = $idx; Length = $len; Text = $repl; Mode = $tag; Hunk = $hNum }
+			}
+		}
+		if ($null -eq $picked) {
+			$oldText = [string]($oldLines -join "`n")
+			$hint = Find-MBSearchNearMiss -Content $Work -Search $oldText
+			$snip = $oldText
+			if ($snip.Length -gt 300) { $snip = $snip.Substring(0, 300) }
+			$result.Error = "hunk #$hNum old text not found (tried whitespace, indent, and up to 2 context lines).`n$hint`nHunk old (first 300 chars):`n$snip"
+			return $result
+		}
+		[void]$edits.Add($picked)
+		[void]$notes.Add(("hunk#{0} {1}" -f $hNum, $picked.Mode))
+	}
+
+	$ordered = @($edits.ToArray() | Sort-Object @{ Expression = { [int]$_.Index } }, @{ Expression = { [int]$_.Hunk } })
+	for ($i = 1; $i -lt $ordered.Count; $i++) {
+		$prevEnd = [int]$ordered[$i - 1].Index + [int]$ordered[$i - 1].Length
+		if ([int]$ordered[$i].Index -lt $prevEnd) {
+			$result.Error = "hunk #$($ordered[$i].Hunk) overlaps hunk #$($ordered[$i - 1].Hunk). Add context so the hunks cover different lines."
+			return $result
+		}
+	}
+	$newWork = $Work
+	for ($i = $ordered.Count - 1; $i -ge 0; $i--) {
+		$e = $ordered[$i]
+		$newWork = $newWork.Remove([int]$e.Index, [int]$e.Length).Insert([int]$e.Index, [string]$e.Text)
+	}
+	$result.Ok = $true
+	$result.Text = $newWork
+	$result.Note = ($notes -join ', ')
+	return $result
 }
 
 function Invoke-ApplyPatch {
@@ -15366,13 +16219,20 @@ function Invoke-ApplyPatch {
 	$oldBuf = $null
 	$newBuf = $null
 	$inHunk = $false
+	$hunkOldStart = 0
+	$hunkOldCount = -1
 
 	$flushHunk = {
-		param($Hunks, $OldBuf, $NewBuf)
+		param($Hunks, $OldBuf, $NewBuf, $OldStart, $OldCount)
 		if ($null -eq $OldBuf -and $null -eq $NewBuf) { return }
-		$o = if ($null -ne $OldBuf) { @($OldBuf) } else { @() }
-		$n = if ($null -ne $NewBuf) { @($NewBuf) } else { @() }
-		[void]$Hunks.Add([pscustomobject]@{ Old = $o; New = $n })
+		$o = if ($null -ne $OldBuf) { @($OldBuf.ToArray()) } else { @() }
+		$n = if ($null -ne $NewBuf) { @($NewBuf.ToArray()) } else { @() }
+		[void]$Hunks.Add([pscustomobject]@{
+			Old = $o
+			New = $n
+			OldStart = [int]$OldStart
+			OldCount = [int]$OldCount
+		})
 	}
 	$flushFile = {
 		param($Files, [string]$P, $Hunks, [bool]$IsNew)
@@ -15391,7 +16251,7 @@ function Invoke-ApplyPatch {
 
 		if ($line -match '^\*\*\*\s+(?:Update|Add)\s+File:\s*(.+)\s*$') {
 			if ($inHunk) {
-				& $flushHunk $curHunks $oldBuf $newBuf
+				& $flushHunk $curHunks $oldBuf $newBuf $hunkOldStart $hunkOldCount
 				$inHunk = $false; $oldBuf = $null; $newBuf = $null
 			}
 			& $flushFile $files $curPath $curHunks $curIsNew
@@ -15403,7 +16263,7 @@ function Invoke-ApplyPatch {
 
 		if ($line -match '^---\s+') {
 			if ($inHunk) {
-				& $flushHunk $curHunks $oldBuf $newBuf
+				& $flushHunk $curHunks $oldBuf $newBuf $hunkOldStart $hunkOldCount
 				$inHunk = $false; $oldBuf = $null; $newBuf = $null
 			}
 			$p = ($line.Substring(3)).Trim() -replace '\t.*$',''
@@ -15422,7 +16282,7 @@ function Invoke-ApplyPatch {
 				# delete-file patches not supported; leave path as-is
 			} elseif (-not [string]::IsNullOrWhiteSpace($p)) {
 				if ($inHunk) {
-					& $flushHunk $curHunks $oldBuf $newBuf
+					& $flushHunk $curHunks $oldBuf $newBuf $hunkOldStart $hunkOldCount
 					$inHunk = $false; $oldBuf = $null; $newBuf = $null
 				}
 				$resolved = Resolve-MBPath $p
@@ -15435,10 +16295,16 @@ function Invoke-ApplyPatch {
 			continue
 		}
 		if ($line -match '^@@') {
-			if ($inHunk) { & $flushHunk $curHunks $oldBuf $newBuf }
+			if ($inHunk) { & $flushHunk $curHunks $oldBuf $newBuf $hunkOldStart $hunkOldCount }
 			$inHunk = $true
 			$oldBuf = New-Object System.Collections.Generic.List[string]
 			$newBuf = New-Object System.Collections.Generic.List[string]
+			$hunkOldStart = 0
+			$hunkOldCount = -1
+			if ($line -match '^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?') {
+				$hunkOldStart = [int]$Matches[1]
+				if ($Matches[2]) { $hunkOldCount = [int]$Matches[2] } else { $hunkOldCount = 1 }
+			}
 			continue
 		}
 		if (-not $inHunk) {
@@ -15448,12 +16314,14 @@ function Invoke-ApplyPatch {
 				$inHunk = $true
 				$oldBuf = New-Object System.Collections.Generic.List[string]
 				$newBuf = New-Object System.Collections.Generic.List[string]
+				$hunkOldStart = 0
+				$hunkOldCount = -1
 			} else {
 				continue
 			}
 		}
 
-		if ($line.StartsWith('\')) { continue } # "\ No newline at end of file"
+		if ($line -eq '\ No newline at end of file' -or $line.StartsWith('\ No newline at end of file')) { continue }
 		if ($line.StartsWith('+')) {
 			[void]$newBuf.Add($line.Substring(1))
 		}
@@ -15469,14 +16337,17 @@ function Invoke-ApplyPatch {
 			[void]$oldBuf.Add('')
 			[void]$newBuf.Add('')
 		}
+		elseif ($curIsNew) {
+			# New-file hunks are often emitted without '+' prefixes.
+			[void]$newBuf.Add($line)
+		}
 		else {
-			& $flushHunk $curHunks $oldBuf $newBuf
-			$inHunk = $false
-			$oldBuf = $null
-			$newBuf = $null
+			# Context line missing its leading space.
+			[void]$oldBuf.Add($line)
+			[void]$newBuf.Add($line)
 		}
 	}
-	if ($inHunk) { & $flushHunk $curHunks $oldBuf $newBuf }
+	if ($inHunk) { & $flushHunk $curHunks $oldBuf $newBuf $hunkOldStart $hunkOldCount }
 	& $flushFile $files $curPath $curHunks $curIsNew
 
 	if ($files.Count -eq 0) {
@@ -15509,6 +16380,8 @@ Or:
 	$previewBlocks = New-Object System.Collections.Generic.List[string]
 	foreach ($f in $files) {
 		$fp = [string]$f.Path
+		$blockedPatch = Test-MBTextMutationBlocked -Path $fp
+		if ($blockedPatch) { return "ERROR: $fp - $blockedPatch" }
 		$exists = Test-Path -LiteralPath $fp -PathType Leaf
 		$wantCreate = [bool]$f.IsNew -or (-not $exists)
 
@@ -15546,6 +16419,8 @@ Or:
 				Preview   = $diff.Preview
 				LineDiffs = $diff.LineDiffs
 				Summary   = $diff.Summary
+				DiffRows  = (Get-MBProp $diff 'DiffRows' $null)
+				Note      = ''
 				IsNew     = $true
 				Nudge     = $nudge
 			})
@@ -15572,34 +16447,10 @@ Or:
 		}
 		$nudge = Get-MBReadBeforeEditNudge -Path $fp
 		$work = ([string]$st.Text) -replace "`r`n", "`n" -replace "`r", "`n"
-		$hNum = 0
-		foreach ($h in @($f.Hunks)) {
-			$hNum++
-			$oldText = (@($h.Old) -join "`n")
-			$newText = (@($h.New) -join "`n")
-			if ($oldText.Length -eq 0) {
-				return "ERROR: $fp hunk #$hNum has empty old side (include context lines). For new files use --- /dev/null or *** Add File."
-			}
-			$positions = @(Find-MBLiteralMatches -Content $work -Search $oldText)
-			if ($positions.Count -eq 0) {
-				$oldTrim = $oldText -replace "`n$", ''
-				$positions = @(Find-MBLiteralMatches -Content $work -Search $oldTrim)
-				if ($positions.Count -gt 0) {
-					$oldText = $oldTrim
-					$newText = $newText -replace "`n$", ''
-				}
-			}
-			if ($positions.Count -eq 0) {
-				$hint = Find-MBSearchNearMiss -Content $work -Search $oldText
-				$snip = $oldText.Substring(0, [math]::Min(300, $oldText.Length))
-				return "ERROR: $fp hunk #$hNum old text not found.`n$hint`nHunk old (first 300 chars):`n$snip"
-			}
-			if ($positions.Count -gt 1) {
-				return "ERROR: $fp hunk #$hNum matched $($positions.Count) places - add more context lines to make it unique."
-			}
-			$pos = $positions[0]
-			$work = $work.Remove($pos, $oldText.Length).Insert($pos, $newText)
-		}
+		$applied = Invoke-MBApplyUnifiedHunks -Work $work -Hunks @($f.Hunks)
+		if (-not $applied.Ok) { return "ERROR: ${fp}: $($applied.Error)" }
+		$work = [string]$applied.Text
+		$hNum = @($f.Hunks).Count
 		$origLF = ([string]$st.Text) -replace "`r`n", "`n" -replace "`r", "`n"
 		$diff = Get-MBLineDiffPreview -OldText $origLF -NewText $work -MaxLines 40 -Context 3
 		[void]$plan.Add([pscustomobject]@{
@@ -15611,11 +16462,14 @@ Or:
 			Preview   = $diff.Preview
 			LineDiffs = $diff.LineDiffs
 			Summary   = $diff.Summary
+			DiffRows  = (Get-MBProp $diff 'DiffRows' $null)
+			Note      = [string]$applied.Note
 			IsNew     = $false
 			Nudge     = $nudge
 		})
 		$nudgeLine = if ($nudge) { "`n$nudge" } else { '' }
-		[void]$previewBlocks.Add("UPDATE: $fp (hunks=$hNum, $($diff.Summary), enc=$($st.Encoding), bak=$backup)$nudgeLine`n$($diff.Preview)")
+		$noteLine = if ($applied.Note) { "`nMatch: $($applied.Note)" } else { '' }
+		[void]$previewBlocks.Add("UPDATE: $fp (hunks=$hNum, $($diff.Summary), enc=$($st.Encoding), bak=$backup)$noteLine$nudgeLine`n$($diff.Preview)")
 	}
 
 	$details = "ApplyPatch - $($plan.Count) file(s)  |  Backup (.bak) on existing: $backup"
@@ -15635,7 +16489,15 @@ Or:
 			try { Register-MBFileRead -Path $p.Path } catch {}
 			$tag = if ($p.IsNew) { 'CREATE' } else { 'UPDATE' }
 			$bakNote = if ($bakPath) { ", bak=$bakPath" } else { '' }
-			[void]$ok.Add("$tag $($p.Path) (hunks=$($p.Hunks)$bakNote)")
+			$matchNote = ''
+			try { if ($p.Note) { $matchNote = ", $($p.Note)" } } catch {}
+			[void]$ok.Add("$tag $($p.Path) (hunks=$($p.Hunks)$bakNote$matchNote)")
+			try {
+				$cardTitle = ('ApplyPatch  {0}' -f [string]$p.Path)
+				try { $cardTitle = ConvertTo-MBWpfSafeText -Text $cardTitle } catch {}
+				Write-MBDiffInline -Title $cardTitle -DiffText ([string]$p.Preview) `
+					-Summary ([string]$p.Summary) -Rows $p.DiffRows -MaxLines 100
+			} catch {}
 		} catch {
 			return "ERROR: Failed writing $($p.Path): $($_.Exception.Message). Already wrote: $($ok -join '; ')"
 		}
@@ -18004,6 +18866,24 @@ function Invoke-ListDirectory {
 	$path = Resolve-MBPath $path
 	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Path not found: $path" }
 	try {
+		$item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+		if (-not $item.PSIsContainer) {
+			return ConvertTo-MBJson @{
+				path      = $path
+				is_file   = $true
+				total     = 1
+				count     = 1
+				truncated = $false
+				hint      = 'Path is a file. Use ReadFile for text. Images/PDF: vision. Binaries: forensics HexView. Archives: files group.'
+				items     = @([ordered]@{
+					Name = $item.Name
+					Length = [long]$item.Length
+					LastWriteTime = $item.LastWriteTime
+					Mode = [string]$item.Mode
+					Type = 'File'
+				})
+			}
+		}
 		$all = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)
 		$total = $all.Count
 		$items = @(
@@ -18013,6 +18893,7 @@ function Invoke-ListDirectory {
 		)
 		return ConvertTo-MBJson @{
 			path      = $path
+			is_file   = $false
 			total     = $total
 			count     = $items.Count
 			truncated = ($total -gt $items.Count)
@@ -18034,6 +18915,12 @@ function Invoke-SearchFiles {
 	)
 	$path = Resolve-MBPath $path
 	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Path not found: $path" }
+	if ([string]::IsNullOrWhiteSpace($pattern)) { return "ERROR: pattern is required (regex)." }
+	try {
+		$null = New-Object System.Text.RegularExpressions.Regex($pattern, [System.Text.RegularExpressions.RegexOptions]::None, [TimeSpan]::FromSeconds(2))
+	} catch {
+		return "ERROR: invalid regex: $($_.Exception.Message)"
+	}
 	if ($maxResults -le 0) { $maxResults = 50 }
 	if ($maxResults -gt 200) { $maxResults = 200 }
 
@@ -18045,15 +18932,19 @@ function Invoke-SearchFiles {
 	)
 
 	try {
-		$gciParams = @{
-			LiteralPath = $path
-			File        = $true
-			ErrorAction = 'SilentlyContinue'
+		$rootItem = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+		if (-not $rootItem.PSIsContainer) {
+			$files = @($rootItem)
+		} else {
+			$gciParams = @{
+				LiteralPath = $path
+				File        = $true
+				ErrorAction = 'SilentlyContinue'
+			}
+			if ($recursive) { $gciParams['Recurse'] = $true }
+			if ($glob) { $gciParams['Filter'] = $glob }
+			$files = @(Get-ChildItem @gciParams | Select-Object -First 2000)
 		}
-		if ($recursive) { $gciParams['Recurse'] = $true }
-		if ($glob) { $gciParams['Filter'] = $glob }
-
-		$files = Get-ChildItem @gciParams | Select-Object -First 2000
 		$ssParams = @{ Pattern = $pattern; SimpleMatch = $false; ErrorAction = 'SilentlyContinue' }
 		if ($ignoreCase) { $ssParams['CaseSensitive'] = $false } else { $ssParams['CaseSensitive'] = $true }
 
@@ -18115,7 +19006,12 @@ function Invoke-DiffText {
 			$leftLabel = $lp
 			try { $leftLeaf = [System.IO.Path]::GetFileName($lp) } catch { $leftLeaf = $lp }
 			if ([string]::IsNullOrWhiteSpace($leftLeaf)) { $leftLeaf = $lp }
-			$left = [System.IO.File]::ReadAllText($lp)
+			if (-not (Test-Path -LiteralPath $lp -PathType Leaf)) { return "ERROR: File not found: $lp" }
+			$leftKind = $null
+			try { $leftKind = Test-MBBinaryMediaSniff -Path $lp } catch { $leftKind = $null }
+			if ($leftKind) { return "ERROR: $lp looks like $leftKind. Use ReadImage/ReadPdf or HexView, not DiffText." }
+			$leftDoc = Read-MBTextFile -Path $lp
+			$left = [string]$leftDoc.Text
 			try { Register-MBFileRead -Path $lp } catch {}
 		} else {
 			# Inline text — short preview for the card title
@@ -18130,7 +19026,12 @@ function Invoke-DiffText {
 			$rightLabel = $rp
 			try { $rightLeaf = [System.IO.Path]::GetFileName($rp) } catch { $rightLeaf = $rp }
 			if ([string]::IsNullOrWhiteSpace($rightLeaf)) { $rightLeaf = $rp }
-			$right = [System.IO.File]::ReadAllText($rp)
+			if (-not (Test-Path -LiteralPath $rp -PathType Leaf)) { return "ERROR: File not found: $rp" }
+			$rightKind = $null
+			try { $rightKind = Test-MBBinaryMediaSniff -Path $rp } catch { $rightKind = $null }
+			if ($rightKind) { return "ERROR: $rp looks like $rightKind. Use ReadImage/ReadPdf or HexView, not DiffText." }
+			$rightDoc = Read-MBTextFile -Path $rp
+			$right = [string]$rightDoc.Text
 			try { Register-MBFileRead -Path $rp } catch {}
 		} else {
 			$snip = ([string]$right) -replace '[\r\n]+', ' '
@@ -18316,10 +19217,28 @@ function Invoke-GetSystemInfo {
 function Invoke-GetProcessList {
 	param([int]$limit = 15)
 	if ($limit -le 0) { $limit = 15 }
-	Get-Process -ErrorAction SilentlyContinue |
-		Sort-Object CPU -Descending |
-		Select-Object -First $limit Id, ProcessName, CPU, @{N='WS_MB';E={[math]::Round($_.WorkingSet64/1MB,1)}} |
-		ConvertTo-Json -Depth 2 -Compress
+	if ($limit -gt 100) { $limit = 100 }
+	try {
+		$rows = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+			$cpu = $null
+			try { if ($null -ne $_.CPU) { $cpu = [math]::Round([double]$_.CPU, 2) } } catch { $cpu = $null }
+			[ordered]@{
+				Id          = [int]$_.Id
+				ProcessName = [string]$_.ProcessName
+				CPU         = $cpu
+				WS_MB       = [math]::Round($_.WorkingSet64 / 1MB, 1)
+			}
+		})
+		$rows = @($rows | Sort-Object { if ($null -eq $_.CPU) { -1 } else { [double]$_.CPU } } -Descending | Select-Object -First $limit)
+		return ConvertTo-MBJson @{
+			ok        = $true
+			count     = $rows.Count
+			sorted_by = 'CPU'
+			processes = $rows
+		}
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
+	}
 }
 
 function Invoke-GetProcessTree {
@@ -18472,24 +19391,57 @@ function Invoke-GetNetConnections {
 	}
 }
 
+function Invoke-MBStaAction {
+	# Clipboard and a few COM calls require STA. Tool turns may run off the UI thread.
+	param([scriptblock]$Action)
+	if ($null -eq $Action) { return $null }
+	$d = $null
+	try { if ($script:MB.Wpf) { $d = $script:MB.Wpf.Dispatcher } } catch { $d = $null }
+	if ($d -and -not $d.HasShutdownStarted -and -not $d.CheckAccess()) {
+		return $d.Invoke([Func[object]]$Action)
+	}
+	if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -eq [System.Threading.ApartmentState]::STA) {
+		return & $Action
+	}
+	$box = New-Object System.Collections.Hashtable
+	$box.Result = $null
+	$box.Error = $null
+	$thr = New-Object System.Threading.Thread([System.Threading.ThreadStart]{
+		try { $box.Result = & $Action } catch { $box.Error = $_.Exception.Message }
+	})
+	$thr.IsBackground = $true
+	$thr.SetApartmentState([System.Threading.ApartmentState]::STA)
+	$thr.Start()
+	if (-not $thr.Join(8000)) { throw 'STA action timed out.' }
+	if ($box.Error) { throw $box.Error }
+	return $box.Result
+}
+
 function Invoke-Clipboard {
 	param([string]$action, [string]$text)
 	try {
-		if ($action -eq "read") {
+		$act = ([string]$action).Trim().ToLowerInvariant()
+		if ($act -eq "read") {
 			if (-not (Request-Confirmation -Title "Clipboard read requires approval" -Details "The agent wants to read the Windows clipboard (may contain secrets/passwords).")) {
 				return "BLOCKED BY USER: Clipboard read denied."
 			}
-			Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-			$t = [System.Windows.Forms.Clipboard]::GetText()
+			$t = [string](Invoke-MBStaAction -Action {
+				Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+				[System.Windows.Forms.Clipboard]::GetText()
+			})
 			if ([string]::IsNullOrEmpty($t)) { return "(clipboard empty)" }
 			return Limit-MBResult $t
 		}
-		elseif ($action -eq "write") {
+		elseif ($act -eq "write") {
+			if ($null -eq $text) { $text = '' }
 			if (-not (Request-Confirmation -Title "Clipboard write requires approval" -Details "Write text to clipboard ($($text.Length) chars).")) {
 				return "BLOCKED BY USER: Clipboard write denied."
 			}
-			Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-			[System.Windows.Forms.Clipboard]::SetText([string]$text)
+			$payload = [string]$text
+			Invoke-MBStaAction -Action {
+				Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+				[System.Windows.Forms.Clipboard]::SetText($payload)
+			} | Out-Null
 			return "Clipboard write successful"
 		}
 		return "ERROR: Invalid action (use read|write)"
@@ -18503,8 +19455,10 @@ function Set-MBClipboardTextQuiet {
 	param([string]$Text)
 	try {
 		if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
-		Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-		[System.Windows.Forms.Clipboard]::SetText([string]$Text)
+		Invoke-MBStaAction -Action {
+			Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+			[System.Windows.Forms.Clipboard]::SetText([string]$Text)
+		} | Out-Null
 		return $true
 	} catch {
 		return $false
@@ -19745,18 +20699,40 @@ namespace MiniBot.Core {
 }
 
 function Invoke-GetBSODInfo {
-	$minidumpPath = "C:\Windows\Minidump"
-	$result = @{}
-	if (Test-Path $minidumpPath) {
-		$dumps = Get-ChildItem $minidumpPath -Filter *.dmp -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-		$result.Minidumps = @($dumps | Select-Object Name, LastWriteTime, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}})
-	} else {
-		$result.Minidumps = "No minidump folder found"
+	try {
+		$minidumpPath = "C:\Windows\Minidump"
+		$result = @{ ok = $true }
+		if (Test-Path -LiteralPath $minidumpPath) {
+			$dumps = @(Get-ChildItem -LiteralPath $minidumpPath -Filter *.dmp -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+			$result.Minidumps = @($dumps | ForEach-Object {
+				[ordered]@{
+					Name = $_.Name
+					LastWriteTime = $_.LastWriteTime
+					SizeMB = [math]::Round($_.Length / 1MB, 2)
+				}
+			})
+		} else {
+			$result.Minidumps = @()
+			$result.note = 'No minidump folder found'
+		}
+		$bsodEvents = @()
+		try {
+			$bsodEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ID = 41,1001; Level = 2,3 } -MaxEvents 20 -ErrorAction SilentlyContinue | ForEach-Object {
+				$m = [string]$_.Message
+				if ($m.Length -gt 300) { $m = $m.Substring(0, 300) + '...' }
+				[ordered]@{
+					TimeCreated = $_.TimeCreated
+					Id = $_.Id
+					ProviderName = [string]$_.ProviderName
+					Message = $m
+				}
+			})
+		} catch {}
+		$result.RecentBSODEvents = @($bsodEvents)
+		return ConvertTo-MBJson $result -Depth 4
+	} catch {
+		return "ERROR: $($_.Exception.Message)"
 	}
-	$bsodEvents = Get-WinEvent -FilterHashtable @{LogName='System'; ID=41,1001; Level=2,3} -MaxEvents 20 -ErrorAction SilentlyContinue |
-		Select-Object TimeCreated, Id, ProviderName, @{N='Message';E={ if ($_.Message.Length -gt 300) { $_.Message.Substring(0,300) + '...' } else { $_.Message } }}
-	$result.RecentBSODEvents = @($bsodEvents)
-	ConvertTo-MBJson $result -Depth 4
 }
 
 function Invoke-GetEventLogs {
@@ -19816,10 +20792,29 @@ function Invoke-GetEventLogs {
 		}
 	}
 
-	$rawGeneral = @(Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2,3; StartTime=$start} -MaxEvents 200 -ErrorAction SilentlyContinue |
-		Select-Object TimeCreated, LogName, LevelDisplayName, Id, ProviderName, Message)
-	$rawDisk = @(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='*disk*','*ntfs*','*stor*'; Level=1,2,3; StartTime=$start} -MaxEvents 100 -ErrorAction SilentlyContinue |
-		Select-Object TimeCreated, Id, ProviderName, @{N='LogName';E={'System'}}, @{N='LevelDisplayName';E={$null}}, Message)
+	$rawGeneral = @()
+	$rawDisk = @()
+	try {
+		$rawGeneral = @(Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2,3; StartTime=$start} -MaxEvents 200 -ErrorAction SilentlyContinue |
+			Select-Object TimeCreated, LogName, LevelDisplayName, Id, ProviderName, Message)
+	} catch {}
+	try {
+		# ProviderName wildcards are not reliable in FilterHashtable; filter the provider after a level query.
+		$diskRaw = @(Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2,3; StartTime=$start} -MaxEvents 400 -ErrorAction SilentlyContinue)
+		$rawDisk = @($diskRaw | Where-Object {
+			$p = [string]$_.ProviderName
+			$p -match '(?i)disk|ntfs|stor'
+		} | Select-Object -First 100 | ForEach-Object {
+			[pscustomobject]@{
+				TimeCreated = $_.TimeCreated
+				Id = $_.Id
+				ProviderName = [string]$_.ProviderName
+				LogName = 'System'
+				LevelDisplayName = [string]$_.LevelDisplayName
+				Message = [string]$_.Message
+			}
+		})
+	} catch {}
 
 	$g = & $collapse $rawGeneral $max
 	$d = & $collapse $rawDisk ([math]::Min(20, $max))
@@ -19839,10 +20834,30 @@ function Invoke-GetEventLogs {
 
 function Invoke-GetDiskHealth {
 	try {
-		$disks = Get-PhysicalDisk -ErrorAction Stop | Select-Object FriendlyName, MediaType, BusType, HealthStatus, OperationalStatus, @{N='SizeGB';E={[math]::Round($_.Size/1GB,1)}}
-		$smart = Get-PhysicalDisk -ErrorAction SilentlyContinue | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue |
-			Select-Object DeviceId, Temperature, ReadErrorsCorrected, ReadErrorsUncorrected, WriteErrorsCorrected, WriteErrorsUncorrected
-		ConvertTo-MBJson @{ PhysicalDisks = @($disks); SMART = @($smart) } -Depth 4
+		$disks = @(Get-PhysicalDisk -ErrorAction Stop | ForEach-Object {
+			[ordered]@{
+				FriendlyName = [string]$_.FriendlyName
+				MediaType = [string]$_.MediaType
+				BusType = [string]$_.BusType
+				HealthStatus = [string]$_.HealthStatus
+				OperationalStatus = ((@($_.OperationalStatus) | ForEach-Object { [string]$_ }) -join ',')
+				SizeGB = [math]::Round($_.Size / 1GB, 1)
+			}
+		})
+		$smart = @()
+		try {
+			$smart = @(Get-PhysicalDisk -ErrorAction SilentlyContinue | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue | ForEach-Object {
+				[ordered]@{
+					DeviceId = [string]$_.DeviceId
+					Temperature = $_.Temperature
+					ReadErrorsCorrected = $_.ReadErrorsCorrected
+					ReadErrorsUncorrected = $_.ReadErrorsUncorrected
+					WriteErrorsCorrected = $_.WriteErrorsCorrected
+					WriteErrorsUncorrected = $_.WriteErrorsUncorrected
+				}
+			})
+		} catch { $smart = @() }
+		return ConvertTo-MBJson @{ ok = $true; PhysicalDisks = @($disks); SMART = @($smart) } -Depth 4
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -22160,36 +23175,6 @@ function Invoke-ScanNetwork {
 	}) -Depth 6
 }
 
-function Test-MBTcpPortOpen {
-	# Async TCP connect with short timeout (ms). No hang.
-	param(
-		[string]$Computer,
-		[int]$Port,
-		[int]$TimeoutMs = 300
-	)
-	$targetHost = ([string]$Computer).Trim()
-	if ([string]::IsNullOrWhiteSpace($targetHost)) { return $false }
-	if ($Port -lt 1 -or $Port -gt 65535) { return $false }
-	if ($TimeoutMs -lt 50) { $TimeoutMs = 50 }
-	if ($TimeoutMs -gt 10000) { $TimeoutMs = 10000 }
-	$tcp = $null
-	try {
-		$tcp = New-Object System.Net.Sockets.TcpClient
-		$iar = $tcp.BeginConnect($targetHost, $Port, $null, $null)
-		$ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $true)
-		if (-not $ok) {
-			try { $tcp.Close() } catch {}
-			return $false
-		}
-		try { $tcp.EndConnect($iar) } catch { return $false }
-		return [bool]$tcp.Connected
-	} catch {
-		return $false
-	} finally {
-		try { if ($tcp) { $tcp.Close() } } catch {}
-	}
-}
-
 function Test-MBShareMapGuess {
 	# Guess-and-test: timed "net use \\host\share" then cleanup. Classifies existence without hanging enum.
 	# found: connected OK, or access/logon denied (share exists, auth needed)
@@ -22955,7 +23940,9 @@ function Invoke-RunRepairTool {
 			if ($arguments) { "sfc $arguments" } else { "sfc /scannow" }
 		}
 		"chkdsk" {
-			$drive = if ($driveLetter) { $driveLetter } else { "C:" }
+			$drive = if ($driveLetter) { ([string]$driveLetter).Trim() } else { "C:" }
+			if ($drive -match '^[A-Za-z]$') { $drive = $drive + ':' }
+			$drive = $drive.TrimEnd('\')
 			if ($arguments) { "chkdsk $drive $arguments" } else { "chkdsk $drive /scan" }
 		}
 		"dism" {
@@ -22973,6 +23960,26 @@ function Invoke-RunRepairTool {
 		return "BLOCKED BY USER: Repair action denied by operator."
 	}
 	return Invoke-RunCommand -command $command -shell "cmd" -timeout_sec 7200
+}
+
+function Resolve-MBService {
+	# Exact service name first, then one display-name or wildcard hit. Several hits stay an error.
+	param([string]$Name)
+	if ([string]::IsNullOrWhiteSpace($Name)) { return @{ Ok = $false; Error = 'name is required.' } }
+	$exact = $null
+	try { $exact = @(Get-Service -Name $Name -ErrorAction Stop) } catch { $exact = @() }
+	if ($exact.Count -eq 1) { return @{ Ok = $true; Service = $exact[0] } }
+	$needle = $Name.Trim()
+	$hits = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
+		$_.Name -like $needle -or $_.DisplayName -like $needle -or
+		$_.Name -like ('*' + $needle + '*') -or $_.DisplayName -like ('*' + $needle + '*')
+	})
+	if ($hits.Count -eq 1) { return @{ Ok = $true; Service = $hits[0] } }
+	if ($hits.Count -gt 1) {
+		$shown = @($hits | Select-Object -First 8 | ForEach-Object { '{0} ({1})' -f $_.Name, $_.DisplayName })
+		return @{ Ok = $false; Error = ("Multiple services match '{0}': {1}. Pass the exact service name." -f $Name, ($shown -join '; ')) }
+	}
+	return @{ Ok = $false; Error = "Service not found: $Name" }
 }
 
 function ConvertTo-MBServiceRow {
@@ -23001,7 +24008,11 @@ function Invoke-GetServiceStatus {
 	if ($max -gt 1000) { $max = 1000 }
 	try {
 		if ($name) {
-			$svc = Get-Service -Name $name -ErrorAction Stop
+			$resolved = Resolve-MBService -Name $name
+			if (-not $resolved.Ok) {
+				return ConvertTo-MBJson ([ordered]@{ ok = $false; error = [string]$resolved.Error })
+			}
+			$svc = $resolved.Service
 			return ConvertTo-MBJson ([ordered]@{
 				ok      = $true
 				count   = 1
@@ -23066,11 +24077,9 @@ function Invoke-ControlService {
 		return "ERROR: set_startup requires startup_type."
 	}
 
-	try {
-		$svc = Get-Service -Name $name -ErrorAction Stop
-	} catch {
-		return "ERROR: Service not found: $name - $($_.Exception.Message)"
-	}
+	$resolvedSvc = Resolve-MBService -Name $name
+	if (-not $resolvedSvc.Ok) { return ("ERROR: {0}" -f $resolvedSvc.Error) }
+	$svc = $resolvedSvc.Service
 
 	$details = "Service: $($svc.Name) ($($svc.DisplayName))`nCurrent: Status=$($svc.Status) StartType=$($svc.StartType)`nAction: $action"
 	if ($wantStartup) {
@@ -23366,8 +24375,12 @@ function Invoke-ExpandArchive {
 	$dest = Resolve-MBPath $destination
 	if (-not (Test-Path -LiteralPath $src)) { return "ERROR: Archive not found: $src" }
 	if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { return "ERROR: path must be a file: $src" }
-	$ext = [System.IO.Path]::GetExtension($src)
-	if ($ext -notin @('.zip','.ZIP')) {
+	$ext = [System.IO.Path]::GetExtension($src).ToLowerInvariant()
+	if ($ext -eq '.cab') { return "ERROR: $src is a cabinet. Use ExpandCab, not ExpandArchive." }
+	if ($ext -in @('.7z','.rar','.tar','.gz','.tgz','.bz2','.xz')) {
+		return "ERROR: ExpandArchive handles .zip only (got '$ext'). Use 7-Zip via the installers group, or ExpandCab for .cab."
+	}
+	if ($ext -ne '.zip') {
 		return "ERROR: Only .zip archives are supported (got extension '$ext')."
 	}
 
@@ -25349,15 +26362,62 @@ function Resolve-MBRegistryValueType {
 	return $null
 }
 
+function Format-MBRegistryValue {
+	param($Value)
+	if ($null -eq $Value) { return $null }
+	if ($Value -is [byte[]]) {
+		$n = $Value.Length
+		$preview = ''
+		$take = [Math]::Min(16, $n)
+		if ($take -gt 0) {
+			$hex = New-Object System.Collections.Generic.List[string]
+			for ($i = 0; $i -lt $take; $i++) { [void]$hex.Add('{0:X2}' -f $Value[$i]) }
+			$preview = $hex -join ' '
+			if ($n -gt $take) { $preview += ' ...' }
+		}
+		return [ordered]@{ kind = 'binary'; bytes = $n; preview_hex = $preview }
+	}
+	if ($Value -is [Array] -and -not ($Value -is [string])) {
+		return @($Value | ForEach-Object { [string]$_ })
+	}
+	return $Value
+}
+
 function Invoke-ReadRegistry {
 	param([string]$path)
 	try {
 		$path = Convert-MBRegistryPath -Path $path
 		if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: path is required (e.g. HKLM:\\Software\\...)." }
-		if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Registry path not found: $path" }
-		Get-ItemProperty -LiteralPath $path -ErrorAction Stop |
-			Select-Object * -ExcludeProperty PSPath, PSParentPath, PSChildName, PSDrive, PSProvider |
-			ConvertTo-Json -Compress -Depth 4
+		if (-not (Test-Path -LiteralPath $path)) {
+			$parent = Split-Path -Parent $path
+			$leaf = Split-Path -Leaf $path
+			if ($parent -and $leaf -and (Test-Path -LiteralPath $parent)) {
+				$names = @()
+				try { $names = @((Get-Item -LiteralPath $parent -ErrorAction Stop).Property) } catch { $names = @() }
+				$hit = $null
+				foreach ($n in $names) {
+					if ([string]::Equals([string]$n, $leaf, [StringComparison]::OrdinalIgnoreCase)) { $hit = [string]$n; break }
+				}
+				if ($hit) {
+					$one = Get-ItemProperty -LiteralPath $parent -Name $hit -ErrorAction Stop
+					return ConvertTo-MBJson ([ordered]@{
+						ok    = $true
+						path  = $parent
+						name  = $hit
+						value = (Format-MBRegistryValue $one.$hit)
+						note  = 'Path pointed at a value name. Returned that value, not the whole key.'
+					}) -Depth 5
+				}
+			}
+			return "ERROR: Registry path not found: $path"
+		}
+		$raw = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
+		$out = [ordered]@{}
+		foreach ($prop in @($raw.PSObject.Properties)) {
+			if ($prop.Name -in @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')) { continue }
+			$out[$prop.Name] = Format-MBRegistryValue $prop.Value
+		}
+		return ConvertTo-MBJson ([ordered]@{ ok = $true; path = $path; values = $out }) -Depth 6
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -25515,7 +26575,7 @@ function Invoke-FindFiles {
 		[int]$modified_within_days = 0,
 		[long]$min_bytes = 0,
 		[long]$max_bytes = 0,
-		[switch]$recursive,
+		[bool]$recursive = $false,
 		[int]$max = 100
 	)
 	if ($max -le 0) { $max = 100 }
@@ -25525,20 +26585,26 @@ function Invoke-FindFiles {
 	$patterns = @(Convert-MBFindFilePatterns -glob $glob -globs $globs -extensions $extensions)
 	if ($patterns.Count -eq 0) { $patterns = @('*') }
 	try {
-		$gci = @{
-			LiteralPath = $root
-			File        = $true
-			ErrorAction = 'SilentlyContinue'
-			Force       = $true
-		}
-		if ($recursive) { $gci['Recurse'] = $true }
+		$rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+		if (-not $rootItem.PSIsContainer) {
+			$files = @($rootItem)
+			$useNativeFilter = $false
+		} else {
+			$gci = @{
+				LiteralPath = $root
+				File        = $true
+				ErrorAction = 'SilentlyContinue'
+				Force       = $true
+			}
+			if ($recursive) { $gci['Recurse'] = $true }
 
-		# Single simple name filter -> native Filter (fast). Multi-pattern -> one walk + -like any.
-		$useNativeFilter = ($patterns.Count -eq 1 -and $patterns[0] -ne '*' -and $patterns[0] -notmatch '[\\/]')
-		if ($useNativeFilter) {
-			$gci['Filter'] = $patterns[0]
+			# Single simple name filter -> native Filter (fast). Multi-pattern -> one walk + -like any.
+			$useNativeFilter = ($patterns.Count -eq 1 -and $patterns[0] -ne '*' -and $patterns[0] -notmatch '[\\/]')
+			if ($useNativeFilter) {
+				$gci['Filter'] = $patterns[0]
+			}
+			$files = @(Get-ChildItem @gci)
 		}
-		$files = @(Get-ChildItem @gci)
 		if (-not $useNativeFilter) {
 			$matchAny = {
 				param($f)
@@ -31020,6 +32086,7 @@ function Invoke-HexView {
 		[bool]$ignore_mz_header = $false,
 		[bool]$help = $false
 	)
+	if ([string]::IsNullOrWhiteSpace($path) -and -not $help) { return "ERROR: path is required." }
 	if ($help) {
 		return ConvertTo-MBJson ([ordered]@{
 			tool = 'HexView'
@@ -40944,6 +42011,8 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'tail')   { $p['tail']   = [int](Get-MBProp $ArgsObj 'tail') }
 				if (Test-MBHasProp $ArgsObj 'offset') { $p['offset'] = [int](Get-MBProp $ArgsObj 'offset') }
 				if (Test-MBHasProp $ArgsObj 'length') { $p['length'] = [int](Get-MBProp $ArgsObj 'length') }
+				if (Test-MBHasProp $ArgsObj 'numbered') { $p['numbered'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'numbered') $false) }
+				elseif (Test-MBHasProp $ArgsObj 'numbers') { $p['numbered'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'numbers') $false) }
 				Invoke-ReadFile @p
 			}
 			"WriteFile" {
@@ -40965,6 +42034,14 @@ function Invoke-MBTool {
 				if (Test-MBHasProp $ArgsObj 'occurrence') { $p['occurrence'] = (Convert-MBToInt (Get-MBProp $ArgsObj 'occurrence') 0) }
 				if (Test-MBHasProp $ArgsObj 'backup') { $p['backup'] = (Convert-MBToBool (Get-MBProp $ArgsObj 'backup') $true) }
 				if (Test-MBHasProp $ArgsObj 'edits') { $p['edits'] = (Get-MBProp $ArgsObj 'edits') }
+				$sln = $null
+				if (Test-MBHasProp $ArgsObj 'startLine') { $sln = Get-MBProp $ArgsObj 'startLine' }
+				elseif (Test-MBHasProp $ArgsObj 'start_line') { $sln = Get-MBProp $ArgsObj 'start_line' }
+				if ($null -ne $sln) { $p['startLine'] = (Convert-MBToInt $sln 0) }
+				$eln = $null
+				if (Test-MBHasProp $ArgsObj 'endLine') { $eln = Get-MBProp $ArgsObj 'endLine' }
+				elseif (Test-MBHasProp $ArgsObj 'end_line') { $eln = Get-MBProp $ArgsObj 'end_line' }
+				if ($null -ne $eln) { $p['endLine'] = (Convert-MBToInt $eln 0) }
 				Invoke-EditFile @p
 			}
 			"ApplyPatch" {
