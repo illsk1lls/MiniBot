@@ -1,12 +1,12 @@
 # MiniBot
 
-**v2.61.0** — one Windows PowerShell 5.1 script. Point it at an OpenAI-compatible server and you get a chat window that can use the PC: files, tools, and changes that ask first.
+**v2.61.0** — PowerShell 5.1. Point to an OpenAI-compatible server, it can use the PC: files, tools, and make changes with user permission.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
 </p>
 
-The script is the whole app. Copy `MiniBot.ps1` (or rename it to `.cmd` and double-click). No installer, no extra runtime.
+A single file. MiniBot.ps1
 
 ---
 
@@ -328,6 +328,6 @@ While tools are running, the start of the conversation stays put so a local serv
 
 ## License
 
-MIT. Copy `MiniBot.ps1`. Icons next to the script are picked up when they are there.
+MIT.
 
 Made for IRM | IEX Deployment
