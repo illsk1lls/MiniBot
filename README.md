@@ -115,22 +115,6 @@ Drag the borderless frame. Minimize, maximize, close are on the title bar.
 
 Images: png, jpg, gif, webp, bmp, tif. Video: mp4, m4v, mov, wmv. Audio: mp3, wav, flac, m4a, and the usual others. Use a full path. MiniBot plays it in the chat. It opens an outside player only if you ask, or if the format will not play inline.
 
-### Draw a chart
-
-```text
-@@@RenderOpen
-<svg width="680" height="240" viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg">
-  <rect width="680" height="240" fill="#1A1A1E"/>
-</svg>
-@@@RenderClose
-```
-
-`width` and `height` have to be numbers, and the SVG needs `viewBox` and `xmlns`. Do not wrap that block in a markdown fence.
-
-Shapes, paths, text, `tspan`, dashed lines, and `rgb` / `rgba` draw. Gradients, filters, markers, and `<use>` do not. If some of those are in the file, the card title says how many were skipped. The card can save SVG or HTML.
-
-Dark colors that match the window: background `#121216` / `#1A1A1E`, text `#E5E7EB`, accent `#7AA2F7`.
-
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot-Login.png" alt="Login"><br>
   Login
