@@ -1,6 +1,6 @@
 # MiniBot
 
-**v2.56.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
+**v2.60.0** - Local AI agent for Windows. Connect a PowerShell 5.1 host to any **OpenAI-compatible** model server and get a polished dark WPF workspace: chat, tools, approvals, live media, and **inline SVG visualizations** - on your machine.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
@@ -19,7 +19,7 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 | **Connect** | Fast hard-timeout probe; if the host is down (or `-BaseUrl` is empty), **Connect** collects URL + auth without hard-exiting |
 | **UI** | Borderless dark WPF chrome, sticky status, tool-group chips, **PoweredBy** model/endpoint picker, **TaskBoard sticky** under chips |
 | **Media** | Inline images, video, and audio via `![label](path)` - external players only as a last resort |
-| **Visualize** | Inline **SVG** charts and visualization - pure WPF **SvgView** (save SVG/HTML from the card) |
+| **Visualize** | Inline **SVG** charts - WPF **SvgView** draws shapes, dashed strokes, `rgba`, and `tspan` labels (save SVG/HTML from the card) |
 | **Speed** | Prefill / generation timing under replies (**pp/s** · **t/s**) when the server or stream window provides it |
 | **Network** | **PortProbe**, **FindShares**, **FindWebHosts**, **FindRdp** - targeted host(s) or LAN search when hosts are omitted |
 | **Remote** | **RemoteCommand** (WinRM) for domain admins on domain-joined hosts - orange / unavailable off-domain |
@@ -27,6 +27,7 @@ MiniBot is a single-file agent harness: progressive tools, operator approvals fo
 | **Tools** | Progressive groups (catalog-order chips; volume/brightness, GPO, shares, CAB/ISO, Gallery, SearchWeb/BrowsePage, …) |
 | **TaskBoard** | Multi-step checklist: sticky flyout under chips + SESSION STATE (`set` / `update` / `status` / `clear`) |
 | **Edit stack** | **EditFile** / **ApplyPatch** / **WriteFile**: line-range edits, whitespace and indent tolerant match, `@@` hints, atomic save, default **`.bak`**. Saves include a **VERIFY** syntax check for PowerShell, JSON, and XML |
+| **Coding** | **SearchFiles** with line context (skips `.git` and `node_modules`), **RunProjectCheck** for the test command already on the machine, and a four-step checklist the model has to follow |
 | **Forensics** | **ForensicsSummary**, **PeInfo**, **HexView** / **HexEdit** (presets, session undo), **FindHexPattern**, **StringExtract**, imports, resources, sections |
 | **Deploy** | One `.ps1` (or hybrid `.cmd`), optional elevation, single-instance lock |
 
@@ -94,7 +95,7 @@ The file begins with a hybrid CMD header. Rename to `.cmd` for double-click laun
 | `-ModelAlias` | *(empty)* | Display label in PoweredBy; empty → live server model id |
 | `-ApiKey` | `none` | HTTP **Bearer** only. Use `none` to skip. |
 | `-AgentName` | `MiniBot` | Window brand / agent identity |
-| `-Version` | `2.56.0` | Version string |
+| `-Version` | `2.60.0` | Version string |
 | `-MaxTokens` | `0` | Max completion tokens. **`0` = auto** (`n_ctx / 8` from server). |
 | `-ContextWindowTokens` | `0` | Fallback `n_ctx`. **`0` = use server `/props` + `/models` only** |
 | `-Temperature` | `0.15` | Sampling temperature |
@@ -220,6 +221,7 @@ Supported: common images, video (`mp4` / `m4v` / `mov` / `wmv`), audio (`mp3` / 
 | **Format** | SVG only - not WPF XAML, not markdown fences around the body |
 | **Size** | Numeric `width` and `height` (pixels) |
 | **Theme** | Dark palette: `#121216` / `#1A1A1E` bg, `#E5E7EB` text, `#7AA2F7` accent |
+| **Drawn** | Shapes, paths, text/`tspan`, dashed strokes, `rgb`/`rgba`. Gradients, filters, markers, and `<use>` are skipped (the card title counts them) |
 | **Save** | Card actions export **SVG** or **HTML** |
 
 ---
@@ -229,6 +231,7 @@ Supported: common images, video (`mp4` / `m4v` / `mov` / `wmv`), audio (`mp3` / 
 | Command | Description |
 |---------|-------------|
 | `/help` | Full help |
+| `/doctor` | Check the harness itself (no files written) |
 | `/status` | Session stats and context bar |
 | `/context` | Detailed context breakdown |
 | `/clear` | Clear chat history (sticky notes / pins kept) |
@@ -245,8 +248,10 @@ Supported: common images, video (`mp4` / `m4v` / `mov` / `wmv`), audio (`mp3` / 
 | `/tools full` \| `core` \| `list` | Full surface / core-only / list |
 | `/sandbox` | Show sandbox root |
 | `/sandbox clear` \| `clear all` | Clear session or all machine sandboxes |
-| `/save [path]` | Save session (JSON / Markdown; picker if omitted) |
-| `/load [path]` | Load session |
+| `/save [path]` | Save a copy. Picker if omitted; suggested name is `minibot-date.md` |
+| `/load [path]` | Load a saved copy |
+| `/sessions` | List chats autosaved for this folder |
+| `/resume [n\|id]` | Continue the latest chat, or one from the list |
 | `/model` | Show active model id |
 | `/retry` | Re-send last user message |
 | `/speech [on\|off]` | Voice (`auto`, `test`, `listen`, `say …`) |

@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.56.0 - Local AI agent host for Windows PowerShell 5.1
+	MiniBot v2.60.0 - Local AI agent host for Windows PowerShell 5.1
 .DESCRIPTION
 	OpenAI-compatible agent client (WPF UI + tools). Hybrid .CMD/.PS1 launcher; irm|iex friendly.
 .NOTES
@@ -38,7 +38,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.56.0",
+	[string]$Version = "2.60.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -480,6 +480,9 @@ $script:MB = @{
 	ModeSwitch         = $false
 	WorkingDir         = $__mbWd
 	SessionStart       = Get-Date
+	# Autosaved chat under LocalAppData\MiniBot\sessions (not the repo)
+	SessionStoreId     = $null
+	SessionStoreDir    = $null
 	UserTurns          = 0
 	AgentTurns         = 0
 	ToolCalls          = 0
@@ -6398,11 +6401,51 @@ function Show-MBActiveEndpointBanner {
 	} catch {}
 }
 
+function Invoke-MBHarnessDoctor {
+	# In-memory checks. Does not write a file.
+	$lines = New-Object System.Collections.Generic.List[string]
+	$state = @{ Fail = 0 }
+	$add = {
+		param([string]$Name, [bool]$Ok, [string]$Detail)
+		if ($Ok) { [void]$lines.Add("PASS $Name") }
+		else { $state.Fail++; [void]$lines.Add("FAIL $Name  $Detail") }
+	}
+	$scriptPath = ''
+	try { $scriptPath = [string]$PSCommandPath } catch { $scriptPath = '' }
+	if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath)) {
+		& $add 'script' $false 'script path unknown'
+	} else {
+		$tok = $null
+		$err = $null
+		try {
+			[void][System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tok, [ref]$err)
+			$n = @($err).Count
+			& $add 'parse' ($n -eq 0) ("errors=$n")
+		} catch { & $add 'parse' $false $_.Exception.Message }
+	}
+	$need = @('Test-MBSourceText','Get-MBProjectCheckPlan','Invoke-RunProjectCheck','Format-MBCodeVerifyBlock','Get-MBStoredSessions','Find-MBSearchNearMiss')
+	$missing = @($need | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+	& $add 'functions' ($missing.Count -eq 0) ($missing -join ',')
+	$bad = $null
+	$good = $null
+	try { $bad = Test-MBSourceText -Path 'a.ps1' -Text "function x {`n" } catch { $bad = $null }
+	try { $good = Test-MBSourceText -Path 'a.ps1' -Text "function x { 'ok' }`n" } catch { $good = $null }
+	& $add 'syntax_fail' ($bad -and $bad.Ok -eq $false) 'bad ps1 was accepted'
+	& $add 'syntax_ok' ($good -and $good.Ok -eq $true) 'good ps1 was rejected'
+	$none = $null
+	try { $none = Get-MBProjectCheckPlan -Path $env:TEMP } catch { $none = $null }
+	& $add 'check_plan' ($null -ne $none -and $none.ContainsKey('Found')) 'plan missing'
+	$pass = $lines.Count - [int]$state.Fail
+	[void]$lines.Add(("doctor {0} pass, {1} fail" -f $pass, $state.Fail))
+	return ($lines -join "`n")
+}
+
 function Show-MBHelp {
 	Write-Host ""
 	Write-MBRule -Label "commands"
 	$cmds = @(
 		@{ c = "/help";            d = "Show this help" },
+		@{ c = "/doctor";          d = "Check this harness (parse, syntax check, project-check finder)" },
 		@{ c = "/status";          d = "Session stats + context budget" },
 		@{ c = "/context";         d = "Detailed context breakdown" },
 		@{ c = "/clear";           d = "Clear chat history (keeps sticky notes / pins)" },
@@ -6416,8 +6459,10 @@ function Show-MBHelp {
 		@{ c = "/wd";              d = "Print working directory" },
 		@{ c = "/tools [group]";   d = "List tools by group; enable a group or full|core" },
 		@{ c = "/sandbox [clear|clear all]"; d = "Show SandBox root; clear this session or all machine sessions" },
-		@{ c = "/save [path]";     d = "Save session (file picker if no path; .json or .md)" },
-		@{ c = "/load [path]";     d = "Load session (file picker if no path; .json or .md)" },
+		@{ c = "/save [path]";     d = "Save a copy (picker if no path; default minibot-date.md)" },
+		@{ c = "/load [path]";     d = "Load a saved copy (file picker if no path; .json or .md)" },
+		@{ c = "/sessions";        d = "List chats autosaved for this folder" },
+		@{ c = "/resume [n|id]";   d = "Continue the latest chat, a list number, or an id prefix" },
 		@{ c = "/model";           d = "Show current model id" },
 		@{ c = "/retry";           d = "Re-send the last user message" },
 		@{ c = "exit | quit";      d = "End session" },
@@ -12101,15 +12146,21 @@ You are $AgentName v$Version - local Windows tool-first agent (PS 5.1). Evidence
 No delete/destroy unless operator asked for that specific target. Mutate after read when possible; deny = stop + replan (never retry the same blocked approach). Prefer specialized tools; RunCommand is LAST resort.
 TASKBOARD: multi-step → one TaskBoard call per turn (no parallel board tools). action=set ordered items first; execute ONLY now; update id=now status=done epoch=<last epoch> to advance (or use concrete id). Never mark later steps early. blocked+note if stuck. After complete: do not invent a new board unless operator asks. Board lives in SESSION STATE.
 LOOP HYGIENE: identical tool+args → same result (harness loop-guards). After LOOP GUARD / TOOLS_DONE=1 / NEED_INPUT: STOP tools, tell operator. Do not thrash. When finishing after tools, end with short DID / NEXT (or ASK) — never trail off mid-loop.
+CODE CHECKLIST, in order. Stop when a step fails:
+1. SearchFiles (line numbers; it skips .git and node_modules) or ReadFile numbered=true. The NNNN| prefix is not file text.
+2. EditFile. A miss names the near-miss line. Re-read that line. Do not guess a new search.
+3. VERIFY syntax=FAIL means fix the file before any other claim.
+4. RunProjectCheck before saying the change works. No check found means you cannot claim behavior. STATUS: FAILED means it does not work.
+PROJECT below is the nearest AGENTS.md, CLAUDE.md, or minibot.md. /sessions and /resume reopen chats for this folder.
 Bad tool twice (same blocked/NEED_INPUT): stop and ASK operator — no third identical retry.
 Never ReadFile images/video/PDF/binary (crashes servers) — images/PDF/screen: vision group; PE/binary/hex: forensics; operator display: markdown below.
 INLINE MEDIA (chat UI) — REQUIRED for play/show/hear: always embed on its own line as ![label](absolute-path). Prefer absolute Windows paths. Images png/jpg/gif/webp/bmp/tif; video mp4/m4v/mov/wmv; audio mp3/wav/flac/m4a/aac/ogg/wma. After DownloadFile / ViewScreen save / FindFiles pick / any "play or show" ask: emit ![...](...) so it plays in-chat. NEVER Start-Process/Invoke-Item/explorer/VLC/default-app first. External player ONLY if format not inline-compatible or operator explicitly asked external. Do not reply with a bare path alone when they should see/hear it.
-INLINE VISUALS — emit SVG between @@@RenderOpen and @@@RenderClose (own lines). Host renders pure WPF SvgView (scrolls/clips like media, centered in the card). Not WPF XAML. No markdown fences. SVG body only. ALWAYS set numeric width AND height on <svg> (pixels). Never width="100%" or height="auto". Include xmlns + viewBox. Colors: #E5E7EB / #9CA3AF text; #121216 / #1A1A1E / #252530 bg; #3A3A42 border; #7AA2F7 / #7DCFFF accent. Optional per-shape <title> for tooltips only. Do NOT put a chart title on the drawing unless the operator asked or labels are needed (axes/legend). Prefer data geometry first. Example:
+INLINE VISUALS — emit SVG between @@@RenderOpen and @@@RenderClose (own lines). Host renders pure WPF SvgView (centered in the card). Not WPF XAML. No markdown fences. SVG body only. Drawn: svg, g, a, rect, circle, ellipse, line, polyline, polygon, path, text, tspan. Paint: fill/stroke as #hex, rgb(), or rgba(); stroke-width; stroke-dasharray; linecap/linejoin; opacity; font-size; font-weight; text-anchor; transform translate/scale/rotate/matrix. ALWAYS numeric width and height on <svg> (pixels) plus xmlns and viewBox. Colors: #E5E7EB / #9CA3AF text; #121216 / #1A1A1E / #252530 bg; #3A3A42 border; #7AA2F7 / #7DCFFF accent. <title> is a tooltip only. Do NOT use gradients, filters, markers, masks, clipPath, use, image, or style blocks — they are skipped and the card title shows the skip count. No chart title on the drawing unless the operator asked or axis/legend labels are needed. Prefer data geometry first. Example:
 @@@RenderOpen
 <svg width="680" height="240" viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg"><rect width="680" height="240" fill="#1A1A1E"/><rect x="80" y="40" width="40" height="160" fill="#7AA2F7"/><rect x="160" y="80" width="40" height="120" fill="#9ECE6A"/><line x1="60" y1="200" x2="620" y2="200" stroke="#3A3A42" stroke-width="1"/></svg>
 @@@RenderClose
 Do not stream bare SVG outside those markers.
-VIZ RULES: SVG only (rect/circle/ellipse/line/path/polyline/polygon/text/g; fill/stroke attr or style=). REQUIRED width="N" height="N" + viewBox + xmlns. No JavaScript, CDNs, or WPF/XAML. No decorative title banner unless relevant. Flyer/poster layouts: be careful with text size and alignment (readable hierarchy, consistent columns, no overlapping labels, text-anchor when centering).
+VIZ RULES: SVG only. REQUIRED width="N" height="N" + viewBox + xmlns. Dash grids with stroke-dasharray. Labels with text/tspan and text-anchor. No JavaScript, CDNs, WPF/XAML, gradients, filters, markers, or <use>. No decorative title banner unless relevant. Flyer/poster layouts: readable type hierarchy, consistent columns, no overlapping labels.
 Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration). If a tool is missing: ERROR may say missing_tool=X group=Y — EnableToolGroup group=Y then call X same turn; do NOT invent COM/shell.
 ROUTER (intent->tool; enable group first if off; do not shell these):
  volume|mute|unmute|speaker|sound level -> EnableToolGroup group=sound then AudioVolume (action=get|set|mute|unmute; level=0-100)
@@ -12142,7 +12193,7 @@ FINAL REPLY after tools (when no more tools): short DID: and NEXT: or ASK:. DID:
 
 $script:MBGroupPrompt = [ordered]@{
 	core = @"
-CORE: multi-step → TaskBoard first (one board call/turn; ordered plan; execute ONLY now; update id=now status=done epoch=<from last result>; never mark later steps early; blocked+note if stuck; after complete do not invent a new board). Text files: ReadFile numbered=true before edits; EditFile unique search OR startLine+endLine (whitespace/tab/indent tolerant); ApplyPatch for hunks (@@ line hints, context may omit the leading space); WriteFile to create/overwrite. path.bak default. VERIFY CODE: SUCCESS means saved, not correct. VERIFY syntax=FAIL must be fixed before claiming. syntax=ok is parse-only (ps1/json/xml). Quote LANDED or ReadFile numbered=true on that range. Claim behavior only after a run (RunCommand, or SandBox ok=true). List/Search/FindFiles; DiffText; RunCommand last resort; EnableToolGroup. Prefer specialized tools. PE/binary: forensics. Deleted files (live NTFS): recovery. Images/PDF/screen: vision. MEDIA: ![label](absolute-path).
+CORE: Follow CODE CHECKLIST for file edits. TaskBoard for multi-step work (one call per turn; execute ONLY now; update id=now status=done epoch=<last epoch>; never mark later steps early). EditFile search or startLine+endLine; ApplyPatch for hunks; WriteFile to create. path.bak on overwrite. SearchFiles for code search. RunProjectCheck after a code change. RunCommand is the last resort. EnableToolGroup before a tool whose group is off. PE/binary: forensics. Deleted files: recovery. Images/PDF/screen: vision. MEDIA: ![label](absolute-path).
 "@
 	vision = @"
 VISION: ReadImage (auto-downscale); ReadPdf page=1 first; ViewScreen look-only default (if save=true -> show with ![label](path) inline, not external open). No ReadFile on images/PDF. SpeakText is sound group.
@@ -12219,6 +12270,10 @@ function Build-MBSystemPromptLive {
 	}
 	if (-not $activeSet.ContainsKey('core')) { $activeSet['core'] = $true }
 
+	$project = ''
+	try { $project = Get-MBProjectInstructions } catch { $project = '' }
+	if ($project) { [void]$parts.Add($project) }
+
 	$order = @('core','vision','sound','forensics','recovery','system','network','diag','repair','setup','identity','shares','installers','sandbox','files','packages','registry','clipboard','docs','web')
 	$onList = New-Object System.Collections.ArrayList
 	$offBits = New-Object System.Collections.ArrayList
@@ -12261,7 +12316,8 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "RunCommand"; description = "Run PowerShell (default) or cmd. Pass exact command text. Mutating/multi-statement/redirects need approval."; parameters = @{ type = "object"; properties = @{ command = @{ type = "string" }; shell = @{ type = "string"; enum = @("powershell","cmd") }; timeout_sec = @{ type = "integer" } }; required = @("command") } } },
 	@{ type = "function"; function = @{ name = "RemoteCommand"; description = "Domain-administrator remoting tool (WinRM only). REQUIRES this host domain-joined with a signed-in domain user (orange/unavailable on workgroup or local-user sessions). Run a command on a REMOTE host (not this PC). ALWAYS approval. Native WinRM/PowerShell remoting. host= + command= required. shell=powershell|cmd|pwsh. Prefer username=DOMAIN\\DomainAdmin + password. Empty password only if account is truly blank. Optional port, use_ssl, timeout_sec. transport=winrm only. On auth failure NEED_INPUT for domain admin credentials. Do not use local RunCommand for remote hosts."; parameters = @{ type = "object"; properties = @{ host = @{ type = "string"; description = "Remote IP or hostname (also accepts user@host or host:port)" }; computer = @{ type = "string"; description = "Alias for host" }; command = @{ type = "string"; description = "Command/script to run on the remote host" }; transport = @{ type = "string"; description = "winrm only (default)" }; shell = @{ type = "string"; description = "powershell (default), cmd, or pwsh" }; username = @{ type = "string"; description = "Domain account preferred: DOMAIN\\DomainAdmin (domain admin tool)" }; password = @{ type = "string"; description = "Domain account password (WinRM). Empty only if truly blank" }; port = @{ type = "integer"; description = "WinRM port (default 5985 / 5986 with use_ssl)" }; use_ssl = @{ type = "boolean"; description = "WinRM over HTTPS" }; timeout_sec = @{ type = "integer"; description = "Timeout seconds (default harness CommandTimeout)" } }; required = @("host","command") } } },
 	@{ type = "function"; function = @{ name = "ListDirectory"; description = "List directory (≤500; truncated flag)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" } }; required = @("path") } } },
-	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents under path."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string" }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" } }; required = @("path","pattern") } } },
+	@{ type = "function"; function = @{ name = "SearchFiles"; description = "Regex search file contents. Returns path, line, text, and a ReadFile hint. Skips .git, node_modules, and build folders. context= lines around each hit."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string" }; pattern = @{ type = "string" }; glob = @{ type = "string"; description = "Name filter such as *.ps1. * is all files." }; recursive = @{ type = "boolean" }; ignoreCase = @{ type = "boolean" }; maxResults = @{ type = "integer" }; context = @{ type = "integer"; description = "Lines before and after each hit (0-3, default 1)" } }; required = @("path","pattern") } } },
+	@{ type = "function"; function = @{ name = "RunProjectCheck"; description = "Run the one test command already on this machine for a file or folder (PowerShell *.Tests.ps1, npm test, cargo test, go test, dotnet test, or pytest). Does not install anything. STATUS: OK means that command passed. STATUS: NO_CHECK means there is no command, so do not claim behavior. Call this after a code edit."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "File or folder. Defaults to the working directory." }; timeout_sec = @{ type = "integer"; description = "5-600, default 120" } } } } },
 	@{ type = "function"; function = @{ name = "DiffText"; description = "Unified line diff (LCS-based) of two strings or files. Shows @@ hunks with context."; parameters = @{ type = "object"; properties = @{ left = @{ type = "string" }; right = @{ type = "string" }; leftIsFile = @{ type = "boolean" }; rightIsFile = @{ type = "boolean" }; context = @{ type = "integer"; description = "Context lines around changes (default 3)" }; maxLines = @{ type = "integer"; description = "Max output lines (default 200)" } }; required = @("left","right") } } },
 	@{ type = "function"; function = @{ name = "HexView"; description = "Binary/PE forensics: hex dump + PE labels; disasm=true x86/x64 with IAT/delay/export labels + uncertain resync; hash=true SHA256 file+sections; functions=true prologue scan; entropy/carve; at_entry/rva/section. Flags .NET managed. DIFF path2. Prefer over ReadAllBytes. HexEdit presets; FindHexPattern; StringExtract; PeInfo/ImportTableViewer/ResourceEditor/SectionManager."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Primary file" }; path2 = @{ type = "string"; description = "Optional compare file (diff mode)" }; compare = @{ type = "string"; description = "Alias for path2" }; offset = @{ type = "string"; description = "Start offset decimal or 0xHEX" }; length = @{ type = "integer"; description = "Bytes to show (default 256, max 16384)" }; width = @{ type = "integer"; description = "Bytes per line (default 16)" }; show_ascii = @{ type = "boolean" }; annotate = @{ type = "boolean"; description = "PE headers/sections + strings (default false; use detail=full for tour)" }; next_diff = @{ type = "boolean"; description = "With path2: seek next byte difference from offset" }; side_by_side = @{ type = "boolean"; description = "Diff layout side-by-side (default true)" }; max_scan = @{ type = "integer"; description = "Optional max bytes to scan for next_diff (0=full)" }; disasm = @{ type = "boolean"; description = "x86/x64 disassembly; IAT/export labels on indirect calls" }; trace = @{ type = "boolean"; description = "Walk control flow from offset (follow JMP; list JE/JNE both paths)" }; at_entry = @{ type = "boolean"; description = "Start at PE entry point file offset" }; rva = @{ type = "string"; description = "PE RVA (decimal/0x) -> map to file offset" }; section = @{ type = "string"; description = "PE section name (e.g. .text) -> start raw offset" }; max_insns = @{ type = "integer"; description = "Disasm instruction count (default 48, max 200)" }; max_steps = @{ type = "integer"; description = "Trace steps (default 32, max 80)" }; follow_calls = @{ type = "boolean"; description = "trace: step into CALL targets" }; prefer_branch = @{ type = "string"; description = "trace: fallthrough (default) or taken at Jcc" }; arch = @{ type = "string"; description = "auto|x86|x64 (default auto from PE)" }; dump_hex = @{ type = "boolean"; description = "Include hex dump (default true)" }; entropy = @{ type = "boolean"; description = "Shannon entropy map (high = packed/encrypted)" }; entropy_blocks = @{ type = "integer"; description = "Entropy windows (default 64)" }; carve = @{ type = "boolean"; description = "Find embedded MZ/PE images" }; hash = @{ type = "boolean"; description = "SHA256 of file + each PE section" }; functions = @{ type = "boolean"; description = "Heuristic function prologue scan in .text" }; detail = @{ type = "string"; description = "minimal|full (full forces annotate)" }; skip_mz_header = @{ type = "boolean"; description = "At offset 0, jump to the PE entry or .text instead of the DOS stub" }; ignore_mz_header = @{ type = "boolean"; description = "Alias of skip_mz_header" }; help = @{ type = "boolean" } }; required = @("path") } } },
 	@{ type = "function"; function = @{ name = "HexEdit"; description = "Patch bytes OR replace_pattern across file OR undo session patches. action=patch|replace_pattern|undo|undo_all|history|export_history. presets force_jcc|invert_jcc|nop_range|ret0. Near force_jcc keeps the displacement. Undo shrinks a file this patch extended. history lists all undo_ids. Session stack (export_history saves JSON). path.bak when backup=true. help=true. dry_run=true."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Target file (optional for action=history; filter for undo_all)" }; offset = @{ type = "string" }; hex = @{ type = "string" }; bytes = @{ type = "array"; items = @{ type = "integer" } }; preset = @{ type = "string"; description = "force_jcc|invert_jcc|nop_range|ret0|ret|int3" }; length = @{ type = "integer"; description = "Byte count for nop_range/int3 presets" }; extend = @{ type = "boolean" }; backup = @{ type = "boolean"; description = "Write path.bak before patch (default true)" }; action = @{ type = "string"; description = "patch|undo|undo_all|history" }; id = @{ type = "integer"; description = "undo id from prior patch undo_id" }; undo = @{ type = "boolean"; description = "true = action=undo (last or id=)" }; pattern = @{ type = "string"; description = "replace_pattern: hex with optional ??" }; replace_hex = @{ type = "string"; description = "replace_pattern: same length as pattern; ?? keeps the original byte" }; replace = @{ type = "string"; description = "Alias of replace_hex" }; max = @{ type = "string"; description = "Max replace_pattern hits" }; preview = @{ type = "boolean"; description = "Alias of dry_run" }; dry_run = @{ type = "boolean"; description = "Show the patch and do not write" }; help = @{ type = "boolean" } }; required = @() } } },
@@ -12385,7 +12441,7 @@ $script:MBToolCatalog = [ordered]@{
 		# TaskBoard first in core so multi-step planning is always visible and preferred
 		'TaskBoard','EnableToolGroup','ListToolGroups',
 		'ReadFile','WriteFile','EditFile','ApplyPatch','ListDirectory','SearchFiles','FindFiles','DiffText',
-		'RunCommand','GetWorkingDirectory','SetWorkingDirectory','GetEnvironment','SetEnvironment'
+		'RunProjectCheck','RunCommand','GetWorkingDirectory','SetWorkingDirectory','GetEnvironment','SetEnvironment'
 	)
 	vision = @(
 		'ReadImage','ReadPdf','ViewScreen'
@@ -12532,7 +12588,8 @@ $script:MBToolUserTips = [ordered]@{
 	EditFile              = 'Search-and-replace or replace a line range (diff shown in chat). You will be asked to approve.'
 	ApplyPatch            = 'Apply a unified diff / patch to files. You will be asked to approve.'
 	ListDirectory         = 'List files and folders in a directory.'
-	SearchFiles           = 'Search inside file contents under a folder (regex).'
+	SearchFiles           = 'Regex search with line numbers. Skips .git and node_modules. Use match.read to open the hit.'
+	RunProjectCheck       = 'Run the project test already installed (npm, cargo, go, dotnet, pytest, or *.Tests.ps1).'
 	FindFiles             = 'Find files by name, extension, size, or how recently they changed.'
 	DiffText              = 'Compare two texts or files and show a line-by-line diff (also drawn in chat).'
 	RunCommand            = 'Run a PowerShell or cmd command on this PC. Prefer dedicated tools when one exists; approval for risky commands.'
@@ -14171,7 +14228,12 @@ function Invoke-ReadFile {
 
 	$path = Resolve-MBPath $path
 	if ([string]::IsNullOrWhiteSpace($path)) { return "ERROR: Empty or invalid path" }
-	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: File not found: $path" }
+	if (-not (Test-Path -LiteralPath $path)) {
+		$hint = ''
+		try { $hint = Get-MBMissingPathHint -Path $path } catch { $hint = '' }
+		if ($hint) { return "ERROR: File not found: $path`n$hint" }
+		return "ERROR: File not found: $path"
+	}
 
 	$file = Get-Item -LiteralPath $path
 	if ($file.PSIsContainer) { return "ERROR: Path is a directory. Use ListDirectory: $path" }
@@ -15291,8 +15353,97 @@ function Find-MBSearchNearMiss {
 		[void]$hits.Add(('  line {0}: {1}' -f ($i + 1), $show))
 		if ($hits.Count -ge $MaxHits) { break }
 	}
-	if ($hits.Count -eq 0) { return '' }
+	if ($hits.Count -eq 0) {
+		$token = ''
+		foreach ($w in ($firstLine -split '\s+')) {
+			$w = ([string]$w).Trim('`"''()[]{}.,;:')
+			if ($w.Length -ge 6 -and $w.Length -gt $token.Length) { $token = $w }
+		}
+		if ($token) {
+			for ($i = 0; $i -lt $lines.Count; $i++) {
+				$ln = [string]$lines[$i]
+				if ($ln.IndexOf($token, [System.StringComparison]::Ordinal) -lt 0) { continue }
+				$show = $ln
+				if ($show.Length -gt 140) { $show = $show.Substring(0, 137) + '...' }
+				[void]$hits.Add(('  line {0}: {1}' -f ($i + 1), $show))
+				if ($hits.Count -ge $MaxHits) { break }
+			}
+			if ($hits.Count -gt 0) {
+				return ("Nearest token '{0}':`n{1}" -f $token, ($hits -join "`n"))
+			}
+		}
+		return ''
+	}
 	return "Near-miss lines (first search line):`n" + ($hits -join "`n")
+}
+
+function Get-MBMissingPathHint {
+	# Sibling names when a coding path is wrong. Built-in directory listing only.
+	param([string]$Path)
+	$parent = ''
+	$leaf = ''
+	try {
+		$parent = [System.IO.Path]::GetDirectoryName([string]$Path)
+		$leaf = [System.IO.Path]::GetFileName([string]$Path)
+	} catch { return '' }
+	if ([string]::IsNullOrWhiteSpace($parent)) { return '' }
+	if (-not (Test-Path -LiteralPath $parent -PathType Container)) { return '' }
+	$stem = ''
+	try { $stem = [System.IO.Path]::GetFileNameWithoutExtension($leaf) } catch { $stem = $leaf }
+	if ([string]::IsNullOrWhiteSpace($stem) -or $stem.Length -lt 2) { $stem = $leaf }
+	if ([string]::IsNullOrWhiteSpace($stem)) { return '' }
+	$scored = New-Object System.Collections.ArrayList
+	try {
+		$seen = 0
+		foreach ($item in @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) {
+			$seen++
+			if ($seen -gt 400) { break }
+			$name = [string]$item.Name
+			if ([string]::Equals($name, $leaf, [StringComparison]::OrdinalIgnoreCase)) { continue }
+			$score = 0
+			if ($name.StartsWith($stem, [StringComparison]::OrdinalIgnoreCase)) { $score = 3 }
+			elseif ($name.IndexOf($stem, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $score = 2 }
+			if ($score -le 0) { continue }
+			$kind = if ($item.PSIsContainer) { 'dir' } else { 'file' }
+			[void]$scored.Add([pscustomobject]@{ Score = $score; Line = ('  {0} {1}' -f $kind, $name) })
+		}
+	} catch { return '' }
+	if ($scored.Count -eq 0) { return '' }
+	$top = @($scored | Sort-Object Score -Descending | Select-Object -First 6)
+	$lines = New-Object System.Collections.Generic.List[string]
+	foreach ($row in $top) { [void]$lines.Add([string]$row.Line) }
+	return ("Nearby in {0}:`n{1}" -f $parent, ($lines -join "`n"))
+}
+
+function Get-MBProjectInstructions {
+	# Nearest minibot.md / AGENTS.md / CLAUDE.md, walking up from the working directory. Read only.
+	param([string]$Start = '')
+	if ([string]::IsNullOrWhiteSpace($Start)) {
+		try { $Start = [string]$script:MB.WorkingDir } catch { $Start = '' }
+	}
+	if ([string]::IsNullOrWhiteSpace($Start)) {
+		try { $Start = (Get-Location).Path } catch { return '' }
+	}
+	$dir = $Start
+	$names = @('minibot.md', 'AGENTS.md', 'CLAUDE.md')
+	for ($depth = 0; $depth -lt 6; $depth++) {
+		if ([string]::IsNullOrWhiteSpace($dir)) { break }
+		foreach ($n in $names) {
+			$p = Join-Path $dir $n
+			if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+			$text = ''
+			try { $text = [System.IO.File]::ReadAllText($p) } catch { continue }
+			$text = ($text -replace "`r`n", "`n" -replace "`r", "`n").Trim()
+			if ([string]::IsNullOrWhiteSpace($text)) { continue }
+			if ($text.Length -gt 2200) { $text = $text.Substring(0, 2200) + "`n... [project instructions truncated]" }
+			return ("PROJECT ({0}):`n{1}" -f $p, $text)
+		}
+		$parent = ''
+		try { $parent = [System.IO.Path]::GetDirectoryName($dir) } catch { $parent = '' }
+		if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $dir) { break }
+		$dir = $parent
+	}
+	return ''
 }
 
 function Find-MBLiteralMatches {
@@ -15844,6 +15995,120 @@ function Test-MBSourceText {
 	return @{ Kind = $kind; Ok = $ok; Note = $note }
 }
 
+function Get-MBProjectCheckPlan {
+	# Find one check the machine can already run. Does not install anything.
+	param([string]$Path = '')
+	$start = $Path
+	if ([string]::IsNullOrWhiteSpace($start)) {
+		try { $start = [string]$script:MB.WorkingDir } catch { $start = '' }
+	}
+	if ([string]::IsNullOrWhiteSpace($start)) { return @{ Found = $false; Note = 'No path.' } }
+	$start = Resolve-MBPath $start
+	$dir = $start
+	$file = ''
+	if (Test-Path -LiteralPath $start -PathType Leaf) {
+		$file = $start
+		$dir = [System.IO.Path]::GetDirectoryName($start)
+	} elseif (-not (Test-Path -LiteralPath $start -PathType Container)) {
+		return @{ Found = $false; Note = "Path not found: $start" }
+	}
+	$have = {
+		param([string]$Name)
+		return ($null -ne (Get-Command $Name -ErrorAction SilentlyContinue))
+	}
+	for ($depth = 0; $depth -lt 6; $depth++) {
+		if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) { break }
+		if ($depth -le 2) {
+			$leaf = ''
+			if ($file) { try { $leaf = [System.IO.Path]::GetFileNameWithoutExtension($file) } catch { $leaf = '' } }
+			$tests = @()
+			if ($leaf) {
+				$tests = @(Get-ChildItem -LiteralPath $dir -Filter ($leaf + '*.Tests.ps1') -File -ErrorAction SilentlyContinue)
+			}
+			if ($tests.Count -eq 0 -and $depth -eq 0) {
+				$tests = @(Get-ChildItem -LiteralPath $dir -Filter '*.Tests.ps1' -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+			}
+			if ($tests.Count -gt 0) {
+				$t = [string]$tests[0].FullName
+				$ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+				return @{
+					Found = $true; Kind = 'powershell-test'; WorkDir = $dir; Command = $t
+					FileName = $ps
+					Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $t)
+					Note = 'Runs the PowerShell test file next to the edit.'
+				}
+			}
+		}
+		$pkg = Join-Path $dir 'package.json'
+		if ((Test-Path -LiteralPath $pkg -PathType Leaf) -and (& $have 'npm')) {
+			$hasTest = $false
+			try {
+				$j = Get-Content -LiteralPath $pkg -Raw -ErrorAction Stop | ConvertFrom-Json
+				if ($j.scripts -and $j.scripts.test -and [string]$j.scripts.test -notmatch '^(?i)echo\b.*no test') { $hasTest = $true }
+			} catch { $hasTest = $false }
+			if ($hasTest) {
+				return @{
+					Found = $true; Kind = 'npm'; WorkDir = $dir; Command = 'npm test'
+					FileName = $env:ComSpec
+					Arguments = '/d /c npm test'
+					Note = 'package.json scripts.test'
+				}
+			}
+		}
+		if ((Test-Path -LiteralPath (Join-Path $dir 'Cargo.toml') -PathType Leaf) -and (& $have 'cargo')) {
+			return @{ Found = $true; Kind = 'cargo'; WorkDir = $dir; Command = 'cargo test'; FileName = $env:ComSpec; Arguments = '/d /c cargo test'; Note = 'Cargo.toml' }
+		}
+		if ((Test-Path -LiteralPath (Join-Path $dir 'go.mod') -PathType Leaf) -and (& $have 'go')) {
+			return @{ Found = $true; Kind = 'go'; WorkDir = $dir; Command = 'go test ./...'; FileName = $env:ComSpec; Arguments = '/d /c go test ./...'; Note = 'go.mod' }
+		}
+		$csproj = @(Get-ChildItem -LiteralPath $dir -Filter '*.csproj' -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+		if ($csproj.Count -gt 0 -and (& $have 'dotnet')) {
+			return @{ Found = $true; Kind = 'dotnet'; WorkDir = $dir; Command = 'dotnet test --nologo'; FileName = $env:ComSpec; Arguments = '/d /c dotnet test --nologo'; Note = [string]$csproj[0].Name }
+		}
+		$pyMark = (Test-Path -LiteralPath (Join-Path $dir 'pytest.ini')) -or (Test-Path -LiteralPath (Join-Path $dir 'pyproject.toml'))
+		if ($pyMark -and (& $have 'python')) {
+			return @{ Found = $true; Kind = 'pytest'; WorkDir = $dir; Command = 'python -m pytest -q --tb=line'; FileName = $env:ComSpec; Arguments = '/d /c python -m pytest -q --tb=line'; Note = 'pytest config' }
+		}
+		$parent = ''
+		try { $parent = [System.IO.Path]::GetDirectoryName($dir) } catch { $parent = '' }
+		if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $dir) { break }
+		$dir = $parent
+	}
+	return @{ Found = $false; Kind = 'none'; Note = 'No project test command found. syntax=ok is not proof of behavior.' }
+}
+
+function Invoke-RunProjectCheck {
+	param(
+		[string]$path = '',
+		[int]$timeout_sec = 120
+	)
+	$plan = Get-MBProjectCheckPlan -Path $path
+	if (-not $plan.Found) {
+		return ("STATUS: NO_CHECK`n{0}`nDo not claim the change works." -f [string]$plan.Note)
+	}
+	if ($timeout_sec -lt 5) { $timeout_sec = 5 }
+	if ($timeout_sec -gt 600) { $timeout_sec = 600 }
+	$rr = Invoke-MBProcessCapture -FileName ([string]$plan.FileName) -Arguments ([string]$plan.Arguments) -WorkingDir ([string]$plan.WorkDir) -TimeoutMs ($timeout_sec * 1000)
+	$parts = New-Object System.Collections.Generic.List[string]
+	if ($rr.TimedOut) {
+		[void]$parts.Add(("STATUS: TIMED_OUT after {0}s  check={1}" -f $timeout_sec, $plan.Command))
+	} elseif ($rr.Cancelled) {
+		[void]$parts.Add(("STATUS: CANCELLED  check={0}" -f $plan.Command))
+	} elseif ([int]$rr.ExitCode -eq 0) {
+		[void]$parts.Add(("STATUS: OK exit=0  check={0}  cwd={1}" -f $plan.Command, $plan.WorkDir))
+	} else {
+		[void]$parts.Add(("STATUS: FAILED exit={0}  check={1}  cwd={2}. The project check failed." -f $rr.ExitCode, $plan.Command, $plan.WorkDir))
+	}
+	[void]$parts.Add(('kind={0}  {1}' -f $plan.Kind, $plan.Note))
+	$out = ''
+	try { $out = Sanitize-MBProcessOutput -Text $rr.StdOut } catch { $out = [string]$rr.StdOut }
+	$err = ''
+	try { $err = Sanitize-MBProcessOutput -Text $rr.StdErr } catch { $err = [string]$rr.StdErr }
+	if ($out) { [void]$parts.Add($out.TrimEnd()) }
+	if ($err) { [void]$parts.Add("STDERR:`n$($err.TrimEnd())") }
+	return Limit-MBResult ($parts -join "`n`n")
+}
+
 function Format-MBCodeVerifyBlock {
 	# Evidence block appended to edit-tool results so the model checks the save.
 	param(
@@ -15860,7 +16125,17 @@ function Format-MBCodeVerifyBlock {
 		[void]$lines.Add('LANDED:')
 		[void]$lines.Add($diff)
 	}
-	[void]$lines.Add('Do not claim more than VERIFY shows. ReadFile numbered=true on this range if LANDED is not enough. Run it before claiming behavior.')
+	if ($v.Kind -ne 'none' -and $v.Ok -eq $false) {
+		[void]$lines.Add('CHECK: fix syntax=FAIL before RunProjectCheck. Do not claim the edit works.')
+	} else {
+		$plan = $null
+		try { $plan = Get-MBProjectCheckPlan -Path $Path } catch { $plan = $null }
+		if ($plan -and $plan.Found) {
+			[void]$lines.Add(('CHECK: RunProjectCheck path={0}  ({1}). Claim behavior only if that returns STATUS: OK.' -f $Path, $plan.Command))
+		} else {
+			[void]$lines.Add('CHECK: no project test command. Do not claim behavior.')
+		}
+	}
 	return ($lines -join "`n")
 }
 
@@ -15965,7 +16240,12 @@ function Invoke-EditFile {
 		$edits = $null
 	)
 	$path = Resolve-MBPath $path
-	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: File not found: $path" }
+	if (-not (Test-Path -LiteralPath $path)) {
+		$hint = ''
+		try { $hint = Get-MBMissingPathHint -Path $path } catch { $hint = '' }
+		if ($hint) { return "ERROR: File not found: $path`n$hint" }
+		return "ERROR: File not found: $path"
+	}
 	$blockedEdit = Test-MBTextMutationBlocked -Path $path
 	if ($blockedEdit) { return "ERROR: $path - $blockedEdit" }
 
@@ -18298,15 +18578,19 @@ function Invoke-RunCommand {
 			$script:MB.Interrupt = $true
 		}
 		$parts = @()
-		if ($rr.TimedOut) { $parts += "ERROR: Command timed out after $([math]::Round($timeoutMs/1000))s" }
-		if ($rr.Cancelled) { $parts += "CANCELLED: Interrupted by user (ESC)" }
+		if ($rr.TimedOut) {
+			$parts += ("STATUS: TIMED_OUT after {0}s cwd={1}" -f [math]::Round($timeoutMs/1000), $wd)
+		} elseif ($rr.Cancelled) {
+			$parts += ("STATUS: CANCELLED cwd={0}" -f $wd)
+		} elseif ([int]$rr.ExitCode -eq 0) {
+			$parts += ("STATUS: OK exit=0 cwd={0} ({1} ms)" -f $wd, $rr.ElapsedMs)
+		} else {
+			$parts += ("STATUS: FAILED exit={0} cwd={1} ({2} ms). The command failed." -f $rr.ExitCode, $wd, $rr.ElapsedMs)
+		}
 		$stdoutClean = Sanitize-MBProcessOutput -Text $rr.StdOut
 		$stderrClean = Sanitize-MBProcessOutput -Text $rr.StdErr
 		if ($stdoutClean) { $parts += $stdoutClean.TrimEnd() }
 		if ($stderrClean) { $parts += "STDERR:`n$($stderrClean.TrimEnd())" }
-		if (-not $rr.TimedOut -and -not $rr.Cancelled) {
-			$parts += "EXIT_CODE: $($rr.ExitCode) ($($rr.ElapsedMs) ms)"
-		}
 		return Limit-MBResult ($parts -join "`n`n")
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
@@ -19009,7 +19293,8 @@ function Invoke-SearchFiles {
 		[string]$glob = "*.*",
 		[bool]$recursive = $true,
 		[bool]$ignoreCase = $true,
-		[int]$maxResults = 50
+		[int]$maxResults = 50,
+		[int]$context = 1
 	)
 	$path = Resolve-MBPath $path
 	if (-not (Test-Path -LiteralPath $path)) { return "ERROR: Path not found: $path" }
@@ -19029,40 +19314,64 @@ function Invoke-SearchFiles {
 		'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.db','.sqlite','.bin','.pak'
 	)
 
+	if ($context -lt 0) { $context = 0 }
+	if ($context -gt 3) { $context = 3 }
+	$skipDir = @('node_modules', '.git', '.vs', '.venv', 'venv', 'bin', 'obj', 'packages', 'vendor', 'dist', '__pycache__')
+	$like = $glob
+	if ([string]::IsNullOrWhiteSpace($like) -or $like -eq '*.*') { $like = '*' }
+
 	try {
 		$rootItem = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+		$files = New-Object System.Collections.ArrayList
 		if (-not $rootItem.PSIsContainer) {
-			$files = @($rootItem)
+			[void]$files.Add($rootItem)
 		} else {
-			$gciParams = @{
-				LiteralPath = $path
-				File        = $true
-				ErrorAction = 'SilentlyContinue'
+			$queue = New-Object System.Collections.Queue
+			$queue.Enqueue($rootItem.FullName)
+			while ($queue.Count -gt 0 -and $files.Count -lt 2000) {
+				if ((Test-MBInterrupt)) { break }
+				$current = [string]$queue.Dequeue()
+				foreach ($item in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction SilentlyContinue)) {
+					if ($item.PSIsContainer) {
+						if (-not $recursive) { continue }
+						if ($skipDir -contains $item.Name.ToLowerInvariant()) { continue }
+						$queue.Enqueue($item.FullName)
+					} else {
+						if ($item.Name -notlike $like) { continue }
+						[void]$files.Add($item)
+						if ($files.Count -ge 2000) { break }
+					}
+				}
 			}
-			if ($recursive) { $gciParams['Recurse'] = $true }
-			if ($glob) { $gciParams['Filter'] = $glob }
-			$files = @(Get-ChildItem @gciParams | Select-Object -First 2000)
 		}
 		$ssParams = @{ Pattern = $pattern; SimpleMatch = $false; ErrorAction = 'SilentlyContinue' }
+		if ($context -gt 0) { $ssParams['Context'] = $context }
 		if ($ignoreCase) { $ssParams['CaseSensitive'] = $false } else { $ssParams['CaseSensitive'] = $true }
 
-		$matches = @()
+		$matches = New-Object System.Collections.ArrayList
 		$skippedBinary = 0
 		$scanned = 0
-		foreach ($f in $files) {
+		foreach ($f in @($files)) {
 			if ((Test-MBInterrupt)) { break }
 			if ($f.Length -gt 5MB) { continue }
 			$ext = $f.Extension.ToLowerInvariant()
 			if ($skipExt -contains $ext) { $skippedBinary++; continue }
 			$scanned++
 			try {
-				$hits = Select-String -LiteralPath $f.FullName @ssParams | Select-Object -First 10
+				$hits = @(Select-String -LiteralPath $f.FullName @ssParams | Select-Object -First 8)
 				foreach ($h in $hits) {
-					$matches += [pscustomobject]@{
+					$before = @()
+					$after = @()
+					try { $before = @($h.Context.PreContext) } catch { $before = @() }
+					try { $after = @($h.Context.PostContext) } catch { $after = @() }
+					[void]$matches.Add([pscustomobject]@{
 						path = $f.FullName
 						line = $h.LineNumber
-						text = $h.Line.Trim()
-					}
+						text = ([string]$h.Line).Trim()
+						before = @($before | ForEach-Object { ([string]$_).Trim() })
+						after = @($after | ForEach-Object { ([string]$_).Trim() })
+						read = ('ReadFile path={0} numbered=true offset={1} length={2}' -f $f.FullName, [Math]::Max(1, ($h.LineNumber - 2)), (5 + ($context * 2)))
+					})
 					if ($matches.Count -ge $maxResults) { break }
 				}
 			} catch {}
@@ -19072,14 +19381,16 @@ function Invoke-SearchFiles {
 		return ConvertTo-MBJson @{
 			root          = $path
 			pattern       = $pattern
-			glob          = $glob
-			filesConsidered = @($files).Count
+			glob          = $like
+			filesConsidered = $files.Count
 			filesScanned  = $scanned
 			skippedBinary = $skippedBinary
+			skippedDirs   = ($skipDir -join ',')
 			matchCount    = $matches.Count
 			truncated    = ($matches.Count -ge $maxResults)
-			matches       = $matches
-		} -Depth 4
+			next          = 'Open match.read with ReadFile. Do not edit from the trimmed text alone.'
+			matches       = @($matches)
+		} -Depth 5
 	} catch {
 		return "ERROR: $($_.Exception.Message)"
 	}
@@ -42676,10 +42987,17 @@ function Invoke-MBTool {
 					pattern = (Get-MBProp $ArgsObj 'pattern')
 				}
 				if (Test-MBHasProp $ArgsObj 'glob')       { $p['glob'] = (Get-MBProp $ArgsObj 'glob') }
-				if (Test-MBHasProp $ArgsObj 'recursive')  { $p['recursive'] = [bool](Get-MBProp $ArgsObj 'recursive') }
-				if (Test-MBHasProp $ArgsObj 'ignoreCase') { $p['ignoreCase'] = [bool](Get-MBProp $ArgsObj 'ignoreCase') }
+				if (Test-MBHasProp $ArgsObj 'recursive')  { $p['recursive'] = (Convert-MBToBool -Value (Get-MBProp $ArgsObj 'recursive') -Default $true) }
+				if (Test-MBHasProp $ArgsObj 'ignoreCase') { $p['ignoreCase'] = (Convert-MBToBool -Value (Get-MBProp $ArgsObj 'ignoreCase') -Default $true) }
 				if (Test-MBHasProp $ArgsObj 'maxResults') { $p['maxResults'] = [int](Get-MBProp $ArgsObj 'maxResults') }
+				if (Test-MBHasProp $ArgsObj 'context')    { $p['context'] = [int](Get-MBProp $ArgsObj 'context') }
 				Invoke-SearchFiles @p
+			}
+			"RunProjectCheck" {
+				$p = @{}
+				if (Test-MBHasProp $ArgsObj 'path') { $p['path'] = (Get-MBProp $ArgsObj 'path') }
+				if (Test-MBHasProp $ArgsObj 'timeout_sec') { $p['timeout_sec'] = [int](Get-MBProp $ArgsObj 'timeout_sec') }
+				Invoke-RunProjectCheck @p
 			}
 			"FindFiles" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path' '.') }
@@ -48634,9 +48952,7 @@ function Show-MBSessionFilePicker {
 		$Title = if ($Mode -eq 'Save') { ("{0} Save session" -f $agentTitle) } else { ("{0} Load session" -f $agentTitle) }
 	}
 	if ([string]::IsNullOrWhiteSpace($FileName) -and $Mode -eq 'Save') {
-		$safe = try { [string]$AgentName } catch { 'MiniBot' }
-		if ([string]::IsNullOrWhiteSpace($safe)) { $safe = 'MiniBot' }
-		$FileName = ("{0}-session-{1:yyyyMMdd-HHmmss}.json" -f $safe, (Get-Date))
+		$FileName = ("minibot-{0:yyyyMMdd-HHmmss}.md" -f (Get-Date))
 	}
 	if ([string]::IsNullOrWhiteSpace($InitialDirectory)) {
 		# Prefer Documents over Desktop (OneDrive Desktop listing is a common hang source)
@@ -48830,6 +49146,267 @@ function Show-MBSessionFilePicker {
 		try { if ($ps) { $ps.Dispose() } } catch {}
 		try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
 	}
+}
+
+function Get-MBSessionStoreRoot {
+	param([string]$Root = '')
+	if (-not [string]::IsNullOrWhiteSpace($Root)) { return $Root }
+	$base = $env:LOCALAPPDATA
+	if ([string]::IsNullOrWhiteSpace($base)) { $base = [Environment]::GetFolderPath('LocalApplicationData') }
+	if ([string]::IsNullOrWhiteSpace($base)) { $base = $env:TEMP }
+	return (Join-Path $base 'MiniBot\sessions')
+}
+
+function Convert-MBSessionCwdKey {
+	param([string]$Cwd)
+	$c = ([string]$Cwd).Trim().TrimEnd('\')
+	if ([string]::IsNullOrWhiteSpace($c)) { $c = 'unknown' }
+	$slug = ($c.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+	if ($slug.Length -gt 40) { $slug = $slug.Substring($slug.Length - 40).Trim('-') }
+	if ([string]::IsNullOrWhiteSpace($slug)) { $slug = 'cwd' }
+	$sha = $null
+	try {
+		$sha = [System.Security.Cryptography.SHA1]::Create()
+		$bytes = [System.Text.Encoding]::UTF8.GetBytes($c.ToLowerInvariant())
+		$hash = ($sha.ComputeHash($bytes) | ForEach-Object { '{0:x2}' -f $_ }) -join ''
+	} finally {
+		if ($sha) { try { $sha.Dispose() } catch {} }
+	}
+	if ([string]::IsNullOrWhiteSpace($hash)) { $hash = '0000000000' }
+	return ($slug + '-' + $hash.Substring(0, 10))
+}
+
+function Write-MBSessionText {
+	# Atomic UTF-8 write inside the session store. The temp file is removed before return.
+	param([string]$Path, [string]$Text)
+	$dir = [System.IO.Path]::GetDirectoryName($Path)
+	if ($dir -and -not [System.IO.Directory]::Exists($dir)) {
+		[void][System.IO.Directory]::CreateDirectory($dir)
+	}
+	$tmp = [System.IO.Path]::Combine($dir, ('.mbsess-' + [guid]::NewGuid().ToString('n') + '.tmp'))
+	$utf8 = New-Object System.Text.UTF8Encoding $false
+	try {
+		[System.IO.File]::WriteAllText($tmp, [string]$Text, $utf8)
+		if ([System.IO.File]::Exists($Path)) {
+			try {
+				[System.IO.File]::Replace($tmp, $Path, $null, $true)
+			} catch {
+				[System.IO.File]::Copy($tmp, $Path, $true)
+			}
+		} else {
+			try { [System.IO.File]::Move($tmp, $Path) } catch { [System.IO.File]::Copy($tmp, $Path, $true) }
+		}
+	} finally {
+		if ([System.IO.File]::Exists($tmp)) {
+			try { [System.IO.File]::Delete($tmp) } catch {}
+		}
+	}
+}
+
+function Test-MBSessionWorthSaving {
+	param($Messages)
+	foreach ($m in @($Messages)) {
+		$role = ''
+		try { $role = [string](Get-MBProp $m 'role') } catch { $role = '' }
+		if ($role -eq 'user' -or $role -eq 'assistant') {
+			$text = ''
+			try { $text = [string](Get-MBProp $m 'content') } catch { $text = '' }
+			if (-not [string]::IsNullOrWhiteSpace($text)) { return $true }
+			$calls = $null
+			try { $calls = Get-MBProp $m 'tool_calls' } catch { $calls = $null }
+			if ($calls) { return $true }
+		}
+	}
+	return $false
+}
+
+function Get-MBSessionTitleFromMessages {
+	param($Messages)
+	foreach ($m in @($Messages)) {
+		$role = ''
+		try { $role = [string](Get-MBProp $m 'role') } catch { continue }
+		if ($role -ne 'user') { continue }
+		$text = ''
+		try { $text = [string](Get-MBProp $m 'content') } catch { $text = '' }
+		$text = ($text -replace '\s+', ' ').Trim()
+		if ([string]::IsNullOrWhiteSpace($text)) { continue }
+		if ($text.Length -gt 80) { $text = $text.Substring(0, 77) + '...' }
+		return $text
+	}
+	return 'Chat'
+}
+
+function Save-MBStoredSession {
+	# Autosave the live chat. Files live under LocalAppData, never the repo.
+	param([string]$Root = '')
+	if (-not (Test-MBSessionWorthSaving -Messages $script:Messages)) { return $null }
+	$cwd = ''
+	try { $cwd = [string]$script:MB.WorkingDir } catch { $cwd = '' }
+	$id = ''
+	try { $id = [string]$script:MB.SessionStoreId } catch { $id = '' }
+	if ($id -notmatch '^[0-9a-f]{8,32}$') {
+		$id = [guid]::NewGuid().ToString('n').Substring(0, 12)
+		$script:MB.SessionStoreId = $id
+		$script:MB.SessionStoreDir = $null
+	}
+	$dir = ''
+	try { $dir = [string]$script:MB.SessionStoreDir } catch { $dir = '' }
+	if ([string]::IsNullOrWhiteSpace($dir)) {
+		$dir = Join-Path (Join-Path (Get-MBSessionStoreRoot -Root $Root) (Convert-MBSessionCwdKey -Cwd $cwd)) $id
+		$script:MB.SessionStoreDir = $dir
+	}
+	$sessionPath = Join-Path $dir 'session.json'
+	$null = Save-MBSessionJson -Messages @($script:Messages) -Path $sessionPath
+	$n = 0
+	foreach ($m in @($script:Messages)) {
+		$role = ''
+		try { $role = [string](Get-MBProp $m 'role') } catch { $role = '' }
+		if ($role -and $role -ne 'system') { $n++ }
+	}
+	$model = ''
+	try { $model = [string](Get-MBActiveModel) } catch { $model = '' }
+	$summary = [ordered]@{
+		id       = $id
+		title    = (Get-MBSessionTitleFromMessages -Messages $script:Messages)
+		cwd      = $cwd
+		savedAt  = [datetime]::UtcNow.ToString('o')
+		model    = $model
+		messages = $n
+	}
+	Write-MBSessionText -Path (Join-Path $dir 'summary.json') -Text (ConvertTo-Json -InputObject ([pscustomobject]$summary) -Compress -Depth 4)
+	return $dir
+}
+
+function Get-MBStoredSessions {
+	param(
+		[string]$Cwd = '',
+		[string]$Root = '',
+		[bool]$All = $false,
+		[int]$Max = 20
+	)
+	if ($Max -lt 1) { $Max = 20 }
+	if ($Max -gt 100) { $Max = 100 }
+	$rootPath = Get-MBSessionStoreRoot -Root $Root
+	$out = New-Object System.Collections.ArrayList
+	if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { return ,$out }
+	$dirs = New-Object System.Collections.ArrayList
+	if ($All) {
+		try {
+			foreach ($cwdDir in @(Get-ChildItem -LiteralPath $rootPath -Directory -ErrorAction SilentlyContinue)) {
+				foreach ($sess in @(Get-ChildItem -LiteralPath $cwdDir.FullName -Directory -ErrorAction SilentlyContinue)) {
+					[void]$dirs.Add($sess.FullName)
+				}
+			}
+		} catch {}
+	} else {
+		$keyDir = Join-Path $rootPath (Convert-MBSessionCwdKey -Cwd $Cwd)
+		if (Test-Path -LiteralPath $keyDir -PathType Container) {
+			foreach ($sess in @(Get-ChildItem -LiteralPath $keyDir -Directory -ErrorAction SilentlyContinue)) {
+				[void]$dirs.Add($sess.FullName)
+			}
+		}
+	}
+	foreach ($dir in @($dirs)) {
+		$sumPath = Join-Path $dir 'summary.json'
+		$sessPath = Join-Path $dir 'session.json'
+		if (-not (Test-Path -LiteralPath $sumPath -PathType Leaf)) { continue }
+		if (-not (Test-Path -LiteralPath $sessPath -PathType Leaf)) { continue }
+		try {
+			$obj = Get-Content -LiteralPath $sumPath -Raw -Encoding UTF8 | ConvertFrom-Json
+		} catch { continue }
+		$id = ''
+		try { $id = [string]$obj.id } catch { $id = '' }
+		if ([string]::IsNullOrWhiteSpace($id)) { $id = [System.IO.Path]::GetFileName($dir) }
+		$when = [datetime]::MinValue
+		try { $when = [datetime]::Parse([string]$obj.savedAt).ToUniversalTime() } catch {
+			try { $when = (Get-Item -LiteralPath $sumPath).LastWriteTimeUtc } catch { $when = [datetime]::MinValue }
+		}
+		[void]$out.Add([pscustomobject]@{
+			Id       = $id
+			Title    = $(try { [string]$obj.title } catch { 'Chat' })
+			Cwd      = $(try { [string]$obj.cwd } catch { '' })
+			SavedAt  = $when
+			Model    = $(try { [string]$obj.model } catch { '' })
+			Messages = $(try { [int]$obj.messages } catch { 0 })
+			Dir      = $dir
+			Path     = $sessPath
+		})
+	}
+	$sorted = @($out | Sort-Object SavedAt -Descending)
+	if ($sorted.Count -gt $Max) { $sorted = @($sorted | Select-Object -First $Max) }
+	$list = New-Object System.Collections.ArrayList
+	foreach ($row in $sorted) { if ($null -ne $row) { [void]$list.Add($row) } }
+	return ,$list
+}
+
+function Resolve-MBStoredSession {
+	param(
+		[string]$Which = '',
+		[string]$Cwd = '',
+		[string]$Root = ''
+	)
+	$which = ([string]$Which).Trim()
+	$here = Get-MBStoredSessions -Cwd $Cwd -Root $Root -All $false -Max 30
+	if ([string]::IsNullOrWhiteSpace($which) -or $which -match '^(?i)latest|last$') {
+		if ($here.Count -lt 1) { return $null }
+		return $here[0]
+	}
+	$n = 0
+	if ([int]::TryParse($which, [ref]$n) -and $n -ge 1 -and $n -le $here.Count) {
+		return $here[$n - 1]
+	}
+	$want = $which.ToLowerInvariant()
+	$hits = New-Object System.Collections.ArrayList
+	$addPrefix = {
+		param($Row)
+		$idText = ''
+		try { $idText = ([string]$Row.Id).ToLowerInvariant() } catch { return }
+		if ($want.Length -lt 4 -or $idText.Length -lt $want.Length) { return }
+		if ($idText.Substring(0, $want.Length) -eq $want) { [void]$hits.Add($Row) }
+	}
+	foreach ($row in @($here)) { & $addPrefix $row }
+	if ($hits.Count -eq 0) {
+		$all = Get-MBStoredSessions -Root $Root -All $true -Max 100
+		foreach ($row in @($all)) { & $addPrefix $row }
+	}
+	if ($hits.Count -eq 1) { return $hits[0] }
+	if ($hits.Count -gt 1) {
+		$names = ($hits | ForEach-Object { $_.Id } | Select-Object -First 6) -join ', '
+		throw ("Session id '{0}' matches more than one chat: {1}" -f $which, $names)
+	}
+	return $null
+}
+
+function Format-MBStoredSessionList {
+	param($Sessions, [string]$Cwd = '')
+	$lines = New-Object System.Collections.Generic.List[string]
+	[void]$lines.Add(('Saved chats for {0}' -f $Cwd))
+	if ($null -eq $Sessions -or @($Sessions).Count -eq 0) {
+		[void]$lines.Add('No saved chats for this folder yet. A chat is kept after the first reply.')
+		[void]$lines.Add('Store: LocalAppData\MiniBot\sessions')
+		return ($lines -join "`n")
+	}
+	$i = 1
+	foreach ($row in @($Sessions)) {
+		$local = ''
+		try { $local = $row.SavedAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm') } catch { $local = '' }
+		$title = [string]$row.Title
+		if ([string]::IsNullOrWhiteSpace($title)) { $title = 'Chat' }
+		[void]$lines.Add(('{0,3}  {1}  {2}' -f $i, $local, $title))
+		[void]$lines.Add(('      id {0}   {1} messages' -f $row.Id, $row.Messages))
+		$i++
+	}
+	[void]$lines.Add('/resume loads the newest. /resume 2 or /resume <id> loads that chat.')
+	return ($lines -join "`n")
+}
+
+function Import-MBStoredSession {
+	param($Session)
+	if ($null -eq $Session) { throw 'No saved chat to resume.' }
+	$loaded = Load-MBSessionJson -Path ([string]$Session.Path)
+	$script:MB.SessionStoreId = [string]$Session.Id
+	$script:MB.SessionStoreDir = [string]$Session.Dir
+	return $loaded
 }
 
 function Save-MBSessionJson {
@@ -50717,7 +51294,7 @@ namespace MiniBot.Live {
         XmlElement el = child as XmlElement;
         if (el == null) continue;
         Dictionary<string, string> ctx = MergePaint(inherit, el);
-        if (NameIs(el, "g") || NameIs(el, "svg")) {
+        if (NameIs(el, "g") || NameIs(el, "svg") || NameIs(el, "a") || NameIs(el, "switch")) {
           Canvas layer = new Canvas();
           layer.IsHitTestVisible = true;
           Transform layerTf = BuildNodeTransform(el);
@@ -50731,8 +51308,11 @@ namespace MiniBot.Live {
           continue;
         }
         string ln = Local(el);
-        if (ln == "defs" || ln == "clipPath" || ln == "style" || ln == "title" || ln == "desc" || ln == "metadata" || ln == "symbol" || ln == "use" || ln == "image" || ln == "foreignObject" || ln == "mask" || ln == "filter" || ln == "linearGradient" || ln == "radialGradient" || ln == "pattern")
+        if (ln == "title" || ln == "desc" || ln == "metadata") continue;
+        if (ln == "defs" || ln == "clipPath" || ln == "style" || ln == "symbol" || ln == "use" || ln == "image" || ln == "foreignObject" || ln == "mask" || ln == "filter" || ln == "linearGradient" || ln == "radialGradient" || ln == "pattern") {
+          skipped++;
           continue;
+        }
         UIElement u = Build(el, ctx);
         if (u == null) { skipped++; continue; }
         ApplyNodeTransform(u, el);
@@ -50939,31 +51519,84 @@ namespace MiniBot.Live {
       }
     }
 
-    UIElement BuildText(XmlElement el, Dictionary<string, string> ctx) {
-      double x = ParseD(Paint(ctx, el, "x"), 0);
-      double y = ParseD(Paint(ctx, el, "y"), 0);
-      string text = el.InnerText == null ? "" : el.InnerText.Trim();
+    TextBlock MakeTextBlock(string text, Dictionary<string, string> ctx, XmlElement el) {
       TextBlock tb = new TextBlock();
-      tb.Text = text;
+      tb.Text = text ?? "";
       tb.FontSize = ParseD(Paint(ctx, el, "font-size"), 12);
       string ff = Paint(ctx, el, "font-family");
       if (!string.IsNullOrEmpty(ff)) {
         try { tb.FontFamily = new FontFamily(ff.Split(',')[0].Trim().Trim('\'', '"')); } catch { }
       }
+      string fw = Paint(ctx, el, "font-weight");
+      if (!string.IsNullOrEmpty(fw)) {
+        string f = fw.Trim().ToLowerInvariant();
+        int wnum;
+        bool bold = f == "bold" || f == "bolder" || (int.TryParse(f, out wnum) && wnum >= 600);
+        if (bold) tb.FontWeight = FontWeights.SemiBold;
+      }
       Brush fill = ParseBrush(Paint(ctx, el, "fill"), Brushes.White);
       if (fill != null) tb.Foreground = fill;
       double op = ParseD(Paint(ctx, el, "opacity"), 1);
       if (op < 1 && op >= 0) tb.Opacity = op;
-      string anchor = (Paint(ctx, el, "text-anchor") ?? "").ToLowerInvariant();
-      double estH = tb.FontSize * 1.2;
-      double left = x;
-      double top = y - estH * 0.8;
+      return tb;
+    }
+
+    void PlaceText(Canvas host, TextBlock tb, double x, double y, string anchor) {
       tb.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+      double left = x;
+      double top = y - tb.FontSize * 0.8;
       if (anchor == "middle") left = x - tb.DesiredSize.Width / 2;
       else if (anchor == "end") left = x - tb.DesiredSize.Width;
       Canvas.SetLeft(tb, left);
       Canvas.SetTop(tb, top);
-      return tb;
+      host.Children.Add(tb);
+    }
+
+    UIElement BuildText(XmlElement el, Dictionary<string, string> ctx) {
+      double x = ParseFirstD(Paint(ctx, el, "x"), 0) + ParseFirstD(Paint(ctx, el, "dx"), 0);
+      double y = ParseFirstD(Paint(ctx, el, "y"), 0) + ParseFirstD(Paint(ctx, el, "dy"), 0);
+      bool hasTspan = false;
+      foreach (XmlNode c in el.ChildNodes) {
+        XmlElement ce = c as XmlElement;
+        if (ce != null && NameIs(ce, "tspan")) { hasTspan = true; break; }
+      }
+      if (!hasTspan) {
+        string text = el.InnerText == null ? "" : el.InnerText.Trim();
+        TextBlock tb = MakeTextBlock(text, ctx, el);
+        string anchor = (Paint(ctx, el, "text-anchor") ?? "").ToLowerInvariant();
+        Canvas host = new Canvas();
+        PlaceText(host, tb, x, y, anchor);
+        return host;
+      }
+      Canvas box = new Canvas();
+      double cx = x;
+      double cy = y;
+      foreach (XmlNode c in el.ChildNodes) {
+        if (c.NodeType == XmlNodeType.Text || c.NodeType == XmlNodeType.CDATA) {
+          string raw = c.Value == null ? "" : c.Value;
+          if (raw.Trim().Length == 0) continue;
+          TextBlock plain = MakeTextBlock(raw.Trim(), ctx, el);
+          string a0 = (Paint(ctx, el, "text-anchor") ?? "").ToLowerInvariant();
+          PlaceText(box, plain, cx, cy, a0);
+          cx += plain.DesiredSize.Width;
+          continue;
+        }
+        XmlElement span = c as XmlElement;
+        if (span == null || !NameIs(span, "tspan")) continue;
+        Dictionary<string, string> ctx2 = MergePaint(ctx, span);
+        string sx = Attr(span, "x");
+        string sy = Attr(span, "y");
+        if (!string.IsNullOrEmpty(sx)) cx = ParseFirstD(sx, cx);
+        if (!string.IsNullOrEmpty(sy)) cy = ParseFirstD(sy, cy);
+        cx += ParseFirstD(Attr(span, "dx"), 0);
+        cy += ParseFirstD(Attr(span, "dy"), 0);
+        string spanText = span.InnerText == null ? "" : span.InnerText.Trim();
+        TextBlock tb = MakeTextBlock(spanText, ctx2, span);
+        string anchor = (Paint(ctx2, span, "text-anchor") ?? "").ToLowerInvariant();
+        PlaceText(box, tb, cx, cy, anchor);
+        if (string.IsNullOrEmpty(sx)) cx += tb.DesiredSize.Width;
+      }
+      return box;
     }
 
     void ApplyPaint(Shape sh, XmlElement el, Dictionary<string, string> ctx, bool strokeDefault) {
@@ -50999,6 +51632,56 @@ namespace MiniBot.Live {
       if (fo >= 0 && fo < 1 && sh.Fill != null) {
         try { sh.Fill = sh.Fill.Clone(); sh.Fill.Opacity = fo; } catch { }
       }
+
+      string cap = Paint(ctx, el, "stroke-linecap");
+      if (!string.IsNullOrEmpty(cap)) {
+        string c = cap.Trim().ToLowerInvariant();
+        PenLineCap pc = PenLineCap.Flat;
+        if (c == "round") pc = PenLineCap.Round;
+        else if (c == "square") pc = PenLineCap.Square;
+        sh.StrokeStartLineCap = pc;
+        sh.StrokeEndLineCap = pc;
+        sh.StrokeDashCap = pc;
+      }
+      string join = Paint(ctx, el, "stroke-linejoin");
+      if (!string.IsNullOrEmpty(join)) {
+        string j = join.Trim().ToLowerInvariant();
+        if (j == "round") sh.StrokeLineJoin = PenLineJoin.Round;
+        else if (j == "bevel") sh.StrokeLineJoin = PenLineJoin.Bevel;
+        else sh.StrokeLineJoin = PenLineJoin.Miter;
+      }
+      string dash = Paint(ctx, el, "stroke-dasharray");
+      if (!string.IsNullOrEmpty(dash) && !IsNone(dash)) {
+        double[] nums = ParseNumList(dash);
+        if (nums.Length > 0) {
+          double unit = sh.StrokeThickness > 0 ? sh.StrokeThickness : 1;
+          DoubleCollection dashes = new DoubleCollection();
+          for (int i = 0; i < nums.Length; i++) {
+            double len = nums[i] / unit;
+            if (len < 0) len = 0;
+            dashes.Add(len);
+          }
+          if (dashes.Count == 1) dashes.Add(dashes[0]);
+          sh.StrokeDashArray = dashes;
+        }
+      }
+      string rule = Paint(ctx, el, "fill-rule");
+      if (!string.IsNullOrEmpty(rule) && rule.Trim().Equals("evenodd", StringComparison.OrdinalIgnoreCase)) {
+        Polygon poly = sh as Polygon;
+        if (poly != null) poly.FillRule = FillRule.EvenOdd;
+        System.Windows.Shapes.Path path = sh as System.Windows.Shapes.Path;
+        if (path != null && path.Data != null) {
+          try {
+            PathGeometry geo = path.Data as PathGeometry;
+            if (geo == null) geo = PathGeometry.CreateFromGeometry(path.Data);
+            if (geo != null) {
+              if (geo.IsFrozen) geo = geo.Clone();
+              geo.FillRule = FillRule.EvenOdd;
+              path.Data = geo;
+            }
+          } catch { }
+        }
+      }
     }
 
     static Dictionary<string, string> MergePaint(Dictionary<string, string> inherit, XmlElement el) {
@@ -51008,7 +51691,8 @@ namespace MiniBot.Live {
       }
       string[] keys = new string[] {
         "fill","stroke","stroke-width","opacity","fill-opacity","stroke-opacity",
-        "font-size","font-family","text-anchor","stroke-linecap","stroke-linejoin"
+        "font-size","font-family","font-weight","text-anchor","fill-rule",
+        "stroke-linecap","stroke-linejoin","stroke-dasharray"
       };
       for (int i = 0; i < keys.Length; i++) {
         string a = Attr(el, keys[i]);
@@ -51080,12 +51764,26 @@ namespace MiniBot.Live {
       s = s.Trim();
       try {
         if (s.StartsWith("#")) return new SolidColorBrush((Color)ColorConverter.ConvertFromString(s));
-        Match m = Regex.Match(s, @"rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", RegexOptions.IgnoreCase);
+        if (s.Equals("currentColor", StringComparison.OrdinalIgnoreCase))
+          return new SolidColorBrush(Color.FromRgb(0xE5, 0xE7, 0xEB));
+        Match m = Regex.Match(s, @"rgba?\s*\(\s*([0-9.]+%?)\s*,\s*([0-9.]+%?)\s*,\s*([0-9.]+%?)\s*(?:,\s*([0-9.]+%?)\s*)?\)", RegexOptions.IgnoreCase);
         if (m.Success) {
-          byte r = (byte)Math.Min(255, int.Parse(m.Groups[1].Value));
-          byte g = (byte)Math.Min(255, int.Parse(m.Groups[2].Value));
-          byte b = (byte)Math.Min(255, int.Parse(m.Groups[3].Value));
-          return new SolidColorBrush(Color.FromRgb(r, g, b));
+          byte r = ParseColorChannel(m.Groups[1].Value);
+          byte g = ParseColorChannel(m.Groups[2].Value);
+          byte b = ParseColorChannel(m.Groups[3].Value);
+          byte a = 255;
+          if (m.Groups[4].Success && m.Groups[4].Value.Length > 0) {
+            string av = m.Groups[4].Value.Trim();
+            double af;
+            if (av.EndsWith("%")) {
+              if (double.TryParse(av.Substring(0, av.Length - 1), NumberStyles.Float, CultureInfo.InvariantCulture, out af))
+                a = (byte)Math.Max(0, Math.Min(255, (int)Math.Round(af * 2.55)));
+            } else if (double.TryParse(av, NumberStyles.Float, CultureInfo.InvariantCulture, out af)) {
+              if (af <= 1) a = (byte)Math.Max(0, Math.Min(255, (int)Math.Round(af * 255)));
+              else a = (byte)Math.Max(0, Math.Min(255, (int)Math.Round(af)));
+            }
+          }
+          return new SolidColorBrush(Color.FromArgb(a, r, g, b));
         }
         return new SolidColorBrush((Color)ColorConverter.ConvertFromString(s));
       } catch { return fallback; }
@@ -51112,6 +51810,25 @@ namespace MiniBot.Live {
       string n = el.Name;
       int i = n.IndexOf(':');
       return i >= 0 ? n.Substring(i + 1) : n;
+    }
+
+    static byte ParseColorChannel(string s) {
+      if (string.IsNullOrEmpty(s)) return 0;
+      s = s.Trim();
+      double v;
+      if (s.EndsWith("%")) {
+        if (!double.TryParse(s.Substring(0, s.Length - 1), NumberStyles.Float, CultureInfo.InvariantCulture, out v)) return 0;
+        return (byte)Math.Max(0, Math.Min(255, (int)Math.Round(v * 2.55)));
+      }
+      if (!double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) return 0;
+      return (byte)Math.Max(0, Math.Min(255, (int)Math.Round(v)));
+    }
+
+    static double ParseFirstD(string s, double def) {
+      if (string.IsNullOrEmpty(s)) return def;
+      Match m = Regex.Match(s.Trim(), @"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?");
+      if (!m.Success) return def;
+      return ParseD(m.Value, def);
     }
 
     static double ParseD(string s, double def) {
@@ -51214,6 +51931,8 @@ function Get-MBVizFallbackMessage {
 function Repair-MBVizSvgFragment {
 	param([string]$Body = '')
 	if ([string]::IsNullOrWhiteSpace($Body)) { return $Body }
+	# Bare ampersands break the XML parser (labels like Q&A). Leave real entities alone.
+	$Body = [regex]::Replace([string]$Body, '&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9A-Fa-f]+);)', '&amp;')
 	$rx = New-Object System.Text.RegularExpressions.Regex '(?is)<svg\b([^>]*)>'
 	$eval = {
 		param($m)
@@ -51223,10 +51942,10 @@ function Repair-MBVizSvgFragment {
 		}
 		$vbW = 0.0
 		$vbH = 0.0
-		if ($attrs -match '(?i)\bviewBox\s*=\s*"\s*([0-9.eE+-]+)\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\s*"') {
+		if ($attrs -match '(?i)\bviewBox\s*=\s*"\s*([0-9.eE+-]+)[\s,]+([0-9.eE+-]+)[\s,]+([0-9.eE+-]+)[\s,]+([0-9.eE+-]+)\s*"') {
 			$vbW = [double]$Matches[3]
 			$vbH = [double]$Matches[4]
-		} elseif ($attrs -match "(?i)\bviewBox\s*=\s*'\s*([0-9.eE+-]+)\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\s*'") {
+		} elseif ($attrs -match "(?i)\bviewBox\s*=\s*'\s*([0-9.eE+-]+)[\s,]+([0-9.eE+-]+)[\s,]+([0-9.eE+-]+)[\s,]+([0-9.eE+-]+)\s*'") {
 			$vbW = [double]$Matches[3]
 			$vbH = [double]$Matches[4]
 		}
@@ -62531,6 +63250,15 @@ public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref
 									try { & $uiLog 'VIZ_UI_SVG_PROBE' ("mode=svg-wpf {0} loadedOk={1}" -f $svg.LastProbe, $svg.LoadedOk) } catch {}
 
 									$vizOk = [bool]$svg.LoadedOk
+									if ($vizOk) {
+										$skipN = 0
+										if ([string]$svg.LastProbe -match 'skipped=(\d+)') { try { $skipN = [int]$Matches[1] } catch { $skipN = 0 } }
+										if ($skipN -gt 0) {
+											$htSkip = $null
+											try { if ($outer -and $outer.Tag -is [hashtable]) { $htSkip = $outer.Tag['HdrTitle'] } } catch {}
+											if ($htSkip) { try { $htSkip.Text = ('visualization · {0} skipped' -f $skipN) } catch {} }
+										}
+									}
 									if (-not $vizOk) {
 										throw ("SVG render failed: " + $svg.LastProbe)
 									}
@@ -67523,6 +68251,7 @@ function Start-LocalAgent {
 		$typedExit = ($lower -in @('exit', 'quit', '/exit', '/quit'))
 		if ($wpfClosed -or $typedExit) {
 			Write-MBDebugLog -Step 'LOOP_SESSION_END' -Detail ("wpfClosed={0} exitReq={1} lower={2}" -f $wpfClosed, $exitReq, $lower)
+			try { $null = Save-MBStoredSession } catch {}
 			Complete-MBSessionExit -Message 'session ended.'
 			break
 		}
@@ -67538,6 +68267,10 @@ function Start-LocalAgent {
 
 			switch -Regex ($cmd) {
 				'^/help$|^/h$|^/\?$' { Show-MBHelp; continue }
+				'^/doctor$' {
+					try { Write-Host (Invoke-MBHarnessDoctor) -ForegroundColor Gray } catch { Write-MBErr $_.Exception.Message }
+					continue
+				}
 				'^/status$|^/stat$'  { Show-MBStatus; continue }
 				'^/context$|^/ctx$' {
 					Show-MBContextDetail -Messages $script:Messages
@@ -67714,6 +68447,11 @@ function Start-LocalAgent {
 				}
 				'^/clear$|^/reset$' {
 					try { Thaw-MBWireState -Force } catch {}
+					try { $null = Save-MBStoredSession } catch {}
+					try {
+						$script:MB.SessionStoreId = [guid]::NewGuid().ToString('n').Substring(0, 12)
+						$script:MB.SessionStoreDir = $null
+					} catch {}
 					$script:Messages = @(Sync-MBSystemMessages -Messages @())
 					$script:MB.StickyExtra = ''
 					Write-MBOk "Conversation cleared (sticky notes kept - /forget to wipe those)."
@@ -67797,7 +68535,7 @@ function Start-LocalAgent {
 					try {
 						$spath = [string]$arg
 						if ([string]::IsNullOrWhiteSpace($spath)) {
-							$def = ("MiniBot-session-{0:yyyyMMdd-HHmmss}.json" -f (Get-Date))
+							$def = ("minibot-{0:yyyyMMdd-HHmmss}.md" -f (Get-Date))
 							$spath = Show-MBSessionFilePicker -Mode Save -FileName $def
 							if ([string]::IsNullOrWhiteSpace($spath)) {
 								Write-MBInfo "Save cancelled."
@@ -67848,6 +68586,36 @@ function Start-LocalAgent {
 						}
 						# Model call to refill context; instruction is private (not painted as user bubble).
 						# If the model replies anyway, show it normally.
+						$userInput = 'Context Fully Reloaded.. Wait for the next message from the user before responding.'
+						$trimmed = $userInput
+						$script:MB.LoadResumeTurn = $true
+					} catch {
+						Write-MBErr $_.Exception.Message
+						continue
+					}
+				}
+				'^/sessions$' {
+					try {
+						$cwd = [string]$script:MB.WorkingDir
+						$list = Get-MBStoredSessions -Cwd $cwd -Max 20
+						Write-Host ''
+						Write-Host (Format-MBStoredSessionList -Sessions $list -Cwd $cwd) -ForegroundColor Gray
+						Write-Host ''
+					} catch { Write-MBErr $_.Exception.Message }
+					continue
+				}
+				'^/resume$' {
+					try {
+						$cwd = [string]$script:MB.WorkingDir
+						$picked = Resolve-MBStoredSession -Which ([string]$arg) -Cwd $cwd
+						if ($null -eq $picked) {
+							Write-MBWarn 'No saved chat for this folder. /sessions lists them. /load opens a file you saved with /save.'
+							continue
+						}
+						$r = Import-MBStoredSession -Session $picked
+						Write-MBOk ("Resumed: {0}  |  messages: {1}" -f $picked.Title, $r.Count)
+						Write-Host ("  id: {0}" -f $picked.Id) -ForegroundColor DarkGray
+						if ($picked.Cwd) { Write-Host ("  cwd: {0}" -f $picked.Cwd) -ForegroundColor DarkGray }
 						$userInput = 'Context Fully Reloaded.. Wait for the next message from the user before responding.'
 						$trimmed = $userInput
 						$script:MB.LoadResumeTurn = $true
@@ -68416,6 +69184,7 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 		} catch {}
 
 		try { Clear-MBWorkingState } catch {}
+		try { $null = Save-MBStoredSession } catch {}
 		Write-MBDebugLog -Step 'TURN_END'
 		} catch {
 			# Per-turn catch; session stays open
