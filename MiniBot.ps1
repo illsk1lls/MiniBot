@@ -4,7 +4,7 @@
 
 <#
 .SYNOPSIS
-	MiniBot v2.61.0 - Local AI agent host for Windows PowerShell 5.1
+	MiniBot v2.64.0 - Local AI agent host for Windows PowerShell 5.1
 .DESCRIPTION
 	OpenAI-compatible agent client (WPF UI + tools). Hybrid .CMD/.PS1 launcher; irm|iex friendly.
 .NOTES
@@ -38,7 +38,7 @@ param(
 	# Auto-continue when a text reply is truncated (finish_reason=length or mid-sentence)
 	[int]$MaxReplyContinues = 5,
 	[string]$AgentName = "MiniBot",
-	[string]$Version = "2.61.0",
+	[string]$Version = "2.64.0",
 	[bool]$AutoApproveEnabled = $false,
 	# Voice: Right-Ctrl hold-to-talk dictation + optional TTS of model replies
 	[bool]$SpeechEnabled = $false,
@@ -61,7 +61,9 @@ param(
 	# File debug log (Desktop\MiniBot-debug.log). Off by default. Env: debug=1
 	[bool]$DebugLog = $false,
 	# Hide attached console / Windows Terminal host window (PS1 and irm|iex). CMD hybrid line is separate (START /MIN -w hidden).
-	[bool]$HideConsole = $true
+	[bool]$HideConsole = $true,
+	# Run harness checks and exit. No window, no elevation, no single-instance lock.
+	[switch]$Doctor
 )
 
 # =============================================================================
@@ -116,6 +118,7 @@ $script:MBExtraApiKeys = @{
 
 # Console hide (PS param -HideConsole). CMD users: edit the hybrid @START line at top of file.
 $solo = $true
+if ($Doctor) { $HideConsole = $false }
 $script:MB_HideConsole = [bool]$HideConsole
 $script:MB_HiddenConsoleHwnd = [IntPtr]::Zero
 if ($script:MB_HideConsole) {
@@ -358,6 +361,7 @@ function Request-MBElevationOrExit {
 	}
 }
 
+if (-not $Doctor) {
 try { Request-MBElevationOrExit } catch {
 	try {
 		$title = Get-MBAgentDisplayTitle
@@ -366,8 +370,9 @@ try { Request-MBElevationOrExit } catch {
 	} catch {}
 	exit 1
 }
+}
 
-if ($solo) {
+if ($solo -and -not $Doctor) {
 	$AppId = 'MiniBot-Agent'
 	$singleInstance = $false
 	$script:SingleInstanceEvent = New-Object Threading.EventWaitHandle $true, ([Threading.EventResetMode]::ManualReset), "Global\$AppId", ([ref]$singleInstance)
@@ -529,6 +534,8 @@ $script:MB = @{
 	MdVizBuf           = ''
 	ActiveToolGroups   = New-Object System.Collections.ArrayList
 	ToolProfile        = [string]$ToolProfile
+	ToolGroupTouch     = @{}
+	IdleGroupsNote     = ''
 	ToolsOverheadChars = 0
 	ToolsOverheadTok   = 0
 	LastCtxChars       = 0
@@ -537,7 +544,9 @@ $script:MB = @{
 	LastCtxLevel       = 'ok'   # ok | soft | hard
 	CtxBarReady        = $false
 	TokenCountSource   = 'estimate'  # server | usage | estimate
-	ServerTokenize     = $null       # $true/$false once probed; $null = not yet
+	ServerTokenize     = $null       # $true after a good /tokenize; $false until TokenizeRetryAfter
+	TokenizeFailStreak = 0
+	TokenizeRetryAfter = [datetime]::MinValue
 	TokenizeProbeTok   = -1
 	TokCacheKey        = ''
 	TokCacheTokens     = 0
@@ -6435,6 +6444,21 @@ function Invoke-MBHarnessDoctor {
 	$none = $null
 	try { $none = Get-MBProjectCheckPlan -Path $env:TEMP } catch { $none = $null }
 	& $add 'check_plan' ($null -ne $none -and $none.ContainsKey('Found')) 'plan missing'
+	$loop = $null
+	try { $loop = Get-MBLanProbeHostList -Computer '127.0.0.1' -MaxHosts 4 } catch { $loop = $null }
+	$loopOk = $false
+	$loopDetail = 'probe helper failed'
+	if ($loop -and $loop.Ok -and $loop.Explicit -and -not $loop.AutoDiscover) {
+		$hasLocal = $false
+		foreach ($t in @($loop.Targets)) { if ([string]$t -eq '127.0.0.1') { $hasLocal = $true } }
+		$loopOk = $hasLocal
+		if (-not $loopOk) { $loopDetail = '127.0.0.1 was dropped' }
+	} elseif ($loop -and $loop.AutoDiscover) {
+		$loopDetail = 'localhost fell through to LAN discovery'
+	}
+	& $add 'portprobe_localhost' $loopOk $loopDetail
+	$rights = Format-MBFileSystemRights -Rights ([int]-536805376)
+	& $add 'acl_rights' ($rights -notmatch '^-?\d+$') $rights
 	$pass = $lines.Count - [int]$state.Fail
 	[void]$lines.Add(("doctor {0} pass, {1} fail" -f $pass, $state.Fail))
 	return ($lines -join "`n")
@@ -12155,13 +12179,8 @@ PROJECT below is the nearest AGENTS.md, CLAUDE.md, or minibot.md. /sessions and 
 Bad tool twice (same blocked/NEED_INPUT): stop and ASK operator — no third identical retry.
 Never ReadFile images/video/PDF/binary (crashes servers) — images/PDF/screen: vision group; PE/binary/hex: forensics; operator display: markdown below.
 INLINE MEDIA (chat UI) — REQUIRED for play/show/hear: always embed on its own line as ![label](absolute-path). Prefer absolute Windows paths. Images png/jpg/gif/webp/bmp/tif; video mp4/m4v/mov/wmv; audio mp3/wav/flac/m4a/aac/ogg/wma. After DownloadFile / ViewScreen save / FindFiles pick / any "play or show" ask: emit ![...](...) so it plays in-chat. NEVER Start-Process/Invoke-Item/explorer/VLC/default-app first. External player ONLY if format not inline-compatible or operator explicitly asked external. Do not reply with a bare path alone when they should see/hear it.
-INLINE VISUALS — emit SVG between @@@RenderOpen and @@@RenderClose (own lines). Host renders pure WPF SvgView (centered in the card). Not WPF XAML. No markdown fences. SVG body only. Drawn: svg, g, a, rect, circle, ellipse, line, polyline, polygon, path, text, tspan. Paint: fill/stroke as #hex, rgb(), or rgba(); stroke-width; stroke-dasharray; linecap/linejoin; opacity; font-size; font-weight; text-anchor; transform translate/scale/rotate/matrix. ALWAYS numeric width and height on <svg> (pixels) plus xmlns and viewBox. Colors: #E5E7EB / #9CA3AF text; #121216 / #1A1A1E / #252530 bg; #3A3A42 border; #7AA2F7 / #7DCFFF accent. <title> is a tooltip only. Do NOT use gradients, filters, markers, masks, clipPath, use, image, or style blocks — they are skipped and the card title shows the skip count. No chart title on the drawing unless the operator asked or axis/legend labels are needed. Prefer data geometry first. Example:
-@@@RenderOpen
-<svg width="680" height="240" viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg"><rect width="680" height="240" fill="#1A1A1E"/><rect x="80" y="40" width="40" height="160" fill="#7AA2F7"/><rect x="160" y="80" width="40" height="120" fill="#9ECE6A"/><line x1="60" y1="200" x2="620" y2="200" stroke="#3A3A42" stroke-width="1"/></svg>
-@@@RenderClose
-Do not stream bare SVG outside those markers.
-VIZ RULES: SVG only. REQUIRED width="N" height="N" + viewBox + xmlns. Dash grids with stroke-dasharray. Labels with text/tspan and text-anchor. No JavaScript, CDNs, WPF/XAML, gradients, filters, markers, or <use>. No decorative title banner unless relevant. Flyer/poster layouts: readable type hierarchy, consistent columns, no overlapping labels.
-Tool groups: only active schemas are visible. core always on. EnableToolGroup group=a,b or groups=[a,b] silently before work (same turn; multi ok; no ListToolGroups/narration). If a tool is missing: ERROR may say missing_tool=X group=Y — EnableToolGroup group=Y then call X same turn; do NOT invent COM/shell.
+INLINE VISUALS — SVG between @@@RenderOpen and @@@RenderClose on their own lines. Not a markdown fence. Numeric width and height, xmlns, viewBox. Shapes, path, text/tspan, dashed strokes, rgb/rgba. No gradients, filters, markers, masks, or use. Skipped tags show in the card title.
+Tool groups: only active schemas are sent. core stays on. Other groups turn off after 2 turns without a call. EnableToolGroup group=a,b before the tool, same turn. missing_tool=X group=Y means enable Y and call X. Do not invent a shell substitute. -ToolProfile full keeps every group on.
 ROUTER (intent->tool; enable group first if off; do not shell these):
  volume|mute|unmute|speaker|sound level -> EnableToolGroup group=sound then AudioVolume (action=get|set|mute|unmute; level=0-100)
  speak|tts|say aloud -> EnableToolGroup group=sound then SpeakText
@@ -12185,9 +12204,7 @@ ROUTER (intent->tool; enable group first if off; do not shell these):
  NEVER RunCommand for volume/mute/speech COM — use sound group (AudioVolume/SpeakText). Brightness: system DisplayBrightness.
  NEVER raw reg.exe for policy keys if GroupPolicy tool available (setup group).
  NEVER shell bulk rename / dupe-scan first (Rename-Item loops, Get-FileHash|Group-Object, robocopy/fdupes style) — files BulkRename / FindDuplicates; RunCommand only after those tools error/fail.
-MAP: vision=ReadImage/ReadPdf/ViewScreen | sound=SpeakText/AudioVolume | forensics=ForensicsSummary/PeInfo/HexView/HexEdit/FindHexPattern/StringExtract/ImportTableViewer/ResourceEditor/SectionManager | recovery=ListRecycleBin/ListDeletedFiles/RecoverDeletedFile/ListShadowCopies/ListUsnRecent | system=inventory+services+DisplayBrightness | network=LAN+PortProbe+FindShares+FindWebHosts+FindRdp+RemoteCommand | diag=BSOD/disk/events/space/kill | repair=sfc/dism/chkdsk | setup=options/GroupPolicy/restore/uninstall/reboot/NewMachine | identity=users/domain | shares=map/share/print mutate | installers=apps | sandbox=PS lab | files=dl/zip/cab/iso/BulkRename/FindDuplicates | packages=PSGallery | registry | clipboard | docs=SearchMicrosoftLearn/ReadMicrosoftLearn/SearchSs64/ReadSs64 | web=HTTP/SearchWeb/BrowsePage
-DOCS (group=docs): official Windows/PowerShell/cmd references when unsure of API/policy/syntax. Prefer SearchMicrosoftLearn + ReadMicrosoftLearn for MS docs; SearchSs64 + ReadSs64 for cmd/PowerShell/bash cheat sheets. EnableToolGroup group=docs first. Not for general web (use web group). Local Get-Help is version-accurate when available — still use Learn for product docs.
-FindFiles: multi-ext one call; truncated=normal (use rows); specific ask->narrow; vague play/show->pick one then INLINE ![label](path); no GCI -Recurse dumps. Bad tool output twice->tell operator. User text = results only.
+FindFiles: one call can take several extensions. truncated means use the rows you got or narrow the pattern. Play/show: pick one file and emit ![label](path). Bad tool output twice: tell the operator.
 FINAL REPLY after tools (when no more tools): short DID: and NEXT: or ASK:. DID: only what tool evidence showed (VERIFY syntax, HexEdit verified, command output). A write or patch SUCCESS is not "it works". Keep it tight for local models.
 "@
 
@@ -12214,7 +12231,7 @@ SYSTEM: GetSystemInfo/Process*/Memory/Power/Service/Software/Updates/Uptime; Dis
 NETWORK: GetNetworkInfo/NetConnections/ScanNetwork; PortProbe (TCP open/closed); FindShares (REQUIRED for shares — never net view loops); FindWebHosts; FindRdp; GetLocalShares/MappedDrives/Printers; RemoteCommand (domain-admin: domain-joined + domain user only; PortProbe first; orange off-domain). If remote_command_unavailable=1 or remote_port_closed=1 / TOOLS_DONE=1: STOP tools and tell operator. Do not RunCommand/Test-NetConnection thrash. NEED_INPUT when ports open but auth failed — DOMAIN\\DomainAdmin + password. Search=omit hosts; targeted=computer=/hosts=.
 "@
 	diag = @"
-DIAG: BSOD/events/disk/startup/tasks/drivers/StopProcess/RunQuickDiagnostics; GetDiskSpace (free space, top folders, optional largest_files= / mode=files|both for recursive biggest files). Never dump .dmp bytes. Kill only if asked. Deleted-file recovery is recovery group.
+DIAG: BSOD/events/disk/startup/tasks/drivers/StopProcess/RunQuickDiagnostics; GetDiskSpace; GetHostSecurity (Defender, firewall, local users, BitLocker, logons). GetEventLogs log=Security|Setup|Application|System. Never dump .dmp bytes. Kill only if asked. Deleted-file recovery is recovery group.
 "@
 	repair = @"
 REPAIR: RunRepairTool sfc|dism|chkdsk (prompt). Prefer diag first.
@@ -12353,10 +12370,11 @@ $Tools = @(
 	@{ type = "function"; function = @{ name = "Clipboard"; description = "Read or write clipboard text. Always requires approval."; parameters = @{ type = "object"; properties = @{ action = @{ type = "string"; enum = @("read","write") }; text = @{ type = "string" } }; required = @("action") } } },
 	@{ type = "function"; function = @{ name = "ViewScreen"; description = "Look at the desktop for vision (MemoryStream base64; NO file by default). NO approval. DEFAULT: omit save and path - capture stays in memory for the next model turn only. ONLY set save=true or path= when the user explicitly wants a PNG on disk. After a disk save, reply with the exact path. monitor: primary|all|0|1|... Do not save screenshots unprompted."; parameters = @{ type = "object"; properties = @{ save = @{ type = "boolean"; description = "Write PNG to disk. Default false = memory only. true without path = Desktop. Only when user asked to save." }; path = @{ type = "string"; description = "Disk save path (file or folder). Implies save. Only when user asked for a file. Omit for look-only." }; monitor = @{ type = "string"; description = "primary | all | 0-based monitor index" }; x = @{ type = "integer" }; y = @{ type = "integer" }; width = @{ type = "integer" }; height = @{ type = "integer" }; maxWidth = @{ type = "integer"; description = "Vision downscale max width (default 1280); disk save (if any) is full-res" } }; required = @() } } },
 	@{ type = "function"; function = @{ name = "GetBSODInfo"; description = "Recent BSOD/minidump info + related events."; parameters = @{ type = "object"; properties = @{} } } },
-	@{ type = "function"; function = @{ name = "GetEventLogs"; description = "Recent errors/warnings + disk I/O events. Collapses duplicate Id+Provider (e.g. DCOM 10016 spam) into Count. Default hours=72 max=40."; parameters = @{ type = "object"; properties = @{ hours = @{ type = "integer"; description = "Lookback hours (default 72, max 168)" }; max = @{ type = "integer"; description = "Max unique event rows (default 40)" } } } } },
+	@{ type = "function"; function = @{ name = "GetEventLogs"; description = "Recent errors/warnings + disk I/O events. Collapses duplicate Id+Provider into Count. log=Security|Setup|Application|System. Default System+Application, hours=72, max=40. Security often needs admin."; parameters = @{ type = "object"; properties = @{ hours = @{ type = "integer"; description = "Lookback hours (default 72, max 168)" }; max = @{ type = "integer"; description = "Max unique event rows (default 40)" }; log = @{ type = "string"; description = "One channel: System, Application, Security, Setup, or a full log name" } } } } },
+	@{ type = "function"; function = @{ name = "GetHostSecurity"; description = "Read-only host security snapshot: Defender, firewall profiles, local users, BitLocker, who is logged on, and recent failed logons (4625) when the Security log is readable."; parameters = @{ type = "object"; properties = @{ } } } },
 	@{ type = "function"; function = @{ name = "GetDiskHealth"; description = "Physical disk health + SMART counters."; parameters = @{ type = "object"; properties = @{} } } },
 	@{ type = "function"; function = @{ name = "GetDiskSpace"; description = "Drive free/used + space breakdown under path. mode=children (default): top-level folders/files (folder sizes recursive when deep=true). mode=files: largest individual files recursive under path. mode=both: TopLargeFolders + TopFiles. largest_files=N also requests recursive file list (implies both if mode was children). Local NTFS uses MFT when possible. Not for deleted-file recovery (use recovery group)."; parameters = @{ type = "object"; properties = @{ path = @{ type = "string"; description = "Folder or drive root (default C:\\)" }; deep = @{ type = "boolean"; description = "For mode=children/both: recursive folder sizes (default true)" }; top = @{ type = "integer"; description = "How many top-level consumers (default 10)" }; mode = @{ type = "string"; description = "children (default) | files | both" }; largest_files = @{ type = "integer"; description = "If >0, include top N recursive largest files (default 0). Implies mode=both when mode=children." }; timeout_sec = @{ type = "integer"; description = "Scan budget seconds (default 45)" } } } } },
-	@{ type = "function"; function = @{ name = "GetInstalledSoftware"; description = "Installed programs (Uninstall registry). Optional name filter; caps results for context."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Filter by display name or publisher (substring)" }; max = @{ type = "integer"; description = "Max rows (default 200, max 1000)" } } } } },
+	@{ type = "function"; function = @{ name = "GetInstalledSoftware"; description = "Installed programs from HKLM and HKCU Uninstall. include_store=true adds Appx packages. Optional name filter; caps results for context."; parameters = @{ type = "object"; properties = @{ name = @{ type = "string"; description = "Filter by display name or publisher (substring)" }; max = @{ type = "integer"; description = "Max rows (default 200, max 1000)" }; include_store = @{ type = "boolean"; description = "Also list non-Windows Appx packages" } } } } },
 	@{ type = "function"; function = @{ name = "GetDriverInfo"; description = "Query PnP drivers with filters."; parameters = @{ type = "object"; properties = @{ filter = @{ type = "string"; description = "unsigned, microsoft, realtek, nvidia, network, audio, storage, or free text" }; limit = @{ type = "integer" }; showAll = @{ type = "boolean" } } } } },
 	@{ type = "function"; function = @{ name = "GetStartupItems"; description = "Startup programs + automatic services (capped; default max_services=25, system noise deprioritized)."; parameters = @{ type = "object"; properties = @{ max_services = @{ type = "integer"; description = "Max auto services to return (default 25)" }; include_all_services = @{ type = "boolean"; description = "true = dump all auto services up to max (default false prioritizes non-system)" } } } } },
 	@{ type = "function"; function = @{ name = "GetMemoryInfo"; description = "RAM usage + top consumers."; parameters = @{ type = "object"; properties = @{} } } },
@@ -12467,7 +12485,7 @@ $script:MBToolCatalog = [ordered]@{
 		'GetLocalShares','GetMappedDrives','GetPrinters','RemoteCommand'
 	)
 	diag = @(
-		'GetBSODInfo','GetEventLogs','GetDiskHealth','GetDiskSpace','GetStartupItems','GetScheduledTasks',
+		'GetBSODInfo','GetEventLogs','GetHostSecurity','GetDiskHealth','GetDiskSpace','GetStartupItems','GetScheduledTasks',
 		'GetDriverInfo','StopProcess','RunQuickDiagnostics'
 	)
 	repair    = @('RunRepairTool')
@@ -12641,7 +12659,7 @@ $script:MBToolUserTips = [ordered]@{
 	GetPowerInfo          = 'Battery and power status (laptops and similar).'
 	GetServiceStatus      = 'List Windows services or check one by name.'
 	ControlService        = 'Start, stop, restart a service, or set startup type. You will be asked to approve.'
-	GetInstalledSoftware  = 'List installed programs from the Uninstall registry.'
+	GetInstalledSoftware  = 'Installed programs from HKLM and HKCU. include_store=true adds Appx.'
 	GetWindowsUpdateStatus = 'Show pending Windows updates.'
 	GetSystemUptime       = 'How long the PC has been up and last boot time.'
 	DisplayBrightness     = 'Get or set built-in display brightness (usually laptops). Set asks for approval.'
@@ -12661,7 +12679,8 @@ $script:MBToolUserTips = [ordered]@{
 
 	# diag
 	GetBSODInfo           = 'Recent blue-screen / crash dump info and related events.'
-	GetEventLogs          = 'Recent error and warning events (and related disk I/O noise).'
+	GetEventLogs          = 'Recent error and warning events. log= picks System, Application, Security, or Setup.'
+	GetHostSecurity       = 'Defender, firewall, local users, BitLocker, logged-on users, recent failed logons.'
 	GetDiskHealth         = 'Physical disk health and SMART-style counters.'
 	GetDiskSpace          = 'Drive free space, top folders, and optional largest files (mode=files|both or largest_files=N). Live data only — not undelete.'
 	GetStartupItems       = 'Programs and services that start with Windows.'
@@ -13937,6 +13956,58 @@ function Get-MBToolConsoleLabel {
 	return 'EnableToolGroup'
 }
 
+function Touch-MBToolGroup {
+	param([string]$Group)
+	if ([string]::IsNullOrWhiteSpace($Group)) { return }
+	$g = $Group.Trim().ToLowerInvariant()
+	if ($g -eq 'core') { return }
+	if ($null -eq $script:MB.ToolGroupTouch) { $script:MB.ToolGroupTouch = @{} }
+	$turn = 0
+	try { $turn = [int]$script:MB.UserTurns } catch { $turn = 0 }
+	$script:MB.ToolGroupTouch[$g] = $turn
+}
+
+function Get-MBIdleToolGroupsToDrop {
+	# Groups with no call for 2 user turns. core stays. -ToolProfile full stays.
+	$out = New-Object System.Collections.ArrayList
+	$toolProfile = ''
+	try { $toolProfile = [string]$script:MB.ToolProfile } catch { $toolProfile = '' }
+	if ($toolProfile -match '^(?i)full|all$') { return @() }
+	try { if (Test-MBShouldHoldWireFreeze) { return @() } } catch {}
+	$turn = 0
+	try { $turn = [int]$script:MB.UserTurns } catch { $turn = 0 }
+	if ($null -eq $script:MB.ToolGroupTouch) { $script:MB.ToolGroupTouch = @{} }
+	foreach ($g in @($script:MB.ActiveToolGroups)) {
+		if ([string]::IsNullOrWhiteSpace([string]$g) -or [string]$g -eq 'core') { continue }
+		$k = ([string]$g).ToLowerInvariant()
+		$seen = 0
+		if ($script:MB.ToolGroupTouch.ContainsKey($k)) { $seen = [int]$script:MB.ToolGroupTouch[$k] }
+		if (($turn - $seen) -ge 2) { [void]$out.Add([string]$g) }
+	}
+	if ($out.Count -eq 0) { return @() }
+	return @($out.ToArray())
+}
+
+function Disable-MBIdleToolGroups {
+	$drop = @(Get-MBIdleToolGroupsToDrop)
+	if ($drop.Count -eq 0) {
+		$script:MB.IdleGroupsNote = ''
+		return @()
+	}
+	$dropSet = @{}
+	foreach ($d in $drop) { $dropSet[([string]$d).ToLowerInvariant()] = $true }
+	$keep = New-Object System.Collections.ArrayList
+	foreach ($g in @($script:MB.ActiveToolGroups)) {
+		if ($dropSet.ContainsKey(([string]$g).ToLowerInvariant())) { continue }
+		[void]$keep.Add([string]$g)
+	}
+	if (-not ($keep -contains 'core')) { [void]$keep.Insert(0, 'core') }
+	$script:MB.ActiveToolGroups = $keep
+	$script:MB.IdleGroupsNote = ($drop -join ', ')
+	try { Sync-MBPromptAfterToolGroups } catch {}
+	return @($drop)
+}
+
 function Enable-MBToolGroup {
 	param(
 		[string]$Group = '',
@@ -13994,6 +14065,7 @@ function Enable-MBToolGroup {
 				[void]$script:MB.ActiveToolGroups.Add($name)
 			}
 		}
+		foreach ($name in @(Get-MBToolGroupOrder)) { Touch-MBToolGroup -Group $name }
 		Sync-MBPromptAfterToolGroups
 		$nNow = @((Get-MBActiveToolNames)).Count
 		return "OK full ($nNow tools)."
@@ -14004,6 +14076,8 @@ function Enable-MBToolGroup {
 	if ($onlyCore) {
 		$script:MB.ActiveToolGroups.Clear()
 		[void]$script:MB.ActiveToolGroups.Add('core')
+		$script:MB.ToolGroupTouch = @{}
+		$script:MB.IdleGroupsNote = ''
 		Sync-MBPromptAfterToolGroups
 		$nNow = @((Get-MBActiveToolNames)).Count
 		return "OK core only ($nNow tools)."
@@ -14028,6 +14102,7 @@ function Enable-MBToolGroup {
 			[void]$script:MB.ActiveToolGroups.Add($g)
 			[void]$enabled.Add($g)
 		}
+		Touch-MBToolGroup -Group $g
 	}
 	if ($enabled.Count -eq 0 -and $already.Count -eq 0) {
 		$known = ($script:MBToolCatalog.Keys -join ', ')
@@ -19610,6 +19685,11 @@ function Invoke-GetSystemInfo {
 			OS           = $os.Caption
 			OSVersion    = $os.Version
 			Build        = $os.BuildNumber
+			DisplayVersion = $(try { [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).DisplayVersion } catch { '' })
+			CurrentBuild = $(try { [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).CurrentBuild } catch { '' })
+			UBR          = $(try { [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).UBR } catch { '' })
+			ProductNameRegistry = $(try { [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop).ProductName } catch { '' })
+			OSNote       = 'Trust OS (Win32_OperatingSystem.Caption) and DisplayVersion. ProductNameRegistry can still say Windows 10 on Windows 11.'
 			Arch         = $os.OSArchitecture
 			PSVersion    = $PSVersionTable.PSVersion.ToString()
 			RAM_GB       = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
@@ -21144,10 +21224,122 @@ function Invoke-GetBSODInfo {
 	}
 }
 
+function Format-MBFileSystemRights {
+	# FileSystemRights.ToString() can print a negative int for combined generic flags.
+	param($Rights)
+	$u = [uint32]0
+	try {
+		$signed = [int64]$Rights
+		if ($signed -lt 0) { $signed = $signed + 4294967296 }
+		$u = [uint32]($signed -band 4294967295)
+	} catch { return [string]$Rights }
+	$prefer = @('FullControl','Modify','ReadAndExecute','Read','Write')
+	foreach ($n in $prefer) {
+		try {
+			$bit = [uint32]([System.Security.AccessControl.FileSystemRights]::$n)
+			if ($bit -ne 0 -and (($u -band $bit) -eq $bit)) { return $n }
+		} catch {}
+	}
+	$names = @('Delete','ChangePermissions','TakeOwnership','ListDirectory','CreateFiles','CreateDirectories','Traverse','AppendData')
+	$hit = New-Object System.Collections.Generic.List[string]
+	foreach ($n in $names) {
+		try {
+			$bit = [uint32]([System.Security.AccessControl.FileSystemRights]::$n)
+			if ($bit -ne 0 -and (($u -band $bit) -eq $bit)) { [void]$hit.Add($n) }
+		} catch {}
+	}
+	if ($hit.Count -gt 0) { return ($hit -join ', ') }
+	return ('0x{0:X}' -f $u)
+}
+
+function Invoke-GetHostSecurity {
+	# Read-only snapshot. Each section fails on its own so one denial does not blank the rest.
+	$out = [ordered]@{ ok = $true }
+	try {
+		$mp = Get-MpComputerStatus -ErrorAction Stop
+		$out['defender'] = [ordered]@{
+			service_enabled = [bool]$mp.AMServiceEnabled
+			antivirus_enabled = [bool]$mp.AntivirusEnabled
+			realtime = [bool]$mp.RealTimeProtectionEnabled
+			ioav = [bool]$mp.IoavProtectionEnabled
+			signatures_updated = $(try { $mp.AntivirusSignatureLastUpdated.ToString('o') } catch { $null })
+		}
+	} catch {
+		$out['defender'] = [ordered]@{ error = $_.Exception.Message }
+	}
+	try {
+		$fw = @(Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {
+			[ordered]@{ name = [string]$_.Name; enabled = [string]$_.Enabled }
+		})
+		$out['firewall'] = $fw
+	} catch {
+		$out['firewall'] = [ordered]@{ error = $_.Exception.Message }
+	}
+	try {
+		$users = @(Get-LocalUser -ErrorAction Stop | ForEach-Object {
+			[ordered]@{
+				name = [string]$_.Name
+				enabled = [bool]$_.Enabled
+				last_logon = $(try { if ($_.LastLogon) { $_.LastLogon.ToString('o') } else { $null } } catch { $null })
+			}
+		})
+		$out['local_users'] = $users
+	} catch {
+		$out['local_users'] = [ordered]@{ error = $_.Exception.Message }
+	}
+	try {
+		$admins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop | ForEach-Object {
+			[ordered]@{ name = [string]$_.Name; class = [string]$_.ObjectClass }
+		})
+		$out['local_admins'] = $admins
+	} catch {
+		$out['local_admins'] = [ordered]@{ error = $_.Exception.Message }
+	}
+	try {
+		$vols = @()
+		if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+			$vols = @(Get-BitLockerVolume -ErrorAction Stop | ForEach-Object {
+				[ordered]@{
+					mount = [string]$_.MountPoint
+					protection = [string]$_.ProtectionStatus
+					volume_status = [string]$_.VolumeStatus
+					encryption_percent = $_.EncryptionPercentage
+				}
+			})
+		} else {
+			$blob = (& manage-bde.exe -status 2>$null | Out-String)
+			$vols = @([ordered]@{ raw = $(if ($blob.Length -gt 800) { $blob.Substring(0, 800) } else { $blob }) })
+		}
+		$out['bitlocker'] = $vols
+	} catch {
+		$out['bitlocker'] = [ordered]@{ error = $_.Exception.Message }
+	}
+	try {
+		$logged = @(Get-CimInstance Win32_LogonSession -ErrorAction Stop | Where-Object { $_.LogonType -in 2, 10, 11 } | ForEach-Object {
+			[ordered]@{
+				logon_id = [string]$_.LogonId
+				logon_type = [int]$_.LogonType
+				start = $(try { $_.StartTime.ToString('o') } catch { $null })
+			}
+		})
+		$out['logon_sessions'] = $logged
+	} catch {
+		$out['logon_sessions'] = [ordered]@{ error = $_.Exception.Message }
+	}
+	try {
+		$fail = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4625; StartTime = (Get-Date).AddHours(-24) } -MaxEvents 30 -ErrorAction Stop)
+		$out['failed_logons_24h'] = [ordered]@{ count = $fail.Count; note = 'Security 4625, last 24h, capped at 30.' }
+	} catch {
+		$out['failed_logons_24h'] = [ordered]@{ count = $null; note = $_.Exception.Message }
+	}
+	return ConvertTo-MBJson $out -Depth 5
+}
+
 function Invoke-GetEventLogs {
 	param(
 		[int]$hours = 72,
-		[int]$max = 40
+		[int]$max = 40,
+		[string]$log = ''
 	)
 	if ($hours -le 0) { $hours = 72 }
 	if ($hours -gt 168) { $hours = 168 }
@@ -21201,12 +21393,19 @@ function Invoke-GetEventLogs {
 		}
 	}
 
+	$logNames = @('System','Application')
+	if (-not [string]::IsNullOrWhiteSpace($log)) {
+		$logNames = @($log.Trim())
+	}
 	$rawGeneral = @()
 	$rawDisk = @()
+	$logNote = ''
 	try {
-		$rawGeneral = @(Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2,3; StartTime=$start} -MaxEvents 200 -ErrorAction SilentlyContinue |
+		$rawGeneral = @(Get-WinEvent -FilterHashtable @{LogName=$logNames; Level=1,2,3; StartTime=$start} -MaxEvents 200 -ErrorAction Stop |
 			Select-Object TimeCreated, LogName, LevelDisplayName, Id, ProviderName, Message)
-	} catch {}
+	} catch {
+		$logNote = $_.Exception.Message
+	}
 	try {
 		# ProviderName wildcards are not reliable in FilterHashtable; filter the provider after a level query.
 		$diskRaw = @(Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2,3; StartTime=$start} -MaxEvents 400 -ErrorAction SilentlyContinue)
@@ -21237,7 +21436,9 @@ function Invoke-GetEventLogs {
 		DiskIO_Errors      = @($d.rows)
 		DiskUnique         = [int]$d.unique
 		DiskTruncated      = [bool]$d.truncated
-		note               = 'Duplicate Id+Provider collapsed into Count. Pass hours= for window (default 72, max 168). DCOM 10016 repeats appear as one row with Count.'
+		log                = $(if ($log) { $log } else { 'System,Application' })
+		log_error          = $(if ($logNote) { $logNote } else { $null })
+		note               = 'Duplicate Id+Provider collapsed into Count. log=Security|Setup|Application|System (Security often needs admin). hours default 72, max 168.'
 	} -Depth 5
 }
 
@@ -22420,21 +22621,55 @@ function Invoke-RecoverySmokeTest {
 function Invoke-GetInstalledSoftware {
 	param(
 		[string]$name = '',
-		[int]$max = 200
+		[int]$max = 200,
+		[object]$include_store = $null
 	)
 	try {
 		if ($max -le 0) { $max = 200 }
 		if ($max -gt 1000) { $max = 1000 }
-		$keys = @(
-			'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-			'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+		$includeStore = Convert-MBToBool -Value $include_store -Default $false
+		$sources = @(
+			@{ Path = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'machine' }
+			@{ Path = 'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'machine' }
+			@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'user' }
 		)
-		$all = @(
-			Get-ItemProperty $keys -ErrorAction SilentlyContinue |
-				Where-Object DisplayName |
-				Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
-				Sort-Object DisplayName
-		)
+		$all = New-Object System.Collections.ArrayList
+		$seen = @{}
+		foreach ($src in $sources) {
+			$items = @(Get-ItemProperty -Path $src.Path -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName })
+			foreach ($item in $items) {
+				$disp = [string]$item.DisplayName
+				$key = ($src.Scope + '|' + $disp).ToLowerInvariant()
+				if ($seen.ContainsKey($key)) { continue }
+				$seen[$key] = $true
+				[void]$all.Add([pscustomobject]@{
+					DisplayName = $disp
+					DisplayVersion = [string]$item.DisplayVersion
+					Publisher = [string]$item.Publisher
+					InstallDate = [string]$item.InstallDate
+					Scope = [string]$src.Scope
+				})
+			}
+		}
+		if ($includeStore) {
+			try {
+				$pkgs = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { $_.Name -and $_.Name -notmatch '^Microsoft\.(Windows|Windows\.)' })
+				foreach ($pkg in $pkgs) {
+					$disp = [string]$pkg.Name
+					$key = ('store|' + $disp).ToLowerInvariant()
+					if ($seen.ContainsKey($key)) { continue }
+					$seen[$key] = $true
+					[void]$all.Add([pscustomobject]@{
+						DisplayName = $disp
+						DisplayVersion = [string]$pkg.Version
+						Publisher = [string]$pkg.Publisher
+						InstallDate = ''
+						Scope = 'store'
+					})
+				}
+			} catch {}
+		}
+		$all = @($all | Sort-Object DisplayName)
 		$total = $all.Count
 		if (-not [string]::IsNullOrWhiteSpace($name)) {
 			$n = $name.Trim()
@@ -22451,6 +22686,8 @@ function Invoke-GetInstalledSoftware {
 			returned  = $slice.Count
 			truncated = $truncated
 			filter    = $(if ($name) { $name } else { $null })
+			scopes    = @('machine', 'user') + $(if ($includeStore) { @('store') } else { @() })
+			note      = 'machine = HKLM uninstall. user = HKCU uninstall (per-user apps). store = Appx when include_store=true.'
 			software  = $slice
 		} -Depth 4)
 	} catch {
@@ -22675,7 +22912,7 @@ function Get-MBShareAccessEntries {
 				# Cap noise: skip inherited-only flood if many; still include explicit + a sample of inherited
 				[void]$ntfs.Add([ordered]@{
 					account        = [string]$ace.IdentityReference
-					access_right   = [string]$ace.FileSystemRights
+					access_right   = (Format-MBFileSystemRights -Rights $ace.FileSystemRights)
 					access_control = [string]$ace.AccessControlType
 					inherited      = [bool]$ace.IsInherited
 					scope          = 'ntfs'
@@ -23946,7 +24183,7 @@ function Invoke-FindShares {
 		elapsed_ms        = $sw.ElapsedMilliseconds
 		operator_card     = $card
 		results           = @($results)
-		note              = 'Modes: known machine -> computer=IP or hosts=[IP] (only those; self IP/hostname always skipped). Unknown -> omit hosts (auto LAN flood then same guess; self excluded). Port filter then timed net use \\host\share. exists_auth_required = share found, needs MapNetworkDrive + creds.'
+		note              = 'Modes: known machine -> computer=IP or hosts=[IP] (only those, including localhost). Unknown -> omit hosts (auto LAN flood; this PC excluded). Port filter then timed net use \\host\share. exists_auth_required = share found, needs MapNetworkDrive + creds.'
 	}) -Depth 8
 }
 
@@ -23983,11 +24220,13 @@ function Get-MBLanProbeHostList {
 		[void]$uniq.Add($t)
 	}
 	$targets = $uniq
+	# A named computer= or hosts= list is the whole job. Never replace it with a LAN scan.
+	$explicit = ($targets.Count -gt 0 -and -not $AutoDiscover)
 	$selfIds = Get-MBLocalHostIdentitySet
 	$excludedSelf = New-Object System.Collections.ArrayList
 	$discoverNote = ''
 	$auto = $false
-	if ($targets.Count -eq 0 -or $AutoDiscover) {
+	if ($targets.Count -eq 0 -or ($AutoDiscover -and -not $explicit)) {
 		if ($targets.Count -eq 0) { $auto = $true }
 		if ($auto) {
 			$ctx = Get-MBPrimaryLanContext
@@ -24017,7 +24256,8 @@ function Get-MBLanProbeHostList {
 	}
 	$filtered = New-Object System.Collections.ArrayList
 	foreach ($t in @($targets)) {
-		if (Test-MBIsLocalHostTarget -HostName $t -IdentitySet $selfIds) {
+		# Drop this PC only while discovering the LAN. An explicit localhost or this PC's name is a real target.
+		if (-not $explicit -and (Test-MBIsLocalHostTarget -HostName $t -IdentitySet $selfIds)) {
 			[void]$excludedSelf.Add([string]$t)
 			continue
 		}
@@ -24036,6 +24276,7 @@ function Get-MBLanProbeHostList {
 		ExcludedSelf = @($excludedSelf | Select-Object -Unique)
 		AutoDiscover = $auto
 		Discover = $discoverNote
+		Explicit = [bool]$explicit
 	}
 }
 
@@ -24065,6 +24306,9 @@ function Invoke-PortProbe {
 	$hl = Get-MBLanProbeHostList -Hosts $hosts -Computer $computer -MaxHosts $max_hosts
 	if (-not $hl.Ok) { return ("ERROR: {0}" -f $hl.Error) }
 	$targets = @($hl.Targets)
+	if ($hl.Explicit -and $targets.Count -lt 1) {
+		return "ERROR: computer= or hosts= was set but no host remained to probe. Localhost is allowed. This does not scan the LAN."
+	}
 	if ($targets.Count -lt 1) {
 		$hl = Get-MBLanProbeHostList -MaxHosts $max_hosts -AutoDiscover
 		if (-not $hl.Ok) { return ("ERROR: {0}" -f $hl.Error) }
@@ -24133,7 +24377,10 @@ function Invoke-FindLanService {
 
 	$ports = Get-MBPortProbeProfilePorts -Profile $profile
 	$hl = Get-MBLanProbeHostList -Hosts $Hosts -Computer $Computer -MaxHosts $MaxHosts
-	if ($hl.Targets.Count -lt 1) {
+	if ($hl.Explicit -and @($hl.Targets).Count -lt 1) {
+		return "ERROR: computer= or hosts= was set but no host remained. This does not scan the LAN."
+	}
+	if (@($hl.Targets).Count -lt 1) {
 		$hl = Get-MBLanProbeHostList -MaxHosts $MaxHosts -AutoDiscover
 	}
 	if (-not $hl.Ok) { return ("ERROR: {0}" -f $hl.Error) }
@@ -34212,9 +34459,17 @@ function Invoke-GetPowerInfo {
 	$reportPath = New-MBTempFile -Prefix 'mb-battery' -Extension '.html'
 	try {
 		$scheme = ''
+		$schemeGuid = ''
 		try {
-			$scheme = (powercfg /getactivescheme 2>&1 | Out-String).Trim()
-			if ($scheme.Length -gt 200) { $scheme = $scheme.Substring(0, 197) + '...' }
+			$rawScheme = @(& powercfg.exe /getactivescheme 2>$null | Where-Object { $_ -is [string] })
+			$schemeText = (($rawScheme | ForEach-Object { [string]$_ }) -join ' ').Trim()
+			if ($schemeText -match '(?i)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*\(([^)]+)\)') {
+				$schemeGuid = $Matches[1]
+				$scheme = $Matches[2].Trim()
+			} elseif ($schemeText) {
+				$scheme = ($schemeText -replace '\s+', ' ').Trim()
+				if ($scheme.Length -gt 120) { $scheme = $scheme.Substring(0, 117) + '...' }
+			}
 		} catch { $scheme = '' }
 
 		$p = $null
@@ -34231,9 +34486,9 @@ function Invoke-GetPowerInfo {
 			})
 		}
 		$html = Get-Content -LiteralPath $reportPath -Raw -ErrorAction SilentlyContinue
-		$designCap = if ($html -match 'Design Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { $null }
-		$fullCap   = if ($html -match 'Full Charge Capacity</td>\s*<td[^>]*>([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { $null }
-		$cycleCount = if ($html -match 'Cycle Count</td>\s*<td[^>]*>(\d+)</td>') { $matches[1] } else { $null }
+		$designCap = if ($html -match '(?i)Design Capacity</td>\s*<td[^>]*>\s*([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { $null }
+		$fullCap   = if ($html -match '(?i)Full Charge Capacity</td>\s*<td[^>]*>\s*([\d,]+)\s*mWh') { $matches[1] -replace ',','' } else { $null }
+		$cycleCount = if ($html -match '(?i)Cycle Count</td>\s*<td[^>]*>\s*(\d+)\s*</td>') { $matches[1] } else { $null }
 		$healthPct = $null
 		if ($designCap -and $fullCap) {
 			try {
@@ -34242,14 +34497,17 @@ function Invoke-GetPowerInfo {
 				if ($d -gt 0) { $healthPct = [math]::Round(($f / $d) * 100, 1) }
 			} catch {}
 		}
+		$hasBatt = ($null -ne $designCap -or $null -ne $fullCap)
 		return ConvertTo-MBJson ([ordered]@{
 			ok                       = $true
-			has_battery              = $true
+			has_battery              = $hasBatt
 			design_capacity_mWh      = $designCap
 			full_charge_capacity_mWh = $fullCap
 			estimated_health_percent = $healthPct
 			cycle_count              = $cycleCount
-			active_scheme            = $scheme
+			active_scheme            = $(if ($scheme) { $scheme } else { $null })
+			active_scheme_guid       = $(if ($schemeGuid) { $schemeGuid } else { $null })
+			note                     = $(if ($hasBatt) { $null } else { 'No battery numbers in the power report (desktop, or the report layout did not match).' })
 		})
 	} catch {
 		return ConvertTo-MBJson ([ordered]@{
@@ -42756,6 +43014,10 @@ function Invoke-MBTool {
 	if ($resolvedName -and $resolvedName -ne $Name) {
 		$Name = $resolvedName
 	}
+	try {
+		$usedGroup = Get-MBToolGroupForName -Name $Name
+		if ($usedGroup) { Touch-MBToolGroup -Group $usedGroup }
+	} catch {}
 
 	if ($Name -and -not (Test-MBToolNameActive -Name $Name)) {
 		$allNames = @($Tools | ForEach-Object { $_.function.name })
@@ -43344,8 +43606,10 @@ function Invoke-MBTool {
 				$p = @{}
 				if (Test-MBHasProp $ArgsObj 'hours') { $p['hours'] = [int](Get-MBProp $ArgsObj 'hours') }
 				if (Test-MBHasProp $ArgsObj 'max') { $p['max'] = [int](Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'log') { $p['log'] = [string](Get-MBProp $ArgsObj 'log') }
 				Invoke-GetEventLogs @p
 			}
+			"GetHostSecurity" { Invoke-GetHostSecurity }
 			"GetDiskHealth"           { Invoke-GetDiskHealth }
 			"GetDiskSpace" {
 				$p = @{ path = (Get-MBProp $ArgsObj 'path' 'C:\') }
@@ -43367,6 +43631,7 @@ function Invoke-MBTool {
 				$p = @{}
 				if (Test-MBHasProp $ArgsObj 'name') { $p['name'] = (Get-MBProp $ArgsObj 'name') }
 				if (Test-MBHasProp $ArgsObj 'max')  { $p['max']  = [int](Get-MBProp $ArgsObj 'max') }
+				if (Test-MBHasProp $ArgsObj 'include_store') { $p['include_store'] = (Get-MBProp $ArgsObj 'include_store') }
 				Invoke-GetInstalledSoftware @p
 			}
 			"GetDriverInfo" {
@@ -44025,10 +44290,31 @@ function Invoke-MBServerJson {
 	}
 }
 
+function Test-MBTokenizeRetryOpen {
+	# A failed probe backs off. It does not disable /tokenize for the rest of the session.
+	if ($script:MB.ServerTokenize -ne $false) { return $true }
+	$after = [datetime]::MinValue
+	try { $after = [datetime]$script:MB.TokenizeRetryAfter } catch { return $true }
+	return ((Get-Date) -ge $after)
+}
+
+function Set-MBTokenizeBackoff {
+	$n = 0
+	try { $n = [int]$script:MB.TokenizeFailStreak } catch { $n = 0 }
+	$n++
+	if ($n -gt 6) { $n = 6 }
+	$script:MB.TokenizeFailStreak = $n
+	$script:MB.ServerTokenize = $false
+	$sec = 15
+	try { $sec = [int][math]::Min(120, 15 * [math]::Pow(2, $n - 1)) } catch { $sec = 15 }
+	if ($sec -lt 15) { $sec = 15 }
+	$script:MB.TokenizeRetryAfter = (Get-Date).AddSeconds($sec)
+}
+
 function Get-MBTokenizeCount {
 	param([AllowNull()][string]$Text)
 	if ($null -eq $Text) { $Text = '' }
-	if ($script:MB.ServerTokenize -eq $false) { return -1 }
+	if (-not (Test-MBTokenizeRetryOpen)) { return -1 }
 	$Text = Sanitize-MBText -Text ([string]$Text)
 
 	$body = @{
@@ -44044,11 +44330,14 @@ function Get-MBTokenizeCount {
 			if ($null -eq $tokens) { continue }
 			$arr = @($tokens)
 			$script:MB.ServerTokenize = $true
+			$script:MB.TokenizeFailStreak = 0
+			$script:MB.TokenizeRetryAfter = [datetime]::MinValue
 			return [int]$arr.Count
 		} catch {
 			continue
 		}
 	}
+	Set-MBTokenizeBackoff
 	return -1
 }
 
@@ -44180,7 +44469,7 @@ function Get-MBAccuratePromptTokens {
 		}
 	}
 
-	if ($script:MB.ServerTokenize -ne $false) {
+	if (Test-MBTokenizeRetryOpen) {
 		try {
 			$prompt = Get-MBApplyTemplatePrompt -Messages $Messages
 			if (-not $prompt) {
@@ -44206,9 +44495,6 @@ function Get-MBAccuratePromptTokens {
 				return [pscustomobject]@{ Tokens = $total; Source = 'server' }
 			}
 		} catch {}
-		if ($null -eq $script:MB.ServerTokenize) {
-			$script:MB.ServerTokenize = $false
-		}
 	}
 
 	# Usage only if it was measured against this exact history fingerprint.
@@ -46231,6 +46517,15 @@ function Build-MBStickySystemContentLive {
 	[void]$lines.Add("Machine: $env:COMPUTERNAME  User: $env:USERNAME")
 	[void]$lines.Add("CWD: $($script:MB.WorkingDir)")
 	[void]$lines.Add("AutoApprove: $($script:MB.AutoApprove)")
+	$toolTok = 0
+	try { $toolTok = [int]$script:MB.ToolsOverheadTok } catch { $toolTok = 0 }
+	$groupList = ''
+	try { $groupList = (@($script:MB.ActiveToolGroups) -join ', ') } catch { $groupList = 'core' }
+	$toolLine = "Tools: ~$toolTok tok. Groups: $groupList."
+	if ($script:MB.IdleGroupsNote) {
+		$toolLine += " Dropped idle: $($script:MB.IdleGroupsNote). EnableToolGroup to restore."
+	}
+	[void]$lines.Add($toolLine)
 
 	$tbText = ''
 	try { $tbText = Format-MBTaskBoardText } catch { $tbText = '' }
@@ -46381,7 +46676,7 @@ function New-MBStickyLedgerMessage {
 	$sorted = @($valid | Sort-Object)
 	$ledgerCsv = ($sorted -join ',')
 	$hdr = '{0} v={1} active_v={1} active_ledger=[{2}]]' -f $script:MB_STATE_MARKER, $Version, $ledgerCsv
-	$trust = ('Trust only active_v={0} (listed in active_ledger=[{1}]). Older SESSION STATE blocks not in active_ledger are historical — ignore them for board/goals/cwd.' -f $Version, $ledgerCsv)
+	$trust = 'This is the only SESSION STATE. Notes, findings, and the task list here are current.'
 	return @{
 		role    = 'system'
 		content = ($hdr + "`n" + $trust + "`n" + $body)
@@ -46501,13 +46796,12 @@ function Sync-MBSystemMessages {
 
 	$baseContent = Get-MBSystemPrompt
 	$liveBody = Get-MBStickyLedgerBodyFromContent (Get-MBStickySystemContent)
+	$frozen = $false
+	try { $frozen = [bool]$script:MB.WireStateFrozen } catch { $frozen = $false }
 
 	$prevBase = $null
-	$rest = New-Object System.Collections.ArrayList
-	$byVer = @{}
-	$maxV = 0
-	$lastStickyContent = ''
-	$lastStickyV = 0
+	$keptState = $null
+	$chat = New-Object System.Collections.ArrayList
 	foreach ($m in @($Messages)) {
 		if ($null -eq $m) { continue }
 		if (Test-MBIsBaseSystemMessage $m) {
@@ -46519,38 +46813,11 @@ function Sync-MBSystemMessages {
 		if ($r -eq 'system' -and $c.StartsWith('[Context compacted:')) { continue }
 		if (Test-MBIsTurnHygieneMessage $m) { continue }
 		if (Test-MBIsStateMessage $m) {
-			$v = Get-MBStickyVersionFromContent -Content $c
-			if ($v -le 0) { $v = 1 }
-			$byVer[$v] = Get-MBStickyLedgerBodyFromContent -Content $c
-			if ($v -gt $maxV) { $maxV = $v }
-			$lastStickyContent = $c
-			$lastStickyV = $v
-			[void]$rest.Add($m)
+			# One SESSION STATE message. Extra copies from older builds are dropped.
+			if ($null -eq $keptState) { $keptState = $m }
 			continue
 		}
-		[void]$rest.Add($m)
-	}
-
-	$validSet = New-Object System.Collections.ArrayList
-	$activeV = 0
-	if (-not [string]::IsNullOrWhiteSpace($lastStickyContent)) {
-		foreach ($n in @(Get-MBStickyLedgerIndexFromContent -Content $lastStickyContent)) {
-			if ([int]$n -gt 0 -and -not ($validSet -contains [int]$n)) { [void]$validSet.Add([int]$n) }
-		}
-		$activeV = Get-MBStickyActiveVersionFromContent -Content $lastStickyContent
-	}
-	if ($validSet.Count -eq 0 -and $maxV -gt 0) {
-		for ($i = 1; $i -le $maxV; $i++) { [void]$validSet.Add($i) }
-		$activeV = $maxV
-	}
-	if ($activeV -le 0) { $activeV = $maxV }
-	if ($activeV -le 0 -and $lastStickyV -gt 0) { $activeV = $lastStickyV }
-
-	$lastBody = ''
-	if ($activeV -gt 0 -and $byVer.ContainsKey($activeV)) {
-		$lastBody = [string]$byVer[$activeV]
-	} elseif ($maxV -gt 0 -and $byVer.ContainsKey($maxV)) {
-		$lastBody = [string]$byVer[$maxV]
+		[void]$chat.Add($m)
 	}
 
 	if ($prevBase -and ([string](Get-MBProp $prevBase 'content') -eq $baseContent)) {
@@ -46559,26 +46826,30 @@ function Sync-MBSystemMessages {
 		$baseSystem = @{ role = 'system'; content = $baseContent }
 	}
 
-	$out = New-Object System.Collections.ArrayList
-	[void]$out.Add($baseSystem)
-	foreach ($m in $rest) { [void]$out.Add($m) }
-
-	$needSticky = $false
-	if ($maxV -le 0) {
-		$needSticky = $true
-	} elseif (-not [string]::Equals(([string]$lastBody).Trim(), ([string]$liveBody).Trim(), [StringComparison]::Ordinal)) {
-		$needSticky = $true
+	$existingBody = ''
+	if ($null -ne $keptState) {
+		$existingBody = Get-MBStickyLedgerBodyFromContent ([string](Get-MBProp $keptState 'content'))
 	}
-	try {
-		if ([bool]$script:MB.PendingStickyLedgerSync) { $needSticky = $true }
-	} catch {}
-	if ($needSticky) {
-		$nextV = 1
-		if ($maxV -gt 0) { $nextV = $maxV + 1 }
-		[void]$out.Add((New-MBStickyLedgerMessage -Version $nextV -Body $liveBody -ValidVersions @($nextV)))
+	$same = [string]::Equals(([string]$existingBody).Trim(), ([string]$liveBody).Trim(), [StringComparison]::Ordinal)
+	$stateMsg = $null
+	if ($frozen -and $null -ne $keptState) {
+		# Leave the frozen copy in place so the tool-loop prefix stays cacheable.
+		$stateMsg = $keptState
+		if (-not $same) {
+			try { $script:MB.PendingStickyLedgerSync = $true } catch {}
+		}
+	} elseif ($same -and $null -ne $keptState) {
+		$stateMsg = $keptState
+		try { $script:MB.PendingStickyLedgerSync = $false } catch {}
+	} else {
+		$stateMsg = New-MBStickyLedgerMessage -Version 1 -Body $liveBody -ValidVersions @(1)
 		try { $script:MB.PendingStickyLedgerSync = $false } catch {}
 	}
 
+	$out = New-Object System.Collections.ArrayList
+	[void]$out.Add($baseSystem)
+	if ($null -ne $stateMsg) { [void]$out.Add($stateMsg) }
+	foreach ($m in $chat) { [void]$out.Add($m) }
 	return $out.ToArray()
 }
 
@@ -46652,26 +46923,33 @@ function Shrink-MBToolPayloads {
 		[int]$OldMaxChars = 2500,
 		[int]$RecentMaxChars = 12000
 	)
-	# Protect last ERROR tool message per path (never shrink away the final failure)
+	# Keep the latest failure, syntax=FAIL, and failed project check. A newer success can shrink first.
 	$protectedIds = @{}
 	try {
 		$lastErrByPath = @{}
+		$lastVerifyFail = ''
+		$lastStatusFail = ''
 		$idx = 0
 		foreach ($m in @($Messages)) {
 			$idx++
 			$role = Get-MBProp $m 'role'
 			if ($role -ne 'tool') { continue }
 			$c = [string](Get-MBProp $m 'content')
-			if ($c -notmatch '(?i)^ERROR:|BLOCKED BY USER|NEED_INPUT') { continue }
-			$path = $null
-			if ($c -match '(?i)([A-Za-z]:\\[^\s\r\n"'']+)') { $path = $Matches[1].ToLowerInvariant() }
-			elseif ($c -match '(?i)"path"\s*:\s*"([^"]+)"') { $path = $Matches[1].ToLowerInvariant() }
-			if (-not $path) { $path = '__nopath__' }
 			$tcid = [string](Get-MBProp $m 'tool_call_id')
 			if (-not $tcid) { $tcid = "idx_$idx" }
-			$lastErrByPath[$path] = $tcid
+			if ($c -match '(?i)^ERROR:|BLOCKED BY USER|NEED_INPUT') {
+				$path = $null
+				if ($c -match '(?i)([A-Za-z]:\\[^\s\r\n"'']+)') { $path = $Matches[1].ToLowerInvariant() }
+				elseif ($c -match '(?i)"path"\s*:\s*"([^"]+)"') { $path = $Matches[1].ToLowerInvariant() }
+				if (-not $path) { $path = '__nopath__' }
+				$lastErrByPath[$path] = $tcid
+			}
+			if ($c -match '(?i)VERIFY:\s*syntax\s*=\s*FAIL') { $lastVerifyFail = $tcid }
+			if ($c -match '(?i)STATUS:\s*(FAILED|NO_CHECK)') { $lastStatusFail = $tcid }
 		}
 		foreach ($k in @($lastErrByPath.Keys)) { $protectedIds[$lastErrByPath[$k]] = $true }
+		if ($lastVerifyFail) { $protectedIds[$lastVerifyFail] = $true }
+		if ($lastStatusFail) { $protectedIds[$lastStatusFail] = $true }
 	} catch {}
 
 	$out = New-Object System.Collections.ArrayList
@@ -46689,8 +46967,8 @@ function Shrink-MBToolPayloads {
 			if ($tcid -and $protectedIds.ContainsKey($tcid)) { $isProtected = $true }
 			$cap = if ($isRecent) { $RecentMaxChars } else { $OldMaxChars }
 			if ($isProtected) {
-				# Keep more of last path error
-				$cap = [math]::Max($cap, [math]::Min(6000, $RecentMaxChars))
+				# Latest failure stays readable even when a newer success is in the trim window.
+				$cap = [math]::Max($cap, 6000)
 			}
 			if ($s.Length -gt $cap) {
 				if ($isRecent -or $isProtected) {
@@ -47436,9 +47714,8 @@ function FullReplace-MBHistory {
 
 		$summaryRaw = $null
 		$usedStage = ''
-		# 2nd+ compact: skip verbatim (usually fails / wastes a full n_ctx call); start fitted/lossy.
-		$stages = @('verbatim', 'fitted', 'lossy')
-		if ($hadResume) { $stages = @('fitted', 'lossy') }
+		# Fitted summary first. Verbatim replays the whole window and usually fails.
+		$stages = @('fitted', 'lossy')
 
 		foreach ($stage in $stages) {
 			if ($VerboseLog) {
@@ -68703,6 +68980,7 @@ function Start-LocalAgent {
 			$script:LastUserMessage = $userInput
 		}
 		$script:MB.UserTurns++
+		try { $null = Disable-MBIdleToolGroups } catch {}
 		try {
 			Write-MBDebugLog -Step 'TURN_ADD_USER_MSG'
 			$script:Messages += @{ role = 'user'; content = (Sanitize-MBText -Text ([string]$userInput)) }
@@ -69281,6 +69559,18 @@ Hint: Prefer SandBoxWrite name+code first, then SandBox piece=name with assert l
 }
 
 try {
+	if ($Doctor) {
+		$code = 0
+		try {
+			$text = Invoke-MBHarnessDoctor
+			Write-Output $text
+			if ($text -match '(?m)^doctor \d+ pass, (\d+) fail' -and [int]$Matches[1] -gt 0) { $code = 1 }
+		} catch {
+			Write-Output $_.Exception.Message
+			$code = 1
+		}
+		[Environment]::Exit($code)
+	}
 	Write-MBDebugLog -Step 'ENTRY_BEGIN'
 	Start-LocalAgent
 	Write-MBDebugLog -Step 'ENTRY_AGENT_RETURNED'

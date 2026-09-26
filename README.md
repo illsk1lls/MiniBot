@@ -1,6 +1,6 @@
 # MiniBot
 
-**v2.61.0** — PowerShell 5.1. Point to an OpenAI-compatible server, it can use the PC: files, tools, and make changes with user permission.
+**v2.64.0** — PowerShell 5.1. Point to an OpenAI-compatible server, it can use the PC: files, tools, and make changes with user permission.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/illsk1lls/MiniBot/refs/heads/main/.readme/MiniBot.png" alt="MiniBot">
@@ -127,7 +127,7 @@ Images: png, jpg, gif, webp, bmp, tif. Video: mp4, m4v, mov, wmv. Audio: mp3, wa
 | Command | What it does |
 |---|---|
 | `/help` | The short list inside the app |
-| `/doctor` | Checks that this script still parses and the coding checks are present. Writes nothing |
+| `/doctor` | Same checks as `powershell -File .\MiniBot.ps1 -Doctor`. No window. Exit code 1 if a check fails |
 | `/status` | Session and context |
 | `/context` | Where the context budget went |
 | `/clear` | Wipe the chat. Notes you pinned stay. The chat you cleared is still in `/sessions` |
@@ -173,7 +173,7 @@ Booleans are `-Name:$true` and `-Name:$false`.
 | `-ModelAlias` | empty | Name shown in PoweredBy. Empty shows the server’s id |
 | `-ApiKey` | `none` | Bearer token. `none` sends no key |
 | `-AgentName` | `MiniBot` | Name in the title bar |
-| `-Version` | `2.61.0` | Shown in the title |
+| `-Version` | `2.64.0` | Shown in the title |
 | `-MaxTokens` | `0` | Reply length. `0` means about one eighth of the server context |
 | `-ContextWindowTokens` | `0` | Only if the server will not say its context size |
 | `-Temperature` | `0.15` | |
@@ -250,7 +250,9 @@ A few that people trip on:
 - **Search the web** returns title, url, and snippet. If DuckDuckGo blocks the PC, ask for Bing or Brave, then open the useful links.
 - **Open a page** pulls readable text. Pages that are only a JavaScript shell come back as needing a render. Certificate checks are off by default and go through `curl -k`.
 - **Registry paths** look like `HKLM:\SOFTWARE\…`. Types are `String`, `DWord`, `QWord`, or the `REG_SZ` / `REG_DWORD` names. Setting a value always asks.
-- **Port check** with no host walks the local subnet. Pass a computer name or a list if you mean specific machines.
+- **Port check** with no host walks the local subnet. `computer=` or `hosts=` probes only those machines, including `127.0.0.1`. It does not fall back to a LAN scan.
+- **Installed software** includes per-user uninstall keys. `include_store=true` adds Store apps.
+- **GetHostSecurity** is the read-only pack: Defender, firewall profiles, local users, BitLocker, who is logged on, and recent failed logons when the Security log is readable.
 - **Find shares** is the same idea: one host, or the subnet. It is not a loop of `net view`.
 - **Remote command** is one host and one command, and it asks first.
 - **Rename many files** previews unless you turn the dry run off.
@@ -280,7 +282,7 @@ Changes to the PC wait for Yes / No / All. A read-only command may run on its ow
 
 Esc or Stop cancels the reply and kills child processes MiniBot started.
 
-The context budget comes from the server, minus room for the reply. Around 72% it starts trimming. Around 88% it trims harder. `/compact` does it now. `/clear` wipes the chat and keeps pinned notes.
+The context budget comes from the server, minus room for the reply. Around 72% it starts trimming. Around 88% it trims harder. `/compact` does it now, starting with a short summary instead of a full replay. `/clear` wipes the chat and keeps pinned notes. If the server’s tokenizer misses, MiniBot retries it. Notes and the task list stay in one session-state message. The last failed check is kept when history is trimmed. Tool groups you are not using turn off after two turns so their definitions stop filling the window. `/tools <group>` turns one back on. `-ToolProfile full` keeps every group on.
 
 While tools are running, the start of the conversation stays put so a local server can reuse its prompt cache. It refreshes when your turn ends.
 

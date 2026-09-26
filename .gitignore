@@ -1,0 +1,2 @@
+# Local harness checks (doctor / Pester). Not part of the shipped script.
+tests/
